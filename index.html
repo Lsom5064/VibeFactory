@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Vibe App Factory - Mobile Deployer</title>
+    <style>
+        :root { --primary: #007AFF; --success: #28a745; --bg: #f5f7f9; }
+        body { font-family: -apple-system, sans-serif; background: var(--bg); display: flex; justify-content: center; padding: 40px; }
+        .container { width: 100%; max-width: 500px; background: white; padding: 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); text-align: center; }
+        input, textarea { width: 100%; padding: 15px; border: 1px solid #ddd; border-radius: 12px; margin-bottom: 15px; box-sizing: border-box; }
+        button { width: 100%; padding: 15px; border: none; border-radius: 12px; font-weight: bold; cursor: pointer; background: var(--primary); color: white; }
+        #status-box { margin-top: 20px; padding: 15px; border-radius: 12px; display: none; }
+        .processing { background: #e3f2fd; color: #1976d2; }
+        .success { background: #e8f5e9; color: #2e7d32; }
+        
+        /* 설치 섹션 스타일 */
+        #install-section { display: none; margin-top: 30px; padding: 20px; border: 2px dashed #ddd; border-radius: 15px; }
+        .qr-placeholder { background: #eee; width: 200px; height: 200px; margin: 0 auto 15px; display: flex; align-items: center; justify-content: center; border-radius: 10px; }
+        .download-btn { background: var(--success); text-decoration: none; display: block; padding: 15px; border-radius: 12px; color: white; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🚀 Smartphone App 2.0</h1>
+    <p style="color: #666; font-size: 14px;">의도를 입력하면 스마트폰용 앱이 즉시 배포됩니다.</p>
+
+    <input type="text" id="prompt" placeholder="어떤 앱을 내 폰에 설치할까요?">
+    <button id="main-btn" onclick="startGeneration()">앱 생성 및 배포</button>
+
+    <div id="status-box"></div>
+
+    <div id="install-section">
+        <h3 style="margin-top:0;">📱 내 폰에 설치하기</h3>
+        <p style="font-size:12px; color:#888;">아래 QR 코드를 폰으로 스캔하거나 버튼을 누르세요.</p>
+        <div class="qr-placeholder" id="qr-area">
+            </div>
+        <a id="download-link" href="#" class="download-btn">📥 APK 직접 다운로드</a>
+    </div>
+
+    <div id="refine-ui" style="display:none; margin-top:20px;">
+        <textarea id="feedback-input" placeholder="수정 사항을 입력하세요..."></textarea>
+        <button onclick="requestRefine()" style="background:#6c757d;">피드백 반영 후 다시 배포</button>
+    </div>
+</div>
+
+<script>
+    let currentTaskId = null;
+
+    async function startGeneration() {
+        const prompt = document.getElementById('prompt').value;
+        if (!prompt) return alert("의도를 입력하세요!");
+
+        updateStatus('Processing', "🤖 AI가 앱을 제조 중입니다...");
+        document.getElementById('install-section').style.display = 'none';
+
+        const res = await fetch('/generate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ prompt: prompt, device_info: { sdk: 34 } }) // 예시 기기 정보
+        });
+        const data = await res.json();
+        currentTaskId = data.task_id;
+        pollStatus();
+    }
+
+    async function pollStatus() {
+        const res = await fetch('/status/' + currentTaskId);
+        const data = await res.json();
+        
+        if (data.status === 'Success') {
+            updateStatus('Success', "✅ 배포 준비 완료!");
+            showInstallUI(data.apk_url || `/download/${currentTaskId}`);
+        } else if (data.status === 'Failed') {
+            updateStatus('Failed', "❌ 빌드 실패");
+        } else {
+            setTimeout(pollStatus, 3000);
+        }
+    }
+
+    function showInstallUI(url) {
+        const fullUrl = window.location.origin + url;
+        document.getElementById('install-section').style.display = 'block';
+        document.getElementById('download-link').href = fullUrl;
+        document.getElementById('refine-ui').style.display = 'block';
+        
+        // 구글 차트 API를 이용한 간단한 QR 코드 생성
+        const qrImg = `<img src="https://chart.googleapis.com/chart?chs=200x200&cht=qr&chl=${encodeURIComponent(fullUrl)}&choe=UTF-8" />`;
+        document.getElementById('qr-area').innerHTML = qrImg;
+    }
+
+    function updateStatus(type, msg) {
+        const box = document.getElementById('status-box');
+        box.style.display = 'block';
+        box.className = type.toLowerCase();
+        box.innerText = msg;
+    }
+</script>
+
+</body>
+</html>

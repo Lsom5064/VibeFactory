@@ -1,0 +1,13 @@
+name: kangwonmealalert
+publish_to: 'none'
+description: 강원대 학식 알리미
+
+environment:
+  sdk: '^3.11.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_local_notifications: ^17.2.1
+  timezone: ^0.9.4
+  shared_preferences: ^2.3.2

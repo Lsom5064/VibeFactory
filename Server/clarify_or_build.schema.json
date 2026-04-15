@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["ask_clarification", "reject", "ready_to_build"]
+    },
+    "summary": { "type": "string" },
+    "question": { "type": "string" },
+    "reason": { "type": "string" },
+    "constraints": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["decision", "summary"],
+  "additionalProperties": false
+}
