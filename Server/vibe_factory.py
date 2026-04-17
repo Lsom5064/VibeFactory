@@ -5512,7 +5512,7 @@ def execute_tool(
         return {"status": "ok", "diagnosis": diag_result.get("result", diag_result)}
 
     elif tool_name == "finalize":
-        # P0: finalize 전 코드 내 API URL 자동 검증
+        # P0: finalize 전 코드 자동 검증 (도구 레벨 강제)
         warnings = []
         lib_path = os.path.join(project_path, "lib")
         if os.path.exists(lib_path):
@@ -5526,20 +5526,55 @@ def execute_tool(
                             code = f.read()
                     except Exception:
                         continue
-                    # URL 추출
+
+                    # 1. 플레이스홀더 체크
                     urls = re.findall(r"https?://[^\s'\"<>]+", code)
-                    for url in urls:
-                        url = url.rstrip("');},")
-                        if any(p in url for p in ["$", "{", "YOUR_", "API_KEY", "SERVICE_KEY"]):
-                            warnings.append(f"{fname}: 플레이스홀더 또는 미완성 URL 발견: {url[:80]}")
-                    # [변수] 패턴 체크
+                    clean_urls = []
+                    for u in urls:
+                        u = u.rstrip("');},")
+                        if any(p in u for p in ["YOUR_", "API_KEY", "SERVICE_KEY", "PLACEHOLDER"]):
+                            warnings.append(f"{fname}: 플레이스홀더 URL: {u[:80]}")
+                        elif "$" not in u and "{" not in u:
+                            clean_urls.append(u)
+
+                    # 2. [변수] 패턴 체크
                     bad_interp = re.findall(r"'[^']*\[(?:id|index|item|key|name)\][^']*'", code)
                     if bad_interp:
-                        warnings.append(f"{fname}: 잘못된 문자열 보간 발견: {bad_interp[:3]}")
+                        warnings.append(f"{fname}: 문자열 보간 오류: {bad_interp[:3]}")
+
+                    # 3. placeholder/TODO 텍스트 체크
+                    for pattern in ["placeholder", "TODO: 실제", "// Replace with"]:
+                        if pattern.lower() in code.lower():
+                            warnings.append(f"{fname}: 미구현 코드 발견: '{pattern}'")
+                            break
+
+                    # 4. URL 실제 fetch 검증 (최대 3개)
+                    for u in clean_urls[:3]:
+                        try:
+                            parsed = urlparse.urlparse(u)
+                            host = parsed.hostname or ""
+                            try:
+                                if ipaddress.ip_address(host).is_private:
+                                    continue
+                            except ValueError:
+                                if host in ("localhost", "metadata.google.internal"):
+                                    continue
+                            resp = _requests_lib.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                            if resp.status_code >= 400:
+                                warnings.append(f"{fname}: URL {resp.status_code} 에러: {u[:80]}")
+                            else:
+                                content_type = resp.headers.get("content-type", "")
+                                is_html = "text/html" in content_type
+                                uses_json_decode = "json.decode" in code or "jsonDecode" in code
+                                if is_html and uses_json_decode:
+                                    warnings.append(f"{fname}: HTML 응답인데 json.decode 사용 중: {u[:60]}")
+                        except Exception:
+                            pass
+
         if warnings:
             return {
                 "status": "error",
-                "message": "finalize 전 코드 검증 실패. 수정 후 다시 finalize하세요.",
+                "message": "finalize 전 코드 검증 실패. 아래 문제를 수정하고 다시 finalize하세요.",
                 "warnings": warnings,
             }
         return {"status": "done", **args}
