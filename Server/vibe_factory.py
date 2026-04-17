@@ -5455,6 +5455,9 @@ def execute_tool(
         full = safe_join(project_path, path)
         if not os.path.exists(full):
             return {"status": "error", "message": f"파일 없음: {path}"}
+        if os.path.isdir(full):
+            files = os.listdir(full)
+            return {"status": "ok", "path": path, "content": f"[디렉토리] 파일 목록: {files}"}
         with open(full, "r", encoding="utf-8") as f:
             content = f.read()
         return {"status": "ok", "path": path, "content": content}
