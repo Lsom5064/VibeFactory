@@ -19,18 +19,18 @@ from vibe_factory import run_vibe_factory
 
 APPS = {
     "강원대학식": {
-        "request": "강원대학교 오늘 학식 메뉴를 보여주는 앱 만들어줘. 실제 학식 데이터를 HTTP로 가져와야 해.",
-        "must_contain_any": ["http", "dio", "get(", "fetch", "Uri.parse", "학식", "메뉴"],
+        "request": "강원대학교 오늘 학식 메뉴를 보여주는 앱 만들���줘. 학식 데이터를 인터넷에서 실시간으로 가져와야 해. URL은 직접 검색해서 찾아.",
+        "must_contain_any": ["http", "dio", "get(", "fetch", "Uri.parse"],
         "must_not_contain": ["placeholder", "TODO: 실제", "dummy"],
     },
     "미세먼지": {
-        "request": "현재 위치 기반 미세먼지 정보를 실시간으로 보여주는 앱 만들어줘. 공공데이터포털 또는 OpenWeather API로 실제 데이터 받아와야 해.",
-        "must_contain_any": ["http", "dio", "get(", "Uri.parse", "pm10", "pm25", "미세먼지", "API"],
+        "request": "현재 미세먼�� 정보를 실시간으로 보여주는 앱 만들어줘. 적절한 공공 API를 직접 검색해서 찾아서 사용해.",
+        "must_contain_any": ["http", "dio", "get(", "Uri.parse", "API"],
         "must_not_contain": ["placeholder", "TODO: 실제"],
     },
     "긱뉴스": {
-        "request": "Hacker News 최신 뉴스를 보여주는 앱 만들어줘. 실제 HN API(hacker-news.firebaseio.com)로 데이터 받아와야 해.",
-        "must_contain_any": ["http", "dio", "hacker-news", "hackernews", "hn", "firebase", "get("],
+        "request": "Hacker News 최신 뉴스를 보여주는 앱 만들어줘. HN API URL은 직접 검색해서 찾아.",
+        "must_contain_any": ["http", "dio", "hacker-news", "hackernews", "firebase", "get("],
         "must_not_contain": ["placeholder", "TODO: 실제"],
     },
 }

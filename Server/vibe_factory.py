@@ -14,6 +14,8 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 from urllib import error as urlerror
 from html import unescape
+import requests as _requests_lib
+from bs4 import BeautifulSoup
 from openai import OpenAI
 
 # -------------------------------------------------
@@ -25,8 +27,8 @@ API_KEY = os.environ.get("OPENAI_API_KEY")
 if not API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable not set")
 
-BASE_PROJECT_PATH = "/Users/hai/Desktop/buildingAppwithLLMs_app/BaseProject"
-BUILD_ROOT_DIR = "/Users/hai/Desktop/buildingAppwithLLMs_app/Builds"
+BASE_PROJECT_PATH = os.environ.get("VIBE_BASE_PROJECT", "/Users/hai/Desktop/buildingAppwithLLMs_app/BaseProject")
+BUILD_ROOT_DIR = os.environ.get("VIBE_BUILD_DIR", "/Users/hai/Desktop/buildingAppwithLLMs_app/Builds")
 
 os.environ["ANDROID_HOME"] = "/Users/hai/Library/Android/sdk"
 
@@ -67,7 +69,7 @@ FEEDBACK_ROUTE_ACTIONS = {
     "no_action": {},
 }
 
-MODEL_NAME = "gpt-5.4"
+MODEL_NAME = os.environ.get("VIBE_MODEL", "gpt-5.4")
 MODEL_TEMPERATURE = 0.1
 
 
@@ -512,6 +514,34 @@ ENGINEER_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search",
+            "description": "웹 검색. API URL이나 데이터 소스를 모를 때 사용.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "검색 쿼리"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_http",
+            "description": "URL의 내용을 가져옴. API 응답 확인이나 데이터 구조 파악에 사용.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
             "description": "프로젝트 파일 읽기.",
             "parameters": {
@@ -615,6 +645,20 @@ ENGINEER_TOOLS = [
 ]
 
 DEBUGGER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_http",
+            "description": "코드에 있는 API URL을 실제로 호출해서 정상 응답 확인 (읽기 전용).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -1558,9 +1602,11 @@ ENGINEER_SYSTEM_V2 = """
 아젠틱 루프로 동작하며 도구를 반복 사용해 코드를 완성합니다.
 
 작업 순서:
-1. read_file 로 관련 파일 확인 (쓰기 전 반드시)
-2. write_file 로 파일 작성/수정
-3. pubspec.yaml 변경 시 run_flutter_pub_get 호출
+1. 외부 데이터가 필요하면 search 로 API URL 검색
+2. fetch_http 로 API 응답 구조 확인
+3. read_file 로 관련 파일 확인 (쓰기 전 반드시)
+4. write_file 로 파일 작성/수정
+5. pubspec.yaml 변경 시 run_flutter_pub_get 호출
 4. run_flutter_analyze 로 정적 분석
    - 실패 시 read_file → write_file 로 수정 후 재시도 (최대 3회)
    - 3회 실패 시 request_diagnosis 로 Debugger 진단 요청
@@ -1574,6 +1620,24 @@ ENGINEER_SYSTEM_V2 = """
 - analyze/build 재시도 최대 3회
 - 3회 내 미해결 시 request_diagnosis 호출
 - pubspec.yaml 수정 시 반드시 run_flutter_pub_get 호출
+
+API 데이터 구현 순서 (반드시 따를 것):
+1. search로 데이터 소스 후보 찾기
+2. fetch_http로 후보 URL 호출해서 실제 응답 확인
+3. 응답이 JSON이면 → 키 구조 확인 → 코드에서 정확히 그 키 사용
+4. 응답이 HTML이면 → json.decode 절대 금지 → HTML 파싱(웹 스크래핑)으로 구현
+5. API 키 필요하면 → 키 없이 되는 다른 API 찾기 → 없으면 웹 스크래핑으로 전환
+6. 401/403/404 에러면 → 다른 URL 시도 → 전부 실패하면 웹 스크래핑으로 전환
+7. 코드 작성 후 fetch_http로 재검증 (코드에 넣은 URL이 실제로 되는지)
+- YOUR_SERVICE_KEY, API_KEY 같은 플레이스홀더 절대 금지
+- finalize 전에 반드시 코드 내 모든 API URL을 fetch_http로 재검증
+
+Dart 코드 필수 규칙:
+- 문자열 안에 변수: 반드시 $변수 또는 ${표현식} 사용
+- [변수] 패턴 절대 사용 금지 (Dart에서 리스트 리터럴로 해석됨)
+- HTTP 호출은 반드시 try-catch로 감싸기 (네트워크 에러 대비)
+- async 함수에서 에러 발생 시 사용자에게 보여줄 에러 메시지 포함
+- null safety: ?. 또는 ?? 연산자로 null 방어
 """.strip()
 
 DEBUGGER_SYSTEM_V2 = """
@@ -5236,9 +5300,9 @@ def has_blocking_flutter_analyze_issue(output):
         stripped = line.strip().lower()
         if not stripped:
             continue
-        if re.search(r"\b(error|warning)\s+•", stripped):
+        if re.search(r"\berror\s+•", stripped):
             return True
-        if stripped.startswith("error •") or stripped.startswith("warning •"):
+        if stripped.startswith("error •"):
             return True
     return False
 
@@ -5332,8 +5396,49 @@ def execute_tool(
     ensure_crash_fn=None,
     callback_log=None,
     token_callback=None,
+    _depth: int = 0,
 ) -> dict:
-    if tool_name == "read_file":
+    if tool_name == "search":
+        query = args.get("query", "")
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = _requests_lib.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers=headers,
+                timeout=10,
+            )
+            soup = BeautifulSoup(resp.text, "html.parser")
+            results = []
+            for a in soup.select(".result__a")[:5]:
+                href = a.get("href", "")
+                match = re.search(r"uddg=([^&]+)", href)
+                if match:
+                    from urllib.parse import unquote
+                    url = unquote(match.group(1))
+                else:
+                    url = href
+                results.append({"title": a.get_text(strip=True), "url": url})
+            return {"status": "ok", "results": results}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    elif tool_name == "fetch_http":
+        url = args.get("url", "")
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = _requests_lib.get(url, headers=headers, timeout=15)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+            if len(text) > 8000:
+                text = text[:8000] + "\n...(truncated)"
+            return {"status": "ok", "url": url, "content": text}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    elif tool_name == "read_file":
         path = args.get("path", "").lstrip("/")
         full = safe_join(project_path, path)
         if not os.path.exists(full):
@@ -5352,6 +5457,12 @@ def execute_tool(
         return {"status": "ok", "path": path}
 
     elif tool_name == "run_flutter_pub_get":
+        pubspec_path = os.path.join(project_path, "pubspec.yaml")
+        pubspec_mtime = os.path.getmtime(pubspec_path) if os.path.exists(pubspec_path) else 0
+        lock_path = os.path.join(project_path, "pubspec.lock")
+        lock_mtime = os.path.getmtime(lock_path) if os.path.exists(lock_path) else 0
+        if lock_mtime > 0 and lock_mtime >= pubspec_mtime:
+            return {"status": "ok", "output": "pubspec.yaml 변경 없음, pub get 스킵"}
         ok, output = run_flutter_pub_get(project_path)
         return {"status": "ok" if ok else "error", "output": output[:3000]}
 
@@ -5364,6 +5475,8 @@ def execute_tool(
         return {"status": "pass" if ok else "fail", "output": res[:3000] if isinstance(res, str) else res}
 
     elif tool_name == "request_diagnosis":
+        if _depth >= 1:
+            return {"status": "error", "message": "재귀 깊이 초과: Debugger 내에서 request_diagnosis 호출 불가"}
         error_log = args.get("error_log", "")
         affected_files = args.get("affected_files", [])
         diag_request = (
@@ -5382,14 +5495,58 @@ def execute_tool(
             max_turns=10,
             pkg=pkg,
             ensure_crash_fn=ensure_crash_fn,
+            _depth=_depth + 1,
         )
         return {"status": "ok", "diagnosis": diag_result.get("result", diag_result)}
 
-    elif tool_name in ("finalize", "finalize_plan", "report_diagnosis"):
+    elif tool_name == "finalize":
+        # P0: finalize 전 코드 내 API URL 자동 검증
+        warnings = []
+        lib_path = os.path.join(project_path, "lib")
+        if os.path.exists(lib_path):
+            for root, _, fnames in os.walk(lib_path):
+                for fname in fnames:
+                    if not fname.endswith(".dart"):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            code = f.read()
+                    except Exception:
+                        continue
+                    # URL 추출
+                    urls = re.findall(r"https?://[^\s'\"<>]+", code)
+                    for url in urls:
+                        url = url.rstrip("');},")
+                        if any(p in url for p in ["$", "{", "YOUR_", "API_KEY", "SERVICE_KEY"]):
+                            warnings.append(f"{fname}: 플레이스홀더 또는 미완성 URL 발견: {url[:80]}")
+                    # [변수] 패턴 체크
+                    bad_interp = re.findall(r"'[^']*\[(?:id|index|item|key|name)\][^']*'", code)
+                    if bad_interp:
+                        warnings.append(f"{fname}: 잘못된 문자열 보간 발견: {bad_interp[:3]}")
+        if warnings:
+            return {
+                "status": "error",
+                "message": "finalize 전 코드 검증 실패. 수정 후 다시 finalize하세요.",
+                "warnings": warnings,
+            }
+        return {"status": "done", **args}
+
+    elif tool_name in ("finalize_plan", "report_diagnosis"):
         return {"status": "done", **args}
 
     else:
         return {"status": "error", "message": f"unknown tool: {tool_name}"}
+
+
+def _truncate_old_messages(messages: list, max_content_len: int = 2000):
+    """오래된 tool result의 content를 절단해서 토큰 폭발 방지."""
+    if len(messages) < 10:
+        return
+    for msg in messages[:-6]:
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
+            if len(msg["content"]) > max_content_len:
+                msg["content"] = msg["content"][:max_content_len] + "\n...(truncated)"
 
 
 def run_agentic_loop(
@@ -5400,13 +5557,21 @@ def run_agentic_loop(
     project_path: str,
     callback_log=None,
     token_callback=None,
-    max_turns: int = 30,
+    max_turns: int = 50,
     pkg: str = "",
     ensure_crash_fn=None,
+    _depth: int = 0,
 ) -> dict:
+    if _depth > 1:
+        return {"status": "error", "message": "최대 재귀 깊이 초과 (depth > 1)"}
+
     messages = [{"role": "user", "content": user_request}]
+    analyze_fail_count = 0
+    diagnosis_count = 0
 
     for turn in range(max_turns):
+        _truncate_old_messages(messages)
+
         try:
             response = client.chat.completions.create(
                 model=MODEL_NAME,
@@ -5425,18 +5590,17 @@ def run_agentic_loop(
         assistant_msg = response.choices[0].message
         tool_calls = getattr(assistant_msg, "tool_calls", None) or []
 
-        messages.append({
-            "role": "assistant",
-            "content": assistant_msg.content,
-            "tool_calls": [
+        msg = {"role": "assistant", "content": assistant_msg.content or ""}
+        if tool_calls:
+            msg["tool_calls"] = [
                 {
                     "id": tc.id,
                     "type": "function",
                     "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                 }
                 for tc in tool_calls
-            ] or None,
-        })
+            ]
+        messages.append(msg)
 
         if not tool_calls:
             return {"status": "success", "message": assistant_msg.content}
@@ -5451,11 +5615,38 @@ def run_agentic_loop(
             if callback_log:
                 callback_log(f"  🔧 {tool_name}")
 
-            result = execute_tool(
-                tool_name, args, project_path, task_id,
-                pkg=pkg, ensure_crash_fn=ensure_crash_fn,
-                callback_log=callback_log, token_callback=token_callback,
-            )
+            # P1-1: analyze 실패 카운터
+            if tool_name == "run_flutter_analyze":
+                result = execute_tool(
+                    tool_name, args, project_path, task_id,
+                    pkg=pkg, ensure_crash_fn=ensure_crash_fn,
+                    callback_log=callback_log, token_callback=token_callback,
+                    _depth=_depth,
+                )
+                if result.get("status") == "fail":
+                    analyze_fail_count += 1
+                    if analyze_fail_count >= 3:
+                        result["_force_hint"] = "analyze가 3회 연속 실패했습니다. 반드시 request_diagnosis를 호출하세요."
+                else:
+                    analyze_fail_count = 0
+            elif tool_name == "request_diagnosis":
+                diagnosis_count += 1
+                if diagnosis_count > 3:
+                    result = {"status": "error", "message": "request_diagnosis 3회 초과. 문제되는 기능을 빼고 빌드하거나, 현재 상태로 finalize하세요."}
+                else:
+                    result = execute_tool(
+                        tool_name, args, project_path, task_id,
+                        pkg=pkg, ensure_crash_fn=ensure_crash_fn,
+                        callback_log=callback_log, token_callback=token_callback,
+                        _depth=_depth,
+                    )
+            else:
+                result = execute_tool(
+                    tool_name, args, project_path, task_id,
+                    pkg=pkg, ensure_crash_fn=ensure_crash_fn,
+                    callback_log=callback_log, token_callback=token_callback,
+                    _depth=_depth,
+                )
 
             messages.append({
                 "role": "tool",
@@ -6323,7 +6514,8 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
     
     base_pkg = plan.get("package_name", "kr.ac.kangwon.hai.generated")
     base_pkg = sanitize_package(base_pkg)
-    pkg = f"{base_pkg}.t{task_id}"
+    safe_task_id = re.sub(r'[^a-z0-9_]', '', task_id.lower())
+    pkg = f"{base_pkg}.t{safe_task_id}"
 
 
     if callback_log:
