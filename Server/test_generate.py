@@ -11,7 +11,6 @@ OPENAI_API_KEY 환경변수 필요.
 
 import sys
 import os
-import json
 import glob
 
 sys.path.insert(0, os.path.dirname(__file__))
