@@ -469,6 +469,210 @@ FILE_CHANGE_TOOL_SCHEMAS = [
 ]
 
 
+# -------------------------------------------------
+# AGENTIC LOOP TOOL SCHEMAS
+# -------------------------------------------------
+
+PLANNER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "프로젝트 파일 읽기.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "프로젝트 루트 기준 상대경로"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finalize_plan",
+            "description": "플래닝 완료. 구현 계획 반환.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "description": "구현 계획 JSON",
+                    },
+                    "summary": {"type": "string"},
+                },
+                "required": ["plan", "summary"],
+            },
+        },
+    },
+]
+
+ENGINEER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "프로젝트 파일 읽기.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "파일 생성 또는 덮어쓰기.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["path", "content", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flutter_pub_get",
+            "description": "pubspec.yaml 변경 후 패키지 설치. pubspec.yaml 수정 시 반드시 호출.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flutter_analyze",
+            "description": "Flutter 정적 분석 실행. 코드 작성 후 호출.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flutter_build",
+            "description": "Flutter APK 빌드 실행.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_diagnosis",
+            "description": "분석/빌드 실패가 3회 이상 반복될 때 Debugger에게 진단 요청.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "error_log": {"type": "string", "description": "flutter analyze/build 출력"},
+                    "affected_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "오류와 관련된 파일 경로 목록",
+                    },
+                },
+                "required": ["error_log", "affected_files"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finalize",
+            "description": "구현 완료. 결과 요약 반환.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "built_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+]
+
+DEBUGGER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "프로젝트 파일 읽기 (읽기 전용).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flutter_analyze",
+            "description": "Flutter 정적 분석 실행 (읽기 전용).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_diagnosis",
+            "description": "진단 완료. 원인 분석과 수정 제안을 Engineer에게 반환.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "root_cause": {"type": "string"},
+                    "affected_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "fix_suggestions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["file", "description"],
+                        },
+                    },
+                },
+                "required": ["root_cause", "affected_files", "fix_suggestions"],
+            },
+        },
+    },
+]
+
+
 def get_trace_conn():
     return sqlite3.connect(
         TRACE_DB_PATH,
@@ -1348,6 +1552,45 @@ Return ONLY a valid JSON object. No prose or commentary outside the JSON.
 ]
 }
 """
+
+ENGINEER_SYSTEM_V2 = """
+당신은 Flutter 앱을 구현하는 시니어 엔지니어입니다.
+아젠틱 루프로 동작하며 도구를 반복 사용해 코드를 완성합니다.
+
+작업 순서:
+1. read_file 로 관련 파일 확인 (쓰기 전 반드시)
+2. write_file 로 파일 작성/수정
+3. pubspec.yaml 변경 시 run_flutter_pub_get 호출
+4. run_flutter_analyze 로 정적 분석
+   - 실패 시 read_file → write_file 로 수정 후 재시도 (최대 3회)
+   - 3회 실패 시 request_diagnosis 로 Debugger 진단 요청
+5. run_flutter_build 로 APK 빌드
+   - 실패 시 analyze 실패와 동일하게 처리
+6. 빌드 성공 시 finalize
+
+규칙:
+- write_file 전에 반드시 read_file 로 현재 파일 확인
+- 수정 시 전체 재생성 금지, 문제 부분만 수정
+- analyze/build 재시도 최대 3회
+- 3회 내 미해결 시 request_diagnosis 호출
+- pubspec.yaml 수정 시 반드시 run_flutter_pub_get 호출
+""".strip()
+
+DEBUGGER_SYSTEM_V2 = """
+당신은 Flutter 빌드 오류를 진단하는 시니어 디버거입니다.
+읽기 전용으로 동작합니다. 파일을 직접 수정하지 않습니다.
+
+작업 순서:
+1. read_file 로 오류 관련 파일 확인
+2. run_flutter_analyze 로 현재 상태 재확인
+3. 원인 파악 후 report_diagnosis 로 결과 반환
+
+규칙:
+- write_file 사용 금지 (읽기 전용)
+- 코드 수정은 Engineer가 담당
+- report_diagnosis 에 root_cause, affected_files, fix_suggestions 포함
+- fix_suggestions 는 파일별 구체적 수정 방향 명시
+""".strip()
 
 REFINER_PLANNER_SYSTEM = """
 You are the Senior Strategic Refinement Planner for the Smartphone App 2.0 Project. Your role is to carefully evolve existing Flutter applications by analyzing user feedback and the current source code to design a safe and efficient modification plan.
@@ -4998,6 +5241,18 @@ def has_blocking_flutter_analyze_issue(output):
         if stripped.startswith("error •") or stripped.startswith("warning •"):
             return True
     return False
+
+
+def run_flutter_pub_get(project_path: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["flutter", "pub", "get"],
+        cwd=project_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    ok = result.returncode == 0
+    return ok, result.stdout + result.stderr
 
 
 def run_flutter_analyze(project_path):
