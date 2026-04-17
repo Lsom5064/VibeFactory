@@ -1,7 +1,6 @@
 import os
 import shutil
 import subprocess
-import uuid
 import re
 import json
 import sqlite3
@@ -9,10 +8,9 @@ import ipaddress
 import base64
 import mimetypes
 from html.parser import HTMLParser
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib import parse as urlparse
 from urllib import request as urlrequest
-from urllib import error as urlerror
 from html import unescape
 import requests as _requests_lib
 from bs4 import BeautifulSoup
@@ -27,8 +25,8 @@ API_KEY = os.environ.get("OPENAI_API_KEY")
 if not API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable not set")
 
-BASE_PROJECT_PATH = os.environ.get("VIBE_BASE_PROJECT", "/Users/hai/Desktop/buildingAppwithLLMs_app/BaseProject")
-BUILD_ROOT_DIR = os.environ.get("VIBE_BUILD_DIR", "/Users/hai/Desktop/buildingAppwithLLMs_app/Builds")
+BASE_PROJECT_PATH = os.environ.get("VIBE_BASE_PROJECT", "")
+BUILD_ROOT_DIR = os.environ.get("VIBE_BUILD_DIR", "")
 
 os.environ["ANDROID_HOME"] = "/Users/hai/Library/Android/sdk"
 
@@ -1626,6 +1624,12 @@ API 데이터 구현 순서 (반드시 따를 것):
 2. fetch_http로 후보 URL 호출해서 실제 응답 확인
 3. 응답이 JSON이면 → 키 구조 확인 → 코드에서 정확히 그 키 사용
 4. 응답이 HTML이면 → json.decode 절대 금지 → HTML 파싱(웹 스크래핑)으로 구현
+   - pubspec.yaml에 html: ^0.15.4 패키지 추가
+   - import 'package:html/parser.dart' as html_parser;
+   - var document = html_parser.parse(response.body);
+   - document.querySelectorAll('선택자')로 데이터 추출
+   - fetch_http 응답에서 HTML 구조를 보고 적절한 CSS 선택자를 파악할 것
+   - placeholder나 빈 리스트로 대체 절대 금지, 반드시 실제 파싱 구현
 5. API 키 필요하면 → 키 없이 되는 다른 API 찾기 → 없으면 웹 스크래핑으로 전환
 6. 401/403/404 에러면 → 다른 URL 시도 → 전부 실패하면 웹 스크래핑으로 전환
 7. 코드 작성 후 fetch_http로 재검증 (코드에 넣은 URL이 실제로 되는지)
@@ -5043,7 +5047,7 @@ def build_refinement_user_summary(plan, files_to_modify):
 def _extract_refinement_keep_text(plan):
     analysis = _compact_korean_text(plan.get("analysis", ""), max_len=100)
     if analysis:
-        return [f"기존 화면 구조와 흐름을 유지합니다.", analysis]
+        return ["기존 화면 구조와 흐름을 유지합니다.", analysis]
     return ["기존 화면 구조와 흐름을 유지합니다.", "필요한 부분만 부분 수정합니다."]
 
 
@@ -5250,7 +5254,7 @@ def get_current_project_snapshot(project_path, relevant_files=None):
                 with open(full) as fp:
                     out.append(f"[{f}]\n{fp.read()}")
 
-        except:
+        except Exception:
             pass
 
     return "\n\n".join(out)
@@ -5426,6 +5430,14 @@ def execute_tool(
     elif tool_name == "fetch_http":
         url = args.get("url", "")
         try:
+            parsed = urlparse.urlparse(url)
+            host = parsed.hostname or ""
+            try:
+                if ipaddress.ip_address(host).is_private:
+                    return {"status": "error", "message": "private IP 접근 차단"}
+            except ValueError:
+                if host in ("localhost", "metadata.google.internal", "169.254.169.254"):
+                    return {"status": "error", "message": "private URL 접근 차단"}
             headers = {"User-Agent": "Mozilla/5.0"}
             resp = _requests_lib.get(url, headers=headers, timeout=15)
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -6548,6 +6560,7 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
     ensure_crash_handler_identity(project, task_id, pkg)
 
     ensure_crash_fn = lambda: ensure_crash_handler_identity(project, task_id, pkg)
+    current_files = []
 
     # ENGINEER AGENTIC LOOP
     eng_user_request = (

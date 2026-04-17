@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 Server/tasks.db
+.env
