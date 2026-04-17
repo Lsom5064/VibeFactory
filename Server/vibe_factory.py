@@ -5320,6 +5320,156 @@ def run_flutter_build(project_path):
 
 
 # -------------------------------------------------
+# AGENTIC LOOP ENGINE
+# -------------------------------------------------
+
+def execute_tool(
+    tool_name: str,
+    args: dict,
+    project_path: str,
+    task_id: str,
+    pkg: str = "",
+    ensure_crash_fn=None,
+    callback_log=None,
+    token_callback=None,
+) -> dict:
+    if tool_name == "read_file":
+        path = args.get("path", "").lstrip("/")
+        full = safe_join(project_path, path)
+        if not os.path.exists(full):
+            return {"status": "error", "message": f"파일 없음: {path}"}
+        with open(full, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"status": "ok", "path": path, "content": content}
+
+    elif tool_name == "write_file":
+        path = args.get("path", "")
+        content = args.get("content", "")
+        reason = args.get("reason", "")
+        save_project_files(project_path, [{"path": path, "content": content, "change_type": "modify", "reason": reason}])
+        if ensure_crash_fn:
+            ensure_crash_fn()
+        return {"status": "ok", "path": path}
+
+    elif tool_name == "run_flutter_pub_get":
+        ok, output = run_flutter_pub_get(project_path)
+        return {"status": "ok" if ok else "error", "output": output[:3000]}
+
+    elif tool_name == "run_flutter_analyze":
+        ok, output = run_flutter_analyze(project_path)
+        return {"status": "pass" if ok else "fail", "output": output[:3000]}
+
+    elif tool_name == "run_flutter_build":
+        ok, res = run_flutter_build(project_path)
+        return {"status": "pass" if ok else "fail", "output": res[:3000] if isinstance(res, str) else res}
+
+    elif tool_name == "request_diagnosis":
+        error_log = args.get("error_log", "")
+        affected_files = args.get("affected_files", [])
+        diag_request = (
+            f"다음 Flutter 오류를 진단하세요.\n\n"
+            f"error_log:\n{error_log}\n\n"
+            f"affected_files: {json.dumps(affected_files, ensure_ascii=False)}"
+        )
+        diag_result = run_agentic_loop(
+            task_id=task_id,
+            user_request=diag_request,
+            tools=DEBUGGER_TOOLS,
+            system=DEBUGGER_SYSTEM_V2,
+            project_path=project_path,
+            callback_log=callback_log,
+            token_callback=token_callback,
+            max_turns=10,
+            pkg=pkg,
+            ensure_crash_fn=ensure_crash_fn,
+        )
+        return {"status": "ok", "diagnosis": diag_result.get("result", diag_result)}
+
+    elif tool_name in ("finalize", "finalize_plan", "report_diagnosis"):
+        return {"status": "done", **args}
+
+    else:
+        return {"status": "error", "message": f"unknown tool: {tool_name}"}
+
+
+def run_agentic_loop(
+    task_id: str,
+    user_request: str,
+    tools: list,
+    system: str,
+    project_path: str,
+    callback_log=None,
+    token_callback=None,
+    max_turns: int = 30,
+    pkg: str = "",
+    ensure_crash_fn=None,
+) -> dict:
+    messages = [{"role": "user", "content": user_request}]
+
+    for turn in range(max_turns):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "system", "content": system}] + messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=MODEL_TEMPERATURE,
+            )
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        usage = extract_usage_dict(response)
+        if token_callback:
+            token_callback(task_id, f"AgenticLoop_turn{turn + 1}", usage)
+
+        assistant_msg = response.choices[0].message
+        tool_calls = getattr(assistant_msg, "tool_calls", None) or []
+
+        messages.append({
+            "role": "assistant",
+            "content": assistant_msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in tool_calls
+            ] or None,
+        })
+
+        if not tool_calls:
+            return {"status": "success", "message": assistant_msg.content}
+
+        for tc in tool_calls:
+            tool_name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except Exception:
+                args = {}
+
+            if callback_log:
+                callback_log(f"  🔧 {tool_name}")
+
+            result = execute_tool(
+                tool_name, args, project_path, task_id,
+                pkg=pkg, ensure_crash_fn=ensure_crash_fn,
+                callback_log=callback_log, token_callback=token_callback,
+            )
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+            if tool_name in ("finalize", "finalize_plan", "report_diagnosis"):
+                return {"status": "success", "result": result, "tool": tool_name}
+
+    return {"status": "max_turns_exceeded"}
+
+
+# -------------------------------------------------
 # MAIN ENGINE
 # -------------------------------------------------
 
@@ -6205,48 +6355,79 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
     update_dart_imports(project, "baseproject", title)
     ensure_crash_handler_identity(project, task_id, pkg)
 
-    current_files = []
+    ensure_crash_fn = lambda: ensure_crash_handler_identity(project, task_id, pkg)
 
-    # ENGINEER LOOP
+    # ENGINEER AGENTIC LOOP
+    eng_user_request = (
+        f"다음 설계안을 Flutter 앱으로 구현하세요.\n\n"
+        f"설계안:\n{json.dumps(plan, ensure_ascii=False)}"
+    )
+
+    analyze_ok = False
+    failure_type = "engineer_loop_failed"
+    analyze_res = ""
 
     for attempt in range(2):
-
         if callback_log:
             callback_log(f"✍️ 코드 생성 중 (시도 {attempt+1})")
 
-        eng_result = call_agent_with_tools(
-            ENGINEER_SYSTEM,
-            "설계안을 구현하고 검토 피드백을 반영하세요.",
-            context=plan,
-            trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Engineer", "stage": "implement"},
-            tools=FILE_CHANGE_TOOL_SCHEMAS,
-            validator=validate_file_change_payload,
-            parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
-            fallback_parser=legacy_agent_response_detailed,
+        if attempt > 0 and plan.get("feedback"):
+            eng_user_request += f"\n\n검토 피드백:\n{json.dumps(plan['feedback'], ensure_ascii=False)}"
+
+        eng_loop_result = run_agentic_loop(
+            task_id=task_id,
+            user_request=eng_user_request,
+            tools=ENGINEER_TOOLS,
+            system=ENGINEER_SYSTEM_V2,
+            project_path=project,
+            callback_log=callback_log,
+            token_callback=token_callback,
+            pkg=pkg,
+            ensure_crash_fn=ensure_crash_fn,
         )
-        eng = eng_result.get("parsed_output")
-        usage = eng_result.get("usage")
-        if token_callback and eng and usage:
-            token_callback(task_id, "Engineer", usage)
 
-        if not eng:
-            continue
+        if eng_loop_result.get("status") == "max_turns_exceeded":
+            if callback_log:
+                callback_log("⚠️ Engineer 루프 최대 턴 초과")
 
-        current_files = eng.get("files", [])
+        # Check analyze result from loop or run fresh
+        if callback_log:
+            callback_log("🧪 정적 분석 확인 중")
+        analyze_ok, analyze_res = run_flutter_analyze(project)
 
-        save_project_files(project, current_files)
-        ensure_crash_handler_identity(project, task_id, pkg)
+        if analyze_ok:
+            if callback_log:
+                callback_log("✅ 정적 분석 통과")
+        else:
+            failure_type = classify_failure_type(analyze_res)
+            if callback_log:
+                callback_log(f"❌ 정적 분석 실패 ({failure_type})")
 
         if callback_log:
             callback_log("🧐 코드 검토 중")
+
+        # Read current files for Reviewer context
+        current_dart_files = []
+        lib_path = os.path.join(project, "lib")
+        if os.path.exists(lib_path):
+            for root, _, fnames in os.walk(lib_path):
+                for fname in fnames:
+                    if fname.endswith(".dart"):
+                        rel = os.path.relpath(os.path.join(root, fname), project)
+                        try:
+                            with open(os.path.join(root, fname), "r", encoding="utf-8") as f:
+                                current_dart_files.append({"path": rel, "content": f.read()})
+                        except Exception:
+                            pass
 
         review_result = call_agent_with_tools(
             REVIEWER_SYSTEM,
             "이 코드를 검토하세요.",
             context={
-                "implementation": eng,
+                "implementation": {"files": current_dart_files},
                 "build_spec": build_context.get("build_spec") or {},
                 "ui_contract": ui_contract or {},
+                "analyze_result": {"ok": analyze_ok, "output": analyze_res[:2000]},
             },
             trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Reviewer", "stage": "review"},
             tools=REVIEW_TOOL_SCHEMAS,
@@ -6259,78 +6440,22 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
         if token_callback and review and usage:
             token_callback(task_id, "Reviewer", usage)
 
-        if review and review.get("status") == "pass":
+        if review and review.get("status") == "pass" and analyze_ok:
             break
 
         if review:
             plan["feedback"] = review.get("feedback")
 
-    if callback_log:
-        callback_log("🧪 정적 분석 실행 중")
-
-    analyze_ok, analyze_res = run_flutter_analyze(project)
-    if analyze_ok:
-        if callback_log:
-            callback_log("✅ 정적 분석 통과")
-    else:
-        failure_type = classify_failure_type(analyze_res)
-        if callback_log:
-            callback_log(f"❌ 정적 분석 실패 ({failure_type})")
-
-        for i in range(2):
-            if callback_log:
-                callback_log(f"🛠 정적 분석 오류 수정 중 ({i+1}/2)")
-
-            debug_context = prepare_debugger_context(
-                project,
-                analyze_res,
-                "analyze",
-                relevant_files=current_files,
-                callback_log=callback_log,
-                ui_contract=ui_contract,
-            )
-
-            fix_result = call_agent_with_tools(
-                DEBUGGER_SYSTEM,
-                "정적 분석 오류를 수정하세요.",
-                context=debug_context,
-                trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Debugger", "stage": "analyze_fix"},
-                tools=FILE_CHANGE_TOOL_SCHEMAS,
-                validator=validate_file_change_payload,
-                parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
-                fallback_parser=legacy_agent_response_detailed,
-            )
-            fix = fix_result.get("parsed_output")
-            usage = fix_result.get("usage")
-            if token_callback and fix and usage:
-                token_callback(task_id, "Debugger_Analyze", usage)
-
-            if fix and "files" in fix:
-                save_project_files(project, fix["files"])
-                ensure_crash_handler_identity(project, task_id, pkg)
-                current_files += [f.get("path") for f in fix["files"] if f.get("path")]
-
-            if callback_log:
-                callback_log("🧪 정적 분석 실행 중")
-            analyze_ok, analyze_res = run_flutter_analyze(project)
-            if analyze_ok:
-                if callback_log:
-                    callback_log("✅ 정적 분석 통과")
-                break
-            failure_type = classify_failure_type(analyze_res)
-            if callback_log:
-                callback_log(f"❌ 정적 분석 실패 ({failure_type})")
-
     if not analyze_ok:
-            return {
-                "status": "failed",
-                "error_log": analyze_res,
-                "failure_stage": "analyze",
-                "failure_type": failure_type,
-                "project_path": project,
-                "package_name": pkg,
-                "app_name": title,
-            }
+        return {
+            "status": "failed",
+            "error_log": analyze_res,
+            "failure_stage": "analyze",
+            "failure_type": failure_type,
+            "project_path": project,
+            "package_name": pkg,
+            "app_name": title,
+        }
 
     # BUILD LOOP
 
