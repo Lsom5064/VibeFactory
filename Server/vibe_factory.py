@@ -1,7 +1,6 @@
 import os
 import shutil
 import subprocess
-import uuid
 import re
 import json
 import sqlite3
@@ -9,11 +8,12 @@ import ipaddress
 import base64
 import mimetypes
 from html.parser import HTMLParser
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib import parse as urlparse
 from urllib import request as urlrequest
-from urllib import error as urlerror
 from html import unescape
+import requests as _requests_lib
+from bs4 import BeautifulSoup
 from openai import OpenAI
 
 # -------------------------------------------------
@@ -25,8 +25,8 @@ API_KEY = os.environ.get("OPENAI_API_KEY")
 if not API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable not set")
 
-BASE_PROJECT_PATH = "/Users/hai/Desktop/buildingAppwithLLMs_app/BaseProject"
-BUILD_ROOT_DIR = "/Users/hai/Desktop/buildingAppwithLLMs_app/Builds"
+BASE_PROJECT_PATH = os.environ.get("VIBE_BASE_PROJECT", "")
+BUILD_ROOT_DIR = os.environ.get("VIBE_BUILD_DIR", "")
 
 os.environ["ANDROID_HOME"] = "/Users/hai/Library/Android/sdk"
 
@@ -67,7 +67,7 @@ FEEDBACK_ROUTE_ACTIONS = {
     "no_action": {},
 }
 
-MODEL_NAME = "gpt-5.4"
+MODEL_NAME = os.environ.get("VIBE_MODEL", "gpt-5.4")
 MODEL_TEMPERATURE = 0.1
 
 
@@ -466,6 +466,252 @@ FILE_CHANGE_TOOL_SCHEMAS = [
             "additionalProperties": False,
         },
     )
+]
+
+
+# -------------------------------------------------
+# AGENTIC LOOP TOOL SCHEMAS
+# -------------------------------------------------
+
+PLANNER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "프로젝트 파일 읽기.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "프로젝트 루트 기준 상대경로"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finalize_plan",
+            "description": "플래닝 완료. 구현 계획 반환.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "description": "구현 계획 JSON",
+                    },
+                    "summary": {"type": "string"},
+                },
+                "required": ["plan", "summary"],
+            },
+        },
+    },
+]
+
+ENGINEER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": "웹 검색. API URL이나 데이터 소스를 모를 때 사용.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "검색 쿼리"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_http",
+            "description": "URL의 내용을 가져옴. API 응답 확인이나 데이터 구조 파악에 사용.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "프로젝트 파일 읽기.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "파일 생성 또는 덮어쓰기.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["path", "content", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flutter_pub_get",
+            "description": "pubspec.yaml 변경 후 패키지 설치. pubspec.yaml 수정 시 반드시 호출.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flutter_analyze",
+            "description": "Flutter 정적 분석 실행. 코드 작성 후 호출.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flutter_build",
+            "description": "Flutter APK 빌드 실행.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_diagnosis",
+            "description": "분석/빌드 실패가 3회 이상 반복될 때 Debugger에게 진단 요청.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "error_log": {"type": "string", "description": "flutter analyze/build 출력"},
+                    "affected_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "오류와 관련된 파일 경로 목록",
+                    },
+                },
+                "required": ["error_log", "affected_files"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finalize",
+            "description": "구현 완료. 결과 요약 반환.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "built_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+]
+
+DEBUGGER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_http",
+            "description": "코드에 있는 API URL을 실제로 호출해서 정상 응답 확인 (읽기 전용).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "프로젝트 파일 읽기 (읽기 전용).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flutter_analyze",
+            "description": "Flutter 정적 분석 실행 (읽기 전용).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_diagnosis",
+            "description": "진단 완료. 원인 분석과 수정 제안을 Engineer에게 반환.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "root_cause": {"type": "string"},
+                    "affected_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "fix_suggestions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["file", "description"],
+                        },
+                    },
+                },
+                "required": ["root_cause", "affected_files", "fix_suggestions"],
+            },
+        },
+    },
 ]
 
 
@@ -1348,6 +1594,71 @@ Return ONLY a valid JSON object. No prose or commentary outside the JSON.
 ]
 }
 """
+
+ENGINEER_SYSTEM_V2 = """
+당신은 Flutter 앱을 구현하는 시니어 엔지니어입니다.
+아젠틱 루프로 동작하며 도구를 반복 사용해 코드를 완성합니다.
+
+작업 순서:
+1. 외부 데이터가 필요하면 search 로 API URL 검색
+2. fetch_http 로 API 응답 구조 확인
+3. read_file 로 관련 파일 확인 (쓰기 전 반드시)
+4. write_file 로 파일 작성/수정
+5. pubspec.yaml 변경 시 run_flutter_pub_get 호출
+4. run_flutter_analyze 로 정적 분석
+   - 실패 시 read_file → write_file 로 수정 후 재시도 (최대 3회)
+   - 3회 실패 시 request_diagnosis 로 Debugger 진단 요청
+5. run_flutter_build 로 APK 빌드
+   - 실패 시 analyze 실패와 동일하게 처리
+6. 빌드 성공 시 finalize
+
+규칙:
+- write_file 전에 반드시 read_file 로 현재 파일 확인
+- 수정 시 전체 재생성 금지, 문제 부분만 수정
+- analyze/build 재시도 최대 3회
+- 3회 내 미해결 시 request_diagnosis 호출
+- pubspec.yaml 수정 시 반드시 run_flutter_pub_get 호출
+
+API 데이터 구현 순서 (반드시 따를 것):
+1. search로 데이터 소스 후보 찾기
+2. fetch_http로 후보 URL 호출해서 실제 응답 확인
+3. 응답이 JSON이면 → 키 구조 확인 → 코드에서 정확히 그 키 사용
+4. 응답이 HTML이면 → json.decode 절대 금지 → HTML 파싱(웹 스크래핑)으로 구현
+   - pubspec.yaml에 html: ^0.15.4 패키지 추가
+   - import 'package:html/parser.dart' as html_parser;
+   - var document = html_parser.parse(response.body);
+   - document.querySelectorAll('선택자')로 데이터 추출
+   - fetch_http 응답에서 HTML 구조를 보고 적절한 CSS 선택자를 파악할 것
+   - placeholder나 빈 리스트로 대체 절대 금지, 반드시 실제 파싱 구현
+5. API 키 필요하면 → 키 없이 되는 다른 API 찾기 → 없으면 웹 스크래핑으로 전환
+6. 401/403/404 에러면 → 다른 URL 시도 → 전부 실패하면 웹 스크래핑으로 전환
+7. 코드 작성 후 fetch_http로 재검증 (코드에 넣은 URL이 실제로 되는지)
+- YOUR_SERVICE_KEY, API_KEY 같은 플레이스홀더 절대 금지
+- finalize 전에 반드시 코드 내 모든 API URL을 fetch_http로 재검증
+
+Dart 코드 필수 규칙:
+- 문자열 안에 변수: 반드시 $변수 또는 ${표현식} 사용
+- [변수] 패턴 절대 사용 금지 (Dart에서 리스트 리터럴로 해석됨)
+- HTTP 호출은 반드시 try-catch로 감싸기 (네트워크 에러 대비)
+- async 함수에서 에러 발생 시 사용자에게 보여줄 에러 메시지 포함
+- null safety: ?. 또는 ?? 연산자로 null 방어
+""".strip()
+
+DEBUGGER_SYSTEM_V2 = """
+당신은 Flutter 빌드 오류를 진단하는 시니어 디버거입니다.
+읽기 전용으로 동작합니다. 파일을 직접 수정하지 않습니다.
+
+작업 순서:
+1. read_file 로 오류 관련 파일 확인
+2. run_flutter_analyze 로 현재 상태 재확인
+3. 원인 파악 후 report_diagnosis 로 결과 반환
+
+규칙:
+- write_file 사용 금지 (읽기 전용)
+- 코드 수정은 Engineer가 담당
+- report_diagnosis 에 root_cause, affected_files, fix_suggestions 포함
+- fix_suggestions 는 파일별 구체적 수정 방향 명시
+""".strip()
 
 REFINER_PLANNER_SYSTEM = """
 You are the Senior Strategic Refinement Planner for the Smartphone App 2.0 Project. Your role is to carefully evolve existing Flutter applications by analyzing user feedback and the current source code to design a safe and efficient modification plan.
@@ -4736,7 +5047,7 @@ def build_refinement_user_summary(plan, files_to_modify):
 def _extract_refinement_keep_text(plan):
     analysis = _compact_korean_text(plan.get("analysis", ""), max_len=100)
     if analysis:
-        return [f"기존 화면 구조와 흐름을 유지합니다.", analysis]
+        return ["기존 화면 구조와 흐름을 유지합니다.", analysis]
     return ["기존 화면 구조와 흐름을 유지합니다.", "필요한 부분만 부분 수정합니다."]
 
 
@@ -4943,7 +5254,7 @@ def get_current_project_snapshot(project_path, relevant_files=None):
                 with open(full) as fp:
                     out.append(f"[{f}]\n{fp.read()}")
 
-        except:
+        except Exception:
             pass
 
     return "\n\n".join(out)
@@ -4993,11 +5304,23 @@ def has_blocking_flutter_analyze_issue(output):
         stripped = line.strip().lower()
         if not stripped:
             continue
-        if re.search(r"\b(error|warning)\s+•", stripped):
+        if re.search(r"\berror\s+•", stripped):
             return True
-        if stripped.startswith("error •") or stripped.startswith("warning •"):
+        if stripped.startswith("error •"):
             return True
     return False
+
+
+def run_flutter_pub_get(project_path: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["flutter", "pub", "get"],
+        cwd=project_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    ok = result.returncode == 0
+    return ok, result.stdout + result.stderr
 
 
 def run_flutter_analyze(project_path):
@@ -5062,6 +5385,329 @@ def run_flutter_build(project_path):
         return False, stderr + stdout
 
     return True, apk
+
+
+# -------------------------------------------------
+# AGENTIC LOOP ENGINE
+# -------------------------------------------------
+
+def execute_tool(
+    tool_name: str,
+    args: dict,
+    project_path: str,
+    task_id: str,
+    pkg: str = "",
+    ensure_crash_fn=None,
+    callback_log=None,
+    token_callback=None,
+    _depth: int = 0,
+) -> dict:
+    if tool_name == "search":
+        query = args.get("query", "")
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = _requests_lib.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers=headers,
+                timeout=10,
+            )
+            soup = BeautifulSoup(resp.text, "html.parser")
+            results = []
+            for a in soup.select(".result__a")[:5]:
+                href = a.get("href", "")
+                match = re.search(r"uddg=([^&]+)", href)
+                if match:
+                    from urllib.parse import unquote
+                    url = unquote(match.group(1))
+                else:
+                    url = href
+                results.append({"title": a.get_text(strip=True), "url": url})
+            return {"status": "ok", "results": results}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    elif tool_name == "fetch_http":
+        url = args.get("url", "")
+        try:
+            parsed = urlparse.urlparse(url)
+            host = parsed.hostname or ""
+            try:
+                if ipaddress.ip_address(host).is_private:
+                    return {"status": "error", "message": "private IP 접근 차단"}
+            except ValueError:
+                if host in ("localhost", "metadata.google.internal", "169.254.169.254"):
+                    return {"status": "error", "message": "private URL 접근 차단"}
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = _requests_lib.get(url, headers=headers, timeout=15)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+            if len(text) > 8000:
+                text = text[:8000] + "\n...(truncated)"
+            return {"status": "ok", "url": url, "content": text}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    elif tool_name == "read_file":
+        path = args.get("path", "").lstrip("/")
+        full = safe_join(project_path, path)
+        if not os.path.exists(full):
+            return {"status": "error", "message": f"파일 없음: {path}"}
+        if os.path.isdir(full):
+            files = os.listdir(full)
+            return {"status": "ok", "path": path, "content": f"[디렉토리] 파일 목록: {files}"}
+        with open(full, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"status": "ok", "path": path, "content": content}
+
+    elif tool_name == "write_file":
+        path = args.get("path", "")
+        content = args.get("content", "")
+        reason = args.get("reason", "")
+        save_project_files(project_path, [{"path": path, "content": content, "change_type": "modify", "reason": reason}])
+        if ensure_crash_fn:
+            ensure_crash_fn()
+        return {"status": "ok", "path": path}
+
+    elif tool_name == "run_flutter_pub_get":
+        pubspec_path = os.path.join(project_path, "pubspec.yaml")
+        pubspec_mtime = os.path.getmtime(pubspec_path) if os.path.exists(pubspec_path) else 0
+        lock_path = os.path.join(project_path, "pubspec.lock")
+        lock_mtime = os.path.getmtime(lock_path) if os.path.exists(lock_path) else 0
+        if lock_mtime > 0 and lock_mtime >= pubspec_mtime:
+            return {"status": "ok", "output": "pubspec.yaml 변경 없음, pub get 스킵"}
+        ok, output = run_flutter_pub_get(project_path)
+        return {"status": "ok" if ok else "error", "output": output[:3000]}
+
+    elif tool_name == "run_flutter_analyze":
+        ok, output = run_flutter_analyze(project_path)
+        return {"status": "pass" if ok else "fail", "output": output[:3000]}
+
+    elif tool_name == "run_flutter_build":
+        ok, res = run_flutter_build(project_path)
+        return {"status": "pass" if ok else "fail", "output": res[:3000] if isinstance(res, str) else res}
+
+    elif tool_name == "request_diagnosis":
+        if _depth >= 1:
+            return {"status": "error", "message": "재귀 깊이 초과: Debugger 내에서 request_diagnosis 호출 불가"}
+        error_log = args.get("error_log", "")
+        affected_files = args.get("affected_files", [])
+        diag_request = (
+            f"다음 Flutter 오류를 진단하세요.\n\n"
+            f"error_log:\n{error_log}\n\n"
+            f"affected_files: {json.dumps(affected_files, ensure_ascii=False)}"
+        )
+        diag_result = run_agentic_loop(
+            task_id=task_id,
+            user_request=diag_request,
+            tools=DEBUGGER_TOOLS,
+            system=DEBUGGER_SYSTEM_V2,
+            project_path=project_path,
+            callback_log=callback_log,
+            token_callback=token_callback,
+            max_turns=10,
+            pkg=pkg,
+            ensure_crash_fn=ensure_crash_fn,
+            _depth=_depth + 1,
+        )
+        return {"status": "ok", "diagnosis": diag_result.get("result", diag_result)}
+
+    elif tool_name == "finalize":
+        # P0: finalize 전 코드 자동 검증 (도구 레벨 강제)
+        warnings = []
+        lib_path = os.path.join(project_path, "lib")
+        if os.path.exists(lib_path):
+            for root, _, fnames in os.walk(lib_path):
+                for fname in fnames:
+                    if not fname.endswith(".dart"):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            code = f.read()
+                    except Exception:
+                        continue
+
+                    # 1. 플레이스홀더 체크
+                    urls = re.findall(r"https?://[^\s'\"<>]+", code)
+                    clean_urls = []
+                    for u in urls:
+                        u = u.rstrip("');},")
+                        if any(p in u for p in ["YOUR_", "API_KEY", "SERVICE_KEY", "PLACEHOLDER"]):
+                            warnings.append(f"{fname}: 플레이스홀더 URL: {u[:80]}")
+                        elif "$" not in u and "{" not in u:
+                            clean_urls.append(u)
+
+                    # 2. [변수] 패턴 체크
+                    bad_interp = re.findall(r"'[^']*\[(?:id|index|item|key|name)\][^']*'", code)
+                    if bad_interp:
+                        warnings.append(f"{fname}: 문자열 보간 오류: {bad_interp[:3]}")
+
+                    # 3. placeholder/TODO 텍스트 체크
+                    for pattern in ["placeholder", "TODO: 실제", "// Replace with"]:
+                        if pattern.lower() in code.lower():
+                            warnings.append(f"{fname}: 미구현 코드 발견: '{pattern}'")
+                            break
+
+                    # 4. URL 실제 fetch 검증 (최대 3개)
+                    for u in clean_urls[:3]:
+                        try:
+                            parsed = urlparse.urlparse(u)
+                            host = parsed.hostname or ""
+                            try:
+                                if ipaddress.ip_address(host).is_private:
+                                    continue
+                            except ValueError:
+                                if host in ("localhost", "metadata.google.internal"):
+                                    continue
+                            resp = _requests_lib.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                            if resp.status_code >= 400:
+                                warnings.append(f"{fname}: URL {resp.status_code} 에러: {u[:80]}")
+                            else:
+                                content_type = resp.headers.get("content-type", "")
+                                is_html = "text/html" in content_type
+                                uses_json_decode = "json.decode" in code or "jsonDecode" in code
+                                if is_html and uses_json_decode:
+                                    warnings.append(f"{fname}: HTML 응답인데 json.decode 사용 중: {u[:60]}")
+                        except Exception:
+                            pass
+
+        if warnings:
+            return {
+                "status": "error",
+                "message": "finalize 전 코드 검증 실패. 아래 문제를 수정하고 다시 finalize하세요.",
+                "warnings": warnings,
+            }
+        return {"status": "done", **args}
+
+    elif tool_name in ("finalize_plan", "report_diagnosis"):
+        return {"status": "done", **args}
+
+    else:
+        return {"status": "error", "message": f"unknown tool: {tool_name}"}
+
+
+def _truncate_old_messages(messages: list, max_content_len: int = 2000):
+    """오래된 tool result의 content를 절단해서 토큰 폭발 방지."""
+    if len(messages) < 10:
+        return
+    for msg in messages[:-6]:
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
+            if len(msg["content"]) > max_content_len:
+                msg["content"] = msg["content"][:max_content_len] + "\n...(truncated)"
+
+
+def run_agentic_loop(
+    task_id: str,
+    user_request: str,
+    tools: list,
+    system: str,
+    project_path: str,
+    callback_log=None,
+    token_callback=None,
+    max_turns: int = 50,
+    pkg: str = "",
+    ensure_crash_fn=None,
+    _depth: int = 0,
+) -> dict:
+    if _depth > 1:
+        return {"status": "error", "message": "최대 재귀 깊이 초과 (depth > 1)"}
+
+    messages = [{"role": "user", "content": user_request}]
+    analyze_fail_count = 0
+    diagnosis_count = 0
+
+    for turn in range(max_turns):
+        _truncate_old_messages(messages)
+
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "system", "content": system}] + messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=MODEL_TEMPERATURE,
+            )
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        usage = extract_usage_dict(response)
+        if token_callback:
+            token_callback(task_id, f"AgenticLoop_turn{turn + 1}", usage)
+
+        assistant_msg = response.choices[0].message
+        tool_calls = getattr(assistant_msg, "tool_calls", None) or []
+
+        msg = {"role": "assistant", "content": assistant_msg.content or ""}
+        if tool_calls:
+            msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in tool_calls
+            ]
+        messages.append(msg)
+
+        if not tool_calls:
+            return {"status": "success", "message": assistant_msg.content}
+
+        for tc in tool_calls:
+            tool_name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except Exception:
+                args = {}
+
+            if callback_log:
+                callback_log(f"  🔧 {tool_name}")
+
+            # P1-1: analyze 실패 카운터
+            if tool_name == "run_flutter_analyze":
+                result = execute_tool(
+                    tool_name, args, project_path, task_id,
+                    pkg=pkg, ensure_crash_fn=ensure_crash_fn,
+                    callback_log=callback_log, token_callback=token_callback,
+                    _depth=_depth,
+                )
+                if result.get("status") == "fail":
+                    analyze_fail_count += 1
+                    if analyze_fail_count >= 3:
+                        result["_force_hint"] = "analyze가 3회 연속 실패했습니다. 반드시 request_diagnosis를 호출하세요."
+                else:
+                    analyze_fail_count = 0
+            elif tool_name == "request_diagnosis":
+                diagnosis_count += 1
+                if diagnosis_count > 3:
+                    result = {"status": "error", "message": "request_diagnosis 3회 초과. 문제되는 기능을 빼고 빌드하거나, 현재 상태로 finalize하세요."}
+                else:
+                    result = execute_tool(
+                        tool_name, args, project_path, task_id,
+                        pkg=pkg, ensure_crash_fn=ensure_crash_fn,
+                        callback_log=callback_log, token_callback=token_callback,
+                        _depth=_depth,
+                    )
+            else:
+                result = execute_tool(
+                    tool_name, args, project_path, task_id,
+                    pkg=pkg, ensure_crash_fn=ensure_crash_fn,
+                    callback_log=callback_log, token_callback=token_callback,
+                    _depth=_depth,
+                )
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+            if tool_name in ("finalize", "finalize_plan", "report_diagnosis"):
+                return {"status": "success", "result": result, "tool": tool_name}
+
+    return {"status": "max_turns_exceeded"}
 
 
 # -------------------------------------------------
@@ -5918,7 +6564,8 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
     
     base_pkg = plan.get("package_name", "kr.ac.kangwon.hai.generated")
     base_pkg = sanitize_package(base_pkg)
-    pkg = f"{base_pkg}.t{task_id}"
+    safe_task_id = re.sub(r'[^a-z0-9_]', '', task_id.lower())
+    pkg = f"{base_pkg}.t{safe_task_id}"
 
 
     if callback_log:
@@ -5950,48 +6597,80 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
     update_dart_imports(project, "baseproject", title)
     ensure_crash_handler_identity(project, task_id, pkg)
 
+    ensure_crash_fn = lambda: ensure_crash_handler_identity(project, task_id, pkg)
     current_files = []
 
-    # ENGINEER LOOP
+    # ENGINEER AGENTIC LOOP
+    eng_user_request = (
+        f"다음 설계안을 Flutter 앱으로 구현하세요.\n\n"
+        f"설계안:\n{json.dumps(plan, ensure_ascii=False)}"
+    )
+
+    analyze_ok = False
+    failure_type = "engineer_loop_failed"
+    analyze_res = ""
 
     for attempt in range(2):
-
         if callback_log:
             callback_log(f"✍️ 코드 생성 중 (시도 {attempt+1})")
 
-        eng_result = call_agent_with_tools(
-            ENGINEER_SYSTEM,
-            "설계안을 구현하고 검토 피드백을 반영하세요.",
-            context=plan,
-            trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Engineer", "stage": "implement"},
-            tools=FILE_CHANGE_TOOL_SCHEMAS,
-            validator=validate_file_change_payload,
-            parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
-            fallback_parser=legacy_agent_response_detailed,
+        if attempt > 0 and plan.get("feedback"):
+            eng_user_request += f"\n\n검토 피드백:\n{json.dumps(plan['feedback'], ensure_ascii=False)}"
+
+        eng_loop_result = run_agentic_loop(
+            task_id=task_id,
+            user_request=eng_user_request,
+            tools=ENGINEER_TOOLS,
+            system=ENGINEER_SYSTEM_V2,
+            project_path=project,
+            callback_log=callback_log,
+            token_callback=token_callback,
+            pkg=pkg,
+            ensure_crash_fn=ensure_crash_fn,
         )
-        eng = eng_result.get("parsed_output")
-        usage = eng_result.get("usage")
-        if token_callback and eng and usage:
-            token_callback(task_id, "Engineer", usage)
 
-        if not eng:
-            continue
+        if eng_loop_result.get("status") == "max_turns_exceeded":
+            if callback_log:
+                callback_log("⚠️ Engineer 루프 최대 턴 초과")
 
-        current_files = eng.get("files", [])
+        # Check analyze result from loop or run fresh
+        if callback_log:
+            callback_log("🧪 정적 분석 확인 중")
+        analyze_ok, analyze_res = run_flutter_analyze(project)
 
-        save_project_files(project, current_files)
-        ensure_crash_handler_identity(project, task_id, pkg)
+        if analyze_ok:
+            if callback_log:
+                callback_log("✅ 정적 분석 통과")
+        else:
+            failure_type = classify_failure_type(analyze_res)
+            if callback_log:
+                callback_log(f"❌ 정적 분석 실패 ({failure_type})")
 
         if callback_log:
             callback_log("🧐 코드 검토 중")
+
+        # Read current files for Reviewer context
+        current_dart_files = []
+        lib_path = os.path.join(project, "lib")
+        if os.path.exists(lib_path):
+            for root, _, fnames in os.walk(lib_path):
+                for fname in fnames:
+                    if fname.endswith(".dart"):
+                        rel = os.path.relpath(os.path.join(root, fname), project)
+                        try:
+                            with open(os.path.join(root, fname), "r", encoding="utf-8") as f:
+                                current_dart_files.append({"path": rel, "content": f.read()})
+                        except Exception:
+                            pass
 
         review_result = call_agent_with_tools(
             REVIEWER_SYSTEM,
             "이 코드를 검토하세요.",
             context={
-                "implementation": eng,
+                "implementation": {"files": current_dart_files},
                 "build_spec": build_context.get("build_spec") or {},
                 "ui_contract": ui_contract or {},
+                "analyze_result": {"ok": analyze_ok, "output": analyze_res[:2000]},
             },
             trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Reviewer", "stage": "review"},
             tools=REVIEW_TOOL_SCHEMAS,
@@ -6004,78 +6683,22 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
         if token_callback and review and usage:
             token_callback(task_id, "Reviewer", usage)
 
-        if review and review.get("status") == "pass":
+        if review and review.get("status") == "pass" and analyze_ok:
             break
 
         if review:
             plan["feedback"] = review.get("feedback")
 
-    if callback_log:
-        callback_log("🧪 정적 분석 실행 중")
-
-    analyze_ok, analyze_res = run_flutter_analyze(project)
-    if analyze_ok:
-        if callback_log:
-            callback_log("✅ 정적 분석 통과")
-    else:
-        failure_type = classify_failure_type(analyze_res)
-        if callback_log:
-            callback_log(f"❌ 정적 분석 실패 ({failure_type})")
-
-        for i in range(2):
-            if callback_log:
-                callback_log(f"🛠 정적 분석 오류 수정 중 ({i+1}/2)")
-
-            debug_context = prepare_debugger_context(
-                project,
-                analyze_res,
-                "analyze",
-                relevant_files=current_files,
-                callback_log=callback_log,
-                ui_contract=ui_contract,
-            )
-
-            fix_result = call_agent_with_tools(
-                DEBUGGER_SYSTEM,
-                "정적 분석 오류를 수정하세요.",
-                context=debug_context,
-                trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Debugger", "stage": "analyze_fix"},
-                tools=FILE_CHANGE_TOOL_SCHEMAS,
-                validator=validate_file_change_payload,
-                parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
-                fallback_parser=legacy_agent_response_detailed,
-            )
-            fix = fix_result.get("parsed_output")
-            usage = fix_result.get("usage")
-            if token_callback and fix and usage:
-                token_callback(task_id, "Debugger_Analyze", usage)
-
-            if fix and "files" in fix:
-                save_project_files(project, fix["files"])
-                ensure_crash_handler_identity(project, task_id, pkg)
-                current_files += [f.get("path") for f in fix["files"] if f.get("path")]
-
-            if callback_log:
-                callback_log("🧪 정적 분석 실행 중")
-            analyze_ok, analyze_res = run_flutter_analyze(project)
-            if analyze_ok:
-                if callback_log:
-                    callback_log("✅ 정적 분석 통과")
-                break
-            failure_type = classify_failure_type(analyze_res)
-            if callback_log:
-                callback_log(f"❌ 정적 분석 실패 ({failure_type})")
-
     if not analyze_ok:
-            return {
-                "status": "failed",
-                "error_log": analyze_res,
-                "failure_stage": "analyze",
-                "failure_type": failure_type,
-                "project_path": project,
-                "package_name": pkg,
-                "app_name": title,
-            }
+        return {
+            "status": "failed",
+            "error_log": analyze_res,
+            "failure_stage": "analyze",
+            "failure_type": failure_type,
+            "project_path": project,
+            "package_name": pkg,
+            "app_name": title,
+        }
 
     # BUILD LOOP
 

@@ -34,7 +34,6 @@ from vibe_factory import (
     decide_feedback_action,
     summarize_runtime_error,
     summarize_build_failure,
-    perform_web_research,
     search_web_reference,
     search_api_docs,
     fetch_webpage,
