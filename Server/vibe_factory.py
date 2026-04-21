@@ -5,9 +5,11 @@ import re
 import json
 import sqlite3
 import ipaddress
+import socket
 import base64
 import mimetypes
 from html.parser import HTMLParser
+import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -25,8 +27,9 @@ API_KEY = os.environ.get("OPENAI_API_KEY")
 if not API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable not set")
 
-BASE_PROJECT_PATH = os.environ.get("VIBE_BASE_PROJECT", "")
-BUILD_ROOT_DIR = os.environ.get("VIBE_BUILD_DIR", "")
+DEFAULT_APP_ROOT = "/Users/hai/Desktop/buildingAppwithLLMs_app"
+BASE_PROJECT_PATH = os.environ.get("VIBE_BASE_PROJECT") or os.path.join(DEFAULT_APP_ROOT, "BaseProject")
+BUILD_ROOT_DIR = os.environ.get("VIBE_BUILD_DIR") or os.path.join(DEFAULT_APP_ROOT, "Builds")
 
 os.environ["ANDROID_HOME"] = "/Users/hai/Library/Android/sdk"
 
@@ -67,8 +70,46 @@ FEEDBACK_ROUTE_ACTIONS = {
     "no_action": {},
 }
 
-MODEL_NAME = os.environ.get("VIBE_MODEL", "gpt-5.4")
+DEFAULT_MODEL_NAME = "gpt-5.4"
+DEFAULT_CHEAP_MODEL_NAME = "gpt-5.4-mini"
+
+
+def resolve_runtime_model_name() -> str:
+    configured = (os.environ.get("VIBE_MODEL") or DEFAULT_MODEL_NAME).strip() or DEFAULT_MODEL_NAME
+    if os.environ.get("VIBE_ALLOW_CHEAP_MODELS") == "1":
+        return configured
+    lowered = configured.lower()
+    if any(token in lowered for token in ("mini", "nano", "flash")):
+        return DEFAULT_MODEL_NAME
+    return configured
+
+
+MODEL_NAME = resolve_runtime_model_name()
+CHEAP_MODEL_NAME = (os.environ.get("VIBE_CHEAP_MODEL") or DEFAULT_CHEAP_MODEL_NAME).strip() or DEFAULT_CHEAP_MODEL_NAME
 MODEL_TEMPERATURE = 0.1
+
+CHEAP_AGENT_NAMES = {
+    "Feedback_Router",
+    "Runtime_Error_Summarizer",
+    "Build_Failure_Summarizer",
+    "UI_Contract_Extractor",
+    "Reference_Image_Analyzer",
+    "Research_Requirement_Guard",
+    "Behavioral_Contract_Reviewer",
+    "Repair_Continuation_Guard",
+}
+
+
+def resolve_model_for_agent(agent_name: Optional[str], *, fallback: Optional[str] = None) -> str:
+    base_model = (fallback or MODEL_NAME).strip() or MODEL_NAME
+    normalized_agent = (agent_name or "").strip()
+    if not normalized_agent:
+        return base_model
+    if os.environ.get("VIBE_DISABLE_AGENT_MODEL_ROUTING") == "1":
+        return base_model
+    if normalized_agent in CHEAP_AGENT_NAMES:
+        return CHEAP_MODEL_NAME
+    return base_model
 
 
 def build_function_tool(name: str, description: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
@@ -80,6 +121,549 @@ def build_function_tool(name: str, description: str, parameters: Dict[str, Any])
             "parameters": parameters,
         },
     }
+
+
+def validate_workspace_paths() -> None:
+    if not BASE_PROJECT_PATH or not os.path.isdir(BASE_PROJECT_PATH):
+        raise FileNotFoundError(f"BaseProject directory not found: {BASE_PROJECT_PATH!r}")
+    if not BUILD_ROOT_DIR:
+        raise FileNotFoundError("Build root directory is empty")
+    os.makedirs(BUILD_ROOT_DIR, exist_ok=True)
+
+
+BASE_PROJECT_MAIN_DART = """import 'package:flutter/material.dart';
+
+import 'app.dart';
+import 'crash_handler.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  CrashHandler.initialize("task-unknown", "kr.ac.kangwon.hai.baseproject");
+  ErrorWidget.builder = (details) {
+    return GeneratedErrorView(message: details.exceptionAsString());
+  };
+  runApp(const GeneratedApp());
+}
+"""
+
+
+BASE_PROJECT_APP_DART = """import 'package:flutter/material.dart';
+
+import 'widgets/app_scaffold.dart';
+
+class GeneratedApp extends StatelessWidget {
+  const GeneratedApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Generated App',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF0F766E),
+          brightness: Brightness.light,
+        ),
+        useMaterial3: true,
+        scaffoldBackgroundColor: const Color(0xFFF8FAFC),
+      ),
+      home: const GeneratedHomePage(),
+    );
+  }
+}
+
+class MyApp extends GeneratedApp {
+  const MyApp({super.key});
+}
+
+class GeneratedHomePage extends StatelessWidget {
+  const GeneratedHomePage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const AppScaffold(
+      title: 'Generated App',
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          AppSectionCard(
+            title: 'Ready',
+            message: 'Your generated app is running.',
+            icon: Icons.check_circle_outline,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class GeneratedErrorView extends StatelessWidget {
+  const GeneratedErrorView({super.key, required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    return Material(
+      color: const Color(0xFFF8FAFC),
+      child: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.error_outline,
+                  color: Color(0xFFB91C1C),
+                  size: 40,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Something went wrong',
+                  style: textTheme.titleLarge,
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  message,
+                  style: textTheme.bodyMedium,
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+"""
+
+
+BASE_PROJECT_APP_SCAFFOLD_DART = """import 'package:flutter/material.dart';
+
+class AppScaffold extends StatelessWidget {
+  const AppScaffold({
+    super.key,
+    required this.title,
+    required this.body,
+    this.actions,
+    this.padding = const EdgeInsets.all(20),
+  });
+
+  final String title;
+  final Widget body;
+  final List<Widget>? actions;
+  final EdgeInsetsGeometry padding;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title, overflow: TextOverflow.ellipsis),
+        actions: actions,
+      ),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                child: Padding(
+                  padding: padding,
+                  child: body,
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class AppSectionCard extends StatelessWidget {
+  const AppSectionCard({
+    super.key,
+    required this.title,
+    required this.message,
+    this.icon,
+    this.trailing,
+  });
+
+  final String title;
+  final String message;
+  final IconData? icon;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+        side: BorderSide(color: colorScheme.outlineVariant),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (icon != null) ...[
+              Icon(icon, color: colorScheme.primary),
+              const SizedBox(width: 12),
+            ],
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    style: textTheme.titleMedium,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(message, style: textTheme.bodyMedium),
+                ],
+              ),
+            ),
+            if (trailing != null) ...[
+              const SizedBox(width: 12),
+              trailing!,
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+"""
+
+
+def apply_base_project_runtime_additions(project_path: str) -> None:
+    lib_dir = os.path.join(project_path, "lib")
+    widgets_dir = os.path.join(lib_dir, "widgets")
+    os.makedirs(widgets_dir, exist_ok=True)
+    additions = {
+        os.path.join(lib_dir, "main.dart"): BASE_PROJECT_MAIN_DART,
+        os.path.join(lib_dir, "app.dart"): BASE_PROJECT_APP_DART,
+        os.path.join(widgets_dir, "app_scaffold.dart"): BASE_PROJECT_APP_SCAFFOLD_DART,
+    }
+    for path, content in additions.items():
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+
+STRING_ARRAY_SCHEMA = {"type": "array", "items": {"type": "string"}}
+
+SIMPLE_OBJECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "details": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+EXTERNAL_SOURCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "url": {"type": "string"},
+        "source_type": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+PERMISSION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "usage_reason": {"type": "string"},
+        "runtime_request_required": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
+VERIFICATION_REQUIREMENTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "requires_external_data_verification": {"type": "boolean"},
+        "source_probe_required": {"type": "boolean"},
+        "migration_notice_check": {"type": "boolean"},
+        "parser_smoke_test_required": {"type": "boolean"},
+        "minimum_sample_days": {"type": "integer"},
+        "cache_persistence_required": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
+SOURCE_SELECTION_CONSTRAINTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "required_terms": STRING_ARRAY_SCHEMA,
+        "optional_terms": STRING_ARRAY_SCHEMA,
+        "forbidden_terms": STRING_ARRAY_SCHEMA,
+        "minimum_required_matches": {"type": "integer"},
+        "rationale": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+WEB_DATA_CONTRACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "source_kind": {"type": "string"},
+        "primary_url": {"type": "string"},
+        "candidate_urls": STRING_ARRAY_SCHEMA,
+        "parser_strategy": {"type": "string"},
+        "required_runtime_behavior": {"type": "string"},
+        "sample_records": STRING_ARRAY_SCHEMA,
+        "accepted_parser_strategies": STRING_ARRAY_SCHEMA,
+        "accepted_source_kinds": STRING_ARRAY_SCHEMA,
+        "minimum_sample_records": {"type": "integer"},
+    },
+    "additionalProperties": False,
+}
+
+BUILD_SPEC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "app_goal": {"type": "string"},
+        "target_platform": {"type": "string"},
+        "target_users": {"type": "string"},
+        "core_features": STRING_ARRAY_SCHEMA,
+        "screens": STRING_ARRAY_SCHEMA,
+        "data_model": {"type": "string"},
+        "auth": {"type": "string"},
+        "online_mode": {"type": "string"},
+        "constraints": STRING_ARRAY_SCHEMA,
+        "data_strategy": {"type": "string"},
+        "data_source_type": {"type": "string"},
+        "source_access_mode": {"type": "string"},
+        "source_url_candidates": STRING_ARRAY_SCHEMA,
+        "external_sources": {"type": "array", "items": EXTERNAL_SOURCE_SCHEMA},
+        "source_selection_constraints": SOURCE_SELECTION_CONSTRAINTS_SCHEMA,
+        "required_permissions": {"type": "array", "items": PERMISSION_SCHEMA},
+        "verification_requirements": VERIFICATION_REQUIREMENTS_SCHEMA,
+        "web_data_contract": WEB_DATA_CONTRACT_SCHEMA,
+        "api_key_handling": {"type": "string"},
+        "api_auth_strategy": {"type": "string"},
+        "requires_api_key_input_screen": {"type": "boolean"},
+        "secret_storage_policy": {"type": "string"},
+        "api_key_error_handling_required": {"type": "boolean"},
+        "prefer_public_no_key_api": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
+VISUAL_IDENTITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "style_summary": {"type": "string"},
+        "color_palette": STRING_ARRAY_SCHEMA,
+        "typography": {"type": "string"},
+        "spacing_density": {"type": "string"},
+        "overall_tone": {"type": "string"},
+        "design_system": {"type": "string"},
+        "platform": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+NAVIGATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string"},
+        "screens": STRING_ARRAY_SCHEMA,
+        "routes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "route": {"type": "string"},
+                    "screen_id": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+
+SCREEN_LAYOUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "screen_id": {"type": "string"},
+        "screen_name": {"type": "string"},
+        "layout_summary": {"type": "string"},
+        "main_components": STRING_ARRAY_SCHEMA,
+        "primary_actions": STRING_ARRAY_SCHEMA,
+        "must_preserve": STRING_ARRAY_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+STYLE_TOKENS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "design_system": {"type": "string"},
+        "color_tokens": STRING_ARRAY_SCHEMA,
+        "typography": {"type": "string"},
+        "spacing": {"type": "string"},
+        "shape": {"type": "string"},
+        "motion": {"type": "string"},
+        "layout": {"type": "string"},
+        "scroll": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+DATA_FIELD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "type": {"type": "string"},
+        "required": {"type": "boolean"},
+        "source_path": {"type": "string"},
+        "normalization": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+ENTITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "fields": {"type": "array", "items": DATA_FIELD_SCHEMA},
+        "description": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+SOURCE_MAPPING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "source_kind": {"type": "string"},
+        "primary_url": {"type": "string"},
+        "candidate_urls": STRING_ARRAY_SCHEMA,
+        "parser_strategy": {"type": "string"},
+        "response_root": {"type": "string"},
+        "record_selector": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+CACHE_MODEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "enabled": {"type": "boolean"},
+        "key_fields": STRING_ARRAY_SCHEMA,
+        "ttl_minutes": {"type": "integer"},
+        "stale_data_behavior": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+STATE_MODEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "state_management": {"type": "string"},
+        "data_model": {"type": "string"},
+        "lifecycle_and_resilience": {"type": "string"},
+        "rules_summary": STRING_ARRAY_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+SCREEN_BEHAVIOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "screen_id": {"type": "string"},
+        "behavior_summary": STRING_ARRAY_SCHEMA,
+        "actions": STRING_ARRAY_SCHEMA,
+        "state_updates": STRING_ARRAY_SCHEMA,
+        "data_operations": STRING_ARRAY_SCHEMA,
+        "error_states": STRING_ARRAY_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+UI_CONTRACT_SCREEN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "screen_id": {"type": "string"},
+        "screen_name": {"type": "string"},
+        "purpose": {"type": "string"},
+        "layout_summary": {"type": "string"},
+        "main_components": STRING_ARRAY_SCHEMA,
+        "primary_actions": STRING_ARRAY_SCHEMA,
+        "must_preserve": STRING_ARRAY_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+IMPLEMENTATION_CONTRACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "app_pattern": {"type": "string"},
+        "required_files": STRING_ARRAY_SCHEMA,
+        "required_classes": STRING_ARRAY_SCHEMA,
+        "required_methods": STRING_ARRAY_SCHEMA,
+        "required_dependencies": STRING_ARRAY_SCHEMA,
+        "required_permissions": STRING_ARRAY_SCHEMA,
+        "state_persistence_contract": {
+            "type": "object",
+            "properties": {
+                "required": {"type": "boolean"},
+                "backend": {"type": "string"},
+                "snapshot_model": {"type": "string"},
+                "required_operations": STRING_ARRAY_SCHEMA,
+                "restore_strategy": {"type": "string"},
+                "serialization_required": {"type": "boolean"},
+            },
+            "required": [
+                "required",
+                "backend",
+                "snapshot_model",
+                "required_operations",
+                "restore_strategy",
+                "serialization_required",
+            ],
+            "additionalProperties": False,
+        },
+        "navigation_contract": {
+            "type": "object",
+            "properties": {
+                "screens": STRING_ARRAY_SCHEMA,
+                "routes": STRING_ARRAY_SCHEMA,
+                "restore_flow": {"type": "string"},
+            },
+            "required": ["screens", "routes", "restore_flow"],
+            "additionalProperties": False,
+        },
+        "acceptance_checks": STRING_ARRAY_SCHEMA,
+        "repair_scope_rules": STRING_ARRAY_SCHEMA,
+    },
+    "required": [
+        "app_pattern",
+        "required_files",
+        "required_classes",
+        "required_methods",
+        "state_persistence_contract",
+        "navigation_contract",
+        "acceptance_checks",
+        "repair_scope_rules",
+    ],
+    "additionalProperties": False,
+}
 
 
 FEEDBACK_ROUTE_TOOL_SCHEMAS = [
@@ -134,6 +718,115 @@ BUILD_FAILURE_SUMMARY_TOOL_SCHEMAS = [
     )
 ]
 
+RESEARCH_REQUIREMENT_GUARD_TOOL_SCHEMAS = [
+    build_function_tool(
+        "report_research_requirement",
+        "외부 웹/API 조사가 실제로 필요한지 판단합니다.",
+        {
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "enum": ["force_research", "skip_research", "defer"]},
+                "reason": {"type": "string"},
+                "confidence": {"type": "number"},
+            },
+            "required": ["decision", "reason", "confidence"],
+            "additionalProperties": False,
+        },
+    )
+]
+
+BEHAVIORAL_CONTRACT_REVIEW_TOOL_SCHEMAS = [
+    build_function_tool(
+        "report_behavioral_contract_review",
+        "로컬 상태 저장/복구/되돌리기 계약이 실제 구현과 일치하는지 검토합니다.",
+        {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["pass", "fail", "not_applicable"]},
+                "summary": {"type": "string"},
+                "issues": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["status", "summary", "issues"],
+            "additionalProperties": False,
+        },
+    )
+]
+
+REPAIR_CONTINUATION_GUARD_TOOL_SCHEMAS = [
+    build_function_tool(
+        "report_repair_continuation",
+        "현재 실패 상황에서 추가 복구 라운드를 진행할 가치가 있는지 판단합니다.",
+        {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["continue", "stop"]},
+                "reason": {"type": "string"},
+                "confidence": {"type": "number"},
+            },
+            "required": ["action", "reason", "confidence"],
+            "additionalProperties": False,
+        },
+    )
+]
+
+SOURCE_CONSTRAINT_ENTITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "entity_type": {
+            "type": "string",
+            "enum": [
+                "institution",
+                "brand",
+                "product",
+                "organization",
+                "location",
+                "branch_or_campus",
+                "service",
+                "domain_term",
+                "other",
+            ],
+        },
+        "must_match": {"type": "boolean"},
+        "evidence_span": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["text", "entity_type", "must_match", "evidence_span", "reason"],
+    "additionalProperties": False,
+}
+
+SOURCE_CONSTRAINT_EXTRACTOR_TOOL_SCHEMAS = [
+    build_function_tool(
+        "extract_source_constraints",
+        "사용자 원문에서 외부 출처 선택에 필요한 기관/브랜드/지역/분기 엔티티만 구조화합니다.",
+        {
+            "type": "object",
+            "properties": {
+                "required_entities": {
+                    "type": "array",
+                    "items": SOURCE_CONSTRAINT_ENTITY_SCHEMA,
+                },
+                "optional_domain_terms": STRING_ARRAY_SCHEMA,
+                "forbidden_entities": STRING_ARRAY_SCHEMA,
+                "needs_clarification": {"type": "boolean"},
+                "clarification_reason": {"type": "string"},
+                "confidence": {"type": "number"},
+                "rationale": {"type": "string"},
+            },
+            "required": [
+                "required_entities",
+                "optional_domain_terms",
+                "forbidden_entities",
+                "needs_clarification",
+                "clarification_reason",
+                "confidence",
+                "rationale",
+            ],
+            "additionalProperties": False,
+        },
+    )
+]
+
 GENERATE_DECISION_TOOL_SCHEMAS = [
     build_function_tool(
         "ask_clarification",
@@ -170,7 +863,7 @@ GENERATE_DECISION_TOOL_SCHEMAS = [
             "type": "object",
             "properties": {
                 "summary": {"type": "string"},
-                "build_spec": {"type": "object"},
+                "build_spec": BUILD_SPEC_SCHEMA,
             },
             "required": ["summary", "build_spec"],
             "additionalProperties": False,
@@ -228,7 +921,7 @@ RESEARCH_BUILD_TOOL_SCHEMAS = [
             "type": "object",
             "properties": {
                 "summary": {"type": "string"},
-                "build_spec": {"type": "object"},
+                "build_spec": BUILD_SPEC_SCHEMA,
             },
             "required": ["summary", "build_spec"],
             "additionalProperties": False,
@@ -264,10 +957,10 @@ UI_LAYOUT_PLAN_TOOL_SCHEMAS = [
         {
             "type": "object",
             "properties": {
-                "visual_identity": {"type": "object"},
-                "navigation": {"type": "object"},
-                "screen_layouts": {"type": "array", "items": {"type": "object"}},
-                "style_tokens": {"type": "object"},
+                "visual_identity": VISUAL_IDENTITY_SCHEMA,
+                "navigation": NAVIGATION_SCHEMA,
+                "screen_layouts": {"type": "array", "items": SCREEN_LAYOUT_SCHEMA},
+                "style_tokens": STYLE_TOKENS_SCHEMA,
                 "preservation_targets": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["visual_identity", "navigation", "screen_layouts", "style_tokens", "preservation_targets"],
@@ -283,12 +976,12 @@ DATA_MODEL_PLAN_TOOL_SCHEMAS = [
         {
             "type": "object",
             "properties": {
-                "entities": {"type": "array", "items": {"type": "object"}},
-                "source_mapping": {"type": "object"},
+                "entities": {"type": "array", "items": ENTITY_SCHEMA},
+                "source_mapping": SOURCE_MAPPING_SCHEMA,
                 "normalization_rules": {"type": "array", "items": {"type": "string"}},
                 "validation_rules": {"type": "array", "items": {"type": "string"}},
                 "empty_state_rules": {"type": "array", "items": {"type": "string"}},
-                "cache_model": {"type": "object"},
+                "cache_model": CACHE_MODEL_SCHEMA,
             },
             "required": [
                 "entities",
@@ -310,8 +1003,8 @@ FEATURE_LOGIC_PLAN_TOOL_SCHEMAS = [
         {
             "type": "object",
             "properties": {
-                "state_model": {"type": "object"},
-                "screen_behaviors": {"type": "array", "items": {"type": "object"}},
+                "state_model": STATE_MODEL_SCHEMA,
+                "screen_behaviors": {"type": "array", "items": SCREEN_BEHAVIOR_SCHEMA},
                 "business_rules": {"type": "array", "items": {"type": "string"}},
                 "data_operations": {"type": "array", "items": {"type": "string"}},
                 "error_handling": {"type": "array", "items": {"type": "string"}},
@@ -333,6 +1026,7 @@ PLANNER_TOOL_SCHEMAS = [
                 "package_name": {"type": "string"},
                 "blueprint": {"type": "string"},
                 "files_to_create": {"type": "array", "items": {"type": "string"}},
+                "implementation_contract": IMPLEMENTATION_CONTRACT_SCHEMA,
             },
             "required": ["title", "package_name", "blueprint", "files_to_create"],
             "additionalProperties": False,
@@ -402,7 +1096,7 @@ REFINER_PLANNER_TOOL_SCHEMAS = [
                 "analysis": {"type": "string"},
                 "files_to_modify": {
                     "type": "array",
-                    "items": {"anyOf": [{"type": "string"}, {"type": "object"}]},
+                    "items": {"type": "string"},
                 },
                 "refinement_plan": {"type": "string"},
             },
@@ -419,9 +1113,9 @@ UI_CONTRACT_TOOL_SCHEMAS = [
         {
             "type": "object",
             "properties": {
-                "visual_identity": {"type": "object"},
-                "navigation": {"type": "object"},
-                "screens": {"type": "array", "items": {"type": "object"}},
+                "visual_identity": VISUAL_IDENTITY_SCHEMA,
+                "navigation": NAVIGATION_SCHEMA,
+                "screens": {"type": "array", "items": UI_CONTRACT_SCREEN_SCHEMA},
                 "global_components": {"type": "array", "items": {"type": "string"}},
                 "interaction_patterns": {"type": "array", "items": {"type": "string"}},
                 "preservation_rules": {"type": "array", "items": {"type": "string"}},
@@ -554,6 +1248,41 @@ ENGINEER_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "report_file_manifest",
+            "description": "구현 전에 생성/수정할 파일 목록과 각 파일의 책임을 확정합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "purpose": {"type": "string"},
+                                "change_type": {"type": "string"},
+                            },
+                            "required": ["path", "purpose", "change_type"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "dependency_changes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "risk_notes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["files", "dependency_changes", "risk_notes"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
             "description": "파일 생성 또는 덮어쓰기.",
             "parameters": {
@@ -564,6 +1293,36 @@ ENGINEER_TOOLS = [
                     "reason": {"type": "string"},
                 },
                 "required": ["path", "content", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "기존 파일의 특정 문자열 구간을 찾아 치환합니다. 작은 수정에 우선 사용합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_static_preflight",
+            "description": "서버의 빠른 정적 사전 검증을 실행합니다. import 누락, CrashHandler, pubspec, placeholder, 로컬 상태 계약 문제를 확인합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         },
     },
@@ -641,6 +1400,41 @@ ENGINEER_TOOLS = [
         },
     },
 ]
+
+
+def _tool_function_name(tool: Dict[str, Any]) -> str:
+    function = (tool or {}).get("function") or {}
+    name = function.get("name")
+    return name if isinstance(name, str) else ""
+
+
+def engineer_loop_needs_live_web_tools(build_context: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(build_context, dict):
+        return False
+    build_spec = normalize_runtime_build_spec(build_context.get("build_spec"))
+    if (
+        (build_spec.get("data_source_type") or "").strip().lower() in {"api", "web_scrape"}
+        or (build_spec.get("source_access_mode") or "").strip().lower() in {"api", "scraping"}
+        or bool(build_spec.get("source_url_candidates"))
+        or bool(build_spec.get("external_sources"))
+    ):
+        return True
+    research_context = build_context.get("research_context")
+    if not isinstance(research_context, dict):
+        return False
+    if isinstance(research_context.get("selected_source"), dict) and research_context.get("selected_source"):
+        return True
+    return bool(research_context.get("results"))
+
+
+def build_engineer_tools(build_context: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if engineer_loop_needs_live_web_tools(build_context):
+        return ENGINEER_TOOLS
+    return [
+        tool
+        for tool in ENGINEER_TOOLS
+        if _tool_function_name(tool) not in {"search", "fetch_http"}
+    ]
 
 DEBUGGER_TOOLS = [
     {
@@ -988,6 +1782,7 @@ Your job is to turn the user's request plus fresh web research results into a bu
 Rules:
 - Return strict JSON only.
 - All natural language string values inside the JSON must be written in Korean.
+- For user-facing Korean text, do not use the term "연구 자료" or "제공된 연구 자료". Use "확인한 외부 자료" instead.
 - The target platform is always Android smartphone. Use device_context as the target device context and never ask whether Android is the target.
 - Do not guess external facts. Use only the provided research_context.results and research_context.fetched_pages.
 - When research_context.selected_source is provided, treat it as the primary source for synthesis and use supporting_sources only as secondary context.
@@ -1027,10 +1822,10 @@ Output shape:
     "source_access_mode": "static | scraping | api | manual",
     "source_url_candidates": ["https://..."],
     "web_data_contract": {
-      "source_kind": "static_html_table | static_html_text | json_endpoint_candidate | iframe | dynamic_js",
+      "source_kind": "static_html_table | static_html_text | static_html_links | json_endpoint_candidate | iframe | dynamic_js",
       "primary_url": "https://...",
       "candidate_urls": ["https://..."],
-      "parser_strategy": "html_table | text_pattern | discover_and_fetch_candidate_url | follow_iframe_then_parse",
+      "parser_strategy": "html_table | text_pattern | html_link_list | discover_and_fetch_candidate_url | follow_iframe_then_parse",
       "minimum_sample_records": 1,
       "sample_records": [],
       "required_runtime_behavior": "fetch_live_data_and_show_empty_state_on_parse_failure"
@@ -1147,6 +1942,48 @@ Output rules:
 }
 """
 
+RESEARCH_REQUIREMENT_GUARD_SYSTEM = """
+You are a runtime research-requirement guard for a chat-first app generation server.
+
+Your job is to decide whether a build request really needs live external research before build planning starts.
+
+Rules:
+- Return strict JSON only through report_research_requirement.
+- All natural language string values must be written in Korean.
+- Prefer skipping research for clearly offline/local apps, especially when the user explicitly says web search, crawling, API integration, or external data are unnecessary.
+- Prefer forcing research only when the request clearly depends on current public web data, public APIs, provided external URLs, or live source verification.
+- Use "defer" when the request is too ambiguous and downstream clarification is safer than forcing research immediately.
+- Do not force research merely because the text contains words like API, search, crawl, or web in a negative sentence such as "API는 필요 없어".
+"""
+
+BEHAVIORAL_CONTRACT_REVIEW_SYSTEM = """
+You are a behavioral contract reviewer for a generated Flutter app.
+
+Your job is to decide whether the implementation actually satisfies the requested local-state behavior contract.
+
+Rules:
+- Return strict JSON only through report_behavioral_contract_review.
+- All natural language string values must be written in Korean.
+- Use context.build_spec, context.code_snapshot, and context.deterministic_report.
+- Focus on behaviors such as snapshot save, immutable restore targets, undo, branch/state recovery, and persistent local storage.
+- Fail when the code appears to keep only transient in-memory state or when history/restore records point to mutable current state instead of immutable saved state.
+- Return not_applicable only when the build spec does not imply local state save/restore/undo style behavior.
+"""
+
+REPAIR_CONTINUATION_GUARD_SYSTEM = """
+You are a repair continuation guard for an app-generation server.
+
+Your job is to decide whether another automatic repair round is justified under a bounded token budget.
+
+Rules:
+- Return strict JSON only through report_repair_continuation.
+- All natural language string values must be written in Korean.
+- Use context.flow_type, context.stage, context.remaining_budget, context.round_history, context.current_failure, and context.request_context.
+- Prefer continue when there is clear progress, new failure information, or a realistic next fix.
+- Prefer stop when the same failure fingerprint keeps repeating, patches are not landing, or the remaining budget is too small for likely success.
+- This guard must not redesign the repair loop. It only decides whether another round is worthwhile.
+"""
+
 PRODUCT_PLANNER_SYSTEM = """
 You are the Product Planner for a chat-first Android Flutter app generation system.
 
@@ -1208,6 +2045,9 @@ Rules:
   name, type, required, source_path, normalization.
 - source_mapping must include:
   source_kind, primary_url, candidate_urls, parser_strategy, response_root, record_selector.
+- If web_data_contract.source_kind is static_html_table/static_html_text/static_html_links or parser_strategy is html_table/text_pattern/html_link_list, source_mapping must keep that HTML parser strategy.
+- For HTML parser strategies, never describe JSON paths as the main response mapping. Use CSS selectors, link selectors, table columns, or text extraction rules derived from sample_records.
+- For HTML parser strategies, validation_rules must state that Dart implementation must not use jsonDecode/json.decode on response.body.
 - cache_model must specify enabled, key_fields, ttl_minutes, and stale_data_behavior.
 - validation_rules must explain when a parsed record must be discarded.
 - empty_state_rules must explain what the UI should show when fetch succeeds but no valid records remain.
@@ -1250,8 +2090,13 @@ Your job is to merge the product plan, UI layout plan, and feature logic plan in
 Rules:
 - The output must use create_plan and satisfy the existing Planner schema exactly.
 - The generated app is always an Android smartphone Flutter app.
+- title must be a compact end-user app name, ideally 2-4 words or 18 characters or fewer.
+- Do not use verbose request text or planning labels in title such as 구현, 생성, 통합, 블루프린트, 프로젝트, 요청.
 - The blueprint must clearly tell the Engineer how to connect UI, state, actions, navigation, data, and CrashHandler.
 - The blueprint must explicitly preserve context.data_model_plan entities, source mapping, parser strategy, validation rules, empty state rules, and cache model.
+- Include implementation_contract when possible. It must be machine-checkable and list required_files, required_classes,
+  required_methods, required_dependencies, required_permissions, state_persistence_contract, navigation_contract,
+  acceptance_checks, and repair_scope_rules.
 - The package_name must follow kr.ac.kangwon.hai.[unique_app_name].
 - files_to_create must include lib/main.dart and any other needed Dart files.
 - Preserve ui_contract if provided unless the request explicitly requires UI changes.
@@ -1371,6 +2216,14 @@ STRICT IMPLEMENTATION RULES
 
 4.4. If the live source cannot be parsed safely, show retry/empty-state/stale-cache behavior rather than pretending the fetch succeeded.
 
+4.5. Never bypass TLS/certificate validation with badCertificateCallback, custom permissive HttpClient callbacks, or equivalent insecure networking. If an official source has SSL/certificate problems, try another declared official source first; if none works, show a clear data-source error and stale-cache fallback.
+
+4.6. If web_data_contract.source_kind is static_html_table/static_html_text/static_html_links or parser_strategy is html_table/text_pattern/html_link_list, the source is HTML. In that case:
+    - Do not use jsonDecode/json.decode on response.body.
+    - Add html dependency to pubspec.yaml.
+    - Import package:html/parser.dart and parse response.body as an HTML document.
+    - Extract records through table/link/CSS/text selectors that match web_data_contract.sample_records and data_model_plan.source_mapping.
+
 ============================================================
 UI AND UX STANDARDS
 1. Layout Stability: Every screen must use a Scaffold as the root, and the primary body must be wrapped in a SingleChildScrollView. This is non-negotiable to prevent bottom overflow errors on various physical devices.
@@ -1395,6 +2248,7 @@ CODING PHILOSOPHY
 OUTPUT FORMAT (STRICT JSON ONLY)
 All natural language string values inside the JSON must be written in Korean.
 Return ONLY a valid JSON object. Do not include any prose or explanation outside the JSON.
+For every files[].content value, return the complete final source code of that file. Never put edit instructions, summaries, review notes, or Korean prose in content unless it is inside valid Dart string literals/comments that belong to the app source.
 {
 "files": [
 {
@@ -1434,6 +2288,12 @@ CRITICAL INSPECTION CHECKLIST
 
 2.5. If context.data_model_plan is provided, fail if implementation uses unrelated URLs, placeholder/mock external data, incompatible model fields, or parser logic that contradicts the declared source_mapping and validation rules.
 
+2.6. If context.generation_plan is provided, compare the implementation against product_plan, ui_layout_plan, data_model_plan, feature_logic_plan, and blueprint. Fail when the code builds but omits core requested features, required screens, API/data behavior, permissions, 3D/visual interactions, or other explicit plan requirements.
+
+2.7. If context.engineer_finalize_result is provided, verify that listed built_files and summary are consistent with the actual files in context.implementation.
+
+2.8. If the requested product depends on local history, snapshot save, branch restore, undo, or state recovery, fail when the implementation only keeps transient in-memory state or when history entries point back to a mutable current state instead of an immutable saved snapshot.
+
 3. Code Quality and Syntax:
 
 3.1. Identify any obvious syntax errors, missing semicolons, or undefined variables.
@@ -1455,6 +2315,12 @@ CRITICAL INSPECTION CHECKLIST
 5. External Data Dependency Review:
 
 5.1. If context.build_spec.verification_requirements.requires_external_data_verification is true, inspect whether the implementation actually uses source_url_candidates or external_sources instead of placeholder or obviously unrelated URLs.
+
+6. Complex Visual / 3D Review:
+
+6.1. If the request or build_spec requires 3D, rotation, model viewing, generated visual assets, or advanced visual interaction, fail when the implementation only shows static placeholder text, missing assets, broken remote URLs, or TODO stubs.
+
+6.2. Approve procedural Flutter 3D-style visuals only when they are implemented with real Canvas/Transform/Animation behavior and do not depend on unavailable files.
 
 5.2. Fail if runtime external data is required but there is no visible cache persistence strategy when cache_persistence_required is true.
 
@@ -1508,6 +2374,8 @@ Check definitions:
 - migration_notice: Does the source content look like a relocation notice, old-site 안내, or a page that is not the real data page?
 - parser_smoke: Based on fetched content and code snapshot, is it plausible that the app parser can read the live content shape?
 - If context.static_signals.parser_contract_checks.status is fail, parser_smoke and minimum_sample_data must fail. A warn status means the contract changed shape but live sample evidence still exists, so it should not be auto-blocked by that signal alone.
+- If build_spec.source_selection_constraints.required_terms exists, fail when the fetched source evidence does not clearly contain those scope terms.
+- If build_spec.source_selection_constraints.forbidden_terms exists, fail when the fetched source evidence contains any of those terms.
 - If fetched_sources include web_data_analysis with sample_records, use those records as concrete evidence of parseable live content.
 - minimum_sample_data: Does the fetched source content contain at least one plausible day/menu/date-like sample for the intended feature?
 - cache_persistence: When required, does the code snapshot show a credible persistence mechanism for offline cache retention?
@@ -1564,7 +2432,14 @@ DEBUGGING GUIDELINES
 5. External Data Verification Failures:
 - When context.verification_report is present, treat it as a release-blocking runtime quality gate.
 - Fix the smallest possible code paths related to source URLs, HTML/content parsing, date parsing, sample extraction, empty-state handling, and cache persistence.
+- If the failure says "HTML 응답인데 json.decode 사용 중" or the build_spec web_data_contract is an HTML parser strategy, replace response.body JSON decoding with package:html/parser.dart parsing and add the html dependency.
+- Do not use jsonDecode/json.decode on response.body for text/html sources. Keep JSON decoding only for actual JSON API responses.
 - Do not replace the product with static placeholder data just to satisfy the check unless the build context explicitly allows manual/static fallback.
+
+5. Local State Contract Failures:
+- When context.behavioral_contract_report is present, treat it as a release-blocking product contract gate.
+- Fix the smallest possible code paths related to snapshot persistence, immutable restore targets, undo/state recovery, and local history storage.
+- Do not bypass the contract by changing the requested feature into a read-only log or a non-restorable summary.
 
 6. Permission Handling Failures:
 - If context.build_spec.required_permissions is non-empty, fix missing manifest declarations, missing runtime permission prompt code, and missing denied-state handling with the smallest viable patch.
@@ -1584,6 +2459,7 @@ CRITICAL CONSTRAINTS
 OUTPUT FORMAT (STRICT JSON ONLY)
 All natural language string values inside the JSON must be written in Korean.
 Return ONLY a valid JSON object. No prose or commentary outside the JSON.
+For every files[].content value, return the complete final source code of that file. Never put edit instructions, summaries, review notes, or Korean prose in content unless it is inside valid Dart string literals/comments that belong to the app source.
 {
 "root_cause": "A precise explanation of why the build or runtime error occurred",
 "files": [
@@ -1600,21 +2476,31 @@ ENGINEER_SYSTEM_V2 = """
 아젠틱 루프로 동작하며 도구를 반복 사용해 코드를 완성합니다.
 
 작업 순서:
+0. Context의 implementation_contract와 서버 구현 계약을 읽고, 먼저 report_file_manifest로 생성/수정할 파일과 책임을 확정
 1. 외부 데이터가 필요하면 search 로 API URL 검색
 2. fetch_http 로 API 응답 구조 확인
 3. read_file 로 관련 파일 확인 (쓰기 전 반드시)
-4. write_file 로 파일 작성/수정
-5. pubspec.yaml 변경 시 run_flutter_pub_get 호출
-4. run_flutter_analyze 로 정적 분석
-   - 실패 시 read_file → write_file 로 수정 후 재시도 (최대 3회)
+4. 작은 수정이면 edit_file 로 부분 치환
+5. 새 파일 생성 또는 전체 파일 교체가 필요할 때만 write_file 로 파일 작성/수정
+5.5. 파일 작성 후 run_static_preflight 로 서버 사전 검증 실행
+5.6. preflight 실패 시 read_file → edit_file/write_file로 정확히 수정 후 run_static_preflight 재실행
+5.7. pubspec.yaml 변경 시 run_flutter_pub_get 호출
+6. run_flutter_analyze 로 정적 분석
+   - 실패 시 read_file → edit_file 또는 write_file 로 수정 후 재시도 (최대 3회)
    - 3회 실패 시 request_diagnosis 로 Debugger 진단 요청
-5. run_flutter_build 로 APK 빌드
+7. run_flutter_build 로 APK 빌드
    - 실패 시 analyze 실패와 동일하게 처리
-6. 빌드 성공 시 finalize
+8. 빌드 성공 시 finalize
 
 규칙:
-- write_file 전에 반드시 read_file 로 현재 파일 확인
-- 수정 시 전체 재생성 금지, 문제 부분만 수정
+- report_file_manifest 없이 파일 쓰기 시작 금지
+- edit_file 또는 write_file 전에 반드시 read_file 로 현재 파일 확인
+- 기존 파일의 작은 수정은 edit_file 우선, 전체 재생성은 필요한 경우에만 write_file 사용
+- implementation_contract.required_files/classes/methods/acceptance_checks를 누락하지 말 것
+- implementation_contract.required_dependencies는 pubspec.yaml에 반드시 추가하고, pubspec.yaml 변경 후 run_flutter_pub_get 호출
+- implementation_contract.required_permissions는 AndroidManifest.xml에 uses-permission으로 선언하고 필요한 경우 런타임 권한 요청/거부 UI 구현
+- 로컬 상태 저장/복구 계약이 있으면 snapshot model, storage service, save/list/loadById/restore/delete 흐름을 모두 구현
+- run_static_preflight, run_flutter_analyze, run_flutter_build가 모두 통과하기 전 finalize 금지
 - analyze/build 재시도 최대 3회
 - 3회 내 미해결 시 request_diagnosis 호출
 - pubspec.yaml 수정 시 반드시 run_flutter_pub_get 호출
@@ -1635,6 +2521,16 @@ API 데이터 구현 순서 (반드시 따를 것):
 7. 코드 작성 후 fetch_http로 재검증 (코드에 넣은 URL이 실제로 되는지)
 - YOUR_SERVICE_KEY, API_KEY 같은 플레이스홀더 절대 금지
 - finalize 전에 반드시 코드 내 모든 API URL을 fetch_http로 재검증
+- SSL/TLS 인증서 오류를 badCertificateCallback, 무조건 true 콜백, 검증 우회 HttpClient로 해결하지 말 것. 공식 후보 URL 중 정상 소스를 우선 사용하고, 전부 실패하면 오류 상태와 stale cache fallback을 구현할 것.
+
+3D/복잡한 시각 작업 구현 순서:
+1. 3D 뷰어, 3D 카드, 회전 가능한 물체, 입체 시각화가 핵심이면 Flutter에서 유지보수 가능한 공개 패키지를 우선 사용
+   - pub.dev 지식이 불확실하면 search로 최신 패키지 후보를 확인
+   - pubspec.yaml 변경 후 반드시 run_flutter_pub_get 호출
+2. 외부 3D 모델 URL이나 이미지/텍스처가 필요하면 fetch_http로 접근 가능성과 content-type을 확인
+3. 실제 asset 파일을 생성할 수 없는 상황에서는 깨진 URL이나 없는 asset을 참조하지 말고, Flutter CustomPainter/Canvas/Transform/AnimationController로 절차적 3D 느낌을 구현
+4. 3D/고급 시각 기능은 빈 화면, placeholder, TODO, "asset missing" 상태로 finalize 금지
+5. 시각 효과보다 앱의 핵심 사용자 흐름과 빌드 성공을 우선하되, 사용자가 요청한 3D 상호작용은 회전/확대/상태 변화 중 최소 하나를 실제로 동작하게 구현
 
 Dart 코드 필수 규칙:
 - 문자열 안에 변수: 반드시 $변수 또는 ${표현식} 사용
@@ -1749,6 +2645,7 @@ MANDATORY REFINEMENT RULES
 OUTPUT FORMAT (STRICT JSON ONLY)
 All natural language string values inside the JSON must be written in Korean.
 Return ONLY a valid JSON object. Do not include any prose or explanation outside the JSON.
+For every files[].content value, return the complete final source code of that file. Never put edit instructions, summaries, review notes, or Korean prose in content unless it is inside valid Dart string literals/comments that belong to the app source.
 {
 "files": [
 {
@@ -1862,8 +2759,9 @@ def sanitize_package(pkg):
     return pkg
 
 def safe_join(base, rel):
-    full = os.path.abspath(os.path.join(base, rel))
-    if not full.startswith(os.path.abspath(base)):
+    base_abs = os.path.abspath(base)
+    full = os.path.abspath(os.path.join(base_abs, rel))
+    if os.path.commonpath([base_abs, full]) != base_abs:
         raise ValueError("Unsafe path detected")
     return full
 
@@ -1900,10 +2798,10 @@ def build_tool_raw_output(message, tool_calls) -> str:
     )
 
 
-def get_llm_json(system_prompt, user_prompt, retry_count=2):
+def get_llm_json(system_prompt, user_prompt, retry_count=2, model_name=None):
     for i in range(retry_count):
         try:
-            model_name = MODEL_NAME
+            model_name = (model_name or MODEL_NAME).strip() or MODEL_NAME
             temperature = MODEL_TEMPERATURE
             response = client.chat.completions.create(
                 model=model_name,
@@ -1926,14 +2824,15 @@ def get_llm_json(system_prompt, user_prompt, retry_count=2):
 
         except Exception as e:
             if i == retry_count - 1:
-                return None, None, locals().get("raw_content"), str(e), locals().get("model_name", MODEL_NAME), locals().get("temperature", MODEL_TEMPERATURE)
-    return None, None, None, "llm_json_failed", MODEL_NAME, MODEL_TEMPERATURE
+                return None, None, locals().get("raw_content"), str(e), locals().get("model_name", model_name or MODEL_NAME), locals().get("temperature", MODEL_TEMPERATURE)
+    fallback_model = (model_name or MODEL_NAME).strip() or MODEL_NAME
+    return None, None, None, "llm_json_failed", fallback_model, MODEL_TEMPERATURE
 
 
-def get_llm_tool_call(system_prompt, user_prompt, tools, retry_count=2):
+def get_llm_tool_call(system_prompt, user_prompt, tools, retry_count=2, model_name=None):
     for i in range(retry_count):
         try:
-            model_name = MODEL_NAME
+            model_name = (model_name or MODEL_NAME).strip() or MODEL_NAME
             temperature = MODEL_TEMPERATURE
             response = client.chat.completions.create(
                 model=model_name,
@@ -1967,15 +2866,16 @@ def get_llm_tool_call(system_prompt, user_prompt, tools, retry_count=2):
             return tool_name, arguments, usage, raw_output, finish_reason, None, model_name, temperature
         except Exception as e:
             if i == retry_count - 1:
-                return None, None, {}, locals().get("raw_output"), locals().get("finish_reason"), str(e), locals().get("model_name", MODEL_NAME), locals().get("temperature", MODEL_TEMPERATURE)
-    return None, None, {}, None, None, "llm_tool_call_failed", MODEL_NAME, MODEL_TEMPERATURE
+                return None, None, {}, locals().get("raw_output"), locals().get("finish_reason"), str(e), locals().get("model_name", model_name or MODEL_NAME), locals().get("temperature", MODEL_TEMPERATURE)
+    fallback_model = (model_name or MODEL_NAME).strip() or MODEL_NAME
+    return None, None, {}, None, None, "llm_tool_call_failed", fallback_model, MODEL_TEMPERATURE
 
 
-def legacy_agent_response_detailed(system, user, context=None):
+def legacy_agent_response_detailed(system, user, context=None, model_name=None):
     original_user = user
     if context:
         user = f"Context:\n{json.dumps(context, ensure_ascii=False)}\n\nTask:\n{user}"
-    parsed, usage, raw_output, parse_error, model_name, temperature = get_llm_json(system, user)
+    parsed, usage, raw_output, parse_error, model_name, temperature = get_llm_json(system, user, model_name=model_name)
     return {
         "parsed_output": parsed,
         "usage": usage,
@@ -1987,8 +2887,8 @@ def legacy_agent_response_detailed(system, user, context=None):
     }
 
 
-def normalized_legacy_agent_response(system, user, context=None, normalizer=None):
-    result = legacy_agent_response_detailed(system, user, context)
+def normalized_legacy_agent_response(system, user, context=None, normalizer=None, model_name=None):
+    result = legacy_agent_response_detailed(system, user, context, model_name=model_name)
     if callable(normalizer):
         result["parsed_output"] = normalizer(result.get("parsed_output"))
     return result
@@ -2017,6 +2917,7 @@ def _validate_reference_image_payload(payload):
 
 
 def analyze_reference_image(image_path, analysis_goal, task_id=None):
+    image_agent_model = resolve_model_for_agent("Reference_Image_Analyzer")
     if not isinstance(image_path, str) or not image_path.strip():
         result = {
             "layout_summary": "",
@@ -2030,7 +2931,7 @@ def analyze_reference_image(image_path, analysis_goal, task_id=None):
             flow_type="image_analysis",
             agent_name="Reference_Image_Analyzer",
             stage="analyze",
-            model=MODEL_NAME,
+            model=image_agent_model,
             temperature=0.0,
             system_prompt=REFERENCE_IMAGE_ANALYZER_SYSTEM,
             instruction=analysis_goal,
@@ -2062,7 +2963,7 @@ def analyze_reference_image(image_path, analysis_goal, task_id=None):
             flow_type="image_analysis",
             agent_name="Reference_Image_Analyzer",
             stage="analyze",
-            model=MODEL_NAME,
+            model=image_agent_model,
             temperature=0.0,
             system_prompt=REFERENCE_IMAGE_ANALYZER_SYSTEM,
             instruction=analysis_goal,
@@ -2081,7 +2982,7 @@ def analyze_reference_image(image_path, analysis_goal, task_id=None):
         )
         return {"status": "failed", "error": "image_not_found", **result}
 
-    model_name = MODEL_NAME
+    model_name = image_agent_model
     temperature = 0.0
     raw_output = None
     usage = {}
@@ -2198,6 +3099,7 @@ def call_agent_with_tools(
         user = f"Context:\n{json.dumps(context, ensure_ascii=False)}\n\nTask:\n{user}"
 
     trace = trace or {}
+    agent_model_name = resolve_model_for_agent(trace.get("agent_name"))
     parsed_output_builder = parsed_output_builder or (lambda tool_name, tool_arguments: {"tool": tool_name, "arguments": tool_arguments})
     fallback_parser = fallback_parser or legacy_agent_response_detailed
     allowed_tool_names = {
@@ -2207,7 +3109,12 @@ def call_agent_with_tools(
         if isinstance(function_name, str) and function_name.strip()
     }
 
-    tool_name, tool_arguments, usage, raw_output, finish_reason, tool_error, model_name, temperature = get_llm_tool_call(system, user, tools or [])
+    tool_name, tool_arguments, usage, raw_output, finish_reason, tool_error, model_name, temperature = get_llm_tool_call(
+        system,
+        user,
+        tools or [],
+        model_name=agent_model_name,
+    )
 
     parsed_output = None
     validation_result = "not_run"
@@ -2243,7 +3150,11 @@ def call_agent_with_tools(
     if validation_result != "success":
         fallback_used = True
         fallback_reason = parse_error or "tool_call_failed"
-        fallback_result = fallback_parser(system, original_user, context)
+        fallback_params = inspect.signature(fallback_parser).parameters
+        if "model_name" in fallback_params:
+            fallback_result = fallback_parser(system, original_user, context, model_name=agent_model_name)
+        else:
+            fallback_result = fallback_parser(system, original_user, context)
         fallback_parsed = fallback_result.get("parsed_output")
         fallback_usage = fallback_result.get("usage") or {}
         fallback_error = fallback_result.get("error")
@@ -2326,8 +3237,13 @@ def call_agent_with_tools(
 
 
 def get_agent_response(system, user, context=None, trace=None):
-    legacy = legacy_agent_response_detailed(system, user, context)
     trace = trace or {}
+    legacy = legacy_agent_response_detailed(
+        system,
+        user,
+        context,
+        model_name=resolve_model_for_agent(trace.get("agent_name")),
+    )
     record_agent_trace(
         task_id=trace.get("task_id"),
         flow_type=trace.get("flow_type"),
@@ -2405,6 +3321,415 @@ def _normalize_string_list(values, max_items=5):
     return normalized
 
 
+SOURCE_CONSTRAINT_GENERIC_TERMS = {
+    "앱", "어플", "애플리케이션", "flutter", "android", "스마트폰", "모바일",
+    "알림", "노티", "notification", "notify", "푸시", "push",
+    "조회", "표시", "보여줘", "보여주는", "보여주기", "읽어와", "읽어오기", "읽어와서",
+    "가져와", "가져오기", "가져와서", "불러와", "불러오기", "연동", "추적", "확인",
+    "정리", "제공", "생성", "만들어", "만들어줘", "제작", "빌드", "개발",
+    "서버", "사용자", "기능", "화면", "목록", "상세", "최신", "오늘", "현재", "실시간",
+    "데이터", "정보", "공식", "페이지", "웹", "홈페이지", "사이트", "소스",
+    "어떤", "어느", "무슨", "내가", "선택", "선택할", "정할", "정할수", "수",
+    "매일", "아침", "점심", "저녁", "오전", "오후", "글", "게시글", "포스트", "피드",
+    "api", "openapi", "swagger", "sdk", "rest", "graphql",
+}
+
+SOURCE_CONSTRAINT_OPTIONAL_TERMS = {
+    "식단", "메뉴", "학식", "급식", "학생식당", "학식당", "날씨", "공지", "일정",
+    "시간표", "뉴스", "기사", "환율", "주가", "좌석", "도서", "열람실", "버스",
+    "지하철", "노선", "도착", "식당", "카페", "편의점", "배달", "주문", "예약",
+    "score", "ranking", "schedule", "calendar", "cafeteria", "menu", "weather",
+}
+
+SOURCE_CONSTRAINT_SCOPE_NOUNS = {
+    "캠퍼스", "지점", "본점", "분점", "호선", "노선", "역", "터미널", "정류장",
+    "병원", "센터", "학과", "건물", "도서관", "식당", "매장", "지역", "지구",
+}
+
+SOURCE_CONSTRAINT_VERB_SUFFIXES = (
+    "하기", "해줘", "해줘요", "해주기", "하기", "하기를", "보내줘", "알려줘",
+    "읽기", "읽어", "읽는", "보여", "보이는", "띄워", "주는", "주기", "받기",
+)
+
+HTML_WEB_PARSER_STRATEGIES = {
+    "html_table",
+    "text_pattern",
+    "html_link_list",
+    "html_list_parsing",
+}
+
+HTML_WEB_SOURCE_KINDS = {
+    "static_html_table",
+    "static_html_text",
+    "static_html_links",
+}
+
+SOURCE_CONSTRAINT_REQUIRED_ENTITY_TYPES = {
+    "institution",
+    "brand",
+    "product",
+    "organization",
+    "location",
+    "branch_or_campus",
+    "service",
+}
+
+
+def _normalize_constraint_term(value: Any) -> str:
+    normalized = " ".join(str(value or "").replace("\n", " ").split()).strip(" ,.-_")
+    if re.fullmatch(r"[가-힣]{2,}(?:을|를|이|가|은|는|의|에|로|으로|와|과)", normalized):
+        normalized = re.sub(r"(?:을|를|이|가|은|는|의|에|로|으로|와|과)$", "", normalized)
+    return normalized
+
+
+def _compact_constraint_text(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9가-힣]+", "", str(value or "")).lower()
+
+
+def _term_appears_in_source_text(term: Any, source_text: Any) -> bool:
+    normalized_term = _normalize_constraint_term(term)
+    if not normalized_term:
+        return False
+    source = str(source_text or "")
+    if normalized_term.lower() in source.lower():
+        return True
+    compact_term = _compact_constraint_text(normalized_term)
+    compact_source = _compact_constraint_text(source)
+    return bool(compact_term and compact_term in compact_source)
+
+
+def _build_source_constraint_text(*parts: Any) -> str:
+    segments = []
+    for part in parts:
+        if isinstance(part, dict):
+            try:
+                segments.append(json.dumps(part, ensure_ascii=False))
+            except Exception:
+                segments.append(str(part))
+        elif isinstance(part, list):
+            try:
+                segments.append(json.dumps(part, ensure_ascii=False))
+            except Exception:
+                segments.extend(str(item) for item in part)
+        elif part is not None:
+            segments.append(str(part))
+    return " ".join(segment for segment in segments if segment).strip()
+
+
+def _constraint_tokens_from_text(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9가-힣]+", text or "")
+
+
+def _looks_generic_constraint_token(token: str) -> bool:
+    normalized = _normalize_constraint_term(token)
+    if len(normalized) < 2:
+        return True
+    lowered = normalized.lower()
+    if lowered in SOURCE_CONSTRAINT_GENERIC_TERMS or lowered in SOURCE_CONSTRAINT_OPTIONAL_TERMS:
+        return True
+    if normalized in SOURCE_CONSTRAINT_SCOPE_NOUNS:
+        return True
+    if any(lowered.endswith(suffix.lower()) for suffix in SOURCE_CONSTRAINT_VERB_SUFFIXES):
+        return True
+    return False
+
+
+def _extract_explicit_forbidden_terms(*texts: Any) -> List[str]:
+    forbidden = []
+    patterns = [
+        r"([A-Za-z0-9가-힣]{2,})\s*(?:제외|빼고|말고)",
+        r"(?:제외|빼고|말고)\s*([A-Za-z0-9가-힣]{2,})",
+        r"(?:without|except|exclude)\s+([A-Za-z0-9가-힣]{2,})",
+    ]
+    for text in texts:
+        candidate = str(text or "")
+        for pattern in patterns:
+            for match in re.findall(pattern, candidate, flags=re.I):
+                term = _normalize_constraint_term(match)
+                if term:
+                    forbidden.append(term)
+    return _normalize_string_list(forbidden, max_items=8)
+
+
+def infer_source_selection_constraints(*texts: Any, existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    explicit = dict(existing) if isinstance(existing, dict) else {}
+    required_terms = explicit.get("required_terms")
+    if not isinstance(required_terms, list):
+        required_terms = [required_terms] if required_terms else []
+    optional_terms = explicit.get("optional_terms")
+    if not isinstance(optional_terms, list):
+        optional_terms = [optional_terms] if optional_terms else []
+    forbidden_terms = explicit.get("forbidden_terms")
+    if not isinstance(forbidden_terms, list):
+        forbidden_terms = [forbidden_terms] if forbidden_terms else []
+
+    required_terms = _normalize_string_list(required_terms, max_items=8)
+    optional_terms = _normalize_string_list(optional_terms, max_items=8)
+    forbidden_terms = _normalize_string_list(forbidden_terms, max_items=8)
+
+    inferred_required = []
+    inferred_optional = []
+    combined_text = _build_source_constraint_text(*texts)
+    tokens = _constraint_tokens_from_text(combined_text)
+
+    for token in tokens:
+        normalized = _normalize_constraint_term(token)
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in SOURCE_CONSTRAINT_OPTIONAL_TERMS or normalized in SOURCE_CONSTRAINT_SCOPE_NOUNS:
+            inferred_optional.append(normalized)
+            continue
+        if re.search(r"(대학교|대학|학교|병원|센터|도서관|터미널|캠퍼스|지점|본점|분점|호선|학과)$", normalized):
+            inferred_required.append(normalized)
+            continue
+
+    for scope_noun in SOURCE_CONSTRAINT_SCOPE_NOUNS:
+        scope_pattern = re.compile(rf"([A-Za-z0-9가-힣]{{2,}})\s*{re.escape(scope_noun)}")
+        for text in texts:
+            for match in scope_pattern.findall(str(text or "")):
+                normalized = _normalize_constraint_term(match)
+                if normalized and not _looks_generic_constraint_token(normalized):
+                    inferred_required.append(normalized)
+
+    if not inferred_required:
+        for token in tokens:
+            normalized = _normalize_constraint_term(token)
+            if not normalized or _looks_generic_constraint_token(normalized):
+                continue
+            inferred_required.append(normalized)
+            break
+
+    required_terms = _normalize_string_list(required_terms + inferred_required, max_items=8)
+    optional_terms = _normalize_string_list(
+        [term for term in optional_terms + inferred_optional if term not in required_terms],
+        max_items=8,
+    )
+    forbidden_terms = _normalize_string_list(
+        forbidden_terms + _extract_explicit_forbidden_terms(*texts),
+        max_items=8,
+    )
+
+    try:
+        explicit_min_matches = int(explicit.get("minimum_required_matches") or 0)
+    except (TypeError, ValueError):
+        explicit_min_matches = 0
+    if explicit_min_matches > 0:
+        minimum_required_matches = explicit_min_matches
+    elif len(required_terms) <= 2:
+        minimum_required_matches = len(required_terms)
+    else:
+        minimum_required_matches = min(len(required_terms), 3)
+
+    return {
+        "required_terms": required_terms,
+        "optional_terms": optional_terms,
+        "forbidden_terms": forbidden_terms,
+        "minimum_required_matches": max(0, minimum_required_matches),
+        "rationale": (
+            explicit.get("rationale")
+            or "요청 범위를 좁히는 고유 지명·기관명·분기 엔티티를 공식 출처 선택과 검증에 반영합니다."
+        ),
+    }
+
+
+def validate_source_constraint_extraction_payload(payload):
+    if not isinstance(payload, dict):
+        return False, f"Source constraint payload must be an object | raw_payload={repr(payload)}"
+    if not isinstance(payload.get("required_entities"), list):
+        return False, f"required_entities must be a list | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    for entity in payload.get("required_entities") or []:
+        if not isinstance(entity, dict):
+            return False, f"required_entities items must be objects | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        if not isinstance(entity.get("text"), str):
+            return False, f"required_entities.text must be a string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        if entity.get("entity_type") not in {
+            "institution",
+            "brand",
+            "product",
+            "organization",
+            "location",
+            "branch_or_campus",
+            "service",
+            "domain_term",
+            "other",
+        }:
+            return False, f"required_entities.entity_type is invalid | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        if not isinstance(entity.get("must_match"), bool):
+            return False, f"required_entities.must_match must be boolean | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        if not isinstance(entity.get("evidence_span"), str):
+            return False, f"required_entities.evidence_span must be a string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        if not isinstance(entity.get("reason"), str):
+            return False, f"required_entities.reason must be a string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("optional_domain_terms"), list):
+        return False, f"optional_domain_terms must be a list | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("forbidden_entities"), list):
+        return False, f"forbidden_entities must be a list | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("needs_clarification"), bool):
+        return False, f"needs_clarification must be boolean | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("clarification_reason"), str):
+        return False, f"clarification_reason must be a string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("confidence"), (int, float)):
+        return False, f"confidence must be numeric | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("rationale"), str):
+        return False, f"rationale must be a string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    return True, None
+
+
+def sanitize_source_constraint_extraction(
+    payload: Any,
+    *source_texts: Any,
+    fallback_existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    source_text = _build_source_constraint_text(*source_texts)
+    explicit_forbidden_terms = _extract_explicit_forbidden_terms(source_text)
+    required_terms = []
+    optional_terms = []
+
+    if isinstance(payload, dict):
+        for entity in payload.get("required_entities") or []:
+            if not isinstance(entity, dict):
+                continue
+            term = _normalize_constraint_term(entity.get("text"))
+            entity_type = str(entity.get("entity_type") or "").strip()
+            if not term:
+                continue
+            if not _term_appears_in_source_text(term, source_text):
+                continue
+            if _looks_generic_constraint_token(term):
+                if entity_type == "domain_term":
+                    optional_terms.append(term)
+                continue
+            if entity.get("must_match") and entity_type in SOURCE_CONSTRAINT_REQUIRED_ENTITY_TYPES:
+                required_terms.append(term)
+            else:
+                optional_terms.append(term)
+        optional_terms.extend(payload.get("optional_domain_terms") or [])
+
+    forbidden_terms = []
+    if isinstance(payload, dict):
+        for term in payload.get("forbidden_entities") or []:
+            normalized = _normalize_constraint_term(term)
+            if normalized and normalized in explicit_forbidden_terms:
+                forbidden_terms.append(normalized)
+    forbidden_terms.extend(explicit_forbidden_terms)
+
+    fallback = dict(fallback_existing) if isinstance(fallback_existing, dict) else {}
+    base_constraints = {
+        "required_terms": required_terms or fallback.get("required_terms") or [],
+        "optional_terms": optional_terms or fallback.get("optional_terms") or [],
+        "forbidden_terms": forbidden_terms or fallback.get("forbidden_terms") or [],
+        "minimum_required_matches": fallback.get("minimum_required_matches") or 0,
+        "rationale": (
+            (payload or {}).get("rationale")
+            if isinstance(payload, dict) and isinstance(payload.get("rationale"), str) and payload.get("rationale").strip()
+            else "원문 사용자 요청에서 검증된 출처 선택 엔티티만 반영했습니다."
+        ),
+    }
+    constraints = infer_source_selection_constraints(existing=base_constraints)
+    if not constraints.get("required_terms"):
+        return infer_source_selection_constraints(source_text, existing=fallback_existing)
+    return constraints
+
+
+SOURCE_CONSTRAINT_EXTRACTOR_SYSTEM = """
+당신은 앱 생성 서버의 Source Constraint Extractor입니다.
+오직 사용자 원문 요청만 보고 외부 데이터 출처 선택에 필요한 엔티티를 추출합니다.
+
+규칙:
+- 검색 결과, 생성된 스펙, 선택된 웹페이지 본문을 추정하지 마세요.
+- required_entities에는 출처가 반드시 포함해야 하는 기관명, 브랜드명, 제품/서비스명, 지역명, 캠퍼스/지점명만 넣으세요.
+- "메뉴", "글", "피드", "뉴스", "알림", "아침", "매일", "선택" 같은 기능/콘텐츠 단어는 optional_domain_terms입니다.
+- 원문에 없는 캠퍼스/지점/지역을 만들지 마세요.
+- 특정 범위가 애매하면 needs_clarification=true로 표시하되, 임의로 required entity를 만들지 마세요.
+- forbidden_entities는 사용자가 명시적으로 제외/빼고/말고라고 말한 엔티티만 넣으세요.
+- 각 required entity는 원문에서 그대로 확인 가능한 evidence_span을 포함해야 합니다.
+"""
+
+
+def extract_source_selection_constraints_with_llm(
+    user_request: str,
+    *,
+    task_id: Optional[str] = None,
+    fallback_existing: Optional[Dict[str, Any]] = None,
+) -> tuple[Dict[str, Any], Dict[str, int], Optional[str]]:
+    fallback_constraints = infer_source_selection_constraints(user_request, existing=fallback_existing)
+    if not isinstance(user_request, str) or not user_request.strip():
+        return fallback_constraints, {}, "empty_user_request"
+
+    result = call_agent_with_tools(
+        SOURCE_CONSTRAINT_EXTRACTOR_SYSTEM,
+        "사용자 원문에서 외부 출처 선택 제약 엔티티를 추출하세요.",
+        context={
+            "user_request": user_request,
+            "required_output_policy": {
+                "do_not_infer_missing_branch": True,
+                "required_entities_must_be_supported_by_evidence_span": True,
+                "domain_words_go_to_optional_domain_terms": True,
+                "fallback_if_unsure": "return fewer required_entities and set needs_clarification=true",
+            },
+        },
+        trace={
+            "task_id": task_id,
+            "flow_type": "generate_decision",
+            "agent_name": "Source_Constraint_Extractor",
+            "stage": "extract_source_constraints",
+        },
+        tools=SOURCE_CONSTRAINT_EXTRACTOR_TOOL_SCHEMAS,
+        validator=validate_source_constraint_extraction_payload,
+        parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
+    )
+    parsed = result.get("parsed_output")
+    usage = result.get("usage") or {}
+    error = result.get("parse_error") or result.get("validation_error")
+    if not isinstance(parsed, dict):
+        return fallback_constraints, usage, error or "source_constraint_extraction_failed"
+
+    constraints = sanitize_source_constraint_extraction(
+        parsed,
+        user_request,
+        fallback_existing=fallback_constraints,
+    )
+    return constraints, usage, error
+
+
+def evaluate_source_constraint_alignment(constraints: Any, *texts: Any) -> Dict[str, Any]:
+    normalized = infer_source_selection_constraints(existing=constraints)
+    evidence_text = _build_source_constraint_text(*texts)
+    evidence_lower = evidence_text.lower()
+
+    required_terms = normalized.get("required_terms") or []
+    optional_terms = normalized.get("optional_terms") or []
+    forbidden_terms = normalized.get("forbidden_terms") or []
+
+    matched_required = [term for term in required_terms if term.lower() in evidence_lower]
+    matched_optional = [term for term in optional_terms if term.lower() in evidence_lower]
+    forbidden_hits = [term for term in forbidden_terms if term.lower() in evidence_lower]
+
+    min_required_matches = max(
+        0,
+        min(
+            len(required_terms),
+            int(normalized.get("minimum_required_matches") or 0),
+        ),
+    )
+    passes_required_terms = len(matched_required) >= min_required_matches if required_terms else True
+    coverage = (len(matched_required) / len(required_terms)) if required_terms else 1.0
+
+    return {
+        "required_terms": required_terms,
+        "matched_required_terms": matched_required,
+        "optional_terms": optional_terms,
+        "matched_optional_terms": matched_optional,
+        "forbidden_terms": forbidden_terms,
+        "forbidden_hits": forbidden_hits,
+        "minimum_required_matches": min_required_matches,
+        "passes_required_terms": passes_required_terms,
+        "passes_forbidden_terms": not forbidden_hits,
+        "coverage": round(coverage, 3),
+    }
+
+
 def normalize_runtime_build_spec(build_spec):
     if not isinstance(build_spec, dict):
         return {}
@@ -2412,6 +3737,11 @@ def normalize_runtime_build_spec(build_spec):
     normalized = dict(build_spec)
     external_sources = [item for item in normalized.get("external_sources", []) if isinstance(item, dict)]
     required_permissions = [item for item in normalized.get("required_permissions", []) if isinstance(item, dict)]
+    existing_source_constraints = (
+        normalized.get("source_selection_constraints")
+        if isinstance(normalized.get("source_selection_constraints"), dict)
+        else {}
+    )
     existing_candidates = normalized.get("source_url_candidates")
     web_data_contract = normalized.get("web_data_contract") if isinstance(normalized.get("web_data_contract"), dict) else {}
     source_url_candidates = []
@@ -2474,9 +3804,38 @@ def normalize_runtime_build_spec(build_spec):
         1,
         int(verification_requirements.get("minimum_sample_days") or 1),
     )
+    try:
+        cache_requirement_text = json.dumps(
+            {
+                "app_goal": normalized.get("app_goal"),
+                "core_features": normalized.get("core_features"),
+                "constraints": normalized.get("constraints"),
+                "online_mode": normalized.get("online_mode"),
+                "verification_requirements": existing_requirements or {},
+            },
+            ensure_ascii=False,
+        ).lower()
+    except Exception:
+        cache_requirement_text = str(normalized).lower()
+    explicitly_requires_cache = any(
+        marker in cache_requirement_text
+        for marker in [
+            "cache",
+            "cached",
+            "stale",
+            "offline",
+            "offline fallback",
+            "재실행",
+            "오프라인",
+            "캐시",
+            "임시 저장",
+            "저장된 데이터",
+            "네트워크 없이",
+        ]
+    )
     verification_requirements["cache_persistence_required"] = bool(
         verification_requirements.get("cache_persistence_required")
-    ) or requires_external_data_verification
+    ) or (requires_external_data_verification and explicitly_requires_cache)
 
     normalized_permissions = []
     seen_permissions = set()
@@ -2508,6 +3867,15 @@ def normalize_runtime_build_spec(build_spec):
     normalized["source_url_candidates"] = source_url_candidates
     normalized["data_source_type"] = data_source_type
     normalized["source_access_mode"] = source_access_mode
+    has_explicit_source_constraints = any(
+        existing_source_constraints.get(key)
+        for key in ("required_terms", "optional_terms", "forbidden_terms")
+    )
+    source_constraint_texts = [] if has_explicit_source_constraints else [normalized.get("app_goal")]
+    normalized["source_selection_constraints"] = infer_source_selection_constraints(
+        *source_constraint_texts,
+        existing=existing_source_constraints,
+    )
     normalized["required_permissions"] = normalized_permissions
     normalized["permission_requirements"] = permission_requirements
     normalized["verification_requirements"] = verification_requirements
@@ -2536,6 +3904,7 @@ def extract_build_request_context(user_request):
         "research_query": parsed_payload.get("research_query") if isinstance(parsed_payload.get("research_query"), str) else "",
         "research_reason": parsed_payload.get("research_reason") if isinstance(parsed_payload.get("research_reason"), str) else "",
         "research_results": parsed_payload.get("research_results") if isinstance(parsed_payload.get("research_results"), list) else [],
+        "research_context": parsed_payload.get("research_context") if isinstance(parsed_payload.get("research_context"), dict) else {},
     }
 
 
@@ -2620,6 +3989,9 @@ def validate_plan_payload(payload):
     files_to_create = payload.get("files_to_create")
     if not isinstance(files_to_create, list) or not files_to_create or not all(isinstance(item, str) and item.strip() for item in files_to_create):
         return False, f"files_to_create must be a non-empty string array | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    contract = payload.get("implementation_contract")
+    if contract is not None and not isinstance(contract, dict):
+        return False, f"implementation_contract must be an object when present | raw_payload={json.dumps(payload, ensure_ascii=False)}"
     return True, None
 
 
@@ -2668,6 +4040,46 @@ def validate_refinement_plan_payload(payload):
     return True, None
 
 
+def looks_like_complete_dart_source(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return False
+    structural_markers = (
+        "import ",
+        "library ",
+        "part ",
+        "class ",
+        "enum ",
+        "extension ",
+        "mixin ",
+        "typedef ",
+        "void main(",
+        "Widget build(",
+        "@",
+    )
+    if not any(marker in text for marker in structural_markers):
+        return False
+    prose_starts = (
+        "기존 파일",
+        "기존 코드",
+        "아래",
+        "다음",
+        "수정",
+        "변경",
+        "유지하되",
+        "확인해",
+        "점검해",
+        "please ",
+        "modify ",
+        "update ",
+        "keep ",
+    )
+    first_line = text.splitlines()[0].strip().lower()
+    if any(first_line.startswith(marker) for marker in prose_starts):
+        return False
+    return True
+
+
 def validate_file_change_payload(payload):
     if not isinstance(payload, dict):
         return False, f"File change payload must be an object | raw_payload={repr(payload)}"
@@ -2681,6 +4093,10 @@ def validate_file_change_payload(payload):
             return False, f"files.path must be a non-empty string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
         if not isinstance(item.get("content"), str):
             return False, f"files.content must be a string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        path = item.get("path", "").strip()
+        content = item.get("content", "")
+        if path.endswith(".dart") and not looks_like_complete_dart_source(content):
+            return False, f"files.content for Dart files must be complete Dart source code, not prose or instructions | path={path}"
         if "change_type" in item and (not isinstance(item.get("change_type"), str) or not item.get("change_type", "").strip()):
             return False, f"files.change_type must be a non-empty string when present | raw_payload={json.dumps(payload, ensure_ascii=False)}"
         if "reason" in item and (not isinstance(item.get("reason"), str) or not item.get("reason", "").strip()):
@@ -2907,6 +4323,40 @@ def normalize_data_model_plan_payload(payload):
     return normalized
 
 
+def align_data_model_plan_with_web_data_contract(data_model_plan: Any, build_spec: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = normalize_data_model_plan_payload(data_model_plan)
+    contract = (build_spec or {}).get("web_data_contract") if isinstance(build_spec, dict) else {}
+    if not isinstance(contract, dict) or not contract:
+        return normalized
+
+    source_mapping = normalized.get("source_mapping") if isinstance(normalized.get("source_mapping"), dict) else {}
+    contract_candidate_urls = _normalize_string_list(contract.get("candidate_urls") or [], max_items=8)
+    contract_primary_url = str(contract.get("primary_url") or "").strip()
+    if contract.get("source_kind"):
+        source_mapping["source_kind"] = str(contract.get("source_kind") or "").strip()
+    if contract_primary_url:
+        source_mapping["primary_url"] = contract_primary_url
+    if contract_candidate_urls:
+        source_mapping["candidate_urls"] = contract_candidate_urls
+    elif contract_primary_url and not source_mapping.get("candidate_urls"):
+        source_mapping["candidate_urls"] = [contract_primary_url]
+    if contract.get("parser_strategy"):
+        source_mapping["parser_strategy"] = str(contract.get("parser_strategy") or "").strip()
+    normalized["source_mapping"] = source_mapping
+
+    if web_data_contract_requires_dart_html_parser(build_spec):
+        validation_rules = normalized.get("validation_rules") if isinstance(normalized.get("validation_rules"), list) else []
+        validation_rules.extend([
+            "HTTP Content-Type이 text/html이면 jsonDecode/json.decode를 사용하지 않고 package:html/parser.dart로 파싱해야 합니다.",
+            "pubspec.yaml에 html dependency가 있어야 하며, response.body를 HTML document로 parse해야 합니다.",
+        ])
+        normalized["validation_rules"] = _normalize_string_list(validation_rules, max_items=12)
+        source_mapping["response_root"] = source_mapping.get("response_root") or "html_document"
+        source_mapping["record_selector"] = source_mapping.get("record_selector") or "build_spec.web_data_contract.sample_records 기반 CSS/text selector"
+
+    return normalize_data_model_plan_payload(normalized)
+
+
 def validate_data_model_plan_payload(payload):
     payload = normalize_data_model_plan_payload(payload)
     if not isinstance(payload, dict):
@@ -3120,6 +4570,119 @@ def validate_build_failure_summary(payload):
     return True, None
 
 
+def validate_research_requirement_payload(payload):
+    if not isinstance(payload, dict):
+        return False, f"Research requirement payload must be an object | raw_payload={repr(payload)}"
+    if payload.get("decision") not in {"force_research", "skip_research", "defer"}:
+        return False, f"decision must be force_research/skip_research/defer | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("reason"), str) or not payload.get("reason", "").strip():
+        return False, f"reason must be a non-empty string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, (int, float)):
+        return False, f"confidence must be numeric | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    return True, None
+
+
+def validate_behavioral_contract_review_payload(payload):
+    if not isinstance(payload, dict):
+        return False, f"Behavioral contract review payload must be an object | raw_payload={repr(payload)}"
+    if payload.get("status") not in {"pass", "fail", "not_applicable"}:
+        return False, f"status must be pass/fail/not_applicable | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("summary"), str) or not payload.get("summary", "").strip():
+        return False, f"summary must be a non-empty string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("issues"), list):
+        return False, f"issues must be a list | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    return True, None
+
+
+def validate_repair_continuation_payload(payload):
+    if not isinstance(payload, dict):
+        return False, f"Repair continuation payload must be an object | raw_payload={repr(payload)}"
+    if payload.get("action") not in {"continue", "stop"}:
+        return False, f"action must be continue/stop | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("reason"), str) or not payload.get("reason", "").strip():
+        return False, f"reason must be a non-empty string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, (int, float)):
+        return False, f"confidence must be numeric | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    return True, None
+
+
+def assess_research_requirement(user_message, summary="", build_spec=None, task_id=None):
+    result = call_agent_with_tools(
+        RESEARCH_REQUIREMENT_GUARD_SYSTEM,
+        "이 요청이 빌드 전에 외부 조사 단계를 강제로 거쳐야 하는지 판단하세요.",
+        context={
+            "task_id": task_id,
+            "user_message": user_message,
+            "summary": summary,
+            "build_spec": normalize_runtime_build_spec(build_spec or {}),
+        },
+        trace={"task_id": task_id, "flow_type": "generate_decision", "agent_name": "Research_Requirement_Guard", "stage": "research_gate"},
+        tools=RESEARCH_REQUIREMENT_GUARD_TOOL_SCHEMAS,
+        validator=validate_research_requirement_payload,
+        parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
+        fallback_parser=legacy_agent_response_detailed,
+    )
+    decision = result.get("parsed_output")
+    usage = result.get("usage")
+    error = result.get("error")
+    if not decision:
+        return None, usage, error or "Research requirement guard failed"
+    return decision, usage, None
+
+
+def review_behavioral_contract_with_llm(build_spec, code_snapshot, deterministic_report, task_id=None):
+    result = call_agent_with_tools(
+        BEHAVIORAL_CONTRACT_REVIEW_SYSTEM,
+        "로컬 상태 저장/복구 계약 충족 여부를 검토하세요.",
+        context={
+            "task_id": task_id,
+            "build_spec": normalize_runtime_build_spec(build_spec or {}),
+            "code_snapshot": code_snapshot,
+            "deterministic_report": deterministic_report or {},
+        },
+        trace={"task_id": task_id, "flow_type": "verification", "agent_name": "Behavioral_Contract_Reviewer", "stage": "behavioral_contract_review"},
+        tools=BEHAVIORAL_CONTRACT_REVIEW_TOOL_SCHEMAS,
+        validator=validate_behavioral_contract_review_payload,
+        parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
+        fallback_parser=legacy_agent_response_detailed,
+    )
+    review = result.get("parsed_output")
+    usage = result.get("usage")
+    error = result.get("error")
+    if not review:
+        return None, usage, error or "Behavioral contract reviewer failed"
+    return review, usage, None
+
+
+def decide_repair_continuation(flow_type, stage, round_history, current_failure, remaining_budget, request_context=None, task_id=None):
+    result = call_agent_with_tools(
+        REPAIR_CONTINUATION_GUARD_SYSTEM,
+        "현재 상태에서 자동 복구를 한 번 더 진행할지 판단하세요.",
+        context={
+            "task_id": task_id,
+            "flow_type": flow_type,
+            "stage": stage,
+            "round_history": round_history or [],
+            "current_failure": current_failure or {},
+            "remaining_budget": remaining_budget,
+            "request_context": request_context or {},
+        },
+        trace={"task_id": task_id, "flow_type": flow_type, "agent_name": "Repair_Continuation_Guard", "stage": f"{stage}_continuation_gate"},
+        tools=REPAIR_CONTINUATION_GUARD_TOOL_SCHEMAS,
+        validator=validate_repair_continuation_payload,
+        parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
+        fallback_parser=legacy_agent_response_detailed,
+    )
+    decision = result.get("parsed_output")
+    usage = result.get("usage")
+    error = result.get("error")
+    if not decision:
+        return None, usage, error or "Repair continuation guard failed"
+    return decision, usage, None
+
+
 def decide_generate_action(
     user_request,
     device_context=None,
@@ -3274,7 +4837,7 @@ def _download_web_document(url):
         url,
         headers={"User-Agent": "Mozilla/5.0 VibeFactory/1.0"}
     )
-    with urlrequest.urlopen(request, timeout=15) as response:
+    with _safe_urlopen(request, timeout=15) as response:
         final_url = response.geturl()
         html = response.read().decode("utf-8", errors="ignore")
     title = _extract_html_title(html)
@@ -3519,6 +5082,39 @@ def _line_sample_records(text_content, max_records=5):
     return records
 
 
+def _link_sample_records(links, max_records=5):
+    records = []
+    seen = set()
+    content_url_pattern = re.compile(
+        r"(/|[?&])(topic|post|posts|article|articles|news|story|stories|item|items|view|read|idx|id)[=/_-]?\d*",
+        re.I,
+    )
+    blocked_markers = [
+        "login", "logout", "signup", "register", "write", "edit", "delete",
+        "comment", "comments", "search", "tag", "category", "user", "profile",
+        "privacy", "terms", "rss", "feed",
+    ]
+    for link in links or []:
+        if not isinstance(link, dict):
+            continue
+        url = (link.get("url") or "").strip()
+        text = _collapse_text(link.get("text") or link.get("title") or "")
+        if not url or not text or len(text) < 4:
+            continue
+        lowered_url = url.lower()
+        if lowered_url in seen or lowered_url.endswith("#"):
+            continue
+        if any(marker in lowered_url for marker in blocked_markers):
+            continue
+        if not content_url_pattern.search(lowered_url) and len(text) < 12:
+            continue
+        seen.add(lowered_url)
+        records.append({"title": text[:200], "url": url, "_source": "link"})
+        if len(records) >= max_records:
+            break
+    return records
+
+
 def analyze_web_data_source(url, user_goal="", page_result=None, task_id=None):
     page = page_result if isinstance(page_result, dict) else {}
     if not page:
@@ -3547,7 +5143,8 @@ def analyze_web_data_source(url, user_goal="", page_result=None, task_id=None):
     )
     table_records = _table_sample_records(tables)
     text_records = _line_sample_records(page.get("text_content") or "")
-    sample_records = table_records or text_records
+    link_records = _link_sample_records(structure.get("links") or [])
+    sample_records = table_records or text_records or link_records
 
     source_kind = "unusable"
     parser_strategy = "none"
@@ -3561,6 +5158,10 @@ def analyze_web_data_source(url, user_goal="", page_result=None, task_id=None):
         source_kind = "static_html_text"
         parser_strategy = "text_pattern"
         confidence = 0.65
+    elif link_records:
+        source_kind = "static_html_links"
+        parser_strategy = "html_link_list"
+        confidence = 0.6
     elif structure.get("candidate_data_urls"):
         source_kind = "json_endpoint_candidate"
         parser_strategy = "discover_and_fetch_candidate_url"
@@ -3832,7 +5433,7 @@ def parse_openapi_reference(url, task_id=None):
         headers={"User-Agent": "Mozilla/5.0 VibeFactory/1.0", "Accept": "application/json, text/plain, */*"}
     )
     try:
-        with urlrequest.urlopen(request, timeout=15) as response:
+        with _safe_urlopen(request, timeout=15) as response:
             final_url = response.geturl()
             raw_body = response.read().decode("utf-8", errors="ignore")
         spec = json.loads(raw_body)
@@ -4084,7 +5685,7 @@ def search_web_reference(query, task_id=None, max_results=5):
     )
 
     try:
-        with urlrequest.urlopen(request, timeout=15) as response:
+        with _safe_urlopen(request, timeout=15) as response:
             html = response.read().decode("utf-8", errors="ignore")
     except Exception as e:
         record_agent_trace(
@@ -4305,7 +5906,44 @@ def _is_private_or_local_host(hostname):
         pass
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
         return True
-    return host.startswith("10.") or host.startswith("192.168.") or host.startswith("172.")
+    if host.startswith("10.") or host.startswith("192.168.") or host.startswith("172."):
+        return True
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(host, None):
+            address = sockaddr[0]
+            ip = ipaddress.ip_address(address)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return True
+    except Exception:
+        # DNS/network lookup failure is not evidence that a public hostname is private.
+        # Let the actual request fail with a concrete network/SSL reason instead of
+        # collapsing it into "private_or_local_address".
+        return False
+    return False
+
+
+def _validate_public_http_url(url):
+    parsed = urlparse.urlparse(url or "")
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("unsupported_scheme")
+    if _is_private_or_local_host(parsed.hostname or ""):
+        raise ValueError("private_or_local_address")
+    return parsed
+
+
+class _SafeRedirectHandler(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _safe_urlopen(request, timeout=15):
+    target_url = request.full_url if hasattr(request, "full_url") else str(request)
+    _validate_public_http_url(target_url)
+    opener = urlrequest.build_opener(_SafeRedirectHandler)
+    response = opener.open(request, timeout=timeout)
+    _validate_public_http_url(response.geturl())
+    return response
 
 
 def _coerce_safe_query_params(query_params):
@@ -4409,7 +6047,7 @@ def test_http_request(method, url, headers=None, query_params=None, *, allowed_s
         method="GET",
     )
     try:
-        with urlrequest.urlopen(request, timeout=10) as response:
+        with _safe_urlopen(request, timeout=10) as response:
             response_bytes = response.read(4096)
             response_text = response_bytes.decode("utf-8", errors="ignore")
             content_type = response.headers.get("Content-Type", "")
@@ -4479,16 +6117,19 @@ def test_http_request(method, url, headers=None, query_params=None, *, allowed_s
         return result
 
 
-def select_best_api_source(query, candidates, task_id=None):
+def select_best_api_source(query, candidates, task_id=None, build_spec=None):
     candidates = [candidate for candidate in (candidates or []) if isinstance(candidate, dict)]
     scored_candidates = []
     rejected_sources = []
+    constraint_context = normalize_runtime_build_spec(build_spec or {"app_goal": query})
+    source_constraints = constraint_context.get("source_selection_constraints") or {}
 
     for index, candidate in enumerate(candidates):
         title = _collapse_text(candidate.get("title") or "")
         url = candidate.get("final_url") or candidate.get("url") or ""
         snippet = _collapse_text(candidate.get("snippet") or "")
         text_content = _collapse_text(candidate.get("text_content") or "")
+        page_result = candidate.get("page_result") if isinstance(candidate.get("page_result"), dict) else {}
         source_type = (candidate.get("source_type") or "generic_web").strip() or "generic_web"
         source_kind = (candidate.get("source_kind") or "").strip()
         quality_passed = bool(candidate.get("quality_passed"))
@@ -4507,6 +6148,33 @@ def select_best_api_source(query, candidates, task_id=None):
                 "title": title,
                 "url": url,
                 "reason": f"quality_gate_failed:{quality_reason}",
+            })
+            continue
+
+        constraint_report = evaluate_source_constraint_alignment(
+            source_constraints,
+            title,
+            snippet,
+            url,
+            text_content,
+            page_result.get("title") or "",
+            page_result.get("text_content") or "",
+        )
+        if not constraint_report.get("passes_forbidden_terms"):
+            rejected_sources.append({
+                "title": title,
+                "url": url,
+                "reason": f"source_constraints_forbidden:{','.join(constraint_report.get('forbidden_hits') or [])}",
+            })
+            continue
+        if (source_constraints.get("required_terms") or []) and not constraint_report.get("passes_required_terms"):
+            rejected_sources.append({
+                "title": title,
+                "url": url,
+                "reason": (
+                    "source_constraints_unmatched:"
+                    f"matched={','.join(constraint_report.get('matched_required_terms') or []) or '-'}"
+                ),
             })
             continue
 
@@ -4551,6 +6219,8 @@ def select_best_api_source(query, candidates, task_id=None):
             score += 0.06
 
         score += min(search_confidence, 0.99) * 0.15
+        score += float(constraint_report.get("coverage") or 0.0) * 0.25
+        score += min(len(constraint_report.get("matched_optional_terms") or []), 3) * 0.02
 
         if _looks_low_trust_host(url):
             score -= 0.35
@@ -4624,7 +6294,7 @@ def select_best_api_source(query, candidates, task_id=None):
     return parsed_output
 
 
-def evaluate_research_quality(research_query, results, fetched_pages, *, direct_fetch=False, task_id=None):
+def evaluate_research_quality(research_query, results, fetched_pages, *, direct_fetch=False, task_id=None, build_spec=None):
     results = results or []
     fetched_pages = fetched_pages or []
     used_external_sources = []
@@ -4720,6 +6390,29 @@ def evaluate_research_quality(research_query, results, fetched_pages, *, direct_
         else:
             reason = "search_result_irrelevant_or_weak"
 
+    if isinstance(build_spec, dict) and build_spec:
+        constraint_context = normalize_runtime_build_spec(build_spec)
+    else:
+        constraint_context = normalize_runtime_build_spec({"app_goal": research_query})
+    source_constraints = constraint_context.get("source_selection_constraints") or {}
+    top_result = results[0] if results else {}
+    top_page = fetched_pages[0] if fetched_pages else {}
+    constraint_report = evaluate_source_constraint_alignment(
+        source_constraints,
+        (top_result or {}).get("title") or "",
+        (top_result or {}).get("snippet") or "",
+        (top_result or {}).get("url") or "",
+        (top_page or {}).get("title") or "",
+        (top_page or {}).get("text_content") or "",
+        (top_page or {}).get("final_url") or "",
+    )
+    if forbidden_hits := constraint_report.get("forbidden_hits"):
+        passed = False
+        reason = f"source_constraints_forbidden:{','.join(forbidden_hits)}"
+    elif (source_constraints.get("required_terms") or []) and not constraint_report.get("passes_required_terms"):
+        passed = False
+        reason = "source_constraints_unmatched"
+
     parsed_output = {
         "research_quality_passed": passed,
         "research_quality_reason": reason,
@@ -4727,6 +6420,7 @@ def evaluate_research_quality(research_query, results, fetched_pages, *, direct_
         "results_count": len(results),
         "fetched_pages_count": len(fetched_pages),
         "direct_fetch": direct_fetch,
+        "source_constraint_report": constraint_report,
     }
     record_agent_trace(
         task_id=task_id,
@@ -4899,18 +6593,30 @@ def update_package_name(project_path, new_pkg):
                 pass
 
 
+def normalize_pubspec_package_name(value, fallback="generated_app"):
+    raw = str(value or "").lower()
+    clean_name = re.sub(r'[^a-z0-9_]', '_', raw)
+    clean_name = re.sub(r'_+', '_', clean_name)
+    clean_name = re.sub(r'^_+|_+$', '', clean_name)
+    if not clean_name:
+        clean_name = fallback
+    if clean_name[0].isdigit():
+        clean_name = 'app_' + clean_name
+    return clean_name[:50].rstrip("_") or fallback
+
+
 def update_pubspec_name(project_path, new_name):
     pubspec_path = os.path.join(project_path, "pubspec.yaml")
-    if os.path.exists(pubspec_path):
-        with open(pubspec_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        clean_name = re.sub(r'[^a-z0-9_]', '_', new_name.lower())
-        clean_name = re.sub(r'^_+|_+$', '', clean_name)
+    if not os.path.exists(pubspec_path):
+        return
+    with open(pubspec_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    clean_name = normalize_pubspec_package_name(new_name)
 
-    if clean_name and clean_name[0].isdigit():
-        clean_name = 'app_' + clean_name
-        
-    content = re.sub(r'^name:\s+.*', f'name: {clean_name}', content, flags=re.MULTILINE)
+    if re.search(r'^name:\s*.*$', content, flags=re.MULTILINE):
+        content = re.sub(r'^name:\s*.*$', f'name: {clean_name}', content, flags=re.MULTILINE)
+    else:
+        content = f'name: {clean_name}\n{content}'
     
     with open(pubspec_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -4920,13 +6626,8 @@ def update_dart_imports(project_path, old_project_name, new_project_name):
     if not os.path.exists(lib_path):
         return
 
-    old_name = re.sub(r'[^a-z0-9_]', '_', old_project_name.lower())
-    old_name = re.sub(r'^_+|_+$', '', old_name)
-
-    new_name = re.sub(r'[^a-z0-9_]', '_', new_project_name.lower())
-    new_name = re.sub(r'^_+|_+$', '', new_name)
-    if new_name and new_name[0].isdigit():
-        new_name = 'app_' + new_name
+    old_name = normalize_pubspec_package_name(old_project_name, fallback="baseproject")
+    new_name = normalize_pubspec_package_name(new_project_name)
         
     target = f"package:{old_name}/"
     replacement = f"package:{new_name}/"
@@ -4959,12 +6660,143 @@ def save_project_files(project_path, files):
         if path.endswith(".dart") and not path.startswith("lib/"):
             path = os.path.join("lib", path)
 
+        if path.endswith(".dart") and not looks_like_complete_dart_source(content):
+            raise ValueError(f"Refusing to write non-Dart prose/instruction content to {path}")
+
         full = safe_join(project_path, path)
 
         os.makedirs(os.path.dirname(full), exist_ok=True)
 
         with open(full, "w", encoding="utf-8") as fp:
             fp.write(content)
+
+
+def apply_project_files_safely(project_path, files, *, ensure_crash_fn=None):
+    normalized_files = [item for item in files or [] if isinstance(item, dict) and item.get("path")]
+    if not normalized_files:
+        return True, [], ""
+    try:
+        save_project_files(project_path, normalized_files)
+        if ensure_crash_fn:
+            ensure_crash_fn()
+    except Exception as exc:
+        return False, [], str(exc)
+    touched_paths = [
+        item.get("path")
+        for item in normalized_files
+        if isinstance(item.get("path"), str) and item.get("path").strip()
+    ]
+    return True, touched_paths, ""
+
+
+LEFT_SINGLE_CURLY_QUOTE = "‘"
+RIGHT_SINGLE_CURLY_QUOTE = "’"
+LEFT_DOUBLE_CURLY_QUOTE = "“"
+RIGHT_DOUBLE_CURLY_QUOTE = "”"
+
+
+def normalize_edit_quotes(value: str) -> str:
+    return (
+        str(value or "")
+        .replace(LEFT_SINGLE_CURLY_QUOTE, "'")
+        .replace(RIGHT_SINGLE_CURLY_QUOTE, "'")
+        .replace(LEFT_DOUBLE_CURLY_QUOTE, '"')
+        .replace(RIGHT_DOUBLE_CURLY_QUOTE, '"')
+    )
+
+
+def find_actual_edit_string(file_content: str, search_text: str) -> Optional[str]:
+    if search_text in file_content:
+        return search_text
+    normalized_search = normalize_edit_quotes(search_text)
+    normalized_file = normalize_edit_quotes(file_content)
+    index = normalized_file.find(normalized_search)
+    if index == -1:
+        return None
+    return file_content[index:index + len(search_text)]
+
+
+def preserve_edit_quote_style(old_text: str, actual_old_text: str, new_text: str) -> str:
+    if old_text == actual_old_text:
+        return new_text
+    if any(quote in actual_old_text for quote in (LEFT_DOUBLE_CURLY_QUOTE, RIGHT_DOUBLE_CURLY_QUOTE)):
+        new_text = new_text.replace('"', LEFT_DOUBLE_CURLY_QUOTE if actual_old_text.count(LEFT_DOUBLE_CURLY_QUOTE) >= actual_old_text.count(RIGHT_DOUBLE_CURLY_QUOTE) else RIGHT_DOUBLE_CURLY_QUOTE)
+    if any(quote in actual_old_text for quote in (LEFT_SINGLE_CURLY_QUOTE, RIGHT_SINGLE_CURLY_QUOTE)):
+        new_text = new_text.replace("'", RIGHT_SINGLE_CURLY_QUOTE)
+    return new_text
+
+
+def apply_edit_to_content(original_content: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
+    if replace_all:
+        return original_content.replace(old_text, new_text)
+    if new_text == "" and not old_text.endswith("\n") and f"{old_text}\n" in original_content:
+        return original_content.replace(f"{old_text}\n", new_text, 1)
+    return original_content.replace(old_text, new_text, 1)
+
+
+def apply_text_edit_safely(
+    project_path,
+    *,
+    path: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
+    reason: str = "",
+    ensure_crash_fn=None,
+    read_paths=None,
+):
+    normalized_path = (path or "").strip().lstrip("/")
+    if not normalized_path:
+        return {"status": "error", "message": "path is required"}
+    if not isinstance(old_text, str) or not old_text:
+        return {"status": "error", "message": "old_text must be a non-empty string", "path": normalized_path}
+    if not isinstance(new_text, str):
+        return {"status": "error", "message": "new_text must be a string", "path": normalized_path}
+
+    full_path = safe_join(project_path, normalized_path)
+    if not os.path.exists(full_path):
+        return {"status": "error", "message": f"파일 없음: {normalized_path}", "path": normalized_path}
+    if os.path.isdir(full_path):
+        return {"status": "error", "message": f"디렉토리는 edit_file 대상이 아닙니다: {normalized_path}", "path": normalized_path}
+    if isinstance(read_paths, set) and normalized_path not in read_paths:
+        return {
+            "status": "error",
+            "message": "File has not been read yet. Use read_file before edit_file.",
+            "path": normalized_path,
+        }
+
+    with open(full_path, "r", encoding="utf-8", newline="") as f:
+        original = f.read()
+
+    actual_old_text = find_actual_edit_string(original, old_text)
+    if actual_old_text is None:
+        return {"status": "error", "message": "old_text not found", "path": normalized_path}
+
+    adjusted_new_text = preserve_edit_quote_style(old_text, actual_old_text, new_text)
+    match_count = original.count(actual_old_text)
+    if match_count == 0:
+        return {"status": "error", "message": "old_text not found", "path": normalized_path}
+    if match_count > 1 and not replace_all:
+        return {
+            "status": "error",
+            "message": f"old_text matched {match_count} times; set replace_all=true or use a more specific snippet",
+            "path": normalized_path,
+            "match_count": match_count,
+        }
+
+    updated = apply_edit_to_content(original, actual_old_text, adjusted_new_text, replace_all=replace_all)
+    ok, touched_paths, error = apply_project_files_safely(
+        project_path,
+        [{"path": normalized_path, "content": updated, "change_type": "modify", "reason": reason}],
+        ensure_crash_fn=ensure_crash_fn,
+    )
+    if not ok:
+        return {"status": "error", "message": error, "path": normalized_path}
+    return {
+        "status": "ok",
+        "path": touched_paths[0] if touched_paths else normalized_path,
+        "replacements": match_count if replace_all else 1,
+    }
 
 def normalize_relevant_files(files):
     out = []
@@ -5023,6 +6855,97 @@ def _compact_korean_text(text, max_len=180):
     return trimmed
 
 
+APP_TITLE_STOP_PHRASES = [
+    r"통합\s*구현\s*블루프린트",
+    r"구현\s*블루프린트",
+    r"앱\s*구현\s*블루프린트",
+    r"앱\s*통합\s*구현",
+    r"앱\s*구현",
+    r"앱\s*생성",
+    r"앱\s*제작",
+    r"애플리케이션\s*구현",
+    r"블루프린트",
+    r"프로젝트",
+    r"만들어\s*줘",
+    r"만들기",
+    r"제작해\s*줘",
+    r"생성해\s*줘",
+]
+
+APP_TITLE_STOP_WORDS = {
+    "앱", "어플", "애플리케이션", "구현", "생성", "제작", "개발", "빌드", "통합",
+    "블루프린트", "프로젝트", "기능", "지원", "기반", "중심", "전용", "단일", "화면",
+    "있는", "있는앱", "및", "용", "형", "버전", "요청", "플랜", "계획",
+    "오프라인", "온라인", "실시간", "무료", "공개", "간단한",
+}
+
+
+def _normalize_app_title_candidate(text: Any) -> str:
+    cleaned = " ".join(str(text or "").replace("\n", " ").split())
+    if not cleaned:
+        return ""
+    cleaned = re.split(r"[|/:;\n]", cleaned, maxsplit=1)[0].strip()
+    for pattern in APP_TITLE_STOP_PHRASES:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"[\"'“”‘’\[\](){}<>]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-_")
+    return cleaned
+
+
+def compact_generated_app_title(raw_title: Any, *fallbacks: Any, max_chars: int = 18) -> str:
+    candidates = [raw_title, *fallbacks]
+    for candidate in candidates:
+        cleaned = _normalize_app_title_candidate(candidate)
+        if not cleaned:
+            continue
+        had_app_marker = any(marker in str(candidate or "") for marker in ["앱", "어플", "애플리케이션", " app", " App"])
+        tokens = [token for token in re.split(r"\s+", cleaned) if token]
+        filtered = [token for token in tokens if token.lower() not in APP_TITLE_STOP_WORDS and token not in APP_TITLE_STOP_WORDS]
+        if tokens and not filtered:
+            continue
+        if len(cleaned) <= max_chars and len(tokens) <= 3 and len(filtered) == len(tokens):
+            return cleaned
+
+        preferred_tokens = filtered or tokens
+
+        compact_tail: List[str] = []
+        for token in reversed(preferred_tokens):
+            next_tokens = [token, *compact_tail]
+            next_title = " ".join(next_tokens).strip()
+            if len(next_title) > max_chars:
+                break
+            compact_tail = next_tokens
+            if len(compact_tail) >= 3:
+                break
+
+        compact_title = " ".join(compact_tail).strip()
+        if not compact_title:
+            compact_title = cleaned[:max_chars].rstrip(" ,.-_")
+
+        if had_app_marker and not compact_title.endswith("앱") and len(compact_title) <= max_chars - 2:
+            compact_title = f"{compact_title} 앱".strip()
+
+        compact_title = compact_title[:max_chars].rstrip(" ,.-_")
+        if compact_title:
+            return compact_title
+    return "생성 앱"
+
+
+def normalize_plan_title(plan: Dict[str, Any], *, build_context: Optional[Dict[str, Any]] = None, product_plan: Optional[Dict[str, Any]] = None) -> str:
+    build_spec = (build_context or {}).get("build_spec") if isinstance(build_context, dict) else {}
+    compact_title = compact_generated_app_title(
+        (plan or {}).get("title"),
+        (product_plan or {}).get("app_goal") if isinstance(product_plan, dict) else "",
+        (product_plan or {}).get("summary") if isinstance(product_plan, dict) else "",
+        (build_context or {}).get("summary") if isinstance(build_context, dict) else "",
+        build_spec.get("app_goal") if isinstance(build_spec, dict) else "",
+        (build_context or {}).get("user_request") if isinstance(build_context, dict) else "",
+    )
+    if isinstance(plan, dict):
+        plan["title"] = compact_title
+    return compact_title
+
+
 def build_refinement_user_summary(plan, files_to_modify):
     normalized_files = normalize_relevant_files(files_to_modify)
     file_count = len(normalized_files) if normalized_files else 1
@@ -5042,6 +6965,339 @@ def build_refinement_user_summary(plan, files_to_modify):
         summary += f" 수정 방향은 {refinement_plan}"
 
     return summary.strip()
+
+
+def normalize_project_file_path(path: Any) -> str:
+    if not isinstance(path, str):
+        return ""
+    normalized = path.strip().lstrip("/")
+    if not normalized:
+        return ""
+    if normalized == "pubspec.yaml" or normalized.startswith(("lib/", "android/")):
+        return normalized
+    if normalized.endswith(".dart"):
+        return os.path.join("lib", normalized)
+    return normalized
+
+
+def infer_app_pattern_from_context(build_context: Dict[str, Any], product_plan: Dict[str, Any], feature_logic_plan: Dict[str, Any]) -> str:
+    text = " ".join(
+        str(value or "")
+        for value in [
+            (build_context or {}).get("user_request"),
+            (build_context or {}).get("summary"),
+            json.dumps((build_context or {}).get("build_spec") or {}, ensure_ascii=False),
+            json.dumps(product_plan or {}, ensure_ascii=False),
+            json.dumps(feature_logic_plan or {}, ensure_ascii=False),
+        ]
+    ).lower()
+    if any(marker in text for marker in ["계산기", "calculator", "사칙연산", "덧셈", "뺄셈", "곱셈", "나눗셈"]):
+        if any(marker in text for marker in ["스냅샷", "snapshot", "브랜치", "branch", "분기", "복구", "restore", "히스토리", "history", "되돌리기"]):
+            return "local_state_calculator"
+        return "single_screen_calculator"
+    if any(marker in text for marker in ["체크리스트", "todo", "할 일", "메모", "note"]):
+        return "local_list_crud"
+    if _looks_like_external_data_app((build_context or {}).get("build_spec") or {}):
+        return "read_only_external_data"
+    if _requires_local_state_contract_verification((build_context or {}).get("build_spec") or {}):
+        return "local_state_snapshot_app"
+    return "single_user_utility"
+
+
+def build_default_implementation_contract(
+    *,
+    plan: Dict[str, Any],
+    build_context: Dict[str, Any],
+    product_plan: Dict[str, Any],
+    ui_layout_plan: Dict[str, Any],
+    data_model_plan: Dict[str, Any],
+    feature_logic_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    build_spec = normalize_runtime_build_spec((build_context or {}).get("build_spec") or {})
+    app_pattern = infer_app_pattern_from_context(build_context, product_plan, feature_logic_plan)
+    required_files = [
+        normalize_project_file_path(path)
+        for path in (plan.get("files_to_create") if isinstance(plan.get("files_to_create"), list) else [])
+    ]
+    required_files = [path for path in required_files if path]
+    if "lib/main.dart" not in required_files:
+        required_files.insert(0, "lib/main.dart")
+
+    required_classes = ["MyApp"]
+    required_methods = ["main", "CrashHandler.initialize"]
+    acceptance_checks = [
+        "서버 static preflight 통과",
+        "flutter analyze 통과",
+        "flutter build apk --debug 통과",
+        "CrashHandler.initialize가 실제 task_id/package_name으로 runApp 전에 호출됨",
+    ]
+    repair_scope_rules = [
+        "import/type/pubspec 오류는 관련 파일만 최소 수정",
+        "CrashHandler 파일은 재정의하지 않음",
+        "main.dart는 진입점 또는 라우팅 오류가 원인일 때만 수정",
+    ]
+
+    persistence_required = _requires_local_state_contract_verification(build_spec)
+    state_contract = {
+        "required": persistence_required,
+        "backend": "SharedPreferences 또는 앱 문서 파일 같은 안정 로컬 저장소" if persistence_required else "none",
+        "snapshot_model": "불변 snapshot 모델" if persistence_required else "none",
+        "required_operations": ["save", "list", "load_by_id", "restore", "delete"] if persistence_required else [],
+        "restore_strategy": "저장된 snapshot id로 저장소에서 다시 조회한 뒤 구조화된 필드로 상태 복원" if persistence_required else "not_applicable",
+        "serialization_required": persistence_required,
+    }
+    navigation_contract = {
+        "screens": [],
+        "routes": [],
+        "restore_flow": "not_applicable",
+    }
+
+    if isinstance(ui_layout_plan, dict):
+        navigation = ui_layout_plan.get("navigation") if isinstance(ui_layout_plan.get("navigation"), dict) else {}
+        screens = navigation.get("screens") if isinstance(navigation.get("screens"), list) else []
+        routes = navigation.get("routes") if isinstance(navigation.get("routes"), list) else []
+        navigation_contract["screens"] = [str(item) for item in screens if str(item).strip()][:8]
+        navigation_contract["routes"] = [
+            str(item.get("route") if isinstance(item, dict) else item)
+            for item in routes
+            if str(item.get("route") if isinstance(item, dict) else item).strip()
+        ][:8]
+    if persistence_required:
+        navigation_contract["restore_flow"] = "저장/히스토리 화면에서 항목 선택 시 snapshot을 복원하고 계산기/원 화면으로 돌아감"
+        acceptance_checks.extend([
+            "로컬 저장소 기반 save/list/load_by_id/restore/delete 흐름 구현",
+            "snapshot toJson/fromJson 또는 동등한 직렬화 구현",
+            "복원은 표시 문자열 재파싱이 아니라 snapshot 필드 기반",
+        ])
+        repair_scope_rules.append("로컬 상태 계약 오류는 snapshot model, storage service, 관련 screen만 우선 수정")
+        required_classes.extend(["Snapshot", "StorageService"])
+        required_methods.extend(["toJson", "fromJson", "save", "list", "loadById", "delete", "restore"])
+
+    if _looks_like_external_data_app(build_spec):
+        acceptance_checks.extend([
+            "외부 데이터 URL은 build_spec의 공식 source_url_candidates 또는 external_sources만 사용",
+            "외부 데이터 성공 경로에 mock/sample 데이터 사용 금지",
+        ])
+        repair_scope_rules.append("외부 데이터 오류는 fetch/parser/cache 레이어 중심으로 수정")
+
+    return {
+        "app_pattern": app_pattern,
+        "required_files": merge_unique_paths(required_files),
+        "required_classes": merge_unique_paths(required_classes),
+        "required_methods": merge_unique_paths(required_methods),
+        "required_dependencies": [],
+        "required_permissions": [],
+        "state_persistence_contract": state_contract,
+        "navigation_contract": navigation_contract,
+        "acceptance_checks": merge_unique_paths(acceptance_checks),
+        "repair_scope_rules": merge_unique_paths(repair_scope_rules),
+    }
+
+
+def normalize_implementation_contract(contract: Any, default_contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return default_contract
+    normalized = dict(default_contract)
+    for key in ["app_pattern"]:
+        if isinstance(contract.get(key), str) and contract[key].strip():
+            normalized[key] = contract[key].strip()
+    for key in [
+        "required_files",
+        "required_classes",
+        "required_methods",
+        "required_dependencies",
+        "required_permissions",
+        "acceptance_checks",
+        "repair_scope_rules",
+    ]:
+        values = contract.get(key)
+        if isinstance(values, list):
+            normalized[key] = merge_unique_paths([
+                normalize_project_file_path(item) if key == "required_files" else str(item).strip()
+                for item in [*normalized.get(key, []), *values]
+                if str(item).strip()
+            ])
+    for key in ["state_persistence_contract", "navigation_contract"]:
+        if isinstance(contract.get(key), dict):
+            merged = dict(normalized.get(key) or {})
+            merged.update({k: v for k, v in contract[key].items() if v is not None})
+            normalized[key] = merged
+    return normalized
+
+
+def _dart_class_name_from_entity_name(value: Any, fallback: str = "AppRecord") -> str:
+    raw = re.sub(r"[^A-Za-z0-9_ ]+", " ", str(value or "")).strip()
+    parts = [part for part in re.split(r"[_\s]+", raw) if part]
+    if not parts:
+        return fallback
+    name = "".join(part[:1].upper() + part[1:] for part in parts)
+    if not re.match(r"^[A-Za-z_]", name):
+        name = f"{fallback}{name}"
+    return name or fallback
+
+
+def _contract_text_for_capability_detection(*values: Any) -> str:
+    return _build_source_constraint_text(*values).lower()
+
+
+def _request_implies_new_content_notification(*values: Any) -> bool:
+    text = _contract_text_for_capability_detection(*values)
+    notification_markers = [
+        "알림", "노티", "notification", "notify", "푸시", "push",
+    ]
+    fresh_markers = [
+        "새 글", "새글", "신규", "최신", "업데이트", "새로운", "latest", "new article", "new post",
+    ]
+    return any(marker in text for marker in notification_markers) and any(marker in text for marker in fresh_markers)
+
+
+def _request_implies_scheduled_refresh(*values: Any) -> bool:
+    text = _contract_text_for_capability_detection(*values)
+    return any(marker in text for marker in [
+        "매일", "매시간", "주기", "정기", "백그라운드", "background", "schedule", "scheduled", "periodic",
+    ])
+
+
+def augment_implementation_contract_for_readiness(
+    contract: Dict[str, Any],
+    *,
+    build_context: Dict[str, Any],
+    data_model_plan: Dict[str, Any],
+    feature_logic_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    build_spec = normalize_runtime_build_spec((build_context or {}).get("build_spec") or {})
+    augmented = normalize_implementation_contract(contract, contract)
+
+    def add_list(key: str, values: List[str]) -> None:
+        augmented[key] = merge_unique_paths([
+            *[str(item).strip() for item in (augmented.get(key) or []) if str(item).strip()],
+            *[str(item).strip() for item in values if str(item).strip()],
+        ])
+
+    entity_names = []
+    if isinstance(data_model_plan, dict):
+        for entity in data_model_plan.get("entities") or []:
+            if isinstance(entity, dict):
+                entity_names.append(_dart_class_name_from_entity_name(entity.get("name")))
+
+    if _looks_like_external_data_app(build_spec):
+        add_list("required_files", [
+            "pubspec.yaml",
+            "lib/services/external_data_repository.dart",
+            "lib/services/local_store.dart",
+        ])
+        add_list("required_classes", [
+            *entity_names,
+            "ExternalDataRepository",
+            "LocalStore",
+            "SyncStatus",
+        ])
+        add_list("required_methods", [
+            "ExternalDataRepository.fetchLatest",
+            "ExternalDataRepository.parseRecords",
+            "LocalStore.loadCachedRecords",
+            "LocalStore.saveCachedRecords",
+            "SyncStatus.idle",
+            "SyncStatus.loading",
+            "SyncStatus.error",
+        ])
+        add_list("acceptance_checks", [
+            "외부 데이터 fetch/parse/cache 상태는 SyncStatus로 표현",
+            "네트워크 실패 시 빈 성공 대신 오류 상태 또는 stale cache 표시",
+            "파서 실패 시 mock 데이터로 성공 처리하지 않음",
+        ])
+
+    if web_data_contract_requires_dart_html_parser(build_spec):
+        add_list("required_dependencies", ["html"])
+        add_list("required_methods", [
+            "ExternalDataRepository.parseHtmlRecords",
+        ])
+        add_list("acceptance_checks", [
+            "HTML 응답은 package:html/parser.dart로 파싱",
+            "response.body에 jsonDecode/json.decode 사용 금지",
+        ])
+        add_list("repair_scope_rules", [
+            "HTML 파싱 오류는 repository parser와 pubspec.yaml dependency만 우선 수정",
+        ])
+
+    requires_notification = _request_implies_new_content_notification(
+        build_context,
+        build_spec,
+        data_model_plan,
+        feature_logic_plan,
+    )
+    if requires_notification:
+        add_list("required_files", [
+            "lib/services/notification_service.dart",
+            "lib/services/local_store.dart",
+        ])
+        add_list("required_classes", [
+            "NotificationService",
+            "LocalStore",
+            "SyncStatus",
+        ])
+        add_list("required_methods", [
+            "NotificationService.initialize",
+            "NotificationService.showNewContentNotification",
+            "LocalStore.loadSeenRecordIds",
+            "LocalStore.saveSeenRecordIds",
+            "ExternalDataRepository.findNewRecords",
+        ])
+        add_list("required_dependencies", [
+            "flutter_local_notifications",
+            "shared_preferences",
+        ])
+        add_list("required_permissions", ["android.permission.POST_NOTIFICATIONS"])
+        add_list("acceptance_checks", [
+            "앱 시작 시 최신 레코드를 조회하고 이전에 본 레코드 id와 비교",
+            "새 레코드가 있으면 사용자에게 알림 표시",
+            "본 레코드 id는 앱 재실행 후에도 유지",
+            "Android 13 이상 알림 권한 요청과 거부 상태 안내 구현",
+        ])
+
+    if _request_implies_scheduled_refresh(build_context, build_spec, feature_logic_plan):
+        add_list("acceptance_checks", [
+            "플랫폼 제한으로 실제 장기 백그라운드 실행이 불가능하면 앱 시작/재개 시 동기화와 명확한 안내를 구현",
+            "주기적 확인을 구현할 경우 사용한 스케줄링 방식과 실패 fallback을 명시",
+        ])
+
+    return normalize_implementation_contract(augmented, augmented)
+
+
+def validate_implementation_readiness_contract(plan: Dict[str, Any], build_context: Dict[str, Any]) -> Dict[str, Any]:
+    contract = (plan or {}).get("implementation_contract") if isinstance((plan or {}).get("implementation_contract"), dict) else {}
+    build_spec = normalize_runtime_build_spec((build_context or {}).get("build_spec") or {})
+    issues = []
+    for key in ["required_files", "required_classes", "required_methods", "acceptance_checks", "repair_scope_rules"]:
+        if not isinstance(contract.get(key), list) or not contract.get(key):
+            issues.append(f"implementation_contract.{key}가 비어 있습니다.")
+    if "lib/main.dart" not in (contract.get("required_files") or []):
+        issues.append("implementation_contract.required_files에 lib/main.dart가 없습니다.")
+    if _looks_like_external_data_app(build_spec):
+        required_classes = set(contract.get("required_classes") or [])
+        required_methods = set(contract.get("required_methods") or [])
+        if not {"ExternalDataRepository", "SyncStatus"}.issubset(required_classes):
+            issues.append("외부 데이터 앱 계약에 ExternalDataRepository와 SyncStatus가 필요합니다.")
+        if not any("fetch" in str(method).lower() for method in required_methods):
+            issues.append("외부 데이터 앱 계약에 fetch 메서드가 필요합니다.")
+        if not any("parse" in str(method).lower() for method in required_methods):
+            issues.append("외부 데이터 앱 계약에 parse 메서드가 필요합니다.")
+    if web_data_contract_requires_dart_html_parser(build_spec):
+        if "html" not in (contract.get("required_dependencies") or []):
+            issues.append("HTML 웹 파싱 계약에는 html dependency가 필요합니다.")
+        if not any("jsondecode" in str(item).lower() or "json.decode" in str(item).lower() for item in contract.get("acceptance_checks") or []):
+            issues.append("HTML 웹 파싱 계약에는 jsonDecode/json.decode 금지 acceptance check가 필요합니다.")
+    if _request_implies_new_content_notification(build_context, build_spec, plan):
+        required_classes = set(contract.get("required_classes") or [])
+        required_dependencies = set(contract.get("required_dependencies") or [])
+        if "NotificationService" not in required_classes:
+            issues.append("새 글 알림 앱 계약에 NotificationService가 필요합니다.")
+        if "flutter_local_notifications" not in required_dependencies:
+            issues.append("새 글 알림 앱 계약에 flutter_local_notifications dependency가 필요합니다.")
+    return {
+        "status": "fail" if issues else "pass",
+        "issues": normalize_issue_list(issues),
+    }
 
 
 def _extract_refinement_keep_text(plan):
@@ -5298,6 +7554,212 @@ def classify_failure_type(error_log):
     return "unknown"
 
 
+def build_failure_fingerprint(error_log, failure_type="unknown"):
+    text = (error_log or "").strip()
+    key_line = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(token in lowered for token in ["error", "exception", "failed", "undefined", "overflow", "invalid", "refusing"]):
+            key_line = stripped[:220]
+            break
+        if not key_line:
+            key_line = stripped[:220]
+    return f"{failure_type}:{key_line}"
+
+
+def init_repair_budget(flow_type):
+    if flow_type == "generate":
+        return {
+            "flow_type": flow_type,
+            "max_total_rounds": 12,
+            "used_rounds": 0,
+            "base_attempts": {"engineer": 2, "analyze": 2, "build": 3, "verification": 3},
+            "hard_attempts": {"engineer": 4, "analyze": 4, "build": 6, "verification": 5},
+            "history": [],
+        }
+    if flow_type == "retry":
+        return {
+            "flow_type": flow_type,
+            "max_total_rounds": 10,
+            "used_rounds": 0,
+            "base_attempts": {"engineer": 2, "analyze": 2, "build": 3, "verification": 3},
+            "hard_attempts": {"engineer": 4, "analyze": 4, "build": 6, "verification": 5},
+            "history": [],
+        }
+    return {
+        "flow_type": flow_type,
+        "max_total_rounds": 8,
+        "used_rounds": 0,
+        "base_attempts": {"engineer": 2, "analyze": 2, "build": 3, "verification": 3},
+        "hard_attempts": {"engineer": 3, "analyze": 3, "build": 5, "verification": 4},
+        "history": [],
+    }
+
+
+def record_repair_round(budget, *, stage, attempt, success, failure_type="", error_log="", touched_paths=None, note=""):
+    if not isinstance(budget, dict):
+        return
+    budget["used_rounds"] = int(budget.get("used_rounds") or 0) + 1
+    history = budget.setdefault("history", [])
+    fingerprint = build_failure_fingerprint(error_log, failure_type or "success" if success else failure_type or "unknown")
+    history.append(
+        {
+            "stage": stage,
+            "attempt": attempt,
+            "success": bool(success),
+            "failure_type": failure_type or "",
+            "fingerprint": fingerprint,
+            "touched_paths": merge_unique_paths(touched_paths or []),
+            "note": note or "",
+        }
+    )
+
+
+def repair_budget_remaining(budget):
+    return max(0, int((budget or {}).get("max_total_rounds") or 0) - int((budget or {}).get("used_rounds") or 0))
+
+
+def repair_attempts_are_repeating_without_progress(budget, stage):
+    history = (budget or {}).get("history") or []
+    same_stage = [item for item in history if item.get("stage") == stage]
+    if len(same_stage) < 2:
+        return False
+    recent = same_stage[-2:]
+    fingerprints = [item.get("fingerprint") for item in recent]
+    touched = [tuple(item.get("touched_paths") or []) for item in recent]
+    return bool(fingerprints[0] and fingerprints[0] == fingerprints[1] and touched[0] == touched[1])
+
+
+def should_extend_attempt_budget(budget, *, stage, attempt, request_context=None, current_failure=None, task_id=None, token_callback=None, callback_log=None):
+    if not isinstance(budget, dict):
+        return False
+    hard_limit = int((budget.get("hard_attempts") or {}).get(stage) or 0)
+    base_limit = int((budget.get("base_attempts") or {}).get(stage) or 0)
+    if attempt < base_limit or attempt >= hard_limit:
+        return False
+    remaining_budget = repair_budget_remaining(budget)
+    if remaining_budget <= 0:
+        return False
+
+    history = budget.get("history") or []
+    same_stage = [item for item in history if item.get("stage") == stage]
+    repeated_fingerprints = [item.get("fingerprint") for item in same_stage[-3:] if item.get("fingerprint")]
+    repeated_without_change = len(repeated_fingerprints) >= 2 and len(set(repeated_fingerprints[-2:])) == 1
+    if repeated_without_change and not any(item.get("touched_paths") for item in same_stage[-2:]):
+        return False
+    if repair_attempts_are_repeating_without_progress(budget, stage):
+        return False
+
+    decision, usage, error = decide_repair_continuation(
+        budget.get("flow_type") or "repair",
+        stage,
+        history[-6:],
+        current_failure or {},
+        remaining_budget,
+        request_context=request_context,
+        task_id=task_id,
+    )
+    if token_callback and task_id and usage:
+        token_callback(task_id, "Repair_Continuation_Guard", usage)
+
+    if decision and decision.get("action") == "continue":
+        if callback_log and decision.get("reason"):
+            callback_log(f"🔁 추가 복구 라운드 승인: {decision.get('reason')}")
+        return True
+    if not decision and error and callback_log:
+        callback_log(f"⚠️ 추가 복구 라운드 판단 실패 fallback 사용: {error}")
+
+    if repeated_without_change:
+        return False
+    return remaining_budget > 0 and attempt < hard_limit
+
+
+def request_needs_full_model_review(build_context, plan):
+    build_spec = (build_context or {}).get("build_spec") or {}
+    implementation_contract = (plan or {}).get("implementation_contract") or build_spec.get("implementation_contract") or {}
+    state_contract = implementation_contract.get("state_persistence_contract") if isinstance(implementation_contract, dict) else {}
+    verification_requirements = build_spec.get("verification_requirements") if isinstance(build_spec, dict) else {}
+    if isinstance(state_contract, dict) and state_contract.get("required") is True:
+        return True
+    if isinstance(verification_requirements, dict) and (
+        verification_requirements.get("requires_external_data_verification")
+        or verification_requirements.get("cache_persistence_required")
+        or verification_requirements.get("parser_smoke_test_required")
+    ):
+        return True
+    if isinstance(build_spec, dict) and (
+        build_spec.get("data_source_type") in {"api", "web_scrape", "local"}
+        or build_spec.get("source_url_candidates")
+        or build_spec.get("external_sources")
+    ):
+        return True
+    files_to_create = (plan or {}).get("files_to_create") or []
+    if isinstance(files_to_create, list) and len(files_to_create) > 6:
+        return True
+    combined = json.dumps(
+        {
+            "build_spec": build_spec,
+            "plan": {
+                "title": (plan or {}).get("title"),
+                "blueprint": (plan or {}).get("blueprint"),
+                "product_plan": (plan or {}).get("product_plan"),
+                "feature_logic_plan": (plan or {}).get("feature_logic_plan"),
+            },
+        },
+        ensure_ascii=False,
+    ).lower()
+    return any(marker in combined for marker in [
+        "auth",
+        "login",
+        "account",
+        "payment",
+        "결제",
+        "로그인",
+        "회원",
+        "계정",
+        "admin",
+        "moderation",
+        "sensor",
+        "camera",
+        "location",
+        "위치",
+        "카메라",
+        "마이크",
+        "권한",
+        "permission",
+        "api",
+        "http",
+        "web",
+        "영속",
+        "local storage",
+        "persistent",
+        "sqlite",
+        "shared_preferences",
+    ])
+
+
+def reviewer_fast_path_allowed(build_context, plan, analyze_ok, engineer_finalize_result, preflight):
+    if not analyze_ok:
+        return False
+    if isinstance(preflight, dict) and preflight.get("status") == "fail":
+        return False
+    if isinstance(engineer_finalize_result, dict) and engineer_finalize_result.get("status") == "error":
+        return False
+    return not request_needs_full_model_review(build_context, plan)
+
+
+def build_fast_reviewer_pass():
+    return {
+        "status": "pass",
+        "feedback": [],
+        "critical_fixes": "정적 사전검증, analyze, Engineer finalize 자동검증이 통과한 단순 앱이므로 모델 Reviewer를 생략했습니다.",
+        "fast_path": True,
+    }
+
+
 def has_blocking_flutter_analyze_issue(output):
     text = output or ""
     for line in text.splitlines():
@@ -5387,6 +7849,405 @@ def run_flutter_build(project_path):
     return True, apk
 
 
+def read_text_file_if_exists(path: str) -> str:
+    try:
+        if os.path.exists(path) and os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+    except Exception:
+        return ""
+    return ""
+
+
+def get_project_pubspec_name(project_path: str) -> str:
+    pubspec = read_text_file_if_exists(os.path.join(project_path, "pubspec.yaml"))
+    match = re.search(r"^name:\s*([a-zA-Z0-9_]+)\s*$", pubspec, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def get_pubspec_dependency_names(project_path: str) -> set:
+    pubspec = read_text_file_if_exists(os.path.join(project_path, "pubspec.yaml"))
+    dependencies = set()
+    in_dependencies = False
+    for line in pubspec.splitlines():
+        if re.match(r"^dependencies:\s*$", line):
+            in_dependencies = True
+            continue
+        if in_dependencies and re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*:\s*$", line):
+            break
+        if in_dependencies:
+            match = re.match(r"^\s{2}([a-zA-Z_][a-zA-Z0-9_]*):", line)
+            if match:
+                dependencies.add(match.group(1))
+    dependencies.add("flutter")
+    return dependencies
+
+
+def web_data_contract_requires_dart_html_parser(build_spec: Dict[str, Any]) -> bool:
+    normalized = normalize_runtime_build_spec(build_spec)
+    contract = normalized.get("web_data_contract") if isinstance(normalized.get("web_data_contract"), dict) else {}
+    parser_strategy = str(contract.get("parser_strategy") or "").strip().lower()
+    source_kind = str(contract.get("source_kind") or "").strip().lower()
+    accepted_strategies = {
+        str(item or "").strip().lower()
+        for item in (contract.get("accepted_parser_strategies") or [])
+        if str(item or "").strip()
+    }
+    accepted_kinds = {
+        str(item or "").strip().lower()
+        for item in (contract.get("accepted_source_kinds") or [])
+        if str(item or "").strip()
+    }
+    return bool(
+        parser_strategy in HTML_WEB_PARSER_STRATEGIES
+        or source_kind in HTML_WEB_SOURCE_KINDS
+        or accepted_strategies.intersection(HTML_WEB_PARSER_STRATEGIES)
+        or accepted_kinds.intersection(HTML_WEB_SOURCE_KINDS)
+    )
+
+
+def dart_code_uses_response_body_json_decode(code: str) -> bool:
+    patterns = [
+        r"\bjsonDecode\s*\(\s*(?:response|res|httpResponse|clientResponse)\.body\b",
+        r"\bjson\s*\.\s*decode\s*\(\s*(?:response|res|httpResponse|clientResponse)\.body\b",
+    ]
+    return any(re.search(pattern, code or "") for pattern in patterns)
+
+
+def dart_code_uses_html_parser(code: str) -> bool:
+    text = code or ""
+    if "package:html/parser.dart" not in text:
+        return False
+    parser_import = re.search(
+        r"import\s+['\"]package:html/parser\.dart['\"]\s+as\s+([A-Za-z_][A-Za-z0-9_]*)",
+        text,
+    )
+    if parser_import:
+        alias = re.escape(parser_import.group(1))
+        return bool(re.search(rf"\b{alias}\s*\.\s*parse(?:Fragment)?\s*\(", text))
+    return bool(re.search(r"\bparse(?:Fragment)?\s*\(\s*(?:response|res|httpResponse|clientResponse)\.body\b", text))
+
+
+def collect_html_web_contract_warnings(project_path: str, build_spec: Dict[str, Any]) -> List[str]:
+    if not web_data_contract_requires_dart_html_parser(build_spec):
+        return []
+    warnings = []
+    dependency_names = get_pubspec_dependency_names(project_path)
+    if "html" not in dependency_names:
+        warnings.append("HTML 웹 파싱 계약인데 pubspec.yaml에 html dependency가 없습니다.")
+
+    lib_path = os.path.join(project_path, "lib")
+    code_by_path = []
+    walk_iter = os.walk(lib_path) if os.path.isdir(lib_path) else []
+    for root, _, fnames in walk_iter:
+        for fname in fnames:
+            if not fname.endswith(".dart"):
+                continue
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, project_path)
+            code_by_path.append((rel_path, read_text_file_if_exists(full_path)))
+
+    if not code_by_path:
+        return warnings
+
+    html_parser_files = [
+        rel_path for rel_path, code in code_by_path
+        if dart_code_uses_html_parser(code)
+    ]
+    if not html_parser_files:
+        warnings.append(
+            "HTML 웹 파싱 계약인데 Dart 코드에서 package:html/parser.dart를 사용한 HTML 파싱 구현을 찾지 못했습니다."
+        )
+
+    for rel_path, code in code_by_path:
+        if dart_code_uses_response_body_json_decode(code):
+            warnings.append(f"{rel_path}: HTML 웹 파싱 계약인데 response.body를 jsonDecode/json.decode로 파싱합니다.")
+
+    return warnings
+
+
+def android_manifest_contains_permission(project_path: str, permission_name: str) -> bool:
+    manifest_path = os.path.join(project_path, "android/app/src/main/AndroidManifest.xml")
+    manifest_text = read_text_file_if_exists(manifest_path)
+    return bool(permission_name and permission_name in manifest_text and "uses-permission" in manifest_text)
+
+
+def resolve_dart_import_path(project_path: str, source_rel: str, import_target: str, package_name: str) -> Optional[str]:
+    target = (import_target or "").strip()
+    if not target or target.startswith(("dart:", "package:flutter/", "package:collection/", "package:async/")):
+        return None
+    if target.startswith("package:"):
+        package_prefix = f"package:{package_name}/" if package_name else ""
+        if package_prefix and target.startswith(package_prefix):
+            return os.path.join("lib", target[len(package_prefix):])
+        return None
+    source_dir = os.path.dirname(source_rel)
+    return os.path.normpath(os.path.join(source_dir, target))
+
+
+def collect_static_code_warnings(
+    project_path: str,
+    *,
+    task_id: str = "",
+    package_name: str = "",
+    validate_urls: bool = False,
+) -> List[str]:
+    warnings = []
+    lib_path = os.path.join(project_path, "lib")
+    if not os.path.isdir(lib_path):
+        return ["lib 디렉터리가 없습니다."]
+
+    pubspec_name = get_project_pubspec_name(project_path)
+    dependency_names = get_pubspec_dependency_names(project_path)
+    dart_files = []
+    for root, _, fnames in os.walk(lib_path):
+        for fname in fnames:
+            if not fname.endswith(".dart"):
+                continue
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, project_path)
+            dart_files.append((rel_path, full_path))
+
+    if not dart_files:
+        warnings.append("lib 아래에 Dart 파일이 없습니다.")
+
+    main_rel = "lib/main.dart"
+    main_text = read_text_file_if_exists(os.path.join(project_path, main_rel))
+    if not main_text:
+        warnings.append("lib/main.dart 파일이 없습니다.")
+    else:
+        if "runApp(" not in main_text:
+            warnings.append("lib/main.dart에 runApp 호출이 없습니다.")
+        if "CrashHandler.initialize(" not in main_text:
+            warnings.append("lib/main.dart에 CrashHandler.initialize(task_id, package_name) 호출이 없습니다.")
+        elif not re.search(r"CrashHandler\.initialize\(\s*['\"][^'\"]+['\"]\s*,\s*['\"][^'\"]+['\"]\s*\)", main_text):
+            warnings.append("CrashHandler.initialize는 실제 task_id와 package_name 문자열 2개로 호출해야 합니다.")
+        else:
+            if task_id and task_id not in main_text:
+                warnings.append("CrashHandler.initialize의 task_id가 현재 작업 ID와 일치하지 않습니다.")
+            if package_name and package_name not in main_text:
+                warnings.append("CrashHandler.initialize의 package_name이 현재 패키지와 일치하지 않습니다.")
+        if "crash_handler.dart" not in main_text and "CrashHandler" in main_text:
+            warnings.append("CrashHandler를 사용하지만 lib/crash_handler.dart import가 보이지 않습니다.")
+
+    for rel_path, full_path in dart_files:
+        code = read_text_file_if_exists(full_path)
+        if rel_path != "lib/crash_handler.dart" and not looks_like_complete_dart_source(code):
+            warnings.append(f"{rel_path}: 완전한 Dart 소스가 아닌 내용으로 보입니다.")
+
+        for import_target in re.findall(r"^\s*import\s+['\"]([^'\"]+)['\"]", code, flags=re.MULTILINE):
+            resolved = resolve_dart_import_path(project_path, rel_path, import_target, pubspec_name)
+            if resolved:
+                imported_full = os.path.join(project_path, resolved)
+                if not os.path.exists(imported_full):
+                    warnings.append(f"{rel_path}: import 대상 파일이 없습니다: {import_target}")
+            elif import_target.startswith("package:baseproject/") and pubspec_name and pubspec_name != "baseproject":
+                warnings.append(f"{rel_path}: 현재 pubspec 이름은 {pubspec_name}인데 baseproject package import가 남아 있습니다.")
+            elif import_target.startswith("package:"):
+                package_match = re.match(r"^package:([^/]+)/", import_target)
+                imported_package = package_match.group(1) if package_match else ""
+                if imported_package and imported_package != pubspec_name and imported_package not in dependency_names:
+                    warnings.append(f"{rel_path}: pubspec.yaml에 없는 패키지를 import합니다: {imported_package}")
+
+        urls = re.findall(r"https?://[^\s'\"<>]+", code)
+        clean_urls = []
+        for url in urls:
+            url = url.rstrip("');},")
+            if any(token in url for token in ["YOUR_", "API_KEY", "SERVICE_KEY", "PLACEHOLDER"]):
+                warnings.append(f"{rel_path}: 플레이스홀더 URL: {url[:80]}")
+            elif "$" not in url and "{" not in url:
+                clean_urls.append(url)
+
+        for pattern in ["placeholder", "TODO: 실제", "// Replace with"]:
+            if pattern.lower() in code.lower():
+                warnings.append(f"{rel_path}: 미구현 코드 흔적 발견: '{pattern}'")
+                break
+
+        if validate_urls:
+            for url in clean_urls[:3]:
+                probe = test_http_request("GET", url, allowed_source={"url": url}, task_id=task_id)
+                if not probe.get("success"):
+                    continue
+                content_type = probe.get("response_content_type", "")
+                is_html = "text/html" in content_type
+                uses_json_decode = "json.decode" in code or "jsonDecode" in code
+                if is_html and uses_json_decode:
+                    warnings.append(f"{rel_path}: HTML 응답인데 json.decode 사용 중: {url[:60]}")
+
+    return normalize_issue_list(warnings)
+
+
+def implementation_method_requirement_present(code_snapshot: str, method_text: str) -> bool:
+    method_text = str(method_text or "").strip()
+    if not method_text:
+        return True
+    lower_snapshot = (code_snapshot or "").lower()
+    if method_text.lower() in lower_snapshot:
+        return True
+
+    class_name = ""
+    member_name = method_text
+    if "." in method_text:
+        class_name, member_name = [part.strip() for part in method_text.rsplit(".", 1)]
+    member_name = re.sub(r"[^A-Za-z0-9_]", "", member_name)
+    class_name = re.sub(r"[^A-Za-z0-9_]", "", class_name)
+    if not member_name:
+        return True
+
+    member_pattern = rf"\b{re.escape(member_name)}\s*\("
+    if class_name:
+        class_pattern = re.compile(
+            rf"\bclass\s+{re.escape(class_name)}\b(?P<body>.*?)(?=\n\s*(?:class|enum|mixin|extension)\s+\w+\b|\Z)",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        class_match = class_pattern.search(code_snapshot or "")
+        if class_match and re.search(member_pattern, class_match.group("body"), flags=re.IGNORECASE):
+            return True
+
+    return bool(re.search(member_pattern, code_snapshot or "", flags=re.IGNORECASE))
+
+
+def run_static_preflight_checks(
+    project_path: str,
+    *,
+    task_id: str = "",
+    package_name: str = "",
+    build_spec: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    normalized_build_spec = build_spec if isinstance(build_spec, dict) else {}
+    issues = collect_static_code_warnings(
+        project_path,
+        task_id=task_id,
+        package_name=package_name,
+        validate_urls=False,
+    )
+    issues.extend(collect_html_web_contract_warnings(project_path, normalized_build_spec))
+    if normalized_build_spec and _requires_local_state_contract_verification(normalized_build_spec):
+        snapshot = get_current_project_snapshot(project_path)
+        local_report = deterministic_local_state_contract_checks(normalized_build_spec, snapshot)
+        if local_report.get("status") == "fail":
+            issues.extend(local_state_release_blocking_issues(local_report))
+    implementation_contract = normalized_build_spec.get("implementation_contract") if isinstance(normalized_build_spec.get("implementation_contract"), dict) else {}
+    if implementation_contract:
+        dependency_names = get_pubspec_dependency_names(project_path)
+        for dependency in implementation_contract.get("required_dependencies") or []:
+            dependency_name = str(dependency or "").strip()
+            if dependency_name and dependency_name not in dependency_names:
+                issues.append(f"implementation_contract.required_dependencies 누락: {dependency_name}")
+        for permission in implementation_contract.get("required_permissions") or []:
+            permission_name = str(permission or "").strip()
+            if permission_name and not android_manifest_contains_permission(project_path, permission_name):
+                issues.append(f"implementation_contract.required_permissions Manifest 누락: {permission_name}")
+        for path in implementation_contract.get("required_files") or []:
+            normalized_path = normalize_project_file_path(path)
+            if normalized_path and not os.path.exists(os.path.join(project_path, normalized_path)):
+                issues.append(f"implementation_contract.required_files 누락: {normalized_path}")
+        snapshot = get_current_project_snapshot(project_path)
+        lower_snapshot = snapshot.lower()
+        for class_name in implementation_contract.get("required_classes") or []:
+            class_text = str(class_name or "").strip()
+            if class_text and class_text not in {"Snapshot", "StorageService"} and f"class {class_text.lower()}" not in lower_snapshot:
+                issues.append(f"implementation_contract.required_classes 누락 의심: {class_text}")
+        for method_name in implementation_contract.get("required_methods") or []:
+            method_text = str(method_name or "").strip()
+            if not method_text or method_text in {"main", "CrashHandler.initialize"}:
+                continue
+            if not implementation_method_requirement_present(snapshot, method_text):
+                issues.append(f"implementation_contract.required_methods 누락 의심: {method_text}")
+    issues = normalize_issue_list(issues)
+    return {
+        "status": "fail" if issues else "pass",
+        "issues": issues,
+    }
+
+
+def build_preflight_feedback(preflight: Dict[str, Any], *, prefix: str = "서버 사전 검증 실패") -> List[str]:
+    issues = normalize_issue_list(preflight.get("issues") if isinstance(preflight, dict) else [])
+    if not issues:
+        return []
+    return [prefix, *issues[:12]]
+
+
+def build_static_contract_guidance(build_context: Dict[str, Any], *, task_id: str, package_name: str) -> str:
+    build_spec = normalize_runtime_build_spec((build_context or {}).get("build_spec") or {})
+    implementation_contract = (build_context or {}).get("implementation_contract") if isinstance((build_context or {}).get("implementation_contract"), dict) else {}
+    lines = [
+        "서버 구현 계약:",
+        f"- lib/main.dart는 CrashHandler.initialize(\"{task_id}\", \"{package_name}\")를 runApp 전에 호출해야 합니다.",
+        "- 생성/수정한 모든 상대 import 대상 파일은 실제로 존재해야 합니다.",
+        "- finalize 전에 placeholder, TODO, baseproject package import, 잘못된 문자열 보간('[id]' 형태)을 제거해야 합니다.",
+    ]
+    if _requires_local_state_contract_verification(build_spec):
+        lines.extend([
+            "- 오프라인 저장/복구 앱은 저장 시점의 불변 snapshot 모델을 사용해야 합니다.",
+            "- 저장, 목록 조회, 항목 선택 복원, 삭제가 실제 로컬 저장소(SharedPreferences/Hive/sqflite/File 등)에 연결되어야 합니다.",
+            "- 복원은 표시 문자열 재파싱에 의존하지 말고 snapshot의 구조화된 필드로 계산기 상태를 되살려야 합니다.",
+            "- 화면이 받은 메모리 객체만 되돌려주는 흐름보다 저장소에서 id로 다시 조회하는 흐름을 선호합니다.",
+        ])
+    if web_data_contract_requires_dart_html_parser(build_spec):
+        lines.extend([
+            "- build_spec.web_data_contract가 HTML 파싱 계약입니다.",
+            "- response.body를 jsonDecode/json.decode로 파싱하면 서버 사전 검증 실패입니다.",
+            "- pubspec.yaml에 html dependency를 추가하고 package:html/parser.dart로 HTML을 parse해야 합니다.",
+        ])
+    if implementation_contract:
+        lines.append(f"- implementation_contract: {json.dumps(implementation_contract, ensure_ascii=False)}")
+    return "\n".join(lines)
+
+
+def apply_static_preflight_fix(
+    project_path: str,
+    preflight: Dict[str, Any],
+    *,
+    task_id: Optional[str] = None,
+    flow_type: str = "generate",
+    current_files: Optional[List[str]] = None,
+    token_callback=None,
+    callback_log=None,
+    ensure_crash_fn=None,
+    ui_contract=None,
+) -> List[str]:
+    issues = normalize_issue_list((preflight or {}).get("issues") or [])
+    if not issues:
+        return []
+    if callback_log:
+        callback_log("🧯 서버 사전 검증 실패 수정 중")
+    error_log = "서버 사전 검증 실패\n" + "\n".join(f"- {issue}" for issue in issues)
+    fix_result = call_agent_with_tools(
+        DEBUGGER_SYSTEM,
+        "서버 사전 검증에서 발견된 컴파일 전 구조 오류를 최소 수정으로 고치세요.",
+        context=prepare_debugger_context(
+            project_path,
+            error_log,
+            "static_preflight",
+            relevant_files=current_files,
+            callback_log=callback_log,
+            ui_contract=ui_contract,
+        ),
+        trace={"task_id": task_id, "flow_type": flow_type, "agent_name": "Static_Preflight_Debugger", "stage": "static_preflight_fix"},
+        tools=FILE_CHANGE_TOOL_SCHEMAS,
+        validator=validate_file_change_payload,
+        parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
+        fallback_parser=legacy_agent_response_detailed,
+    )
+    fix = fix_result.get("parsed_output")
+    usage = fix_result.get("usage")
+    if token_callback and task_id and usage:
+        token_callback(task_id, "Static_Preflight_Debugger", usage)
+    if not fix or "files" not in fix:
+        return []
+    ok, applied_paths, apply_error = apply_project_files_safely(
+        project_path,
+        fix.get("files", []),
+        ensure_crash_fn=ensure_crash_fn,
+    )
+    if not ok:
+        if callback_log:
+            callback_log(f"❌ 서버 사전 검증 수정 적용 실패: {apply_error}")
+        return []
+    return applied_paths
+
+
 # -------------------------------------------------
 # AGENTIC LOOP ENGINE
 # -------------------------------------------------
@@ -5400,6 +8261,7 @@ def execute_tool(
     ensure_crash_fn=None,
     callback_log=None,
     token_callback=None,
+    read_paths=None,
     _depth: int = 0,
 ) -> dict:
     if tool_name == "search":
@@ -5429,26 +8291,14 @@ def execute_tool(
 
     elif tool_name == "fetch_http":
         url = args.get("url", "")
-        try:
-            parsed = urlparse.urlparse(url)
-            host = parsed.hostname or ""
-            try:
-                if ipaddress.ip_address(host).is_private:
-                    return {"status": "error", "message": "private IP 접근 차단"}
-            except ValueError:
-                if host in ("localhost", "metadata.google.internal", "169.254.169.254"):
-                    return {"status": "error", "message": "private URL 접근 차단"}
-            headers = {"User-Agent": "Mozilla/5.0"}
-            resp = _requests_lib.get(url, headers=headers, timeout=15)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup(["script", "style"]):
-                tag.decompose()
-            text = soup.get_text(separator="\n", strip=True)
-            if len(text) > 8000:
-                text = text[:8000] + "\n...(truncated)"
-            return {"status": "ok", "url": url, "content": text}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+        page = fetch_webpage(url, task_id=task_id, max_chars=8000)
+        if page.get("status") != "success":
+            return {"status": "error", "message": page.get("error") or "fetch_failed"}
+        return {
+            "status": "ok",
+            "url": page.get("final_url") or url,
+            "content": page.get("text_content") or "",
+        }
 
     elif tool_name == "read_file":
         path = args.get("path", "").lstrip("/")
@@ -5460,16 +8310,66 @@ def execute_tool(
             return {"status": "ok", "path": path, "content": f"[디렉토리] 파일 목록: {files}"}
         with open(full, "r", encoding="utf-8") as f:
             content = f.read()
+        if isinstance(read_paths, set):
+            read_paths.add(path)
         return {"status": "ok", "path": path, "content": content}
+
+    elif tool_name == "report_file_manifest":
+        files = []
+        for item in args.get("files") or []:
+            if not isinstance(item, dict):
+                continue
+            path = normalize_project_file_path(item.get("path"))
+            if not path:
+                continue
+            files.append({
+                "path": path,
+                "purpose": str(item.get("purpose") or "").strip(),
+                "change_type": str(item.get("change_type") or "").strip(),
+            })
+        return {
+            "status": "ok" if files else "error",
+            "files": files,
+            "dependency_changes": [str(item).strip() for item in args.get("dependency_changes") or [] if str(item).strip()],
+            "risk_notes": [str(item).strip() for item in args.get("risk_notes") or [] if str(item).strip()],
+            "message": "" if files else "files must not be empty",
+        }
 
     elif tool_name == "write_file":
         path = args.get("path", "")
         content = args.get("content", "")
         reason = args.get("reason", "")
-        save_project_files(project_path, [{"path": path, "content": content, "change_type": "modify", "reason": reason}])
-        if ensure_crash_fn:
-            ensure_crash_fn()
-        return {"status": "ok", "path": path}
+        ok, touched_paths, error = apply_project_files_safely(
+            project_path,
+            [{"path": path, "content": content, "change_type": "modify", "reason": reason}],
+            ensure_crash_fn=ensure_crash_fn,
+        )
+        if not ok:
+            return {"status": "error", "message": error, "path": path}
+        return {"status": "ok", "path": touched_paths[0] if touched_paths else path}
+
+    elif tool_name == "edit_file":
+        return apply_text_edit_safely(
+            project_path,
+            path=args.get("path", ""),
+            old_text=args.get("old_text", ""),
+            new_text=args.get("new_text", ""),
+            replace_all=bool(args.get("replace_all")),
+            reason=args.get("reason", ""),
+            ensure_crash_fn=ensure_crash_fn,
+            read_paths=read_paths,
+        )
+
+    elif tool_name == "run_static_preflight":
+        result = run_static_preflight_checks(
+            project_path,
+            task_id=task_id,
+            package_name=pkg,
+        )
+        return {
+            "status": "pass" if result.get("status") == "pass" else "fail",
+            "issues": result.get("issues") or [],
+        }
 
     elif tool_name == "run_flutter_pub_get":
         pubspec_path = os.path.join(project_path, "pubspec.yaml")
@@ -5510,69 +8410,19 @@ def execute_tool(
             max_turns=10,
             pkg=pkg,
             ensure_crash_fn=ensure_crash_fn,
+            agent_label="Debugger",
             _depth=_depth + 1,
         )
         return {"status": "ok", "diagnosis": diag_result.get("result", diag_result)}
 
     elif tool_name == "finalize":
         # P0: finalize 전 코드 자동 검증 (도구 레벨 강제)
-        warnings = []
-        lib_path = os.path.join(project_path, "lib")
-        if os.path.exists(lib_path):
-            for root, _, fnames in os.walk(lib_path):
-                for fname in fnames:
-                    if not fname.endswith(".dart"):
-                        continue
-                    fpath = os.path.join(root, fname)
-                    try:
-                        with open(fpath, "r", encoding="utf-8") as f:
-                            code = f.read()
-                    except Exception:
-                        continue
-
-                    # 1. 플레이스홀더 체크
-                    urls = re.findall(r"https?://[^\s'\"<>]+", code)
-                    clean_urls = []
-                    for u in urls:
-                        u = u.rstrip("');},")
-                        if any(p in u for p in ["YOUR_", "API_KEY", "SERVICE_KEY", "PLACEHOLDER"]):
-                            warnings.append(f"{fname}: 플레이스홀더 URL: {u[:80]}")
-                        elif "$" not in u and "{" not in u:
-                            clean_urls.append(u)
-
-                    # 2. [변수] 패턴 체크
-                    bad_interp = re.findall(r"'[^']*\[(?:id|index|item|key|name)\][^']*'", code)
-                    if bad_interp:
-                        warnings.append(f"{fname}: 문자열 보간 오류: {bad_interp[:3]}")
-
-                    # 3. placeholder/TODO 텍스트 체크
-                    for pattern in ["placeholder", "TODO: 실제", "// Replace with"]:
-                        if pattern.lower() in code.lower():
-                            warnings.append(f"{fname}: 미구현 코드 발견: '{pattern}'")
-                            break
-
-                    # 4. URL 실제 fetch 검증 (최대 3개)
-                    for u in clean_urls[:3]:
-                        try:
-                            parsed = urlparse.urlparse(u)
-                            host = parsed.hostname or ""
-                            try:
-                                if ipaddress.ip_address(host).is_private:
-                                    continue
-                            except ValueError:
-                                if host in ("localhost", "metadata.google.internal"):
-                                    continue
-                            resp = _requests_lib.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-                            if resp.status_code >= 400:
-                                warnings.append(f"{fname}: URL {resp.status_code} 에러: {u[:80]}")
-                            else:
-                                content_type = resp.headers.get("content-type", "")
-                                is_html = "text/html" in content_type
-                                uses_json_decode = "json.decode" in code or "jsonDecode" in code
-                                if is_html and uses_json_decode:
-                                    warnings.append(f"{fname}: HTML 응답인데 json.decode 사용 중: {u[:60]}")
-                        except Exception:
-                            pass
+        warnings = collect_static_code_warnings(
+            project_path,
+            task_id=task_id,
+            package_name=pkg,
+            validate_urls=True,
+        )
 
         if warnings:
             return {
@@ -5599,6 +8449,90 @@ def _truncate_old_messages(messages: list, max_content_len: int = 2000):
                 msg["content"] = msg["content"][:max_content_len] + "\n...(truncated)"
 
 
+def format_agent_tool_activity(agent_label: str, tool_name: str, args: Dict[str, Any]) -> str:
+    normalized_agent = (agent_label or "Agent").strip()
+    detail = ""
+    if tool_name in {"read_file", "write_file", "edit_file"}:
+        detail = (args.get("path") or "").strip()
+    elif tool_name == "report_file_manifest":
+        files = args.get("files") if isinstance(args.get("files"), list) else []
+        detail = f"{len(files)} files"
+    elif tool_name == "search":
+        detail = (args.get("query") or "").strip()
+    elif tool_name == "fetch_http":
+        detail = (args.get("url") or "").strip()
+    elif tool_name == "request_diagnosis":
+        detail = "diagnosis requested"
+    if detail:
+        return f"🤖 {normalized_agent} → {tool_name} {detail}"
+    return f"🤖 {normalized_agent} → {tool_name}"
+
+
+def run_final_preflight_verification(
+    project_path: str,
+    *,
+    task_id: str,
+    package_name: str,
+    callback_log=None,
+    agent_label: str = "Engineer",
+) -> Tuple[bool, List[str]]:
+    if callback_log:
+        callback_log(f"🤖 {agent_label} → run_static_preflight (finalize 자동 검증)")
+    preflight = run_static_preflight_checks(
+        project_path,
+        task_id=task_id,
+        package_name=package_name,
+    )
+    issues = normalize_issue_list(preflight.get("issues") or [])
+    return preflight.get("status") == "pass", issues
+
+
+def run_final_analyze_verification(
+    project_path: str,
+    *,
+    task_id: str,
+    package_name: str,
+    callback_log=None,
+    token_callback=None,
+    agent_label: str = "Engineer",
+) -> Tuple[bool, str]:
+    if callback_log:
+        callback_log(f"🤖 {agent_label} → run_flutter_analyze (finalize 자동 검증)")
+    result = execute_tool(
+        "run_flutter_analyze",
+        {},
+        project_path,
+        task_id,
+        pkg=package_name,
+        callback_log=callback_log,
+        token_callback=token_callback,
+    )
+    return result.get("status") == "pass", str(result.get("output") or result.get("message") or "")
+
+
+def run_final_build_verification(
+    project_path: str,
+    *,
+    task_id: str,
+    package_name: str,
+    callback_log=None,
+    token_callback=None,
+    agent_label: str = "Engineer",
+) -> Tuple[bool, str]:
+    if callback_log:
+        callback_log(f"🤖 {agent_label} → run_flutter_build (finalize 자동 검증)")
+    result = execute_tool(
+        "run_flutter_build",
+        {},
+        project_path,
+        task_id,
+        pkg=package_name,
+        callback_log=callback_log,
+        token_callback=token_callback,
+    )
+    return result.get("status") == "pass", str(result.get("output") or result.get("message") or "")
+
+
 def run_agentic_loop(
     task_id: str,
     user_request: str,
@@ -5610,21 +8544,29 @@ def run_agentic_loop(
     max_turns: int = 50,
     pkg: str = "",
     ensure_crash_fn=None,
+    agent_label: str = "Agent",
     _depth: int = 0,
 ) -> dict:
     if _depth > 1:
         return {"status": "error", "message": "최대 재귀 깊이 초과 (depth > 1)"}
 
+    agent_model_name = resolve_model_for_agent(agent_label)
     messages = [{"role": "user", "content": user_request}]
+    read_paths = set()
     analyze_fail_count = 0
     diagnosis_count = 0
+    manifest_reported = False
+    manifest_paths = set()
+    preflight_passed = False
+    analyze_passed = False
+    build_passed = False
 
     for turn in range(max_turns):
         _truncate_old_messages(messages)
 
         try:
             response = client.chat.completions.create(
-                model=MODEL_NAME,
+                model=agent_model_name,
                 messages=[{"role": "system", "content": system}] + messages,
                 tools=tools,
                 tool_choice="auto",
@@ -5663,22 +8605,51 @@ def run_agentic_loop(
                 args = {}
 
             if callback_log:
-                callback_log(f"  🔧 {tool_name}")
+                callback_log(format_agent_tool_activity(agent_label, tool_name, args))
 
             # P1-1: analyze 실패 카운터
-            if tool_name == "run_flutter_analyze":
+            if agent_label == "Engineer" and tool_name in {"write_file", "edit_file"} and not manifest_reported:
+                result = {
+                    "status": "error",
+                    "message": "파일을 쓰기 전에 report_file_manifest로 파일 계획을 먼저 확정하세요.",
+                }
+            elif tool_name == "run_flutter_analyze":
                 result = execute_tool(
                     tool_name, args, project_path, task_id,
                     pkg=pkg, ensure_crash_fn=ensure_crash_fn,
                     callback_log=callback_log, token_callback=token_callback,
+                    read_paths=read_paths,
                     _depth=_depth,
                 )
                 if result.get("status") == "fail":
                     analyze_fail_count += 1
-                    if analyze_fail_count >= 3:
+                    analyze_passed = False
+                    if analyze_fail_count >= 3 and _depth < 1 and diagnosis_count < 3:
+                        diagnosis_count += 1
+                        if callback_log:
+                            callback_log(f"🤖 {agent_label} → request_diagnosis (analyze 자동 진단)")
+                        diagnosis_result = execute_tool(
+                            "request_diagnosis",
+                            {
+                                "error_log": result.get("output") or result.get("message") or "",
+                                "affected_files": sorted(read_paths)[:8],
+                            },
+                            project_path,
+                            task_id,
+                            pkg=pkg,
+                            ensure_crash_fn=ensure_crash_fn,
+                            callback_log=callback_log,
+                            token_callback=token_callback,
+                            read_paths=read_paths,
+                            _depth=_depth,
+                        )
+                        result["_forced_diagnosis"] = diagnosis_result.get("diagnosis", diagnosis_result)
+                        result["_force_hint"] = "analyze가 3회 연속 실패해 Debugger 자동 진단을 실행했습니다. 진단 결과를 반영한 뒤 다시 analyze/build를 실행하세요."
+                    elif analyze_fail_count >= 3:
                         result["_force_hint"] = "analyze가 3회 연속 실패했습니다. 반드시 request_diagnosis를 호출하세요."
                 else:
                     analyze_fail_count = 0
+                    analyze_passed = True
             elif tool_name == "request_diagnosis":
                 diagnosis_count += 1
                 if diagnosis_count > 3:
@@ -5688,6 +8659,7 @@ def run_agentic_loop(
                         tool_name, args, project_path, task_id,
                         pkg=pkg, ensure_crash_fn=ensure_crash_fn,
                         callback_log=callback_log, token_callback=token_callback,
+                        read_paths=read_paths,
                         _depth=_depth,
                     )
             else:
@@ -5695,8 +8667,81 @@ def run_agentic_loop(
                     tool_name, args, project_path, task_id,
                     pkg=pkg, ensure_crash_fn=ensure_crash_fn,
                     callback_log=callback_log, token_callback=token_callback,
+                    read_paths=read_paths,
                     _depth=_depth,
                 )
+
+            if tool_name == "report_file_manifest" and result.get("status") == "ok":
+                manifest_reported = True
+                manifest_paths = {
+                    item.get("path")
+                    for item in result.get("files") or []
+                    if isinstance(item, dict) and item.get("path")
+                }
+            elif tool_name in {"write_file", "edit_file"} and result.get("status") == "ok":
+                preflight_passed = False
+                analyze_passed = False
+                build_passed = False
+                touched_path = result.get("path")
+                if agent_label == "Engineer" and manifest_paths and touched_path and touched_path not in manifest_paths:
+                    result["_force_hint"] = f"{touched_path}는 report_file_manifest에 없었습니다. manifest를 갱신하거나 계획된 파일만 수정하세요."
+                elif agent_label == "Engineer":
+                    result["_force_hint"] = "파일을 수정했으므로 finalize 전에 run_static_preflight, run_flutter_analyze, run_flutter_build를 다시 실행하세요."
+            elif tool_name == "run_static_preflight":
+                preflight_passed = result.get("status") == "pass"
+            elif tool_name == "run_flutter_build":
+                build_passed = result.get("status") == "pass"
+                if not build_passed:
+                    preflight_passed = False
+
+            if agent_label == "Engineer" and tool_name == "finalize":
+                finalize_warnings = []
+                if not manifest_reported:
+                    finalize_warnings.append("report_file_manifest를 먼저 호출하지 않았습니다.")
+                if not preflight_passed:
+                    preflight_passed, preflight_issues = run_final_preflight_verification(
+                        project_path,
+                        task_id=task_id,
+                        package_name=pkg,
+                        callback_log=callback_log,
+                        agent_label=agent_label,
+                    )
+                    if not preflight_passed:
+                        finalize_warnings.append("finalize 직전 run_static_preflight 자동 검증이 실패했습니다.")
+                        finalize_warnings.extend(preflight_issues)
+                if not analyze_passed:
+                    analyze_passed, analyze_output = run_final_analyze_verification(
+                        project_path,
+                        task_id=task_id,
+                        package_name=pkg,
+                        callback_log=callback_log,
+                        token_callback=token_callback,
+                        agent_label=agent_label,
+                    )
+                    if not analyze_passed:
+                        finalize_warnings.append("finalize 직전 run_flutter_analyze 자동 검증이 실패했습니다.")
+                        if analyze_output:
+                            finalize_warnings.append(analyze_output)
+                if not build_passed:
+                    build_passed, build_output = run_final_build_verification(
+                        project_path,
+                        task_id=task_id,
+                        package_name=pkg,
+                        callback_log=callback_log,
+                        token_callback=token_callback,
+                        agent_label=agent_label,
+                    )
+                    if not build_passed:
+                        finalize_warnings.append("finalize 직전 run_flutter_build 자동 검증이 실패했습니다.")
+                        if build_output:
+                            finalize_warnings.append(build_output)
+                if finalize_warnings:
+                    existing_warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+                    result = {
+                        "status": "error",
+                        "message": "Engineer 완료 절차 검증 실패. 아래 단계를 완료한 뒤 다시 finalize하세요.",
+                        "warnings": normalize_issue_list([*existing_warnings, *finalize_warnings]),
+                    }
 
             messages.append({
                 "role": "tool",
@@ -5729,6 +8774,7 @@ def build_specialized_generation_plan(
     if build_context_error:
         return {"status": "failed", "error_log": build_context_error}
     build_spec = build_context.get("build_spec") or {}
+    research_context = build_context.get("research_context") if isinstance(build_context.get("research_context"), dict) else {}
     planning_prompt = build_context.get("summary") or build_context.get("user_request") or user_request
 
     product_result = call_agent_with_tools(
@@ -5742,6 +8788,7 @@ def build_specialized_generation_plan(
             "research_query": build_context.get("research_query") or "",
             "research_reason": build_context.get("research_reason") or "",
             "research_results": build_context.get("research_results") or [],
+            "research_context": research_context,
             "reference_image_analysis": reference_image_analysis or {},
             "image_conflict_note": image_conflict_note or "",
             "ui_contract": ui_contract or {},
@@ -5809,7 +8856,13 @@ def build_specialized_generation_plan(
             "research_reason": build_context.get("research_reason") or "",
             "research_results": build_context.get("research_results") or [],
             "web_data_contract": build_spec.get("web_data_contract") if isinstance(build_spec, dict) else {},
-            "selected_web_data_analysis": (build_spec.get("web_data_contract") or {}) if isinstance(build_spec, dict) else {},
+            "selected_source": research_context.get("selected_source") or {},
+            "supporting_sources": research_context.get("supporting_sources") or [],
+            "openapi_references": research_context.get("openapi_references") or [],
+            "web_data_analyses": research_context.get("web_data_analyses") or [],
+            "selected_web_data_analysis": (research_context.get("web_data_analyses") or [{}])[0] if research_context.get("web_data_analyses") else {},
+            "http_probe": research_context.get("http_probe") or {},
+            "research_quality": research_context.get("quality") or {},
             "external_sources": build_spec.get("external_sources") if isinstance(build_spec, dict) else [],
             "source_url_candidates": build_spec.get("source_url_candidates") if isinstance(build_spec, dict) else [],
             "ui_contract": ui_contract or {},
@@ -5823,6 +8876,8 @@ def build_specialized_generation_plan(
         ),
     )
     data_model_plan = data_result.get("parsed_output")
+    if data_model_plan:
+        data_model_plan = align_data_model_plan_with_web_data_contract(data_model_plan, build_spec)
     usage = data_result.get("usage")
     if token_callback and data_model_plan and usage:
         token_callback(task_id, "Data_Model_Designer", usage)
@@ -5844,6 +8899,7 @@ def build_specialized_generation_plan(
             "data_model_plan": data_model_plan,
             "build_summary": build_context.get("summary") or "",
             "build_spec": build_spec,
+            "research_context": research_context,
             "ui_contract": ui_contract or {},
         },
         trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Feature_Logic_Designer", "stage": "logic_plan"},
@@ -5879,6 +8935,7 @@ def build_specialized_generation_plan(
             "build_spec": build_spec,
             "research_query": build_context.get("research_query") or "",
             "research_reason": build_context.get("research_reason") or "",
+            "research_context": research_context,
             "reference_image_analysis": reference_image_analysis or {},
             "image_conflict_note": image_conflict_note or "",
             "ui_contract": ui_contract or {},
@@ -5896,6 +8953,43 @@ def build_specialized_generation_plan(
 
     if not plan:
         return {"status": "failed", "error_log": "통합 계획 단계에 실패했습니다."}
+    original_title = " ".join(str(plan.get("title") or "").split())
+    compact_title = normalize_plan_title(
+        plan,
+        build_context=build_context,
+        product_plan=product_plan,
+    )
+    if callback_log and compact_title != original_title:
+        callback_log(f"🏷️ 앱 이름 압축: {original_title or '이름 없음'} -> {compact_title}")
+    default_contract = build_default_implementation_contract(
+        plan=plan,
+        build_context=build_context,
+        product_plan=product_plan,
+        ui_layout_plan=ui_layout_plan,
+        data_model_plan=data_model_plan,
+        feature_logic_plan=feature_logic_plan,
+    )
+    plan["implementation_contract"] = normalize_implementation_contract(
+        plan.get("implementation_contract"),
+        default_contract,
+    )
+    plan["implementation_contract"] = augment_implementation_contract_for_readiness(
+        plan["implementation_contract"],
+        build_context=build_context,
+        data_model_plan=data_model_plan,
+        feature_logic_plan=feature_logic_plan,
+    )
+    readiness = validate_implementation_readiness_contract(plan, build_context)
+    if readiness.get("status") != "pass":
+        return {
+            "status": "failed",
+            "error_log": "Implementation readiness gate failed\n" + "\n".join(readiness.get("issues") or []),
+            "failure_stage": "planning",
+            "failure_type": "implementation_readiness_contract",
+            "implementation_readiness": readiness,
+        }
+    if callback_log:
+        callback_log("✅ 구현 계약 준비 검증 통과")
     plan["product_plan"] = product_plan
     plan["ui_layout_plan"] = ui_layout_plan
     plan["data_model_plan"] = data_model_plan
@@ -6167,6 +9261,7 @@ def _deterministic_parser_contract_checks(build_spec, fetched_sources):
     compatible_strategy_map = {
         "static_html_table": {"html_table", "text_pattern"},
         "static_html_text": {"text_pattern"},
+        "static_html_links": {"html_link_list", "html_list_parsing", "text_pattern"},
         "json_endpoint_candidate": {"discover_and_fetch_candidate_url"},
         "iframe": {"follow_iframe_then_parse", "discover_and_fetch_candidate_url"},
         "dynamic_js": {"discover_and_fetch_candidate_url", "follow_iframe_then_parse"},
@@ -6251,6 +9346,65 @@ def _deterministic_parser_contract_checks(build_spec, fetched_sources):
     }
 
 
+def _deterministic_source_constraint_checks(build_spec, fetched_sources):
+    normalized_build_spec = normalize_runtime_build_spec(build_spec)
+    constraints = normalized_build_spec.get("source_selection_constraints") or {}
+    required_terms = constraints.get("required_terms") or []
+    forbidden_terms = constraints.get("forbidden_terms") or []
+    if not required_terms and not forbidden_terms:
+        return {
+            "status": "not_applicable",
+            "issues": [],
+            "best_report": {},
+        }
+
+    best_report = {}
+    best_coverage = -1.0
+    for source in fetched_sources or []:
+        if not isinstance(source, dict):
+            continue
+        analysis = source.get("web_data_analysis") if isinstance(source.get("web_data_analysis"), dict) else {}
+        sample_records = analysis.get("sample_records") if isinstance(analysis.get("sample_records"), list) else []
+        report = evaluate_source_constraint_alignment(
+            constraints,
+            source.get("title") or "",
+            source.get("text_content") or "",
+            source.get("final_url") or source.get("url") or "",
+            json.dumps(sample_records[:5], ensure_ascii=False),
+        )
+        coverage = float(report.get("coverage") or 0.0)
+        if coverage > best_coverage:
+            best_coverage = coverage
+            best_report = report
+        if report.get("passes_required_terms") and report.get("passes_forbidden_terms"):
+            return {
+                "status": "pass",
+                "issues": [],
+                "best_report": report,
+            }
+
+    issues = []
+    if best_report.get("forbidden_hits"):
+        issues.append(
+            "요청 범위에서 제외해야 하는 엔티티가 선택된 외부 출처 증거에 포함되어 있습니다: "
+            + ", ".join(best_report.get("forbidden_hits") or [])
+        )
+    if required_terms and not best_report.get("passes_required_terms"):
+        missing_terms = [
+            term for term in required_terms
+            if term not in (best_report.get("matched_required_terms") or [])
+        ]
+        issues.append(
+            "선택된 외부 출처가 요청 범위를 좁히는 필수 엔티티를 충분히 증명하지 못했습니다: "
+            + ", ".join(missing_terms or required_terms)
+        )
+    return {
+        "status": "fail" if issues else "pass",
+        "issues": issues,
+        "best_report": best_report,
+    }
+
+
 def collect_external_data_verification_inputs(build_spec, task_id=None):
     normalized_build_spec = normalize_runtime_build_spec(build_spec)
     urls = _normalize_string_list(normalized_build_spec.get("source_url_candidates") or [], max_items=3)
@@ -6307,6 +9461,7 @@ def collect_external_data_verification_inputs(build_spec, task_id=None):
     for item in fetched_sources:
         total_date_tokens.extend((item.get("signals") or {}).get("date_tokens") or [])
     parser_contract_checks = _deterministic_parser_contract_checks(normalized_build_spec, fetched_sources)
+    source_constraint_checks = _deterministic_source_constraint_checks(normalized_build_spec, fetched_sources)
 
     return {
         "build_spec": normalized_build_spec,
@@ -6318,6 +9473,7 @@ def collect_external_data_verification_inputs(build_spec, task_id=None):
             "has_migration_notice": has_migration_notice,
             "sample_date_tokens": _normalize_string_list(total_date_tokens, max_items=8),
             "parser_contract_checks": parser_contract_checks,
+            "source_constraint_checks": source_constraint_checks,
         },
     }
 
@@ -6398,6 +9554,22 @@ def verify_external_data_dependencies(project_path, build_spec, task_id=None, to
         checks["source_probe"] = "fail"
         verification["checks"] = checks
 
+    source_constraint_checks = (evidence.get("static_signals") or {}).get("source_constraint_checks") or {}
+    if isinstance(source_constraint_checks, dict) and source_constraint_checks.get("status") == "fail":
+        constraint_issues = source_constraint_checks.get("issues") or []
+        existing_issues = verification.get("issues") if isinstance(verification.get("issues"), list) else []
+        verification["status"] = "fail"
+        verification["issues"] = existing_issues + [
+            issue for issue in constraint_issues if issue not in existing_issues
+        ]
+        summary = (verification.get("summary") or "").strip()
+        constraint_summary = "선택된 외부 출처가 요청 범위를 좁히는 엔티티 제약을 만족하지 않습니다."
+        verification["summary"] = f"{summary} {constraint_summary}".strip() if summary else constraint_summary
+        checks = verification.get("checks") if isinstance(verification.get("checks"), dict) else {}
+        checks["parser_smoke"] = "fail"
+        checks["minimum_sample_data"] = "fail"
+        verification["checks"] = checks
+
     parser_contract_checks = (evidence.get("static_signals") or {}).get("parser_contract_checks") or {}
     if isinstance(parser_contract_checks, dict) and parser_contract_checks.get("status") == "fail":
         parser_issues = parser_contract_checks.get("issues") or []
@@ -6421,6 +9593,286 @@ def verify_external_data_dependencies(project_path, build_spec, task_id=None, to
         "static_signals": evidence.get("static_signals") or {},
     }
     return verification
+
+
+def _build_spec_keyword_text(build_spec):
+    normalized_build_spec = normalize_runtime_build_spec(build_spec)
+    try:
+        return json.dumps(normalized_build_spec, ensure_ascii=False).lower()
+    except Exception:
+        return str(normalized_build_spec).lower()
+
+
+def normalize_issue_list(values) -> List[str]:
+    normalized = []
+    seen = set()
+    for value in values or []:
+        if not isinstance(value, str):
+            continue
+        issue = value.strip()
+        if not issue or issue in seen:
+            continue
+        seen.add(issue)
+        normalized.append(issue)
+    return normalized
+
+
+def _requires_local_state_contract_verification(build_spec):
+    normalized_build_spec = normalize_runtime_build_spec(build_spec)
+    implementation_contract = normalized_build_spec.get("implementation_contract") if isinstance(normalized_build_spec.get("implementation_contract"), dict) else {}
+    state_contract = implementation_contract.get("state_persistence_contract") if isinstance(implementation_contract.get("state_persistence_contract"), dict) else {}
+    if state_contract.get("required") is True:
+        return True
+    if state_contract.get("required") is False:
+        return False
+
+    semantic_build_spec = {
+        key: value
+        for key, value in normalized_build_spec.items()
+        if key not in {"implementation_contract"}
+    }
+    keyword_text = _build_spec_keyword_text(semantic_build_spec)
+    behavior_markers = [
+        "snapshot",
+        "history",
+        "restore",
+        "undo",
+        "branch",
+        "분기",
+        "saved state",
+        "state recovery",
+        "스냅샷",
+        "히스토리",
+        "복구",
+        "되돌리기",
+        "undo",
+        "브랜치",
+        "저장 상태",
+        "상태 복귀",
+    ]
+    if not any(marker in keyword_text for marker in behavior_markers):
+        return False
+    return (
+        normalized_build_spec.get("data_model") == "local"
+        or (normalized_build_spec.get("online_mode") or "").strip().lower() == "offline"
+        or "offline" in keyword_text
+        or "오프라인" in keyword_text
+    )
+
+
+def with_implementation_contract(build_spec: Dict[str, Any], implementation_contract: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = normalize_runtime_build_spec(build_spec)
+    if isinstance(implementation_contract, dict):
+        normalized["implementation_contract"] = implementation_contract
+    return normalized
+
+
+def _detect_local_state_contract_signals(code_snapshot: str, build_spec: Dict[str, Any]) -> Dict[str, Any]:
+    lower_snapshot = (code_snapshot or "").lower()
+    implementation_contract = build_spec.get("implementation_contract") if isinstance(build_spec.get("implementation_contract"), dict) else {}
+    state_contract = implementation_contract.get("state_persistence_contract") if isinstance(implementation_contract.get("state_persistence_contract"), dict) else {}
+
+    def has_any(markers: List[str]) -> bool:
+        return any(marker.lower() in lower_snapshot for marker in markers)
+
+    backend_markers = [
+        "sharedpreferences",
+        "shared_preferences",
+        "hive",
+        "sqflite",
+        "path_provider",
+        "getapplicationdocumentsdirectory",
+        "dart:io",
+        "writeasstring",
+        "readasstring",
+    ]
+    serialization_markers = ["tojson(", "fromjson(", "jsonencode(", "jsondecode(", ".tomap(", ".frommap("]
+    save_markers = ["save", "addsnapshot", "savesnapshot", "persist", "write", "setstring", "setstringlist"]
+    list_markers = ["listsnapshots", "loadsnapshots", "getsnapshots", "getall", "read", "getstring", "getstringlist"]
+    load_by_id_markers = ["loadbyid", "getbyid", "findbyid", "snapshotbyid", "firstwhere", "where((snapshot"]
+    delete_markers = ["delete", "remove", "removesnapshot"]
+    restore_markers = ["restore", "applysnapshot", "loadsnapshot", "navigator.pop<", "navigator.pop(context,", "selectedsnapshot"]
+    empty_callback_patterns = [
+        r"onpressed\s*:\s*\(\s*\)\s*\{\s*\}",
+        r"ontap\s*:\s*\(\s*\)\s*\{\s*\}",
+        r"onpressed\s*:\s*null",
+        r"ontap\s*:\s*null",
+    ]
+    memory_only_patterns = [
+        r"final\s+list<[^>]*(snapshot|history|state)[^>]*>\s+\w+\s*=\s*<",
+        r"list<[^>]*(snapshot|history|state)[^>]*>\s+\w+\s*=\s*\[\]",
+    ]
+
+    required_operations = state_contract.get("required_operations") if isinstance(state_contract.get("required_operations"), list) else []
+    return {
+        "backend_present": has_any(backend_markers),
+        "serialization_present": has_any(serialization_markers),
+        "save_present": has_any(save_markers),
+        "list_present": has_any(list_markers),
+        "load_by_id_present": has_any(load_by_id_markers),
+        "delete_present": has_any(delete_markers),
+        "restore_present": has_any(restore_markers),
+        "empty_callbacks": [pattern for pattern in empty_callback_patterns if re.search(pattern, lower_snapshot)],
+        "memory_only_state": [pattern for pattern in memory_only_patterns if re.search(pattern, lower_snapshot)],
+        "required_operations": [str(item).strip().lower() for item in required_operations if str(item).strip()],
+    }
+
+
+def deterministic_local_state_contract_checks(build_spec: Dict[str, Any], code_snapshot: str) -> Dict[str, Any]:
+    normalized_build_spec = normalize_runtime_build_spec(build_spec)
+    implementation_contract = build_spec.get("implementation_contract") if isinstance(build_spec.get("implementation_contract"), dict) else {}
+    state_contract = implementation_contract.get("state_persistence_contract") if isinstance(implementation_contract.get("state_persistence_contract"), dict) else {}
+    keyword_text = _build_spec_keyword_text(normalized_build_spec)
+    persistence_required = bool(state_contract.get("required")) or any(
+        marker in keyword_text
+        for marker in ["snapshot", "history", "restore", "branch", "saved state", "스냅샷", "히스토리", "복구", "분기", "저장 상태", "상태 복귀"]
+    )
+    undo_required = any(
+        marker in keyword_text
+        for marker in ["undo", "되돌리기", "rollback", "이전 단계", "이전 상태"]
+    )
+    signals = _detect_local_state_contract_signals(code_snapshot, build_spec)
+    issues = []
+
+    if persistence_required and not signals["backend_present"]:
+        issues.append("로컬 저장/복구 기능이 핵심인데 영속 저장 구현 흔적을 찾지 못했습니다.")
+    if persistence_required and not signals["serialization_present"]:
+        issues.append("저장 상태를 앱 재실행 후 복원해야 하지만 snapshot 직렬화(toJson/fromJson 또는 동등 구현) 흔적이 없습니다.")
+    if persistence_required and not signals["save_present"]:
+        issues.append("저장 상태를 생성/저장하는 save 계열 동작 흔적이 없습니다.")
+    if persistence_required and not signals["list_present"]:
+        issues.append("저장된 상태 목록을 조회하는 list/load 계열 동작 흔적이 없습니다.")
+    if persistence_required and ("load_by_id" in signals["required_operations"] or "restore" in signals["required_operations"]) and not signals["load_by_id_present"]:
+        issues.append("저장된 snapshot을 id로 다시 조회하는 loadById/findById 계열 복원 경로가 없습니다.")
+    if persistence_required and "delete" in signals["required_operations"] and not signals["delete_present"]:
+        issues.append("저장된 snapshot 삭제가 계약에 포함되어 있지만 delete/remove 계열 동작 흔적이 없습니다.")
+    if persistence_required and not signals["restore_present"]:
+        issues.append("저장된 상태를 실제 화면 상태로 복원하는 restore/applySnapshot/Navigator.pop 흐름이 없습니다.")
+    if persistence_required and signals["memory_only_state"] and not signals["backend_present"]:
+        issues.append("상태 목록이 메모리 List 중심으로만 보이며 앱 재실행 후 복구될 가능성이 낮습니다.")
+    if persistence_required and signals["empty_callbacks"]:
+        issues.append("저장/복원/삭제 UI일 수 있는 버튼 또는 탭 콜백 중 비어 있는 콜백이 남아 있습니다.")
+    if undo_required and not any(marker in (code_snapshot or "").lower() for marker in ["undo", "_undostack", "removelast()", "previousstate"]):
+        issues.append("되돌리기 또는 이전 상태 복귀 요구가 있지만 코드에서 해당 동작 흔적을 찾지 못했습니다.")
+    if (
+        persistence_required
+        and "historyitemtype.autostep" in (code_snapshot or "").lower()
+        and ("calculationstateid: 'current'" in (code_snapshot or "").lower() or 'calculationstateid: "current"' in (code_snapshot or "").lower())
+    ):
+        issues.append("자동 히스토리 항목이 저장 시점의 스냅샷 대신 현재 상태만 가리켜 과거 상태 복구가 깨질 가능성이 큽니다.")
+    if persistence_required and "navigator.pop(snapshot)" in (code_snapshot or "").lower() and not signals["load_by_id_present"]:
+        issues.append("목록 화면의 메모리 snapshot을 그대로 반환하며 저장소에서 id로 재조회하는 불변 복원 경로가 확인되지 않습니다.")
+
+    return {
+        "status": "fail" if issues else "pass",
+        "summary": (
+            "로컬 상태 저장/복구 계약을 만족합니다."
+            if not issues
+            else "로컬 상태 저장/복구 계약을 만족하지 못했습니다."
+        ),
+        "issues": normalize_issue_list(issues),
+        "signals": signals,
+    }
+
+
+def local_state_release_blocking_issues(deterministic_report: Dict[str, Any]) -> List[str]:
+    issues = normalize_issue_list((deterministic_report or {}).get("issues") or [])
+    signals = (deterministic_report or {}).get("signals") if isinstance((deterministic_report or {}).get("signals"), dict) else {}
+    if not issues:
+        return []
+
+    blocking_markers = [
+        "영속 저장 구현 흔적을 찾지 못했습니다",
+        "메모리 List 중심으로만 보이며",
+        "비어 있는 콜백",
+        "현재 상태만 가리켜 과거 상태 복구가 깨질 가능성이 큽니다",
+        "메모리 snapshot을 그대로 반환",
+    ]
+    blocking = [
+        issue
+        for issue in issues
+        if any(marker in issue for marker in blocking_markers)
+    ]
+
+    if signals.get("memory_only_state") and not signals.get("backend_present"):
+        for issue in issues:
+            if issue not in blocking and ("저장" in issue or "복구" in issue or "메모리" in issue):
+                blocking.append(issue)
+    return normalize_issue_list(blocking)
+
+
+def verify_local_state_behavior_contract(project_path, build_spec, task_id=None, token_callback=None):
+    implementation_contract = build_spec.get("implementation_contract") if isinstance(build_spec, dict) and isinstance(build_spec.get("implementation_contract"), dict) else None
+    normalized_build_spec = with_implementation_contract(build_spec, implementation_contract)
+    if not _requires_local_state_contract_verification(normalized_build_spec):
+        return {
+            "status": "not_applicable",
+            "summary": "로컬 상태 저장/복구 계약 검증이 필요한 앱으로 분류되지 않았습니다.",
+            "issues": [],
+            "evidence": {
+                "build_spec": normalized_build_spec,
+                "code_snapshot_excerpt": "",
+            },
+        }
+
+    code_snapshot = get_current_project_snapshot(project_path)
+    deterministic_report = deterministic_local_state_contract_checks(normalized_build_spec, code_snapshot)
+    deterministic_report["evidence"] = {
+        "build_spec": normalized_build_spec,
+        "code_snapshot_excerpt": code_snapshot[:6000],
+        "signals": deterministic_report.get("signals") or {},
+    }
+
+    review, usage, _ = review_behavioral_contract_with_llm(
+        normalized_build_spec,
+        code_snapshot[:24000],
+        deterministic_report,
+        task_id=task_id,
+    )
+    if token_callback and task_id and usage:
+        token_callback(task_id, "Behavioral_Contract_Reviewer", usage)
+
+    if not review:
+        return deterministic_report
+
+    review_issues = normalize_issue_list(review.get("issues") if isinstance(review.get("issues"), list) else [])
+    deterministic_issues = normalize_issue_list(deterministic_report.get("issues") or [])
+    review_status = review.get("status") if review.get("status") in {"pass", "fail", "not_applicable"} else "pass"
+    blocking_deterministic_issues = local_state_release_blocking_issues(deterministic_report)
+    if review_status == "fail":
+        merged_issues = review_issues + [
+            issue for issue in deterministic_issues if issue not in review_issues
+        ]
+    else:
+        merged_issues = review_issues + [
+            issue for issue in blocking_deterministic_issues if issue not in review_issues
+        ]
+    final_status = "fail" if merged_issues or review_status == "fail" else review_status
+
+    final_summary = (
+        "로컬 상태 저장/복구 계약을 만족합니다."
+        if final_status != "fail"
+        else "로컬 상태 저장/복구 계약을 만족하지 못했습니다."
+    )
+    review_summary = (review.get("summary") or "").strip()
+    if final_status == "fail" and review_summary and "만족합니다" not in review_summary and "충족합니다" not in review_summary:
+        final_summary = review_summary
+    elif final_status != "fail" and review_summary and "못" not in review_summary and "fail" not in review_summary.lower():
+        final_summary = review_summary
+
+    return {
+        "status": final_status,
+        "summary": final_summary,
+        "issues": merged_issues,
+        "evidence": {
+            "build_spec": normalized_build_spec,
+            "code_snapshot_excerpt": code_snapshot[:6000],
+            "deterministic_report": deterministic_report,
+            "non_blocking_deterministic_issues": [
+                issue for issue in deterministic_issues if issue not in blocking_deterministic_issues
+            ],
+        },
+    }
 
 
 def verify_release_external_data_gate(
@@ -6530,10 +9982,15 @@ def apply_external_data_verification_fix(
         return []
 
     files = fix.get("files") or []
-    save_project_files(project_path, files)
-    if package_name:
-        ensure_crash_handler_identity(project_path, task_id, package_name)
-    touched_paths = [f.get("path") for f in files if f.get("path")]
+    ok, touched_paths, apply_error = apply_project_files_safely(
+        project_path,
+        files,
+        ensure_crash_fn=(lambda: ensure_crash_handler_identity(project_path, task_id, package_name)) if package_name else None,
+    )
+    if not ok:
+        if callback_log:
+            callback_log(f"❌ 외부 데이터 검증 수정 패치 적용 실패: {apply_error}")
+        return []
     if callback_log and touched_paths:
         callback_log(f"🩹 외부 데이터 검증 수정 적용 파일: {json.dumps(touched_paths, ensure_ascii=False)}")
     return touched_paths
@@ -6577,6 +10034,7 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
 
     project = os.path.join(BUILD_ROOT_DIR, folder)
 
+    validate_workspace_paths()
     shutil.copytree(
         BASE_PROJECT_PATH,
         project,
@@ -6590,6 +10048,7 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
             '*.iml',
         )
     )
+    apply_base_project_runtime_additions(project)
 
     update_android_label(project, title)
     update_package_name(project, pkg)
@@ -6599,11 +10058,20 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
 
     ensure_crash_fn = lambda: ensure_crash_handler_identity(project, task_id, pkg)
     current_files = []
+    engineer_tools = build_engineer_tools(build_context)
+
+    if callback_log:
+        callback_log("🌐 외부 검색 도구 활성화" if engineer_loop_needs_live_web_tools(build_context) else "🔒 외부 검색 도구 비활성화")
 
     # ENGINEER AGENTIC LOOP
+    engineer_contract_context = {
+        **build_context,
+        "implementation_contract": plan.get("implementation_contract") or {},
+    }
     eng_user_request = (
         f"다음 설계안을 Flutter 앱으로 구현하세요.\n\n"
-        f"설계안:\n{json.dumps(plan, ensure_ascii=False)}"
+        f"설계안:\n{json.dumps(plan, ensure_ascii=False)}\n\n"
+        f"{build_static_contract_guidance(engineer_contract_context, task_id=task_id, package_name=pkg)}"
     )
 
     analyze_ok = False
@@ -6620,18 +10088,52 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
         eng_loop_result = run_agentic_loop(
             task_id=task_id,
             user_request=eng_user_request,
-            tools=ENGINEER_TOOLS,
+            tools=engineer_tools,
             system=ENGINEER_SYSTEM_V2,
             project_path=project,
             callback_log=callback_log,
             token_callback=token_callback,
             pkg=pkg,
             ensure_crash_fn=ensure_crash_fn,
+            agent_label="Engineer",
         )
 
+        engineer_finalize_result = eng_loop_result.get("result") if eng_loop_result.get("tool") == "finalize" else {}
         if eng_loop_result.get("status") == "max_turns_exceeded":
             if callback_log:
                 callback_log("⚠️ Engineer 루프 최대 턴 초과")
+        elif eng_loop_result.get("status") == "error":
+            failure_type = "engineer_loop_error"
+            analyze_res = eng_loop_result.get("message") or "Engineer 루프 실행 실패"
+            if callback_log:
+                callback_log(f"❌ Engineer 루프 실패: {analyze_res[:200]}")
+            continue
+        elif isinstance(engineer_finalize_result, dict) and engineer_finalize_result.get("status") == "error":
+            failure_type = "engineer_finalize_contract"
+            finalize_warnings = normalize_issue_list(engineer_finalize_result.get("warnings") or [])
+            analyze_res = engineer_finalize_result.get("message") or "Engineer finalize 검증 실패"
+            if finalize_warnings:
+                analyze_res = f"{analyze_res}\n" + "\n".join(f"- {item}" for item in finalize_warnings)
+            plan["feedback"] = [analyze_res, *finalize_warnings]
+            if callback_log:
+                callback_log(f"⚠️ Engineer finalize 검증 실패: {analyze_res[:200]}")
+            continue
+
+        preflight = run_static_preflight_checks(
+            project,
+            task_id=task_id,
+            package_name=pkg,
+            build_spec=with_implementation_contract(build_context.get("build_spec") or {}, plan.get("implementation_contract")),
+        )
+        if preflight.get("status") == "fail":
+            failure_type = "static_preflight"
+            preflight_feedback = build_preflight_feedback(preflight)
+            analyze_res = "\n".join(preflight_feedback) or "서버 사전 검증 실패"
+            plan["feedback"] = preflight_feedback
+            analyze_ok = False
+            if callback_log:
+                callback_log(f"⚠️ 서버 사전 검증 실패: {json.dumps(preflight.get('issues') or [], ensure_ascii=False)[:500]}")
+            continue
 
         # Check analyze result from loop or run fresh
         if callback_log:
@@ -6646,42 +10148,79 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
             if callback_log:
                 callback_log(f"❌ 정적 분석 실패 ({failure_type})")
 
-        if callback_log:
-            callback_log("🧐 코드 검토 중")
+        if reviewer_fast_path_allowed(build_context, plan, analyze_ok, engineer_finalize_result, preflight):
+            if callback_log:
+                callback_log("🧐 코드 검토 fast path 적용: 단순 앱 정적 검증 통과")
+            review = build_fast_reviewer_pass()
+        else:
+            if callback_log:
+                callback_log("🧐 코드 검토 중")
 
-        # Read current files for Reviewer context
-        current_dart_files = []
-        lib_path = os.path.join(project, "lib")
-        if os.path.exists(lib_path):
-            for root, _, fnames in os.walk(lib_path):
-                for fname in fnames:
-                    if fname.endswith(".dart"):
-                        rel = os.path.relpath(os.path.join(root, fname), project)
-                        try:
-                            with open(os.path.join(root, fname), "r", encoding="utf-8") as f:
-                                current_dart_files.append({"path": rel, "content": f.read()})
-                        except Exception:
-                            pass
+            # Read current files for Reviewer context
+            current_dart_files = []
+            lib_path = os.path.join(project, "lib")
+            if os.path.exists(lib_path):
+                for root, _, fnames in os.walk(lib_path):
+                    for fname in fnames:
+                        if fname.endswith(".dart"):
+                            rel = os.path.relpath(os.path.join(root, fname), project)
+                            try:
+                                with open(os.path.join(root, fname), "r", encoding="utf-8") as f:
+                                    current_dart_files.append({"path": rel, "content": f.read()})
+                            except Exception:
+                                pass
 
-        review_result = call_agent_with_tools(
-            REVIEWER_SYSTEM,
-            "이 코드를 검토하세요.",
-            context={
-                "implementation": {"files": current_dart_files},
-                "build_spec": build_context.get("build_spec") or {},
-                "ui_contract": ui_contract or {},
-                "analyze_result": {"ok": analyze_ok, "output": analyze_res[:2000]},
-            },
-            trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Reviewer", "stage": "review"},
-            tools=REVIEW_TOOL_SCHEMAS,
-            validator=validate_review_payload,
-            parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
-            fallback_parser=legacy_agent_response_detailed,
+            review_result = call_agent_with_tools(
+                REVIEWER_SYSTEM,
+                "이 코드를 검토하세요.",
+                context={
+                    "implementation": {"files": current_dart_files},
+                    "generation_plan": {
+                        "title": plan.get("title"),
+                        "package_name": plan.get("package_name"),
+                        "blueprint": plan.get("blueprint"),
+                        "files_to_create": plan.get("files_to_create"),
+                        "product_plan": plan.get("product_plan") or {},
+                        "ui_layout_plan": plan.get("ui_layout_plan") or {},
+                        "data_model_plan": plan.get("data_model_plan") or {},
+                        "feature_logic_plan": plan.get("feature_logic_plan") or {},
+                        "build_context": plan.get("build_context") or {},
+                        "implementation_contract": plan.get("implementation_contract") or {},
+                    },
+                    "engineer_loop_result": eng_loop_result,
+                    "engineer_finalize_result": engineer_finalize_result,
+                    "build_spec": build_context.get("build_spec") or {},
+                    "ui_contract": ui_contract or {},
+                    "analyze_result": {"ok": analyze_ok, "output": analyze_res[:2000]},
+                },
+                trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Reviewer", "stage": "review"},
+                tools=REVIEW_TOOL_SCHEMAS,
+                validator=validate_review_payload,
+                parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
+                fallback_parser=legacy_agent_response_detailed,
+            )
+            review = review_result.get("parsed_output")
+            usage = review_result.get("usage")
+            if token_callback and review and usage:
+                token_callback(task_id, "Reviewer", usage)
+
+        local_state_contract_report = verify_local_state_behavior_contract(
+            project,
+            with_implementation_contract(build_context.get("build_spec") or {}, plan.get("implementation_contract")),
+            task_id=task_id,
+            token_callback=token_callback,
         )
-        review = review_result.get("parsed_output")
-        usage = review_result.get("usage")
-        if token_callback and review and usage:
-            token_callback(task_id, "Reviewer", usage)
+        if local_state_contract_report.get("status") == "fail":
+            local_state_issues = normalize_issue_list(local_state_contract_report.get("issues") or [])
+            if not local_state_issues and local_state_contract_report.get("summary"):
+                local_state_issues = [local_state_contract_report.get("summary")]
+            existing_feedback = review.get("feedback") if isinstance(review, dict) and isinstance(review.get("feedback"), list) else []
+            plan["feedback"] = existing_feedback + [
+                issue for issue in local_state_issues if issue not in existing_feedback
+            ]
+            if callback_log:
+                callback_log("⚠️ 로컬 상태 저장/복구 계약 검증 실패")
+            continue
 
         if review and review.get("status") == "pass" and analyze_ok:
             break
@@ -6693,7 +10232,7 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
         return {
             "status": "failed",
             "error_log": analyze_res,
-            "failure_stage": "analyze",
+            "failure_stage": "preflight" if failure_type == "static_preflight" else "analyze",
             "failure_type": failure_type,
             "project_path": project,
             "package_name": pkg,
@@ -6702,8 +10241,12 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
 
     # BUILD LOOP
 
+    repair_budget = init_repair_budget("generate")
     last_verification = None
-    for i in range(3):
+    build_attempt = 0
+    max_build_attempts = int((repair_budget.get("base_attempts") or {}).get("build") or 3)
+    while build_attempt < max_build_attempts:
+        build_attempt += 1
 
         if callback_log:
             callback_log("🏗️ 빌드 실행 중")
@@ -6726,8 +10269,120 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
             last_verification = verification
 
             if verification.get("status") in {"pass", "not_applicable"}:
+                behavioral_contract = verify_local_state_behavior_contract(
+                    project,
+                    with_implementation_contract(build_context.get("build_spec") or {}, plan.get("implementation_contract")),
+                    task_id=task_id,
+                    token_callback=token_callback,
+                )
+                if behavioral_contract.get("status") == "fail":
+                    behavioral_summary = behavioral_contract.get("summary") or "로컬 상태 저장/복구 계약 검증에 실패했습니다."
+                    behavioral_issues = normalize_issue_list(behavioral_contract.get("issues") or [])
+                    if not behavioral_issues and behavioral_summary:
+                        behavioral_issues = [behavioral_summary]
+                    behavioral_error_log = behavioral_summary + ("\n" + "\n".join(behavioral_issues) if behavioral_issues else "")
+                    if callback_log:
+                        callback_log(f"❌ 로컬 상태 계약 검증 실패: {behavioral_summary}")
+
+                    debug_context = prepare_debugger_context(
+                        project,
+                        behavioral_summary,
+                        "behavioral_contract",
+                        relevant_files=current_files,
+                        callback_log=callback_log,
+                        ui_contract=ui_contract,
+                    )
+                    debug_context["behavioral_contract_report"] = behavioral_contract
+                    debug_context["build_spec"] = build_context.get("build_spec") or {}
+                    fix_result = call_agent_with_tools(
+                        DEBUGGER_SYSTEM,
+                        "로컬 상태 저장/복구 계약 검증 실패를 수정하세요.",
+                        context=debug_context,
+                        trace={"task_id": task_id, "flow_type": "generate", "agent_name": "Debugger", "stage": "behavioral_contract_fix"},
+                        tools=FILE_CHANGE_TOOL_SCHEMAS,
+                        validator=validate_file_change_payload,
+                        parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
+                        fallback_parser=legacy_agent_response_detailed,
+                    )
+                    fix = fix_result.get("parsed_output")
+                    usage = fix_result.get("usage")
+                    if token_callback and fix and usage:
+                        token_callback(task_id, "Debugger_Behavioral_Contract", usage)
+                    touched_paths = []
+                    if fix and "files" in fix:
+                        ok, touched_paths, apply_error = apply_project_files_safely(
+                            project,
+                            fix["files"],
+                            ensure_crash_fn=ensure_crash_fn,
+                        )
+                        if not ok:
+                            return {
+                                "status": "failed",
+                                "error_log": apply_error,
+                                "failure_stage": "verification_patch_apply",
+                                "failure_type": "invalid_patch",
+                                "project_path": project,
+                                "package_name": pkg,
+                                "app_name": title,
+                                "verification_summary": behavioral_summary,
+                                "verification_report": behavioral_contract,
+                            }
+                        current_files = merge_unique_paths(current_files + touched_paths)
+                    record_repair_round(
+                        repair_budget,
+                        stage="verification",
+                        attempt=build_attempt,
+                        success=False,
+                        failure_type="local_state_contract",
+                        error_log=behavioral_error_log,
+                        touched_paths=touched_paths,
+                        note="behavioral contract fix attempted",
+                    )
+                    if build_attempt >= max_build_attempts:
+                        should_continue = should_extend_attempt_budget(
+                            repair_budget,
+                            stage="verification",
+                            attempt=build_attempt,
+                            request_context={
+                                "summary": plan.get("title") or title,
+                                "build_spec": build_context.get("build_spec") or {},
+                            },
+                            current_failure={
+                                "failure_type": "local_state_contract",
+                                "error_log": behavioral_error_log,
+                                "issues": behavioral_issues,
+                            },
+                            task_id=task_id,
+                            token_callback=token_callback,
+                            callback_log=callback_log,
+                        )
+                        if not should_continue:
+                            return {
+                                "status": "failed",
+                                "error_log": behavioral_error_log,
+                                "failure_stage": "verification",
+                                "failure_type": "local_state_contract",
+                                "project_path": project,
+                                "package_name": pkg,
+                                "app_name": title,
+                                "verification_summary": behavioral_summary,
+                                "verification_report": behavioral_contract,
+                            }
+                        max_build_attempts += 1
+                    continue
+
                 if callback_log:
                     callback_log("✅ 핵심 기능 검증 통과")
+                record_repair_round(
+                    repair_budget,
+                    stage="build",
+                    attempt=build_attempt,
+                    success=True,
+                    failure_type="",
+                    error_log="",
+                    touched_paths=[],
+                    note="build and verification passed",
+                )
 
                 meta = {
                     "task_id": task_id,
@@ -6753,6 +10408,7 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
 
             verification_summary = verification.get("summary") or "외부 데이터 핵심 기능 검증에 실패했습니다."
             verification_issues = verification.get("issues") or []
+            verification_error_log = verification_summary + ("\n" + "\n".join(verification_issues) if verification_issues else "")
             meta = {
                 "task_id": task_id,
                 "package_name": pkg,
@@ -6768,21 +10424,8 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
             if callback_log:
                 callback_log(f"❌ 핵심 기능 검증 실패: {verification_summary}")
 
-            if i == 2:
-                return {
-                    "status": "failed",
-                    "error_log": verification_summary + ("\n" + "\n".join(verification_issues) if verification_issues else ""),
-                    "failure_stage": "verification",
-                    "failure_type": "external_data_verification",
-                    "project_path": project,
-                    "package_name": pkg,
-                    "app_name": title,
-                    "verification_summary": verification_summary,
-                    "verification_report": verification,
-                }
-
             if callback_log:
-                callback_log(f"🛠 검증 실패 원인 수정 중 ({i+1}/3)")
+                callback_log(f"🛠 검증 실패 원인 수정 중 ({build_attempt}/{max_build_attempts})")
 
             debug_context = prepare_debugger_context(
                 project,
@@ -6808,10 +10451,67 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
             usage = fix_result.get("usage")
             if token_callback and fix and usage:
                 token_callback(task_id, "Debugger_Verification", usage)
+            touched_paths = []
             if fix and "files" in fix:
-                save_project_files(project, fix["files"])
-                ensure_crash_handler_identity(project, task_id, pkg)
-                current_files += [f.get("path") for f in fix["files"] if f.get("path")]
+                ok, touched_paths, apply_error = apply_project_files_safely(
+                    project,
+                    fix["files"],
+                    ensure_crash_fn=ensure_crash_fn,
+                )
+                if not ok:
+                    return {
+                        "status": "failed",
+                        "error_log": apply_error,
+                        "failure_stage": "verification_patch_apply",
+                        "failure_type": "invalid_patch",
+                        "project_path": project,
+                        "package_name": pkg,
+                        "app_name": title,
+                        "verification_summary": verification_summary,
+                        "verification_report": verification,
+                    }
+                current_files = merge_unique_paths(current_files + touched_paths)
+            record_repair_round(
+                repair_budget,
+                stage="verification",
+                attempt=build_attempt,
+                success=False,
+                failure_type="external_data_verification",
+                error_log=verification_error_log,
+                touched_paths=touched_paths,
+                note="external data verification fix attempted",
+            )
+            if build_attempt >= max_build_attempts:
+                should_continue = should_extend_attempt_budget(
+                    repair_budget,
+                    stage="verification",
+                    attempt=build_attempt,
+                    request_context={
+                        "summary": plan.get("title") or title,
+                        "build_spec": build_context.get("build_spec") or {},
+                    },
+                    current_failure={
+                        "failure_type": "external_data_verification",
+                        "error_log": verification_error_log,
+                        "issues": verification_issues,
+                    },
+                    task_id=task_id,
+                    token_callback=token_callback,
+                    callback_log=callback_log,
+                )
+                if not should_continue:
+                    return {
+                        "status": "failed",
+                        "error_log": verification_error_log,
+                        "failure_stage": "verification",
+                        "failure_type": "external_data_verification",
+                        "project_path": project,
+                        "package_name": pkg,
+                        "app_name": title,
+                        "verification_summary": verification_summary,
+                        "verification_report": verification,
+                    }
+                max_build_attempts += 1
             continue
 
         failure_type = classify_failure_type(res)
@@ -6819,7 +10519,7 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
             callback_log(f"❌ 빌드 실패 ({failure_type})")
 
         if callback_log:
-            callback_log(f"🛠 빌드 오류 수정 중 ({i+1}/3)")
+            callback_log(f"🛠 빌드 오류 수정 중 ({build_attempt}/{max_build_attempts})")
 
         debug_context = prepare_debugger_context(
             project,
@@ -6843,14 +10543,53 @@ def run_vibe_factory(task_id, user_request, device_context=None, callback_log=No
         fix = fix_result.get("parsed_output")
         usage = fix_result.get("usage")
         if token_callback and fix and usage:
-            token_callback(task_id, "Debugger", usage)  
+            token_callback(task_id, "Debugger", usage)
 
+        touched_paths = []
         if fix and "files" in fix:
-
-            save_project_files(project, fix["files"])
-            ensure_crash_handler_identity(project, task_id, pkg)
-
-            current_files += [f.get("path") for f in fix["files"] if f.get("path")]
+            ok, touched_paths, apply_error = apply_project_files_safely(
+                project,
+                fix["files"],
+                ensure_crash_fn=ensure_crash_fn,
+            )
+            if not ok:
+                return {
+                    "status": "failed",
+                    "error_log": apply_error,
+                    "failure_stage": "build_patch_apply",
+                    "failure_type": "invalid_patch",
+                    "project_path": project,
+                    "package_name": pkg,
+                    "app_name": title,
+                }
+            current_files = merge_unique_paths(current_files + touched_paths)
+        record_repair_round(
+            repair_budget,
+            stage="build",
+            attempt=build_attempt,
+            success=False,
+            failure_type=failure_type,
+            error_log=res,
+            touched_paths=touched_paths,
+            note="build fix attempted",
+        )
+        if build_attempt >= max_build_attempts and should_extend_attempt_budget(
+            repair_budget,
+            stage="build",
+            attempt=build_attempt,
+            request_context={
+                "summary": plan.get("title") or title,
+                "build_spec": build_context.get("build_spec") or {},
+            },
+            current_failure={
+                "failure_type": failure_type,
+                "error_log": res,
+            },
+            task_id=task_id,
+            token_callback=token_callback,
+            callback_log=callback_log,
+        ):
+            max_build_attempts += 1
 
     return {
         "status": "failed",
@@ -6903,6 +10642,7 @@ def refine_vibe_app(project_path, feedback, task_id=None, callback_log=None, tok
         callback_log(f"🧩 리파인 대상 파일: {json.dumps(files_to_modify, ensure_ascii=False)}")
 
     current_files = list(files_to_modify)
+    last_apply_error = ""
 
     for attempt in range(2):
         if callback_log:
@@ -6951,9 +10691,17 @@ def refine_vibe_app(project_path, feedback, task_id=None, callback_log=None, tok
         if callback_log:
             callback_log(f"📝 실제 적용 리파인 파일: {json.dumps(touched_paths, ensure_ascii=False)}")
 
-        save_project_files(project_path, filtered_files)
-        ensure_crash_handler_identity(project_path, task_id, pkg)
-        current_files = merge_unique_paths(current_files + touched_paths)
+        ok, applied_paths, apply_error = apply_project_files_safely(
+            project_path,
+            filtered_files,
+            ensure_crash_fn=(lambda: ensure_crash_handler_identity(project_path, task_id, pkg)),
+        )
+        if not ok:
+            last_apply_error = apply_error
+            if callback_log:
+                callback_log(f"❌ 리파인 패치 적용 실패: {apply_error}")
+            continue
+        current_files = merge_unique_paths(current_files + applied_paths)
         refinement_snapshot = get_current_project_snapshot(project_path, build_refinement_relevant_files(current_files))
 
         review_result = call_agent_with_tools(
@@ -6980,6 +10728,39 @@ def refine_vibe_app(project_path, feedback, task_id=None, callback_log=None, tok
 
         if review and review.get("status") == "pass":
             break
+
+    preflight = run_static_preflight_checks(
+        project_path,
+        task_id=task_id or "",
+        package_name=pkg or "",
+    )
+    if preflight.get("status") == "fail":
+        applied_preflight_paths = apply_static_preflight_fix(
+            project_path,
+            preflight,
+            task_id=task_id,
+            flow_type="refine",
+            current_files=build_refinement_relevant_files(current_files),
+            token_callback=token_callback,
+            callback_log=callback_log,
+            ensure_crash_fn=(lambda: ensure_crash_handler_identity(project_path, task_id, pkg)),
+            ui_contract=ui_contract,
+        )
+        current_files = merge_unique_paths(current_files + applied_preflight_paths)
+        preflight = run_static_preflight_checks(
+            project_path,
+            task_id=task_id or "",
+            package_name=pkg or "",
+        )
+        if preflight.get("status") == "fail":
+            return {
+                "status": "failed",
+                "error_log": "\n".join(build_preflight_feedback(preflight)),
+                "failure_stage": "preflight",
+                "failure_type": "static_preflight",
+                "project_path": project_path,
+                "package_name": pkg,
+            }
 
     for i in range(3):
         ok, res = run_flutter_build(project_path)
@@ -7054,9 +10835,31 @@ def refine_vibe_app(project_path, feedback, task_id=None, callback_log=None, tok
                 touched_fix_paths = [f.get("path") for f in filtered_fix_files if f.get("path")]
                 if callback_log:
                     callback_log(f"🩹 리파인 빌드 수정 적용 파일: {json.dumps(touched_fix_paths, ensure_ascii=False)}")
-                save_project_files(project_path, filtered_fix_files)
-                ensure_crash_handler_identity(project_path, task_id, pkg)
-                current_files = merge_unique_paths(current_files + touched_fix_paths)
+                ok, applied_fix_paths, apply_error = apply_project_files_safely(
+                    project_path,
+                    filtered_fix_files,
+                    ensure_crash_fn=(lambda: ensure_crash_handler_identity(project_path, task_id, pkg)),
+                )
+                if not ok:
+                    return {
+                        "status": "failed",
+                        "error_log": apply_error,
+                        "failure_stage": "refine_patch_apply",
+                        "failure_type": "invalid_patch",
+                        "project_path": project_path,
+                        "package_name": pkg,
+                    }
+                current_files = merge_unique_paths(current_files + applied_fix_paths)
+
+    if last_apply_error and not res:
+        return {
+            "status": "failed",
+            "error_log": last_apply_error,
+            "failure_stage": "refine_patch_apply",
+            "failure_type": "invalid_patch",
+            "project_path": project_path,
+            "package_name": pkg,
+        }
 
     return {"status": "failed", "error_log": res, "project_path": project_path, "package_name": pkg}
 
@@ -7102,14 +10905,24 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
         return {"status": "failed", "error_log": "재시도 계획 수립에 실패했습니다.", "project_path": project_path, "package_name": package_name}
     plan["ui_contract"] = ui_contract or {}
 
+    patch_applied = False
+    last_apply_error = ""
+
     for attempt in range(2):
         if callback_log:
             callback_log(f"✍️ 실패한 빌드 재시도 코드 수정 중 (시도 {attempt+1})")
 
         eng_result = call_agent_with_tools(
             ENGINEER_SYSTEM,
-            "실패한 빌드 복구 계획을 구현하세요.",
-            context=plan,
+            (
+                "실패한 빌드 복구 계획을 구현하세요. "
+                "불필요한 전체 재작성은 피하고, 현재 오류와 관련된 파일만 최소 수정하세요. "
+                "main.dart, CrashHandler 초기화, import 경로, 기존 화면 구조는 오류 원인일 때만 변경하세요."
+            ),
+            context={
+                **plan,
+                "retry_request_context": request_context or {},
+            },
             trace={"task_id": task_id, "flow_type": "retry", "agent_name": "Retry_Engineer", "stage": "implement"},
             tools=FILE_CHANGE_TOOL_SCHEMAS,
             validator=validate_file_change_payload,
@@ -7124,7 +10937,14 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
         if not eng:
             continue
 
-        save_project_files(project_path, eng.get("files", []))
+        ok, applied_paths, apply_error = apply_project_files_safely(project_path, eng.get("files", []))
+        if not ok:
+            last_apply_error = apply_error
+            if callback_log:
+                callback_log(f"❌ 재시도 패치 적용 실패: {apply_error}")
+            continue
+        patch_applied = bool(applied_paths)
+        current_files = merge_unique_paths(current_files + applied_paths)
 
         if callback_log:
             callback_log("🧐 복구 패치 검토 중")
@@ -7134,6 +10954,7 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
             "실패한 빌드 복구 패치를 검토하세요.",
             context={
                 "implementation": eng,
+                "retry_request_context": request_context or {},
                 "ui_contract": ui_contract or {},
             },
             trace={"task_id": task_id, "flow_type": "retry", "agent_name": "Retry_Reviewer", "stage": "review"},
@@ -7150,6 +10971,54 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
         if review and review.get("status") == "pass":
             break
 
+    if not patch_applied and last_apply_error:
+        return {
+            "status": "failed",
+            "error_log": last_apply_error,
+            "failure_stage": "retry_patch_apply",
+            "failure_type": "invalid_patch",
+            "project_path": project_path,
+            "package_name": package_name,
+        }
+
+    repair_budget = init_repair_budget("retry")
+
+    request_build_spec = (request_context or {}).get("final_app_spec") if isinstance(request_context, dict) else {}
+    preflight = run_static_preflight_checks(
+        project_path,
+        task_id=task_id or "",
+        package_name=package_name or "",
+        build_spec=request_build_spec if isinstance(request_build_spec, dict) else {},
+    )
+    if preflight.get("status") == "fail":
+        applied_preflight_paths = apply_static_preflight_fix(
+            project_path,
+            preflight,
+            task_id=task_id,
+            flow_type="retry",
+            current_files=current_files,
+            token_callback=token_callback,
+            callback_log=callback_log,
+            ensure_crash_fn=(lambda: ensure_crash_handler_identity(project_path, task_id, package_name)),
+            ui_contract=ui_contract,
+        )
+        current_files = merge_unique_paths(current_files + applied_preflight_paths)
+        preflight = run_static_preflight_checks(
+            project_path,
+            task_id=task_id or "",
+            package_name=package_name or "",
+            build_spec=request_build_spec if isinstance(request_build_spec, dict) else {},
+        )
+        if preflight.get("status") == "fail":
+            return {
+                "status": "failed",
+                "error_log": "\n".join(build_preflight_feedback(preflight)),
+                "failure_stage": "preflight",
+                "failure_type": "static_preflight",
+                "project_path": project_path,
+                "package_name": package_name,
+            }
+
     if callback_log:
         callback_log("🧪 정적 분석 실행 중")
 
@@ -7162,9 +11031,12 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
         if callback_log:
             callback_log(f"❌ 정적 분석 실패 ({failure_type})")
 
-        for i in range(2):
+        analyze_attempt = 0
+        max_analyze_attempts = int((repair_budget.get("base_attempts") or {}).get("analyze") or 2)
+        while analyze_attempt < max_analyze_attempts:
+            analyze_attempt += 1
             if callback_log:
-                callback_log(f"🛠 정적 분석 오류 수정 중 ({i+1}/2)")
+                callback_log(f"🛠 정적 분석 오류 수정 중 ({analyze_attempt}/{max_analyze_attempts})")
 
             debug_context = prepare_debugger_context(
                 project_path,
@@ -7174,6 +11046,7 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
                 callback_log=callback_log,
                 ui_contract=ui_contract,
             )
+            debug_context["retry_request_context"] = request_context or {}
 
             fix_result = call_agent_with_tools(
                 DEBUGGER_SYSTEM,
@@ -7190,9 +11063,19 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
             if token_callback and task_id and usage:
                 token_callback(task_id, "Retry_Debugger_Analyze", usage)
 
+            applied_fix_paths = []
             if fix and "files" in fix:
-                save_project_files(project_path, fix["files"])
-                current_files += [f.get("path") for f in fix["files"] if f.get("path")]
+                ok, applied_fix_paths, apply_error = apply_project_files_safely(project_path, fix["files"])
+                if not ok:
+                    return {
+                        "status": "failed",
+                        "error_log": apply_error,
+                        "failure_stage": "retry_analyze_patch_apply",
+                        "failure_type": "invalid_patch",
+                        "project_path": project_path,
+                        "package_name": package_name,
+                    }
+                current_files = merge_unique_paths(current_files + applied_fix_paths)
 
             if callback_log:
                 callback_log("🧪 정적 분석 실행 중")
@@ -7200,22 +11083,58 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
             if analyze_ok:
                 if callback_log:
                     callback_log("✅ 정적 분석 통과")
+                record_repair_round(
+                    repair_budget,
+                    stage="analyze",
+                    attempt=analyze_attempt,
+                    success=True,
+                    failure_type="",
+                    error_log="",
+                    touched_paths=applied_fix_paths,
+                    note="retry analyze passed",
+                )
                 break
             failure_type = classify_failure_type(analyze_res)
             if callback_log:
                 callback_log(f"❌ 정적 분석 실패 ({failure_type})")
+            record_repair_round(
+                repair_budget,
+                stage="analyze",
+                attempt=analyze_attempt,
+                success=False,
+                failure_type=failure_type,
+                error_log=analyze_res,
+                touched_paths=applied_fix_paths,
+                note="retry analyze fix attempted",
+            )
+            if analyze_attempt >= max_analyze_attempts and should_extend_attempt_budget(
+                repair_budget,
+                stage="analyze",
+                attempt=analyze_attempt,
+                request_context=request_context or {},
+                current_failure={
+                    "failure_type": failure_type,
+                    "error_log": analyze_res,
+                },
+                task_id=task_id,
+                token_callback=token_callback,
+                callback_log=callback_log,
+            ):
+                max_analyze_attempts += 1
 
         if not analyze_ok:
             return {"status": "failed", "error_log": analyze_res, "failure_stage": "analyze", "failure_type": failure_type, "project_path": project_path, "package_name": package_name}
 
-    for i in range(3):
+    build_attempt = 0
+    max_build_attempts = int((repair_budget.get("base_attempts") or {}).get("build") or 3)
+    while build_attempt < max_build_attempts:
+        build_attempt += 1
         if callback_log:
             callback_log("🏗️ 빌드 실행 중")
         ok, res = run_flutter_build(project_path)
         if ok:
             if callback_log:
                 callback_log("✅ 빌드 성공")
-            request_build_spec = (request_context or {}).get("final_app_spec") if isinstance(request_context, dict) else {}
             verification = verify_release_external_data_gate(
                 project_path,
                 build_spec=request_build_spec if isinstance(request_build_spec, dict) else {},
@@ -7224,14 +11143,9 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
                 callback_log=callback_log,
             )
             if verification.get("status") not in {"pass", "not_applicable"}:
-                if i == 2:
-                    return build_external_data_verification_failure_result(
-                        verification,
-                        project_path,
-                        package_name=package_name,
-                    )
+                verification_error_log = (verification.get("summary") or "") + ("\n" + "\n".join(verification.get("issues") or []))
                 if callback_log:
-                    callback_log(f"🛠 외부 데이터 검증 실패 원인 수정 중 ({i+1}/3)")
+                    callback_log(f"🛠 외부 데이터 검증 실패 원인 수정 중 ({build_attempt}/{max_build_attempts})")
                 touched_verification_paths = apply_external_data_verification_fix(
                     project_path,
                     verification,
@@ -7243,7 +11157,139 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
                     package_name=package_name,
                 )
                 current_files = merge_unique_paths(current_files + touched_verification_paths)
+                record_repair_round(
+                    repair_budget,
+                    stage="verification",
+                    attempt=build_attempt,
+                    success=False,
+                    failure_type="external_data_verification",
+                    error_log=verification_error_log,
+                    touched_paths=touched_verification_paths,
+                    note="retry external data verification fix attempted",
+                )
+                if build_attempt >= max_build_attempts:
+                    should_continue = should_extend_attempt_budget(
+                        repair_budget,
+                        stage="verification",
+                        attempt=build_attempt,
+                        request_context=request_context or {},
+                        current_failure={
+                            "failure_type": "external_data_verification",
+                            "error_log": verification_error_log,
+                            "issues": verification.get("issues") or [],
+                        },
+                        task_id=task_id,
+                        token_callback=token_callback,
+                        callback_log=callback_log,
+                    )
+                    if not should_continue:
+                        return build_external_data_verification_failure_result(
+                            verification,
+                            project_path,
+                            package_name=package_name,
+                        )
+                    max_build_attempts += 1
                 continue
+            behavioral_contract = verify_local_state_behavior_contract(
+                project_path,
+                request_build_spec if isinstance(request_build_spec, dict) else {},
+                task_id=task_id,
+                token_callback=token_callback,
+            )
+            if behavioral_contract.get("status") == "fail":
+                behavioral_summary = behavioral_contract.get("summary") or "로컬 상태 저장/복구 계약 검증에 실패했습니다."
+                behavioral_issues = normalize_issue_list(behavioral_contract.get("issues") or [])
+                if not behavioral_issues and behavioral_summary:
+                    behavioral_issues = [behavioral_summary]
+                if callback_log:
+                    callback_log(f"❌ 로컬 상태 계약 검증 실패: {behavioral_summary}")
+                behavioral_error_log = behavioral_summary + ("\n" + "\n".join(behavioral_issues) if behavioral_issues else "")
+                debug_context = prepare_debugger_context(
+                    project_path,
+                    behavioral_summary,
+                    "behavioral_contract",
+                    relevant_files=current_files,
+                    callback_log=callback_log,
+                    ui_contract=ui_contract,
+                )
+                debug_context["behavioral_contract_report"] = behavioral_contract
+                debug_context["retry_request_context"] = request_context or {}
+                debug_context["build_spec"] = request_build_spec if isinstance(request_build_spec, dict) else {}
+                fix_result = call_agent_with_tools(
+                    DEBUGGER_SYSTEM,
+                    "로컬 상태 저장/복구 계약 검증 실패를 수정하세요.",
+                    context=debug_context,
+                    trace={"task_id": task_id, "flow_type": "retry", "agent_name": "Retry_Debugger", "stage": "behavioral_contract_fix"},
+                    tools=FILE_CHANGE_TOOL_SCHEMAS,
+                    validator=validate_file_change_payload,
+                    parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
+                    fallback_parser=legacy_agent_response_detailed,
+                )
+                fix = fix_result.get("parsed_output")
+                usage = fix_result.get("usage")
+                if token_callback and task_id and usage:
+                    token_callback(task_id, "Retry_Debugger_Behavioral_Contract", usage)
+                applied_fix_paths = []
+                if fix and "files" in fix:
+                    ok, applied_fix_paths, apply_error = apply_project_files_safely(project_path, fix["files"])
+                    if not ok:
+                        return {
+                            "status": "failed",
+                            "error_log": apply_error,
+                            "failure_stage": "retry_behavioral_patch_apply",
+                            "failure_type": "invalid_patch",
+                            "project_path": project_path,
+                            "package_name": package_name,
+                        }
+                    current_files = merge_unique_paths(current_files + applied_fix_paths)
+                record_repair_round(
+                    repair_budget,
+                    stage="verification",
+                    attempt=build_attempt,
+                    success=False,
+                    failure_type="local_state_contract",
+                    error_log=behavioral_error_log,
+                    touched_paths=applied_fix_paths,
+                    note="retry behavioral contract fix attempted",
+                )
+                if build_attempt >= max_build_attempts:
+                    should_continue = should_extend_attempt_budget(
+                        repair_budget,
+                        stage="verification",
+                        attempt=build_attempt,
+                        request_context=request_context or {},
+                        current_failure={
+                            "failure_type": "local_state_contract",
+                            "error_log": behavioral_error_log,
+                            "issues": behavioral_issues,
+                        },
+                        task_id=task_id,
+                        token_callback=token_callback,
+                        callback_log=callback_log,
+                    )
+                    if not should_continue:
+                        return {
+                            "status": "failed",
+                            "error_log": behavioral_error_log,
+                            "failure_stage": "verification",
+                            "failure_type": "local_state_contract",
+                            "project_path": project_path,
+                            "package_name": package_name,
+                            "verification_summary": behavioral_summary,
+                            "verification_report": behavioral_contract,
+                        }
+                    max_build_attempts += 1
+                continue
+            record_repair_round(
+                repair_budget,
+                stage="build",
+                attempt=build_attempt,
+                success=True,
+                failure_type="",
+                error_log="",
+                touched_paths=[],
+                note="retry build and verification passed",
+            )
             return {
                 "status": "success",
                 "apk_path": res,
@@ -7259,7 +11305,7 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
             callback_log(f"❌ 빌드 실패 ({failure_type})")
 
         if callback_log:
-            callback_log(f"🛠 재시도 빌드 오류 수정 중 ({i+1}/3)")
+            callback_log(f"🛠 재시도 빌드 오류 수정 중 ({build_attempt}/{max_build_attempts})")
 
         debug_context = prepare_debugger_context(
             project_path,
@@ -7269,6 +11315,7 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
             callback_log=callback_log,
             ui_contract=ui_contract,
         )
+        debug_context["retry_request_context"] = request_context or {}
 
         fix_result = call_agent_with_tools(
             DEBUGGER_SYSTEM,
@@ -7285,8 +11332,42 @@ def retry_failed_vibe_app(project_path, feedback, package_name=None, task_id=Non
         if token_callback and task_id and usage:
             token_callback(task_id, "Retry_Debugger", usage)
 
+        applied_fix_paths = []
         if fix and "files" in fix:
-            save_project_files(project_path, fix["files"])
-            current_files += [f.get("path") for f in fix["files"] if f.get("path")]
+            ok, applied_fix_paths, apply_error = apply_project_files_safely(project_path, fix["files"])
+            if not ok:
+                return {
+                    "status": "failed",
+                    "error_log": apply_error,
+                    "failure_stage": "retry_build_patch_apply",
+                    "failure_type": "invalid_patch",
+                    "project_path": project_path,
+                    "package_name": package_name,
+                }
+            current_files = merge_unique_paths(current_files + applied_fix_paths)
+        record_repair_round(
+            repair_budget,
+            stage="build",
+            attempt=build_attempt,
+            success=False,
+            failure_type=failure_type,
+            error_log=res,
+            touched_paths=applied_fix_paths,
+            note="retry build fix attempted",
+        )
+        if build_attempt >= max_build_attempts and should_extend_attempt_budget(
+            repair_budget,
+            stage="build",
+            attempt=build_attempt,
+            request_context=request_context or {},
+            current_failure={
+                "failure_type": failure_type,
+                "error_log": res,
+            },
+            task_id=task_id,
+            token_callback=token_callback,
+            callback_log=callback_log,
+        ):
+            max_build_attempts += 1
 
     return {"status": "failed", "error_log": res, "failure_stage": "build", "failure_type": classify_failure_type(res), "project_path": project_path, "package_name": package_name}

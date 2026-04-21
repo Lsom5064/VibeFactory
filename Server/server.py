@@ -11,6 +11,7 @@ import re
 import base64
 import tempfile
 import hashlib
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
@@ -28,10 +29,13 @@ from vibe_factory import (
     call_agent_with_tools,
     save_project_files,
     run_flutter_build,
+    run_flutter_analyze,
+    run_static_preflight_checks,
     DEBUGGER_SYSTEM,
     FILE_CHANGE_TOOL_SCHEMAS,
     decide_generate_action,
     decide_feedback_action,
+    assess_research_requirement,
     summarize_runtime_error,
     summarize_build_failure,
     search_web_reference,
@@ -50,7 +54,10 @@ from vibe_factory import (
     validate_file_change_payload,
     normalize_file_change_payload,
     normalize_runtime_build_spec,
+    extract_source_selection_constraints_with_llm,
     legacy_agent_response_detailed,
+    classify_failure_type,
+    apply_project_files_safely,
 )
 
 app = FastAPI(title="Vibe App Factory 4.0 - Smartphone App 2.0 Engine")
@@ -163,11 +170,69 @@ def looks_like_runtime_web_data_request(user_prompt: str, research_query: str) -
     ])
 
 
+def choose_external_research_query(
+    *,
+    raw_user_message: str,
+    user_prompt: str,
+    summary: str,
+    build_spec: Dict[str, Any],
+) -> str:
+    candidates = [
+        summary,
+        build_spec.get("app_goal") if isinstance(build_spec, dict) else "",
+        user_prompt,
+        raw_user_message,
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def has_negative_external_dependency_signal(*texts: Any) -> bool:
+    combined = " ".join(str(text or "") for text in texts).lower()
+    if not combined.strip():
+        return False
+    negative_patterns = [
+        "api는 필요 없어",
+        "api 필요 없어",
+        "api는 필요없어",
+        "api 필요없어",
+        "api 필요 없음",
+        "api 안 써도",
+        "api 없이",
+        "web search 필요 없어",
+        "검색 필요 없어",
+        "웹 검색 필요 없어",
+        "웹서치 필요 없어",
+        "웹 서치 필요 없어",
+        "웹 크롤링 필요 없어",
+        "웹크롤링 필요 없어",
+        "크롤링 필요 없어",
+        "크롤링 없이",
+        "외부 데이터 필요 없어",
+        "외부데이터 필요 없어",
+        "외부 연동 필요 없어",
+        "연동 필요 없어",
+        "오프라인이면 돼",
+        "오프라인으로",
+        "offline only",
+        "no api",
+        "without api",
+        "without web",
+        "no web search",
+        "no scraping",
+    ]
+    return any(pattern in combined for pattern in negative_patterns)
+
+
 def maybe_force_external_research_decision(
     decision: Dict[str, Any],
     *,
     user_prompt: str,
     raw_user_message: str,
+    task_id: Optional[str] = None,
+    token_callback=None,
 ) -> Dict[str, Any]:
     if not isinstance(decision, dict):
         return decision
@@ -199,23 +264,95 @@ def maybe_force_external_research_decision(
         or build_spec.get("source_access_mode") in {"scraping", "api"}
         or bool(build_spec.get("external_sources"))
     )
-    api_request = looks_like_api_integration_request(combined_text, combined_text)
+    explicit_source_reference = any(
+        looks_like_url(part)
+        for part in [raw_user_message or "", user_prompt or ""]
+        if isinstance(part, str) and part.strip()
+    )
+    guard_decision = None
+    guard_usage = None
+    guard_error = None
+    try:
+        guard_decision, guard_usage, guard_error = assess_research_requirement(
+            raw_user_message or user_prompt,
+            summary=arguments.get("summary") or "",
+            build_spec=build_spec,
+            task_id=task_id,
+        )
+    except Exception as exc:
+        guard_error = str(exc)
+    if token_callback and task_id and guard_usage:
+        token_callback(task_id, "Research_Requirement_Guard", guard_usage)
+
+    negative_external_signal = has_negative_external_dependency_signal(
+        raw_user_message,
+        user_prompt,
+        arguments.get("summary") or "",
+        build_spec.get("app_goal") or "",
+    )
+    api_request = looks_like_api_integration_request(combined_text, combined_text) and not negative_external_signal
     runtime_web_request = looks_like_runtime_web_data_request(combined_text, combined_text)
-    if not (explicit_external_contract or api_request or runtime_web_request):
+    explicit_api_reference_request = api_request and any(
+        marker in combined_text.lower()
+        for marker in [
+            "swagger",
+            "openapi",
+            " api ",
+            "api ",
+            " endpoint",
+            "endpoint ",
+            "graphql",
+            "webhook",
+            "sdk",
+        ]
+    )
+    if isinstance(guard_decision, dict):
+        if guard_decision.get("decision") == "force_research":
+            if not negative_external_signal or explicit_external_contract or explicit_source_reference or runtime_web_request:
+                research_query = (
+                    guard_decision.get("research_query")
+                    or choose_external_research_query(
+                        raw_user_message=raw_user_message,
+                        user_prompt=user_prompt,
+                        summary=arguments.get("summary") or "",
+                        build_spec=build_spec,
+                    )
+                )
+                research_reason = (
+                    guard_decision.get("reason")
+                    or "사용자 요청이 외부 정보 검증을 요구하므로 조사 후 빌드합니다."
+                )
+                if research_query:
+                    return {
+                        "tool": "research_then_build",
+                        "arguments": {
+                            "summary": (arguments.get("summary") or build_spec.get("app_goal") or research_query).strip(),
+                            "research_query": research_query,
+                            "research_reason": research_reason,
+                        },
+                    }
+        elif guard_decision.get("decision") == "skip_research":
+            return normalized_decision
+
+    if negative_external_signal and not (
+        explicit_external_contract or explicit_source_reference or runtime_web_request
+    ):
+        return normalized_decision
+    if not (explicit_external_contract or explicit_source_reference or explicit_api_reference_request or runtime_web_request):
         return normalized_decision
 
-    research_query = (
-        (raw_user_message or "").strip()
-        or (user_prompt or "").strip()
-        or (arguments.get("summary") or "").strip()
-        or (build_spec.get("app_goal") or "").strip()
+    research_query = choose_external_research_query(
+        raw_user_message=raw_user_message,
+        user_prompt=user_prompt,
+        summary=arguments.get("summary") or "",
+        build_spec=build_spec,
     )
     if not research_query:
         return normalized_decision
 
     research_reason = (
         "사용자 요청이 실시간 외부 데이터에 의존하므로 공식 출처와 검증 계약을 먼저 고정한 뒤 빌드합니다."
-        if runtime_web_request or explicit_external_contract
+        if explicit_external_contract or runtime_web_request or explicit_source_reference
         else "사용자 요청이 외부 API 연동에 의존하므로 공식 문서와 접근 제약을 먼저 확인한 뒤 빌드합니다."
     )
     return {
@@ -276,6 +413,31 @@ def _merge_web_data_contracts(
                     return collected
         return collected
 
+    def _collect_sample_records(*values: Any, max_items: int = 5) -> List[Any]:
+        collected: List[Any] = []
+        seen = set()
+        for value in values:
+            if isinstance(value, list):
+                items = value
+            else:
+                items = [value]
+            for item in items:
+                if isinstance(item, dict):
+                    normalized = dict(item)
+                    key = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+                elif isinstance(item, str) and item.strip():
+                    normalized = item.strip()
+                    key = normalized
+                else:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                collected.append(normalized)
+                if len(collected) >= max_items:
+                    return collected
+        return collected
+
     for key in ("source_kind", "primary_url", "parser_strategy", "required_runtime_behavior"):
         if not isinstance(merged.get(key), str) or not merged.get(key, "").strip():
             if isinstance(selected.get(key), str) and selected.get(key, "").strip():
@@ -288,7 +450,7 @@ def _merge_web_data_contracts(
         selected.get("primary_url"),
         max_items=12,
     )
-    merged["sample_records"] = _collect_strings(
+    merged["sample_records"] = _collect_sample_records(
         merged.get("sample_records"),
         selected.get("sample_records"),
         max_items=5,
@@ -316,6 +478,9 @@ def _merge_web_data_contracts(
         )
     except (TypeError, ValueError):
         minimum_sample_records = 1
+    observed_sample_count = len(merged.get("sample_records") or [])
+    if observed_sample_count:
+        minimum_sample_records = min(max(1, minimum_sample_records), observed_sample_count)
     merged["minimum_sample_records"] = max(1, minimum_sample_records)
     return merged
 
@@ -486,6 +651,81 @@ def _build_api_source_candidate(
     }
 
 
+def _compact_research_source(source: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+    page_result = source.get("page_result") if isinstance(source.get("page_result"), dict) else {}
+    web_data_analysis = source.get("web_data_analysis") if isinstance(source.get("web_data_analysis"), dict) else {}
+    return {
+        "title": source.get("title") or page_result.get("title") or "",
+        "url": source.get("url") or page_result.get("url") or "",
+        "final_url": source.get("final_url") or page_result.get("final_url") or "",
+        "source_type": source.get("source_type") or "",
+        "source_kind": source.get("source_kind") or "",
+        "detected_api_name": source.get("detected_api_name") or page_result.get("detected_api_name") or "",
+        "detected_base_url": source.get("detected_base_url") or page_result.get("detected_base_url") or "",
+        "servers": source.get("servers") or page_result.get("servers") or [],
+        "auth_schemes": source.get("auth_schemes") or page_result.get("auth_schemes") or [],
+        "auth_hints": source.get("auth_hints") or page_result.get("auth_hints") or [],
+        "endpoint_hints": source.get("endpoint_hints") or page_result.get("endpoint_hints") or [],
+        "endpoints": source.get("endpoints") or page_result.get("endpoints") or [],
+        "web_data_contract": web_data_analysis.get("parser_contract") or {},
+        "sample_records": web_data_analysis.get("sample_records") or [],
+        "text_excerpt": (source.get("text_content") or page_result.get("text_content") or "")[:1800],
+    }
+
+
+def _compact_research_context(
+    *,
+    api_source_strategy: Dict[str, Any],
+    selected_source_payload: Optional[Dict[str, Any]],
+    supporting_sources: List[Dict[str, Any]],
+    fetched_pages: List[Dict[str, Any]],
+    web_data_analyses: List[Dict[str, Any]],
+    http_probe_result: Optional[Dict[str, Any]],
+    quality: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "api_source_strategy": api_source_strategy or {},
+        "selected_source": _compact_research_source(selected_source_payload),
+        "supporting_sources": [
+            _compact_research_source(item)
+            for item in supporting_sources[:5]
+            if isinstance(item, dict)
+        ],
+        "openapi_references": [
+            {
+                "title": page.get("title") or "",
+                "final_url": page.get("final_url") or page.get("url") or "",
+                "servers": page.get("servers") or [],
+                "auth_schemes": page.get("auth_schemes") or [],
+                "endpoints": page.get("endpoints") or [],
+            }
+            for page in fetched_pages[:3]
+            if isinstance(page, dict) and (page.get("servers") or page.get("endpoints") or page.get("auth_schemes"))
+        ],
+        "web_data_analyses": [
+            {
+                "status": item.get("status"),
+                "source_kind": item.get("source_kind"),
+                "final_url": item.get("final_url") or item.get("url") or "",
+                "parser_contract": item.get("parser_contract") or {},
+                "sample_records": item.get("sample_records") or [],
+                "confidence": item.get("confidence"),
+                "failure_reason": item.get("failure_reason") or "",
+            }
+            for item in web_data_analyses[:4]
+            if isinstance(item, dict)
+        ],
+        "http_probe": http_probe_result or {},
+        "quality": {
+            "research_quality_passed": quality.get("research_quality_passed"),
+            "research_quality_reason": quality.get("research_quality_reason") or "",
+            "used_external_sources": quality.get("used_external_sources") or [],
+        },
+    }
+
+
 def _build_safe_probe_target(selected_source: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     source = selected_source or {}
     page_result = source.get("page_result") if isinstance(source.get("page_result"), dict) else {}
@@ -521,33 +761,746 @@ def _build_safe_probe_target(selected_source: Optional[Dict[str, Any]]) -> Optio
     return {"method": "GET", "url": probe_url}
 
 
+def _source_urls_for_auth_check(source: Dict[str, Any]) -> List[str]:
+    page_result = source.get("page_result") if isinstance(source.get("page_result"), dict) else {}
+    urls: List[str] = []
+    for container in [source, page_result]:
+        for key in ["final_url", "url", "detected_base_url", "base_url"]:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                urls.append(value.strip())
+        for value in container.get("servers") or []:
+            if isinstance(value, str) and value.strip():
+                urls.append(value.strip())
+    return list(dict.fromkeys(urls))
+
+
+def _looks_like_key_required_api_url(url: str) -> bool:
+    text = (url or "").lower()
+    if not text:
+        return False
+    try:
+        parsed = urlparse(url)
+        auth_like_params = {
+            "api_key",
+            "apikey",
+            "app_key",
+            "appkey",
+            "app_id",
+            "appid",
+            "access_key",
+            "access_token",
+            "auth_token",
+            "token",
+            "subscription-key",
+            "subscription_key",
+            "client_secret",
+        }
+        query_keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        if query_keys & auth_like_params:
+            return True
+        if "key" in query_keys and any(marker in text for marker in ["api", "developer", "maps", "weather"]):
+            return True
+    except Exception:
+        pass
+    if any(marker in text for marker in [
+        "weather.googleapis.com",
+        "developers.google.com/maps/documentation/weather",
+        "maps.googleapis.com",
+        "rapidapi.com",
+        "api-football.com",
+        "newsapi.org",
+        "developer.spotify.com",
+        "developer.twitter.com",
+        "developer.x.com",
+    ]):
+        return True
+    if "open-meteo.com" in text:
+        return False
+    return any(marker in text for marker in [
+        "api.openweathermap.org",
+        "openweathermap.org/api",
+        "openweathermap.org/current",
+        "meteosource.com",
+        "/authentication",
+        "/auth/",
+        "/api-key",
+        "/api_key",
+    ])
+
+
 def _source_has_auth_requirement(source: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(source, dict):
         return False
     page_result = source.get("page_result") if isinstance(source.get("page_result"), dict) else {}
     auth_schemes = source.get("auth_schemes") or page_result.get("auth_schemes") or []
     auth_hints = source.get("auth_hints") or page_result.get("auth_hints") or []
+    source_urls = _source_urls_for_auth_check(source)
+    key_required_by_url = any(_looks_like_key_required_api_url(url) for url in source_urls)
     text = " ".join(
         [
+            json.dumps(source_urls, ensure_ascii=False),
+            str(source.get("title") or ""),
+            str(page_result.get("title") or ""),
             json.dumps(auth_schemes, ensure_ascii=False),
             json.dumps(auth_hints, ensure_ascii=False),
             str(source.get("snippet") or ""),
             str(page_result.get("text_content") or "")[:1200],
         ]
     ).lower()
+    no_auth_markers = [
+        "no api key required",
+        "no api-key required",
+        "no authentication required",
+        "without api key",
+        "without an api key",
+        "does not require an api key",
+        "api key is not required",
+        "authentication is not required",
+        "no auth",
+        "인증이 필요하지",
+        "인증 없이",
+        "키가 필요하지",
+        "api 키가 필요하지",
+    ]
+    concrete_auth_schemes = [
+        scheme for scheme in auth_schemes
+        if str(scheme or "").strip().lower() not in {"none", "noauth", "no_auth", "public"}
+    ]
+    if key_required_by_url:
+        return True
+    if any(marker in text for marker in no_auth_markers) and not concrete_auth_schemes:
+        return False
     if auth_schemes or auth_hints:
         return True
     return any(marker in text for marker in [
+        "requires an api key",
+        "require an api key",
+        "requires api key",
+        "api key required",
+        "get an api key",
+        "your api key",
         "api key",
         "apikey",
+        "api_key",
+        "app_id",
+        "appid",
+        "subscription key",
+        "subscription-key",
+        "x-api-key",
+        "x-rapidapi-key",
+        "key=",
+        "x-goog-api-key",
         "authorization",
         "bearer",
         "oauth",
+        "credential",
+        "credentials",
+        "billing",
+        "quota project",
+        "maps platform",
         "client secret",
         "access token",
+        "consumer key",
+        "consumer secret",
         "인증",
+        "api 키 필요",
+        "api 키가 필요",
+        "키를 발급",
+        "키 발급",
         "토큰",
     ])
+
+
+def _merge_search_results(*search_results: Dict[str, Any]) -> Dict[str, Any]:
+    merged_results: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    errors: List[str] = []
+    query = ""
+    for result in search_results:
+        if not isinstance(result, dict):
+            continue
+        query = query or str(result.get("query") or "")
+        if result.get("error"):
+            errors.append(str(result.get("error")))
+        for item in result.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            dedupe_key = url or json.dumps(item, sort_keys=True, ensure_ascii=False)
+            if dedupe_key in seen_urls:
+                continue
+            seen_urls.add(dedupe_key)
+            merged_results.append(item)
+    return {
+        "status": "success" if merged_results else "failed",
+        "query": query,
+        "results": merged_results,
+        "error": "; ".join(errors[:3]) if errors and not merged_results else "",
+    }
+
+
+def _candidate_quality_score(candidate: Dict[str, Any]) -> float:
+    quality = candidate.get("quality") if isinstance(candidate.get("quality"), dict) else {}
+    score = 0.0
+    if candidate.get("quality_passed") or quality.get("research_quality_passed"):
+        score += 100.0
+    confidence = candidate.get("confidence")
+    if isinstance(confidence, (int, float)):
+        score += float(confidence)
+    search_result = candidate.get("search_result") if isinstance(candidate.get("search_result"), dict) else {}
+    result_confidence = search_result.get("confidence")
+    if isinstance(result_confidence, (int, float)):
+        score += float(result_confidence)
+    if candidate.get("source_type") in {"official_docs", "api_reference", "developer_portal"}:
+        score += 10.0
+    if candidate.get("source_kind") in {"openapi_parse", "api_fetch"}:
+        score += 5.0
+    return score
+
+
+def _best_public_no_key_api_candidate(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    eligible = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict)
+        and not _source_has_auth_requirement(candidate)
+        and bool(
+            candidate.get("quality_passed")
+            or (candidate.get("quality") or {}).get("research_quality_passed")
+        )
+    ]
+    if not eligible:
+        return None
+    return sorted(eligible, key=_candidate_quality_score, reverse=True)[0]
+
+
+def _looks_like_weather_no_key_request(*texts: str) -> bool:
+    combined = " ".join(str(text or "") for text in texts).lower()
+    if not any(marker in combined for marker in ["weather", "날씨", "기온", "온도", "wind", "풍속"]):
+        return False
+    return any(marker in combined for marker in [
+        "free",
+        "public",
+        "no key",
+        "no-key",
+        "no api key",
+        "without api key",
+        "무료",
+        "공개",
+        "무키",
+        "키 없이",
+        "api 키 없이",
+    ])
+
+
+def _build_open_meteo_weather_candidate(research_query: str) -> Dict[str, Any]:
+    docs_url = "https://open-meteo.com/en/docs"
+    base_url = "https://api.open-meteo.com/v1"
+    sample_url = (
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=37.5665&longitude=126.9780"
+        "&current=temperature_2m,wind_speed_10m"
+        "&timezone=Asia%2FSeoul"
+    )
+    search_item = {
+        "title": "Open-Meteo Weather Forecast API official documentation",
+        "url": docs_url,
+        "snippet": "Open-Meteo weather forecast API. No API key required for non-commercial use.",
+        "source_type": "official_docs",
+        "confidence": 0.95,
+    }
+    page_result = {
+        "status": "success",
+        "title": "Open-Meteo Weather Forecast API official documentation",
+        "url": docs_url,
+        "final_url": docs_url,
+        "detected_api_name": "Open-Meteo Weather Forecast API",
+        "detected_base_url": base_url,
+        "servers": [base_url],
+        "auth_schemes": [],
+        "auth_hints": [],
+        "endpoint_hints": ["GET /forecast"],
+        "endpoints": [
+            {
+                "path": "/forecast",
+                "methods": ["GET"],
+                "required_params": ["latitude", "longitude"],
+                "optional_params": ["current", "timezone"],
+                "response_format": "json",
+                "purpose": "현재 날씨와 예보 데이터를 조회합니다.",
+            }
+        ],
+        "text_content": (
+            "Open-Meteo Weather Forecast API official documentation. "
+            "No API key required. Supports latitude, longitude, current weather variables, and timezone. "
+            f"Example: {sample_url}. Query intent: {research_query}"
+        ),
+    }
+    quality = {
+        "research_quality_passed": True,
+        "research_quality_reason": "deterministic_public_no_key_weather_candidate",
+        "used_external_sources": [docs_url],
+    }
+    candidate = _build_api_source_candidate(search_item, page_result, quality, "api_fetch")
+    candidate["selection_reason"] = "무료/무키 날씨 API 요청에 대해 Open-Meteo 공식 API 후보를 보강했습니다."
+    candidate["integration_notes"] = {
+        "auth": "public_no_key",
+        "base_url": base_url,
+        "official_docs_url": docs_url,
+        "sample_url": sample_url,
+    }
+    return candidate
+
+
+def _append_deterministic_public_no_key_candidates(
+    candidates: List[Dict[str, Any]],
+    research_query: str,
+    api_source_strategy: Optional[Dict[str, Any]],
+) -> None:
+    strategy = api_source_strategy or {}
+    if not strategy.get("prefer_public_no_key"):
+        return
+    if not _looks_like_weather_no_key_request(
+        research_query,
+        strategy.get("public_api_search_query") or "",
+        strategy.get("fallback_api_search_query") or "",
+        strategy.get("reason") or "",
+    ):
+        return
+    if any("open-meteo.com" in " ".join(_source_urls_for_auth_check(candidate)).lower() for candidate in candidates):
+        return
+    candidates.append(_build_open_meteo_weather_candidate(research_query))
+
+
+PUBLIC_NO_KEY_ENDPOINT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+        "methods": {"type": "array", "items": {"type": "string"}},
+        "required_params": {"type": "array", "items": {"type": "string"}},
+        "optional_params": {"type": "array", "items": {"type": "string"}},
+        "response_format": {"type": "string"},
+        "purpose": {"type": "string"},
+    },
+    "required": [
+        "path",
+        "methods",
+        "required_params",
+        "optional_params",
+        "response_format",
+        "purpose",
+    ],
+    "additionalProperties": False,
+}
+
+
+PUBLIC_NO_KEY_API_CANDIDATE_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_public_no_key_api_candidate",
+            "description": "검색 실패 또는 약한 검색 결과 상황에서 모델 지식으로 공식 무키 공개 API 후보를 구조화합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "can_use_public_no_key_candidate": {"type": "boolean"},
+                    "api_name": {"type": "string"},
+                    "official_docs_url": {"type": "string"},
+                    "base_url": {"type": "string"},
+                    "no_auth_evidence": {"type": "string"},
+                    "endpoints": {
+                        "type": "array",
+                        "items": PUBLIC_NO_KEY_ENDPOINT_SCHEMA,
+                    },
+                    "implementation_notes": {"type": "string"},
+                    "confidence": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "can_use_public_no_key_candidate",
+                    "api_name",
+                    "official_docs_url",
+                    "base_url",
+                    "no_auth_evidence",
+                    "endpoints",
+                    "implementation_notes",
+                    "confidence",
+                    "reason",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+
+def validate_public_no_key_api_candidate_payload(payload: Any) -> tuple[bool, Optional[str]]:
+    if not isinstance(payload, dict):
+        return False, f"public API candidate payload must be an object | raw_payload={repr(payload)}"
+    if not isinstance(payload.get("can_use_public_no_key_candidate"), bool):
+        return False, f"can_use_public_no_key_candidate must be boolean | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not payload.get("can_use_public_no_key_candidate"):
+        return True, None
+
+    for key in ["api_name", "official_docs_url", "base_url", "no_auth_evidence", "implementation_notes", "reason"]:
+        if not isinstance(payload.get(key), str) or not payload.get(key).strip():
+            return False, f"{key} must be a non-empty string when candidate is usable | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not looks_like_url(payload.get("official_docs_url") or ""):
+        return False, f"official_docs_url must be a URL | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not looks_like_url(payload.get("base_url") or ""):
+        return False, f"base_url must be a URL | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, (int, float)) or float(confidence) < 0.65:
+        return False, f"confidence must be >= 0.65 | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    endpoints = payload.get("endpoints")
+    if not isinstance(endpoints, list) or not endpoints:
+        return False, f"endpoints must be a non-empty list | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            return False, f"endpoint must be object | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        if not isinstance(endpoint.get("path"), str) or not endpoint.get("path", "").startswith("/"):
+            return False, f"endpoint.path must start with / | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        methods = endpoint.get("methods")
+        if not isinstance(methods, list) or not methods or not any(str(method).upper() == "GET" for method in methods):
+            return False, f"at least one GET endpoint is required | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+        for key in ["required_params", "optional_params"]:
+            if not isinstance(endpoint.get(key), list):
+                return False, f"endpoint.{key} must be list | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    return True, None
+
+
+def _llm_payload_to_public_no_key_candidate(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not payload.get("can_use_public_no_key_candidate"):
+        return None
+    docs_url = (payload.get("official_docs_url") or "").strip()
+    base_url = (payload.get("base_url") or "").strip().rstrip("/")
+    api_name = (payload.get("api_name") or "").strip()
+    endpoints = payload.get("endpoints") if isinstance(payload.get("endpoints"), list) else []
+    endpoint_hints = []
+    normalized_endpoints = []
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        methods = [str(method).upper() for method in (endpoint.get("methods") or [])]
+        path = str(endpoint.get("path") or "").strip()
+        if not path:
+            continue
+        endpoint_hints.append(f"{','.join(methods or ['GET'])} {path}")
+        normalized_endpoints.append(
+            {
+                "path": path,
+                "methods": methods or ["GET"],
+                "required_params": endpoint.get("required_params") or [],
+                "optional_params": endpoint.get("optional_params") or [],
+                "response_format": endpoint.get("response_format") or "",
+                "purpose": endpoint.get("purpose") or "",
+            }
+        )
+
+    search_item = {
+        "title": f"{api_name} official API documentation",
+        "url": docs_url,
+        "snippet": payload.get("implementation_notes") or payload.get("reason") or "",
+        "source_type": "official_docs",
+        "confidence": float(payload.get("confidence") or 0.0),
+    }
+    page_result = {
+        "status": "success",
+        "title": f"{api_name} official API documentation",
+        "url": docs_url,
+        "final_url": docs_url,
+        "detected_api_name": api_name,
+        "detected_base_url": base_url,
+        "servers": [base_url],
+        "auth_schemes": [],
+        "auth_hints": [],
+        "endpoint_hints": endpoint_hints,
+        "endpoints": normalized_endpoints,
+        "text_content": " ".join(
+            [
+                f"{api_name} official API documentation.",
+                "Public no-key API candidate selected by LLM.",
+                f"No-auth evidence: {payload.get('no_auth_evidence') or ''}",
+                f"Implementation notes: {payload.get('implementation_notes') or ''}",
+            ]
+        ),
+    }
+    quality = {
+        "research_quality_passed": True,
+        "research_quality_reason": "llm_public_no_key_candidate",
+        "used_external_sources": [docs_url],
+    }
+    candidate = _build_api_source_candidate(search_item, page_result, quality, "llm_public_api_candidate")
+    candidate["selection_reason"] = payload.get("reason") or "LLM selected a public no-key API candidate."
+    candidate["integration_notes"] = {
+        "auth": "public_no_key",
+        "base_url": base_url,
+        "official_docs_url": docs_url,
+        "implementation_notes": payload.get("implementation_notes") or "",
+        "no_auth_evidence": payload.get("no_auth_evidence") or "",
+    }
+    return candidate
+
+
+def propose_public_no_key_api_candidate_with_llm(
+    *,
+    task_id: str,
+    raw_user_message: str,
+    user_prompt: str,
+    research_query: str,
+    api_source_strategy: Dict[str, Any],
+    search_error: str,
+) -> tuple[Optional[Dict[str, Any]], Dict[str, int]]:
+    if not api_source_strategy.get("prefer_public_no_key"):
+        return None, {}
+
+    task = get_task(task_id) or {}
+    result = call_agent_with_tools(
+        "당신은 앱 생성 서버의 API 출처 판별 에이전트입니다. "
+        "서버의 웹 검색이 실패했거나 약한 결과만 있을 때, 특정 도메인별 하드코딩 없이 모델 지식으로 공식 무키 공개 API 후보가 있는지 판단합니다. "
+        "후보를 제안하려면 공식 문서 URL, HTTPS base URL, 인증이 필요 없다는 근거, GET 엔드포인트와 필수 파라미터를 구조화할 수 있어야 합니다. "
+        "확실하지 않거나 인증/키/OAuth/서버 secret이 필요하면 can_use_public_no_key_candidate=false로 답하세요. "
+        "사용자 요청을 충족하지 못하는 API를 억지로 제안하지 마세요.",
+        "공식 무키 공개 API 후보를 사용할 수 있는지 판단하세요.",
+        context={
+            "raw_user_message": raw_user_message,
+            "decision_prompt": user_prompt,
+            "research_query": research_query,
+            "api_source_strategy": api_source_strategy,
+            "search_error": search_error,
+            "conversation_state": get_conversation_state(task),
+            "recent_messages": get_recent_conversation_messages(task_id, limit=12, include_task_logs=False),
+            "required_decision": {
+                "use_candidate_only_if": [
+                    "official_docs_url_known",
+                    "https_base_url_known",
+                    "no_auth_evidence_known",
+                    "at_least_one_get_endpoint_known",
+                    "candidate_satisfies_user_goal",
+                ],
+                "otherwise": "return can_use_public_no_key_candidate=false",
+            },
+        },
+        trace={
+            "task_id": task_id,
+            "flow_type": "generate_decision",
+            "agent_name": "Public_No_Key_API_Candidate",
+            "stage": "api_source_fallback",
+        },
+        tools=PUBLIC_NO_KEY_API_CANDIDATE_TOOL_SCHEMAS,
+        validator=validate_public_no_key_api_candidate_payload,
+        parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
+    )
+    parsed = result.get("parsed_output")
+    usage = result.get("usage") or {}
+    candidate = _llm_payload_to_public_no_key_candidate(parsed) if isinstance(parsed, dict) else None
+    return candidate, usage
+
+
+API_SOURCE_STRATEGY_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "choose_api_source_strategy",
+            "description": "사용자 요구에 맞는 API 문서 탐색 전략을 정합니다. 가능하면 공식 무키 공개 API를 먼저 찾습니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prefer_public_no_key": {"type": "boolean"},
+                    "public_api_search_query": {"type": "string"},
+                    "fallback_api_search_query": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "prefer_public_no_key",
+                    "public_api_search_query",
+                    "fallback_api_search_query",
+                    "reason",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+
+AUTH_BUILD_SPEC_UPDATES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "api_key_handling": {"type": "string"},
+        "api_auth_strategy": {"type": "string"},
+        "requires_api_key_input_screen": {"type": "boolean"},
+        "secret_storage_policy": {"type": "string"},
+        "api_key_error_handling_required": {"type": "boolean"},
+        "prefer_public_no_key_api": {"type": "boolean"},
+        "required_permissions_note": {"type": "string"},
+        "implementation_note": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+
+def validate_api_source_strategy_payload(payload: Any) -> tuple[bool, Optional[str]]:
+    if not isinstance(payload, dict):
+        return False, f"API source strategy payload must be an object | raw_payload={repr(payload)}"
+    if not isinstance(payload.get("prefer_public_no_key"), bool):
+        return False, f"prefer_public_no_key must be boolean | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    for key in ["public_api_search_query", "fallback_api_search_query", "reason"]:
+        if not isinstance(payload.get(key), str):
+            return False, f"{key} must be string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    return True, None
+
+
+def choose_api_source_strategy_with_llm(
+    *,
+    task_id: str,
+    raw_user_message: str,
+    user_prompt: str,
+    research_query: str,
+    tool_args: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, int]]:
+    task = get_task(task_id) or {}
+    result = call_agent_with_tools(
+        "당신은 앱 생성 서버의 API 출처 탐색 전략가입니다. "
+        "사용자 요구가 외부 API나 최신 데이터를 필요로 하면 공식 문서와 안정적인 공개 API를 우선 탐색하세요. "
+        "가능하면 API key, OAuth, 서버 secret 없이 사용할 수 있는 공식 무키 공개 API를 먼저 찾으세요. "
+        "웹사이트 크롤링은 명시적 공개 API가 없거나 요구를 충족하지 못할 때의 fallback입니다. "
+        "유료/키 필요 API만 먼저 고정하지 말고, 무키 공개 API 후보를 확인할 수 있는 검색 질의를 생성하세요. "
+        "단, 결제, 계정, 관리자 권한, 민감 데이터처럼 인증이 본질인 기능은 무키 API를 억지로 선택하지 마세요.",
+        "API 출처 검색 전략을 결정하세요.",
+        context={
+            "raw_user_message": raw_user_message,
+            "decision_prompt": user_prompt,
+            "research_query": research_query,
+            "tool_args": tool_args,
+            "conversation_state": get_conversation_state(task),
+            "recent_messages": get_recent_conversation_messages(task_id, limit=12, include_task_logs=False),
+            "policy": {
+                "preferred": "official public no-key API when it can satisfy the app goal",
+                "fallback": "official API with user-provided in-app key, then structured public web data if appropriate",
+            },
+        },
+        trace={
+            "task_id": task_id,
+            "flow_type": "generate_decision",
+            "agent_name": "API_Source_Strategy",
+            "stage": "api_source_strategy",
+        },
+        tools=API_SOURCE_STRATEGY_TOOL_SCHEMAS,
+        validator=validate_api_source_strategy_payload,
+        parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
+    )
+    parsed = result.get("parsed_output")
+    usage = result.get("usage") or {}
+    return parsed if isinstance(parsed, dict) else {}, usage
+
+
+AUTH_RESOLUTION_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "assess_api_auth_resolution",
+            "description": "대화 문맥과 빌드 명세를 바탕으로 API 인증 처리 방식이 빌드 가능한 수준으로 확정됐는지 판단합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "api_auth_resolved": {"type": "boolean"},
+                    "api_key_handling": {
+                        "type": "string",
+                        "enum": [
+                            "user_provided_in_app",
+                            "server_proxy_required",
+                            "public_no_key",
+                            "unknown",
+                        ],
+                    },
+                    "reason": {"type": "string"},
+                    "build_spec_updates": AUTH_BUILD_SPEC_UPDATES_SCHEMA,
+                    "clarification_question": {"type": "string"},
+                },
+                "required": [
+                    "api_auth_resolved",
+                    "api_key_handling",
+                    "reason",
+                    "build_spec_updates",
+                    "clarification_question",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+
+def validate_auth_resolution_payload(payload: Any) -> tuple[bool, Optional[str]]:
+    if not isinstance(payload, dict):
+        return False, f"Auth resolution payload must be an object | raw_payload={repr(payload)}"
+    if not isinstance(payload.get("api_auth_resolved"), bool):
+        return False, f"api_auth_resolved must be boolean | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if payload.get("api_key_handling") not in {
+        "user_provided_in_app",
+        "server_proxy_required",
+        "public_no_key",
+        "unknown",
+    }:
+        return False, f"api_key_handling invalid | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("reason"), str):
+        return False, f"reason must be string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("build_spec_updates"), dict):
+        return False, f"build_spec_updates must be object | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    if not isinstance(payload.get("clarification_question"), str):
+        return False, f"clarification_question must be string | raw_payload={json.dumps(payload, ensure_ascii=False)}"
+    return True, None
+
+
+def assess_api_auth_resolution_with_llm(
+    *,
+    task_id: str,
+    raw_user_message: str,
+    user_prompt: str,
+    tool_args: Dict[str, Any],
+    selected_source_payload: Optional[Dict[str, Any]],
+    quality: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, int]]:
+    task = get_task(task_id) or {}
+    result = call_agent_with_tools(
+        "당신은 앱 생성 서버의 API 인증 정책 라우터입니다. "
+        "사용자 대화, 직전 확인 질문, 빌드 명세, API 문서 근거를 보고 인증 처리 방식이 빌드 가능한 수준으로 확정됐는지 판단하세요. "
+        "실제 비밀 키를 서버 로그나 앱 코드에 넣는 방식은 확정된 것으로 보지 마세요. "
+        "일반적인 API key, appid, token, bearer token 방식은 모바일 앱에서 사용자가 자신의 키를 입력하고 로컬에 저장하는 안전한 기본 전략으로 처리할 수 있습니다. "
+        "사용자가 명시적으로 키를 제공하지 않아도, 서비스가 사용자 개인 키 입력을 허용하는 형태라면 api_auth_resolved=true, api_key_handling=user_provided_in_app로 판단하세요. "
+        "공개 무키 API도 api_auth_resolved=true입니다. "
+        "OAuth client secret, 서버 전용 secret, 관리자 키, 결제/민감 권한 토큰처럼 모바일 앱에 노출하면 안 되는 credential이 핵심이면 api_auth_resolved=false로 두고 clarification_question에 서버 프록시 필요성을 물으세요. "
+        "server_proxy_required는 사용자가 이미 서버 프록시 구현에 동의했거나 기존 서버 프록시가 명세에 있을 때만 resolved로 봅니다. "
+        "build_spec_updates에는 선택한 인증 전략을 구현하기 위한 화면/저장/오류 처리 요구사항을 넣으세요.",
+        "API 인증 처리 방식 확정 여부를 판단하세요.",
+        context={
+            "raw_user_message": raw_user_message,
+            "decision_prompt": user_prompt,
+            "tool_args": tool_args,
+            "conversation_state": get_conversation_state(task),
+            "recent_messages": get_recent_conversation_messages(task_id, limit=12, include_task_logs=False),
+            "selected_source": selected_source_payload or {},
+            "research_quality": quality or {},
+            "default_safe_policy": {
+                "ordinary_api_key": "Proceed with an in-app user API key input/settings screen; do not hardcode secrets.",
+                "public_no_key": "Proceed without asking.",
+                "oauth_or_server_secret": "Ask only when a confidential server-held credential or proxy is required.",
+            },
+        },
+        trace={
+            "task_id": task_id,
+            "flow_type": "generate_decision",
+            "agent_name": "API_Auth_Resolution",
+            "stage": "api_auth_resolution",
+        },
+        tools=AUTH_RESOLUTION_TOOL_SCHEMAS,
+        validator=validate_auth_resolution_payload,
+        parsed_output_builder=lambda tool_name, tool_arguments: tool_arguments,
+    )
+    parsed = result.get("parsed_output")
+    usage = result.get("usage") or {}
+    return parsed if isinstance(parsed, dict) else {}, usage
 
 
 class TaskStatus:
@@ -708,26 +1661,6 @@ def init_db():
             query_type TEXT NOT NULL,
             endpoint TEXT NOT NULL,
             content TEXT NOT NULL,
-            created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
-        )
-        """)
-        conn.commit()
-
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS task_state_history(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            changed_fields TEXT,
-            status TEXT,
-            app_name TEXT,
-            generated_app_name TEXT,
-            package_name TEXT,
-            apk_url TEXT,
-            build_success INTEGER,
-            build_attempts INTEGER,
-            conversation_state TEXT,
-            log TEXT,
             created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
         )
         """)
@@ -1192,37 +2125,6 @@ def record_orchestration_event(
             )
         )
         conn.commit()
-
-
-def record_task_state_history(task_id: str, *, event_type: str, changed_fields: Optional[Dict[str, Any]] = None):
-    task = get_task(task_id)
-    if not task:
-        return
-    with get_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO task_state_history
-            (task_id, event_type, changed_fields, status, app_name, generated_app_name, package_name, apk_url, build_success, build_attempts, conversation_state, log)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                event_type,
-                json_string(changed_fields) if changed_fields else None,
-                task.get("status"),
-                task.get("app_name"),
-                task.get("generated_app_name"),
-                task.get("package_name"),
-                task.get("apk_url"),
-                1 if to_bool(task.get("build_success")) else 0 if task.get("build_success") is not None else None,
-                task.get("build_attempts"),
-                task.get("conversation_state"),
-                task.get("log"),
-            )
-        )
-        conn.commit()
-
 def update_task(task_id, **kwargs):
     with get_conn() as conn:
         cursor = conn.cursor()
@@ -1255,8 +2157,6 @@ def update_task(task_id, **kwargs):
                 (task_id,)
             )
         conn.commit()
-    if kwargs:
-        record_task_state_history(task_id, event_type="task_updated", changed_fields=kwargs)
 
 def append_log(task_id, message):
     task = get_task(task_id)
@@ -1613,11 +2513,111 @@ def get_latest_status_message(task: Dict[str, Any], log_lines: list[str]) -> str
     return normalize_task_status(task.get("status"))
 
 
+TRANSIENT_APP_NAME_VALUES = {
+    "API 정보 확인 필요",
+    "판단 실패",
+    "추가 확인 필요",
+    "대화 중",
+    "확인 필요",
+    "거절됨",
+    "웹 페이지 읽기 실패",
+    "검색 실패",
+    "웹 데이터 파싱 실패",
+    "외부 정보 품질 부족",
+    "검색 해석 실패",
+    "외부 데이터 계약 누락",
+    "앱 설계 중...",
+}
+
+
+def is_transient_app_name(value: Any) -> bool:
+    text = sanitize_log_text(str(value or ""))
+    if not text:
+        return True
+    if text in TRANSIENT_APP_NAME_VALUES or text in ALLOWED_TASK_STATUSES:
+        return True
+    status_labels = {get_status_display_text(status) for status in ALLOWED_TASK_STATUSES}
+    status_labels.update(get_status_display_text(TaskStatus.PROCESSING, mode) for mode in ("generate", "refine", "retry"))
+    return text in status_labels
+
+
+def trim_task_display_title(value: Any, max_chars: int = 48) -> str:
+    text = sanitize_log_text(str(value or ""))
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip(" ,./-_:;") + "…"
+
+
+def first_string_from_mapping(mapping: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def derive_task_display_app_name(task: Dict[str, Any]) -> str:
+    generated_name = sanitize_log_text(task.get("generated_app_name") or "")
+    if generated_name and not is_transient_app_name(generated_name):
+        return trim_task_display_title(generated_name)
+
+    stored_name = sanitize_log_text(task.get("app_name") or "")
+    if stored_name and not is_transient_app_name(stored_name):
+        return trim_task_display_title(stored_name)
+
+    build_spec = parse_json_object_field(task.get("final_app_spec")) or {}
+    spec_title = first_string_from_mapping(
+        build_spec,
+        "app_name",
+        "app_title",
+        "title",
+        "name",
+        "display_name",
+        "app_goal",
+        "summary",
+    )
+    if spec_title:
+        return trim_task_display_title(spec_title)
+
+    conversation_state = get_conversation_state(task)
+    for candidate in (
+        task.get("final_requirement_summary"),
+        conversation_state.get("latest_summary"),
+        task.get("initial_user_prompt"),
+        conversation_state.get("initial_user_prompt"),
+    ):
+        title = trim_task_display_title(candidate)
+        if title:
+            return title
+    return ""
+
+
 def normalize_phone_number(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     normalized = "".join(ch for ch in value if ch.isdigit() or ch == "+").strip()
     return normalized or None
+
+
+def build_download_url(task: Dict[str, Any]) -> str:
+    task_id = (task.get("task_id") or "").strip()
+    if not task_id:
+        return ""
+
+    query_params: Dict[str, str] = {}
+    # Prefer stable identities that survive reinstall over ephemeral device ids.
+    for key in ("user_id", "phone_number", "device_id"):
+        value = task.get(key)
+        if key == "phone_number":
+            value = normalize_phone_number(value)
+        if isinstance(value, str) and value.strip():
+            query_params[key] = value.strip()
+            break
+
+    suffix = f"?{urlencode(query_params)}" if query_params else ""
+    return f"/download/{task_id}{suffix}"
 
 
 def normalize_task_status(value: Any) -> str:
@@ -1637,7 +2637,7 @@ def get_status_display_text(status: Any, progress_mode: Optional[str] = None) ->
         if mode == "refine":
             return "피드백을 반영하고 있어요"
         if mode == "retry":
-            return "이전 실패를 복구하고 있어요"
+            return "요청을 검토하고 있어요"
         return "앱을 생성하고 있어요"
     if normalized == TaskStatus.REVIEWING:
         return "결과를 점검하고 있어요"
@@ -1940,8 +2940,14 @@ def build_status_payload(task: Dict[str, Any]) -> Dict[str, Any]:
     conversation_state = get_conversation_state(normalized)
     raw_log = normalized.get("log") or ""
     log_lines = extract_log_lines(raw_log)
-    app_name = normalized.get("app_name")
-    generated_app_name = normalized.get("generated_app_name") or app_name
+    raw_app_name = normalized.get("app_name") or ""
+    display_app_name = derive_task_display_app_name(normalized)
+    app_name = raw_app_name if raw_app_name and not is_transient_app_name(raw_app_name) else display_app_name
+    generated_app_name = display_app_name or (
+        normalized.get("generated_app_name")
+        if not is_transient_app_name(normalized.get("generated_app_name"))
+        else ""
+    )
     current_status = normalize_task_status(normalized.get("status"))
     status_message = get_latest_status_message(normalized, log_lines)
     resolved_project_path = resolve_task_project_path(normalized, persist=False)
@@ -1974,7 +2980,7 @@ def build_status_payload(task: Dict[str, Any]) -> Dict[str, Any]:
         "app_name": app_name or "",
         "generated_app_name": generated_app_name or "",
         "package_name": normalized.get("package_name") or "",
-        "apk_url": normalized.get("apk_url") or "",
+        "apk_url": build_download_url(normalized) if current_status == TaskStatus.SUCCESS else (normalized.get("apk_url") or ""),
         "build_success": to_bool(normalized.get("build_success")) if normalized.get("build_success") is not None else False,
         "build_attempts": int(normalized.get("build_attempts") or 0),
         "conversation_state": conversation_state,
@@ -1999,6 +3005,9 @@ def get_conversation_state(task: Dict[str, Any]) -> Dict[str, Any]:
         "latest_assistant_questions": [],
         "latest_user_reply": "",
         "latest_summary": "",
+        "latest_pending_action": "",
+        "latest_pending_summary": "",
+        "latest_pending_reason": "",
     }
 
     raw_state = task.get("conversation_state")
@@ -2013,6 +3022,9 @@ def get_conversation_state(task: Dict[str, Any]) -> Dict[str, Any]:
             "latest_assistant_questions": parsed.get("latest_assistant_questions") or [],
             "latest_user_reply": parsed.get("latest_user_reply") or "",
             "latest_summary": parsed.get("latest_summary") or "",
+            "latest_pending_action": parsed.get("latest_pending_action") or "",
+            "latest_pending_summary": parsed.get("latest_pending_summary") or "",
+            "latest_pending_reason": parsed.get("latest_pending_reason") or "",
         }
     except json.JSONDecodeError:
         return base_state
@@ -2124,316 +3136,6 @@ def get_recent_conversation_messages(
             }
         )
     return normalized
-
-
-def get_all_conversation_messages(
-    task_id: str,
-    *,
-    include_task_logs: bool = False,
-) -> List[Dict[str, Any]]:
-    if not task_id:
-        return []
-
-    where_clause = "WHERE task_id=?"
-    params: List[Any] = [task_id]
-    if not include_task_logs:
-        where_clause += " AND message_type != ?"
-        params.append("task_log")
-
-    with get_conn() as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            SELECT id, role, message_type, endpoint, content, payload, created_at
-            FROM conversation_messages
-            {where_clause}
-            ORDER BY id ASC
-            """,
-            tuple(params)
-        )
-        rows = [dict(row) for row in cursor.fetchall()]
-
-    normalized: List[Dict[str, Any]] = []
-    for row in rows:
-        normalized.append(
-            {
-                "id": row.get("id"),
-                "role": row.get("role") or "",
-                "message_type": row.get("message_type") or "",
-                "endpoint": row.get("endpoint") or "",
-                "content": row.get("content") or "",
-                "payload": parse_json_object_field(row.get("payload")) or {},
-                "created_at": row.get("created_at") or "",
-            }
-        )
-    return normalized
-
-
-def get_task_state_history_rows(task_id: str) -> List[Dict[str, Any]]:
-    if not task_id:
-        return []
-    with get_conn() as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT id, event_type, changed_fields, status, package_name, apk_url, build_success, build_attempts, created_at
-            FROM task_state_history
-            WHERE task_id=?
-            ORDER BY id ASC
-            """,
-            (task_id,)
-        )
-        rows = [dict(row) for row in cursor.fetchall()]
-
-    normalized: List[Dict[str, Any]] = []
-    for row in rows:
-        normalized.append(
-            {
-                "id": row.get("id"),
-                "event_type": row.get("event_type") or "",
-                "changed_fields": parse_json_object_field(row.get("changed_fields")) or {},
-                "status": normalize_task_status(row.get("status")),
-                "package_name": row.get("package_name") or "",
-                "apk_url": row.get("apk_url") or "",
-                "build_success": bool(row.get("build_success")) if row.get("build_success") is not None else False,
-                "build_attempts": int(row.get("build_attempts") or 0),
-                "created_at": row.get("created_at") or "",
-            }
-        )
-    return normalized
-
-
-def build_conversation_timeline(task: Dict[str, Any]) -> List[Dict[str, Any]]:
-    task_id = (task.get("task_id") or "").strip()
-    if not task_id:
-        return []
-
-    timeline: List[Dict[str, Any]] = []
-    seen_keys: Set[Tuple[str, str, str]] = set()
-
-    def append_unique_item(
-        *,
-        sort_created_at: str,
-        sort_id: int,
-        item_id: str,
-        kind: str,
-        title: str,
-        body: str,
-        detail: Optional[str] = None,
-    ) -> None:
-        normalized_body = (body or "").strip()
-        normalized_detail = (detail or "").strip()
-        if not normalized_body:
-            return
-        dedupe_key = (kind, normalized_body, normalized_detail)
-        if dedupe_key in seen_keys:
-            return
-        seen_keys.add(dedupe_key)
-        timeline.append(
-            {
-                "sort_created_at": sort_created_at,
-                "sort_id": sort_id,
-                "id": item_id,
-                "kind": kind,
-                "title": title,
-                "body": normalized_body,
-                "detail": normalized_detail or None,
-                "created_at": sort_created_at,
-            }
-        )
-
-    def append_conversation_state_fallback() -> None:
-        state = get_conversation_state(task)
-        created_at = task.get("created_at") or ""
-        updated_at = task.get("updated_at") or created_at
-
-        initial_user_prompt = (state.get("initial_user_prompt") or "").strip()
-        if initial_user_prompt:
-            append_unique_item(
-                sort_created_at=created_at,
-                sort_id=-40,
-                item_id=f"state-initial-user-{task_id}",
-                kind="user",
-                title="사용자",
-                body=initial_user_prompt,
-            )
-
-        latest_assistant_questions = state.get("latest_assistant_questions") or []
-        if isinstance(latest_assistant_questions, list):
-            for index, question in enumerate(latest_assistant_questions):
-                question_text = str(question or "").strip()
-                if not question_text:
-                    continue
-                append_unique_item(
-                    sort_created_at=updated_at,
-                    sort_id=-30 + index,
-                    item_id=f"state-assistant-{task_id}-{index}",
-                    kind="assistant",
-                    title="AI",
-                    body=question_text,
-                )
-
-        latest_user_reply = (state.get("latest_user_reply") or "").strip()
-        if latest_user_reply:
-            append_unique_item(
-                sort_created_at=updated_at,
-                sort_id=-20,
-                item_id=f"state-user-reply-{task_id}",
-                kind="user",
-                title="사용자",
-                body=latest_user_reply,
-            )
-
-        latest_summary = (state.get("latest_summary") or "").strip()
-        if latest_summary:
-            append_unique_item(
-                sort_created_at=updated_at,
-                sort_id=-10,
-                item_id=f"state-summary-{task_id}",
-                kind="assistant",
-                title="AI",
-                body=latest_summary,
-            )
-
-    conversation_rows = get_all_conversation_messages(task_id, include_task_logs=False)
-    for row in conversation_rows:
-        message_type = row.get("message_type") or ""
-        role = row.get("role") or ""
-        payload = row.get("payload") or {}
-        body = (row.get("content") or "").strip()
-        detail = None
-        kind = "assistant"
-        title = "AI"
-
-        if message_type in {
-            "build_failure_report",
-            "feedback_route",
-            "refine_accepted",
-            "retry_accepted",
-            "runtime_repair_started",
-        }:
-            continue
-
-        if role == "user":
-            kind = "user"
-            title = "사용자"
-        elif message_type in {"runtime_error_report", "runtime_error_detected"}:
-            kind = "log"
-            title = "런타임 오류"
-            detail = (payload.get("stack_trace") or "").strip() or None
-            if not body:
-                body = "런타임 오류가 감지되었어요."
-        else:
-            kind = "assistant"
-            title = "AI"
-
-        if message_type == "clarification_question":
-            summary = ""
-            if isinstance(payload, dict):
-                summary = (payload.get("summary") or "").strip()
-                questions = payload.get("questions") or []
-            else:
-                questions = []
-            if summary:
-                append_unique_item(
-                    sort_created_at=row.get("created_at") or "",
-                    sort_id=int(row.get("id") or 0) * 100,
-                    item_id=f"conversation-{row.get('id')}-summary",
-                    kind="assistant",
-                    title="AI",
-                    body=summary,
-                )
-            if isinstance(questions, list) and questions:
-                for index, question in enumerate(questions):
-                    question_text = str(question or "").strip()
-                    if not question_text:
-                        continue
-                    append_unique_item(
-                        sort_created_at=row.get("created_at") or "",
-                        sort_id=int(row.get("id") or 0) * 100 + index + 1,
-                        item_id=f"conversation-{row.get('id')}-question-{index}",
-                        kind="assistant",
-                        title="AI",
-                        body=question_text,
-                    )
-                continue
-
-        append_unique_item(
-            sort_created_at=row.get("created_at") or "",
-            sort_id=int(row.get("id") or 0),
-            item_id=f"conversation-{row.get('id')}",
-            kind=kind,
-            title=title,
-            body=body,
-            detail=detail,
-        )
-
-    if not any((item.get("kind") or "") in {"user", "assistant", "log"} for item in timeline):
-        append_conversation_state_fallback()
-
-    history_rows = get_task_state_history_rows(task_id)
-    active_flow = ""
-    last_status_key = ""
-    for row in history_rows:
-        changed_fields = row.get("changed_fields") or {}
-        changed_flow = (changed_fields.get("active_flow") or "").strip()
-        if changed_flow:
-            active_flow = changed_flow
-
-        status = normalize_task_status(row.get("status"))
-        if status not in {
-            TaskStatus.PENDING_DECISION,
-            TaskStatus.CLARIFICATION_NEEDED,
-            TaskStatus.PROCESSING,
-            TaskStatus.REVIEWING,
-            TaskStatus.REPAIRING,
-            TaskStatus.SUCCESS,
-            TaskStatus.FAILED,
-            TaskStatus.ERROR,
-            TaskStatus.REJECTED,
-        }:
-            continue
-
-        status_text = get_status_display_text(status, active_flow)
-        status_key = "|".join(
-            [
-                status,
-                active_flow,
-                row.get("package_name") or "",
-                row.get("apk_url") or "",
-                str(1 if row.get("build_success") else 0),
-                str(int(row.get("build_attempts") or 0)),
-            ]
-        )
-        if status_key == last_status_key:
-            continue
-        last_status_key = status_key
-
-        append_unique_item(
-            sort_created_at=row.get("created_at") or "",
-            sort_id=1000000000 + int(row.get("id") or 0),
-            item_id=f"status-{row.get('id')}",
-            kind="status",
-            title="상태",
-            body=status_text,
-            detail=(row.get("package_name") or "").strip() or None,
-        )
-
-    timeline.sort(key=lambda item: (item.get("sort_created_at") or "", int(item.get("sort_id") or 0)))
-    return [
-        {
-            "id": item.get("id") or "",
-            "kind": item.get("kind") or "assistant",
-            "title": item.get("title") or "",
-            "body": item.get("body") or "",
-            "detail": item.get("detail"),
-            "created_at": item.get("created_at") or "",
-        }
-        for item in timeline
-        if (item.get("body") or "").strip()
-    ]
 
 
 def trim_context_text(value: Any, limit: int = 600) -> str:
@@ -2571,7 +3273,7 @@ def build_retry_request_context(task: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "task_id": task.get("task_id") or "",
-        "generated_app_name": task.get("generated_app_name") or task.get("app_name") or "",
+        "generated_app_name": derive_task_display_app_name(task),
         "initial_user_prompt": initial_prompt,
         "requirement_summary": requirement_summary,
         "final_app_spec": final_app_spec or {},
@@ -2651,6 +3353,21 @@ def build_failure_summary_fallback(failure_stage: Optional[str], failure_type: O
     }
 
 
+def extract_primary_failure_line(error_log: Any) -> str:
+    text = str(error_log or "").strip()
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    preferred_keywords = ("error", "exception", "failed", "failure", "undefined", "missing", "refusing", "invalid", "overflow")
+    for line in lines:
+        lowered = line.lower()
+        if any(keyword in lowered for keyword in preferred_keywords):
+            return trim_context_text(line, 280)
+    return trim_context_text(lines[0], 280)
+
+
 def build_spec_requires_external_data_verification(build_spec: Dict[str, Any]) -> bool:
     if not isinstance(build_spec, dict):
         return False
@@ -2692,6 +3409,108 @@ def enforce_release_verification_result(task: Dict[str, Any], result: Dict[str, 
         }
 
     return result
+
+
+def find_existing_built_apk(project_path: str) -> str:
+    if not project_path:
+        return ""
+    candidates = [
+        os.path.join(project_path, "build/app/outputs/flutter-apk/app-debug.apk"),
+        os.path.join(project_path, "build/app/outputs/flutter-apk/app-release.apk"),
+        os.path.join(project_path, "build/app/outputs/apk/debug/app-debug.apk"),
+        os.path.join(project_path, "build/app/outputs/apk/release/app-release.apk"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def reconcile_failed_result_with_verified_artifact(
+    task: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    callback_log=None,
+) -> Dict[str, Any]:
+    if not isinstance(result, dict) or result.get("status") == "success":
+        return result
+
+    task_id = task.get("task_id") or result.get("task_id") or ""
+    current_task = get_task(task_id) if task_id else {}
+    task_context = {**task, **(current_task or {})}
+
+    project_path = result.get("project_path") or task_context.get("project_path")
+    if not project_path or not os.path.isdir(project_path):
+        return result
+
+    existing_apk = find_existing_built_apk(project_path)
+    if not existing_apk:
+        return result
+
+    package_name = result.get("package_name") or task_context.get("package_name") or ""
+    build_spec = result.get("build_spec") if isinstance(result.get("build_spec"), dict) else {}
+    if not build_spec:
+        build_spec = parse_json_object_field(task_context.get("final_app_spec")) or {}
+
+    try:
+        if callback_log:
+            callback_log("🧪 실패 처리 전 기존 APK와 프로젝트 상태를 재검증합니다.")
+
+        preflight = run_static_preflight_checks(
+            project_path,
+            task_id=task_id,
+            package_name=package_name,
+        )
+        if preflight.get("status") != "pass":
+            if callback_log:
+                issues = preflight.get("issues") if isinstance(preflight.get("issues"), list) else []
+                callback_log(f"❌ 재검증 중 preflight 실패: {trim_context_text('; '.join(map(str, issues)), 280)}")
+            return result
+
+        analyze_ok, analyze_output = run_flutter_analyze(project_path)
+        if not analyze_ok:
+            if callback_log:
+                callback_log(f"❌ 재검증 중 analyze 실패: {extract_primary_failure_line(analyze_output)}")
+            return result
+
+        build_ok, build_res = run_flutter_build(project_path)
+        if not build_ok or not isinstance(build_res, str) or not os.path.isfile(build_res):
+            if callback_log:
+                callback_log(f"❌ 재검증 중 build 실패: {extract_primary_failure_line(str(build_res))}")
+            return result
+
+        verification = verify_release_external_data_gate(
+            project_path,
+            build_spec=build_spec,
+            task_id=task_id,
+            token_callback=log_token_usage,
+            callback_log=callback_log,
+        )
+        if verification.get("status") not in {"pass", "not_applicable"}:
+            if callback_log:
+                callback_log(f"❌ 재검증 중 핵심 기능 검증 실패: {verification.get('summary') or '검증 실패'}")
+            return result
+
+        if callback_log:
+            callback_log("✅ 기존 산출물 재검증 통과: 실패 상태를 성공으로 보정합니다.")
+
+        return {
+            **result,
+            "status": "success",
+            "app_name": result.get("app_name") or task_context.get("generated_app_name") or task_context.get("app_name") or "생성 앱",
+            "apk_path": build_res,
+            "project_path": project_path,
+            "package_name": package_name,
+            "build_spec": build_spec,
+            "verification_status": verification.get("status"),
+            "verification_summary": verification.get("summary") or "재검증 통과",
+            "verification_report": verification,
+            "reconciled_from_failure": True,
+        }
+    except Exception as exc:
+        if callback_log:
+            callback_log(f"⚠️ 기존 산출물 재검증 중 예외: {trim_context_text(str(exc), 280)}")
+        return result
 
 
 FUNCTION_CALLING_FALLBACK_REMOVAL_PLAN = [
@@ -2859,7 +3678,6 @@ def increment_build_attempts(task_id: str):
             (task_id,)
         )
         conn.commit()
-    record_task_state_history(task_id, event_type="build_attempt_incremented")
 
 def can_access_task(
     task: Dict[str, Any],
@@ -2906,6 +3724,45 @@ def build_access_denied_reason(
     if normalize_phone_number(task.get("phone_number")) and normalized_phone_number:
         return "phone_number_mismatch"
     return "identity_missing_on_task"
+
+
+def maybe_rebind_task_device(
+    task: Dict[str, Any],
+    *,
+    device_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    phone_number: Optional[str] = None,
+) -> bool:
+    task_id = (task.get("task_id") or "").strip()
+    normalized_device_id = (device_id or "").strip()
+    if not task_id or not normalized_device_id:
+        return False
+
+    current_device_id = (task.get("device_id") or "").strip()
+    if current_device_id == normalized_device_id:
+        return False
+
+    task_user_id = (task.get("user_id") or "").strip()
+    normalized_user_id = (user_id or "").strip()
+    task_phone_number = normalize_phone_number(task.get("phone_number"))
+    normalized_phone_number = normalize_phone_number(phone_number)
+    matched_by_stable_identity = (
+        (task_user_id and normalized_user_id and task_user_id == normalized_user_id)
+        or (task_phone_number and normalized_phone_number and task_phone_number == normalized_phone_number)
+    )
+    if not matched_by_stable_identity:
+        return False
+
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET device_id=? WHERE task_id=?",
+            (normalized_device_id, task_id)
+        )
+        conn.commit()
+
+    task["device_id"] = normalized_device_id
+    return True
 
 
 def log_device_access(endpoint: str, *, task_id: Optional[str] = None, received_device_id: Optional[str] = None, stored_device_id: Optional[str] = None, reason: str = "ok"):
@@ -3017,6 +3874,8 @@ def format_build_input(user_prompt: str, tool_args: Dict[str, Any]) -> str:
         build_payload["research_query"] = tool_args.get("research_query", "")
     if tool_args.get("research_results"):
         build_payload["research_results"] = tool_args.get("research_results", [])
+    if tool_args.get("research_context"):
+        build_payload["research_context"] = tool_args.get("research_context", {})
     return json.dumps(build_payload, ensure_ascii=False, indent=2)
 
 
@@ -3058,7 +3917,18 @@ def materialize_reference_image(
     task_id: Optional[str],
 ) -> Optional[str]:
     if isinstance(reference_image_path, str) and reference_image_path.strip():
-        return reference_image_path.strip()
+        candidate_path = os.path.abspath(reference_image_path.strip())
+        allowed_roots = [
+            os.path.abspath(root)
+            for root in [tempfile.gettempdir(), BUILD_ROOT_DIR]
+            if isinstance(root, str) and root.strip()
+        ]
+        if (
+            os.path.isfile(candidate_path)
+            and any(os.path.commonpath([root, candidate_path]) == root for root in allowed_roots)
+        ):
+            return candidate_path
+        return None
     if not isinstance(reference_image_base64, str) or not reference_image_base64.strip():
         return None
     safe_name = os.path.basename((reference_image_name or "reference.png").strip() or "reference.png")
@@ -3210,19 +4080,19 @@ def build_api_research_clarification_response(
     questions = []
     if reason in {"search_failed", "fetch_failed", "quality_failed", "weak_api_reference"}:
         questions.append(
-            "공식 API 문서 URL이나 OpenAPI/Swagger 명세 URL을 제공할 수 있을까요?"
+            "무료 공개 API나 공개 웹페이지 파싱 후보를 찾지 못했습니다. 사용할 공식 데이터/API URL이 있을까요?"
         )
     if auth_required:
         questions.append(
-            "이 API는 인증이 필요한 것으로 보여요. 실제 키를 앱에 연결해야 하나요, 아니면 사용자가 앱 안에서 API 키를 입력하는 구조로 만들까요?"
+            "무키 공개 API와 웹 크롤링 대안을 먼저 확인했지만 부족했습니다. 이 기능은 사용자가 앱 안에서 API 키를 입력하는 구조로 진행해도 될까요?"
         )
     questions.append(
-        "공식 문서나 API 키를 제공하기 어렵다면, 우선 샘플 데이터 기반 프로토타입으로 만들까요?"
+        "공식 데이터 출처를 제공하기 어렵다면, 외부 연동 없이 수동 입력/오프라인 데이터 기반 앱으로 좁혀서 만들까요?"
     )
     questions = questions[:3]
     summary = (
-        f"'{research_query or user_prompt}' 관련 API 정보를 확인했지만, "
-        "앱에 안전하게 반영하기에는 공식 문서나 인증 방식 확인이 더 필요합니다."
+        f"'{research_query or user_prompt}' 관련 무료 공개 API와 공개 웹페이지 파싱 후보를 확인했지만, "
+        "앱에 안정적으로 반영할 수 있는 출처를 확정하지 못했습니다."
     )
     update_task(
         task_id,
@@ -3271,17 +4141,253 @@ def build_api_research_clarification_response(
     return response
 
 
+def try_public_api_then_web_fallback(
+    *,
+    task_id: str,
+    raw_user_message: str,
+    user_prompt: str,
+    research_query: str,
+    api_source_strategy: Optional[Dict[str, Any]] = None,
+    failure_reason: str = "",
+) -> Optional[Dict[str, Any]]:
+    strategy = dict(api_source_strategy or {})
+    strategy["prefer_public_no_key"] = True
+    strategy["public_api_search_query"] = (
+        strategy.get("public_api_search_query")
+        or f"{research_query} free public API no key official documentation"
+    )
+    strategy["fallback_api_search_query"] = (
+        strategy.get("fallback_api_search_query")
+        or f"{research_query} public API no authentication"
+    )
+    strategy["reason"] = (
+        strategy.get("reason")
+        or "무료 무키 공개 API를 먼저 확인하고, 실패하면 공개 웹페이지 파싱 가능성을 확인합니다."
+    )
+
+    append_log(
+        task_id,
+        "🧭 API fallback 순서 실행\n"
+        "1) 무료/무키 공개 API 탐색\n"
+        "2) 공개 웹페이지 크롤링 가능성 확인\n"
+        "3) 둘 다 실패하면 사용자에게 출처 확인 질문"
+        f"\n직전 실패: {failure_reason or 'unknown'}"
+    )
+
+    api_search_results = [
+        search_api_docs(
+            strategy["public_api_search_query"],
+            api_name=research_query,
+            task_id=task_id,
+            max_results=5,
+        )
+    ]
+    fallback_query = strategy.get("fallback_api_search_query") or ""
+    if fallback_query and fallback_query != strategy["public_api_search_query"]:
+        api_search_results.append(
+            search_api_docs(
+                fallback_query,
+                api_name=research_query,
+                task_id=task_id,
+                max_results=5,
+            )
+        )
+    api_search_result = _merge_search_results(*api_search_results)
+    api_candidates: List[Dict[str, Any]] = []
+    fetched_pages: List[Dict[str, Any]] = []
+    for item in api_search_result.get("results", [])[:5]:
+        candidate_url = item.get("url") or ""
+        if not candidate_url:
+            continue
+        if looks_like_openapi_reference_url(candidate_url):
+            page_result = parse_openapi_reference(candidate_url, task_id=task_id)
+            source_kind = "openapi_parse"
+            if page_result.get("status") != "success":
+                page_result = fetch_api_reference(candidate_url, task_id=task_id)
+                source_kind = "api_fetch"
+        else:
+            source_kind = "api_fetch" if looks_like_api_reference_url(candidate_url) else "generic_fetch"
+            page_result = (
+                fetch_api_reference(candidate_url, task_id=task_id)
+                if source_kind == "api_fetch"
+                else fetch_webpage(candidate_url, task_id=task_id)
+            )
+        if page_result.get("status") != "success":
+            continue
+        fetched_pages.append(page_result)
+        quality = evaluate_research_quality(
+            research_query,
+            [item],
+            [page_result],
+            direct_fetch=False,
+            task_id=task_id,
+            build_spec=None,
+        )
+        api_candidates.append(_build_api_source_candidate(item, page_result, quality, source_kind))
+
+    _append_deterministic_public_no_key_candidates(api_candidates, research_query, strategy)
+    public_candidate = _best_public_no_key_api_candidate(api_candidates)
+    if public_candidate:
+        append_log(
+            task_id,
+            "✅ 무료/무키 공개 API fallback 선택\n"
+            f"- {public_candidate.get('final_url') or public_candidate.get('url')}"
+        )
+        selected_page = public_candidate.get("page_result") or {}
+        selected_result = public_candidate.get("search_result") or {}
+        return {
+            "mode": "api",
+            "selected_source_payload": public_candidate,
+            "supporting_sources": [candidate for candidate in api_candidates if candidate is not public_candidate],
+            "fetched_pages": [selected_page] if selected_page else fetched_pages[:1],
+            "research_result": {
+                "status": "success",
+                "query": research_query,
+                "results": [selected_result] if selected_result else api_search_result.get("results", [])[:1],
+                "fallback_used": "public_no_key_api",
+            },
+            "top_sources": [
+                public_candidate.get("final_url")
+                or public_candidate.get("url")
+            ],
+            "web_data_analyses": [],
+        }
+
+    llm_candidate, usage = propose_public_no_key_api_candidate_with_llm(
+        task_id=task_id,
+        raw_user_message=raw_user_message,
+        user_prompt=user_prompt,
+        research_query=research_query,
+        api_source_strategy=strategy,
+        search_error=failure_reason or "public_no_key_candidate_not_found",
+    )
+    log_token_usage(task_id, "Public_No_Key_API_Candidate", usage)
+    if llm_candidate:
+        append_log(
+            task_id,
+            "✅ 모델 지식 기반 무료/무키 공개 API fallback 선택\n"
+            f"- {llm_candidate.get('final_url') or llm_candidate.get('url')}"
+        )
+        selected_page = llm_candidate.get("page_result") or {}
+        selected_result = llm_candidate.get("search_result") or {}
+        return {
+            "mode": "api",
+            "selected_source_payload": llm_candidate,
+            "supporting_sources": api_candidates[:4],
+            "fetched_pages": [selected_page] if selected_page else [],
+            "research_result": {
+                "status": "success",
+                "query": research_query,
+                "results": [selected_result] if selected_result else [],
+                "fallback_used": "llm_public_no_key_api_candidate",
+            },
+            "top_sources": [llm_candidate.get("final_url") or llm_candidate.get("url")],
+            "web_data_analyses": [],
+        }
+
+    web_queries = [
+        f"{research_query} official data page",
+        f"{research_query} public data webpage",
+        user_prompt,
+    ]
+    web_results = [
+        search_web_reference(query, task_id=task_id, max_results=5)
+        for query in web_queries
+        if isinstance(query, str) and query.strip()
+    ]
+    web_search_result = _merge_search_results(*web_results)
+    web_top_sources = [
+        item.get("url")
+        for item in web_search_result.get("results", [])
+        if isinstance(item, dict) and item.get("url")
+    ]
+    web_fetched_pages: List[Dict[str, Any]] = []
+    web_data_analyses: List[Dict[str, Any]] = []
+    seen_urls = set()
+    for url in web_top_sources[:5]:
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        page = fetch_webpage(url, task_id=task_id, max_chars=16000)
+        if page.get("status") != "success":
+            continue
+        web_fetched_pages.append(page)
+        analysis = analyze_web_data_source(
+            page.get("final_url") or url,
+            user_goal=f"{user_prompt}\n{research_query}",
+            page_result=page,
+            task_id=task_id,
+        )
+        web_data_analyses.append(analysis)
+
+    selected_web_data_analysis = _best_web_data_analysis(web_data_analyses)
+    if selected_web_data_analysis and selected_web_data_analysis.get("sample_records"):
+        selected_url = selected_web_data_analysis.get("final_url") or selected_web_data_analysis.get("url") or ""
+        selected_page = next(
+            (
+                page for page in web_fetched_pages
+                if (page.get("final_url") or page.get("url") or "") == selected_url
+            ),
+            web_fetched_pages[0] if web_fetched_pages else {},
+        )
+        selected_source = {
+            "title": selected_web_data_analysis.get("title") or selected_page.get("title") or "공개 웹 데이터 출처",
+            "url": selected_url,
+            "final_url": selected_url,
+            "source_type": "generic_web",
+            "source_kind": "web_data_analyze",
+            "web_data_analysis": selected_web_data_analysis,
+            "page_result": selected_page,
+            "search_result": {
+                "title": selected_web_data_analysis.get("title") or selected_page.get("title") or "공개 웹 데이터 출처",
+                "url": selected_url,
+                "snippet": json.dumps((selected_web_data_analysis.get("sample_records") or [])[:2], ensure_ascii=False)[:300],
+                "source_type": "generic_web",
+            },
+        }
+        append_log(
+            task_id,
+            "✅ 공개 웹페이지 크롤링 fallback 선택\n"
+            f"- {selected_url}\n"
+            f"- samples={len(selected_web_data_analysis.get('sample_records') or [])}"
+        )
+        return {
+            "mode": "web_scrape",
+            "selected_source_payload": selected_source,
+            "supporting_sources": [],
+            "fetched_pages": web_fetched_pages,
+            "research_result": {
+                "status": "success",
+                "query": research_query,
+                "results": [selected_source["search_result"]],
+                "fallback_used": "web_scrape",
+            },
+            "top_sources": web_top_sources,
+            "web_data_analyses": web_data_analyses,
+        }
+
+    append_log(
+        task_id,
+        "⚠️ API fallback 실패\n"
+        "- 무료/무키 공개 API 후보 없음\n"
+        "- 공개 웹페이지 크롤링 샘플 추출 실패"
+    )
+    return None
+
+
 def build_task_summary_payload(task: Dict[str, Any]) -> Dict[str, Any]:
     conversation_state = get_conversation_state(task)
     progress_mode = (task.get("active_flow") or "").strip()
+    current_status = normalize_task_status(task.get("status"))
+    display_app_name = derive_task_display_app_name(task)
     return {
         "task_id": task.get("task_id") or "",
-        "status": normalize_task_status(task.get("status")),
+        "status": current_status,
         "status_display_text": get_status_display_text(task.get("status"), progress_mode),
-        "generated_app_name": (task.get("generated_app_name") or task.get("app_name") or ""),
+        "generated_app_name": display_app_name,
         "package_name": task.get("package_name") or "",
         "initial_user_prompt": task.get("initial_user_prompt") or conversation_state.get("initial_user_prompt") or "",
-        "apk_url": task.get("apk_url") or "",
+        "apk_url": build_download_url(task) if current_status == TaskStatus.SUCCESS else (task.get("apk_url") or ""),
         "build_success": to_bool(task.get("build_success")) if task.get("build_success") is not None else False,
         "created_at": task.get("created_at") or "",
         "updated_at": task.get("updated_at") or "",
@@ -3392,6 +4498,8 @@ def route_generate_decision(
         decision,
         user_prompt=user_prompt,
         raw_user_message=raw_user_message,
+        task_id=task_id,
+        token_callback=log_token_usage,
     )
     tool_name = decision["tool"]
     tool_args = decision["arguments"]
@@ -3571,6 +4679,31 @@ def route_generate_decision(
         api_reference_fetch = direct_fetch and looks_like_api_reference_url(research_query)
         openapi_reference_fetch = direct_fetch and looks_like_openapi_reference_url(research_query)
         api_search = (not direct_fetch) and looks_like_api_integration_request(user_prompt, research_query)
+        api_source_strategy: Dict[str, Any] = {}
+        intent_build_spec = normalize_runtime_build_spec(tool_args.get("build_spec") or {})
+        intent_source_constraints, source_constraint_usage, source_constraint_error = extract_source_selection_constraints_with_llm(
+            raw_user_message or user_prompt,
+            task_id=task_id,
+            fallback_existing=(
+                intent_build_spec.get("source_selection_constraints")
+                if isinstance(intent_build_spec.get("source_selection_constraints"), dict)
+                else {}
+            ),
+        )
+        log_token_usage(task_id, "Source_Constraint_Extractor", source_constraint_usage)
+        if source_constraint_error:
+            append_log(task_id, f"⚠️ 출처 제약 추출 fallback 사용: {source_constraint_error}")
+        intent_build_spec["source_selection_constraints"] = intent_source_constraints
+        tool_args["build_spec"] = intent_build_spec
+        if api_search:
+            api_source_strategy, api_source_strategy_usage = choose_api_source_strategy_with_llm(
+                task_id=task_id,
+                raw_user_message=raw_user_message,
+                user_prompt=user_prompt,
+                research_query=research_query,
+                tool_args=tool_args,
+            )
+            log_token_usage(task_id, "API_Source_Strategy", api_source_strategy_usage)
         top_sources: List[str] = []
         append_log(task_id, f"🔎 외부 정보 탐색 시작\n질의: {research_query}\n사유: {research_reason}")
 
@@ -3578,6 +4711,46 @@ def route_generate_decision(
         selected_source_payload: Optional[Dict[str, Any]] = None
         supporting_sources: List[Dict[str, Any]] = []
         web_data_analyses: List[Dict[str, Any]] = []
+        fallback_mode = ""
+
+        def apply_public_api_or_web_fallback(reason: str) -> bool:
+            nonlocal research_result, top_sources, fetched_pages, selected_source_payload
+            nonlocal supporting_sources, web_data_analyses, fallback_mode
+            fallback = try_public_api_then_web_fallback(
+                task_id=task_id,
+                raw_user_message=raw_user_message,
+                user_prompt=user_prompt,
+                research_query=research_query,
+                api_source_strategy=api_source_strategy,
+                failure_reason=reason,
+            )
+            if not fallback:
+                return False
+            research_result = fallback.get("research_result") or {
+                "status": "success",
+                "query": research_query,
+                "results": [],
+            }
+            top_sources = [
+                url for url in (fallback.get("top_sources") or [])
+                if isinstance(url, str) and url.strip()
+            ]
+            fetched_pages = [
+                page for page in (fallback.get("fetched_pages") or [])
+                if isinstance(page, dict)
+            ]
+            selected_source_payload = fallback.get("selected_source_payload")
+            supporting_sources = [
+                source for source in (fallback.get("supporting_sources") or [])
+                if isinstance(source, dict)
+            ]
+            web_data_analyses = [
+                analysis for analysis in (fallback.get("web_data_analyses") or [])
+                if isinstance(analysis, dict)
+            ]
+            fallback_mode = fallback.get("mode") or ""
+            return bool(selected_source_payload)
+
         if direct_fetch:
             if openapi_reference_fetch:
                 page_result = parse_openapi_reference(research_query, task_id=task_id)
@@ -3592,7 +4765,10 @@ def route_generate_decision(
             if page_result.get("status") != "success":
                 fetch_error = page_result.get("error") or "웹 페이지를 읽지 못했습니다."
                 append_log(task_id, f"🚨 웹 페이지 읽기 실패: {fetch_error}")
-                if api_reference_fetch or openapi_reference_fetch or looks_like_api_integration_request(user_prompt, research_query):
+                fallback_applied = apply_public_api_or_web_fallback("fetch_failed")
+                if fallback_applied:
+                    append_log(task_id, "🔁 직접 URL 실패 후 fallback 출처로 계속 진행합니다.")
+                elif api_reference_fetch or openapi_reference_fetch or looks_like_api_integration_request(user_prompt, research_query):
                     return build_api_research_clarification_response(
                         task_id=task_id,
                         reason="fetch_failed",
@@ -3602,89 +4778,145 @@ def route_generate_decision(
                         image_conflict_note=image_conflict_note,
                         used_external_sources=[research_query],
                     )
-                update_task(
+                elif not fallback_applied:
+                    update_task(
+                        task_id,
+                        status=TaskStatus.ERROR,
+                        app_name="웹 페이지 읽기 실패",
+                        build_success=0,
+                    )
+                    response = build_generate_response(
+                        task_id=task_id,
+                        status=TaskStatus.ERROR,
+                        tool=tool_name,
+                        message=f"웹 페이지 읽기 단계에 실패했습니다. {fetch_error}",
+                        image_reference_summary=image_reference_summary,
+                        image_conflict_note=image_conflict_note,
+                    )
+                    record_assistant_response(task_id=task_id, message_type="web_research_error", endpoint="/generate", content=response["message"], payload={**response, "research_query": research_query})
+                    return response
+            if page_result.get("status") == "success":
+                fetched_pages.append(page_result)
+                research_result = {
+                    "status": "success",
+                    "query": research_query,
+                    "results": [{
+                        "title": page_result.get("title") or research_query,
+                        "url": page_result.get("final_url") or research_query,
+                        "snippet": (page_result.get("text_content") or "")[:300],
+                    }],
+                }
+                top_sources = [page_result.get("final_url") or research_query]
+                append_log(
                     task_id,
-                    status=TaskStatus.ERROR,
-                    app_name="웹 페이지 읽기 실패",
-                    build_success=0,
+                    f"{'🧩 OpenAPI 명세 확보' if openapi_reference_fetch else ('🧾 API 레퍼런스 확보' if api_reference_fetch else '📄 웹 페이지 확보')}\n- {page_result.get('final_url') or research_query}"
                 )
-                response = build_generate_response(
-                    task_id=task_id,
-                    status=TaskStatus.ERROR,
-                    tool=tool_name,
-                    message=f"웹 페이지 읽기 단계에 실패했습니다. {fetch_error}",
-                    image_reference_summary=image_reference_summary,
-                    image_conflict_note=image_conflict_note,
-                )
-                record_assistant_response(task_id=task_id, message_type="web_research_error", endpoint="/generate", content=response["message"], payload={**response, "research_query": research_query})
-                return response
-            fetched_pages.append(page_result)
-            research_result = {
-                "status": "success",
-                "query": research_query,
-                "results": [{
+                selected_source_payload = {
                     "title": page_result.get("title") or research_query,
                     "url": page_result.get("final_url") or research_query,
-                    "snippet": (page_result.get("text_content") or "")[:300],
-                }],
-            }
-            top_sources = [page_result.get("final_url") or research_query]
-            append_log(
-                task_id,
-                f"{'🧩 OpenAPI 명세 확보' if openapi_reference_fetch else ('🧾 API 레퍼런스 확보' if api_reference_fetch else '📄 웹 페이지 확보')}\n- {page_result.get('final_url') or research_query}"
-            )
-            selected_source_payload = {
-                "title": page_result.get("title") or research_query,
-                "url": page_result.get("final_url") or research_query,
-                "final_url": page_result.get("final_url") or research_query,
-                "source_type": "api_reference" if (api_reference_fetch or openapi_reference_fetch) else "generic_web",
-                "source_kind": "openapi_parse" if openapi_reference_fetch else ("api_fetch" if api_reference_fetch else "generic_fetch"),
-                "page_result": page_result,
-                "search_result": research_result["results"][0],
-            }
+                    "final_url": page_result.get("final_url") or research_query,
+                    "source_type": "api_reference" if (api_reference_fetch or openapi_reference_fetch) else "generic_web",
+                    "source_kind": "openapi_parse" if openapi_reference_fetch else ("api_fetch" if api_reference_fetch else "generic_fetch"),
+                    "page_result": page_result,
+                    "search_result": research_result["results"][0],
+                }
         else:
-            research_result = (
-                search_api_docs(research_query, api_name=research_query, task_id=task_id, max_results=5)
-                if api_search
-                else search_web_reference(research_query, task_id=task_id, max_results=5)
-            )
+            if api_search:
+                api_search_results: List[Dict[str, Any]] = []
+                public_api_query = (api_source_strategy.get("public_api_search_query") or "").strip()
+                fallback_api_query = (api_source_strategy.get("fallback_api_search_query") or "").strip()
+                if api_source_strategy.get("prefer_public_no_key") and public_api_query:
+                    append_log(
+                        task_id,
+                        "🔓 무키 공개 API 우선 탐색\n"
+                        f"- query={public_api_query}\n"
+                        f"- reason={api_source_strategy.get('reason') or 'public_no_key_preferred'}"
+                    )
+                    api_search_results.append(
+                        search_api_docs(public_api_query, api_name=research_query, task_id=task_id, max_results=5)
+                    )
+                if fallback_api_query and fallback_api_query != public_api_query:
+                    api_search_results.append(
+                        search_api_docs(fallback_api_query, api_name=research_query, task_id=task_id, max_results=5)
+                    )
+                if not api_search_results:
+                    api_search_results.append(
+                        search_api_docs(research_query, api_name=research_query, task_id=task_id, max_results=5)
+                    )
+                research_result = _merge_search_results(*api_search_results)
+            else:
+                research_result = search_web_reference(research_query, task_id=task_id, max_results=5)
             if research_result.get("status") != "success" or not research_result.get("results"):
                 search_error = research_result.get("error") or "검색 결과를 찾지 못했습니다."
                 append_log(task_id, f"🚨 웹 검색 실패: {search_error}")
                 if api_search:
-                    return build_api_research_clarification_response(
+                    selected_source_payload, public_api_candidate_usage = propose_public_no_key_api_candidate_with_llm(
                         task_id=task_id,
-                        reason="search_failed",
-                        research_query=research_query,
+                        raw_user_message=raw_user_message,
                         user_prompt=user_prompt,
+                        research_query=research_query,
+                        api_source_strategy=api_source_strategy,
+                        search_error=search_error,
+                    )
+                    log_token_usage(task_id, "Public_No_Key_API_Candidate", public_api_candidate_usage)
+                    if selected_source_payload:
+                        selected_page = selected_source_payload.get("page_result") or {}
+                        selected_result = selected_source_payload.get("search_result") or {}
+                        fetched_pages = [selected_page] if selected_page else []
+                        top_sources = [
+                            selected_source_payload.get("final_url")
+                            or selected_source_payload.get("url")
+                        ]
+                        research_result = {
+                            "status": "success",
+                            "query": research_query,
+                            "results": [selected_result] if selected_result else [],
+                            "fallback_used": "llm_public_no_key_api_candidate",
+                        }
+                        append_log(
+                            task_id,
+                            "🧭 검색 실패 fallback 적용\n"
+                            f"- source={selected_source_payload.get('title')}\n"
+                            f"- url={selected_source_payload.get('final_url') or selected_source_payload.get('url')}\n"
+                            "- auth=public_no_key"
+                        )
+                    else:
+                        fallback_applied = apply_public_api_or_web_fallback("search_failed")
+                        if not fallback_applied:
+                            return build_api_research_clarification_response(
+                                task_id=task_id,
+                                reason="search_failed",
+                                research_query=research_query,
+                                user_prompt=user_prompt,
+                                image_reference_summary=image_reference_summary,
+                                image_conflict_note=image_conflict_note,
+                            )
+                if not selected_source_payload:
+                    update_task(
+                        task_id,
+                        status=TaskStatus.ERROR,
+                        app_name="검색 실패",
+                        build_success=0,
+                    )
+                    response = build_generate_response(
+                        task_id=task_id,
+                        status=TaskStatus.ERROR,
+                        tool=tool_name,
+                        message=f"웹 검색 단계에 실패했습니다. {search_error}",
                         image_reference_summary=image_reference_summary,
                         image_conflict_note=image_conflict_note,
                     )
-                update_task(
-                    task_id,
-                    status=TaskStatus.ERROR,
-                    app_name="검색 실패",
-                    build_success=0,
-                )
-                response = build_generate_response(
-                    task_id=task_id,
-                    status=TaskStatus.ERROR,
-                    tool=tool_name,
-                    message=f"웹 검색 단계에 실패했습니다. {search_error}",
-                    image_reference_summary=image_reference_summary,
-                    image_conflict_note=image_conflict_note,
-                )
-                record_assistant_response(
-                    task_id=task_id,
-                    message_type="web_research_error",
-                    endpoint="/generate",
-                    content=response["message"],
-                    payload={
-                        **response,
-                        "research_query": research_query,
-                    },
-                )
-                return response
+                    record_assistant_response(
+                        task_id=task_id,
+                        message_type="web_research_error",
+                        endpoint="/generate",
+                        content=response["message"],
+                        payload={
+                            **response,
+                            "research_query": research_query,
+                        },
+                    )
+                    return response
 
             top_sources = [item.get("url") for item in research_result.get("results", []) if item.get("url")]
             append_log(
@@ -3692,7 +4924,7 @@ def route_generate_decision(
                 f"{'🧾 API 문서 검색 결과 확보' if api_search else '🌐 웹 검색 결과 확보'}\n"
                 + "\n".join([f"- {url}" for url in top_sources[:3]])
             )
-            if api_search and top_sources:
+            if api_search and top_sources and not selected_source_payload:
                 api_candidates: List[Dict[str, Any]] = []
                 fetch_limit = min(3, len(research_result.get("results", [])))
                 for item in research_result.get("results", [])[:fetch_limit]:
@@ -3721,17 +4953,40 @@ def route_generate_decision(
                         [page_result],
                         direct_fetch=False,
                         task_id=task_id,
+                        build_spec=tool_args.get("build_spec") or {},
                     )
                     api_candidates.append(
                         _build_api_source_candidate(item, page_result, candidate_quality, source_kind)
                     )
 
-                selection = select_best_api_source(research_query, api_candidates, task_id=task_id)
-                selected_source_payload = selection.get("selected_source")
-                supporting_sources = [
-                    item for item in selection.get("rejected_sources", [])
-                    if isinstance(item, dict)
-                ]
+                _append_deterministic_public_no_key_candidates(
+                    api_candidates,
+                    research_query,
+                    api_source_strategy,
+                )
+                public_no_key_candidate = _best_public_no_key_api_candidate(api_candidates)
+                if api_source_strategy.get("prefer_public_no_key") and public_no_key_candidate:
+                    selected_source_payload = public_no_key_candidate
+                    supporting_sources = [
+                        candidate for candidate in api_candidates
+                        if candidate is not public_no_key_candidate
+                    ]
+                    selection = {
+                        "selection_reason": "공식 문서 품질을 통과했고 인증 요구가 감지되지 않아 무키 공개 API 후보를 우선 선택했습니다.",
+                        "confidence": _candidate_quality_score(public_no_key_candidate),
+                    }
+                else:
+                    selection = select_best_api_source(
+                        research_query,
+                        api_candidates,
+                        task_id=task_id,
+                        build_spec=tool_args.get("build_spec") or {},
+                    )
+                    selected_source_payload = selection.get("selected_source")
+                    supporting_sources = [
+                        item for item in selection.get("rejected_sources", [])
+                        if isinstance(item, dict)
+                    ]
                 if selected_source_payload:
                     selected_page = selected_source_payload.get("page_result") or {}
                     selected_result = selected_source_payload.get("search_result") or {}
@@ -3742,13 +4997,39 @@ def route_generate_decision(
                     }
                     append_log(
                         task_id,
-                        "🎯 대표 API 소스 선택\n"
+                        f"{'🔓 무키 공개 API 소스 선택' if public_no_key_candidate is selected_source_payload else '🎯 대표 API 소스 선택'}\n"
                         f"- {selected_source_payload.get('final_url') or selected_source_payload.get('url')}\n"
                         f"- 사유: {selection.get('selection_reason')}\n"
                         f"- 신뢰도: {selection.get('confidence')}"
                     )
                 else:
-                    fetched_pages = []
+                    selected_source_payload, public_api_candidate_usage = propose_public_no_key_api_candidate_with_llm(
+                        task_id=task_id,
+                        raw_user_message=raw_user_message,
+                        user_prompt=user_prompt,
+                        research_query=research_query,
+                        api_source_strategy=api_source_strategy,
+                        search_error="quality_passing_source_not_found",
+                    )
+                    log_token_usage(task_id, "Public_No_Key_API_Candidate", public_api_candidate_usage)
+                    if selected_source_payload:
+                        selected_page = selected_source_payload.get("page_result") or {}
+                        selected_result = selected_source_payload.get("search_result") or {}
+                        fetched_pages = [selected_page] if selected_page else []
+                        research_result = {
+                            **research_result,
+                            "results": [selected_result] if selected_result else research_result.get("results", [])[:1],
+                            "fallback_used": "llm_public_no_key_api_candidate",
+                        }
+                        append_log(
+                            task_id,
+                            "🧭 API 소스 선택 fallback 적용\n"
+                            f"- source={selected_source_payload.get('title')}\n"
+                            f"- url={selected_source_payload.get('final_url') or selected_source_payload.get('url')}\n"
+                            "- auth=public_no_key"
+                        )
+                    else:
+                        fetched_pages = []
             elif top_sources:
                 if looks_like_openapi_reference_url(top_sources[0]):
                     page_result = parse_openapi_reference(top_sources[0], task_id=task_id)
@@ -3776,7 +5057,10 @@ def route_generate_decision(
                         f"{'🧩 대표 OpenAPI 명세 확인' if looks_like_openapi_reference_url(top_sources[0]) else ('🧾 대표 API 레퍼런스 확인' if (api_search or looks_like_api_reference_url(top_sources[0])) else '📄 대표 웹 페이지 확인')}\n- {page_result.get('final_url') or top_sources[0]}"
                     )
 
-        runtime_web_data_request = looks_like_runtime_web_data_request(user_prompt, research_query) and not api_search
+        runtime_web_data_request = (
+            (looks_like_runtime_web_data_request(user_prompt, research_query) and not api_search)
+            or fallback_mode == "web_scrape"
+        )
         if runtime_web_data_request:
             analysis_pages: List[Dict[str, Any]] = list(fetched_pages)
             fetched_page_urls = {
@@ -3875,6 +5159,7 @@ def route_generate_decision(
             fetched_pages,
             direct_fetch=direct_fetch,
             task_id=task_id,
+            build_spec=tool_args.get("build_spec") or {},
         )
         http_probe_result: Optional[Dict[str, Any]] = None
         if quality.get("research_quality_passed") and selected_source_payload:
@@ -3939,56 +5224,145 @@ def route_generate_decision(
         )
         if not quality.get("research_quality_passed"):
             if api_search or api_reference_fetch or openapi_reference_fetch:
+                fallback_applied = apply_public_api_or_web_fallback("quality_failed")
+                if fallback_applied:
+                    runtime_web_data_request = fallback_mode == "web_scrape"
+                    quality = evaluate_research_quality(
+                        research_query,
+                        research_result.get("results", []),
+                        fetched_pages,
+                        direct_fetch=False,
+                        task_id=task_id,
+                        build_spec=tool_args.get("build_spec") or {},
+                    )
+                    append_log(
+                        task_id,
+                        f"🧪 fallback 외부 정보 품질 {'통과' if quality.get('research_quality_passed') else '실패'}\n"
+                        f"사유: {quality.get('research_quality_reason')}"
+                    )
+                if not quality.get("research_quality_passed"):
+                    return build_api_research_clarification_response(
+                        task_id=task_id,
+                        reason="quality_failed",
+                        research_query=research_query,
+                        user_prompt=user_prompt,
+                        image_reference_summary=image_reference_summary,
+                        image_conflict_note=image_conflict_note,
+                        used_external_sources=quality.get("used_external_sources", []),
+                    )
+            if not quality.get("research_quality_passed"):
+                update_task(
+                    task_id,
+                    status=TaskStatus.ERROR,
+                    app_name="외부 정보 품질 부족",
+                    build_success=0,
+                )
+                reason_text = quality.get("research_quality_reason") or "research_quality_failed"
+                response = build_generate_response(
+                    task_id=task_id,
+                    status=TaskStatus.ERROR,
+                    tool=tool_name,
+                    message=f"외부 참고 정보의 관련성이나 본문 품질이 충분하지 않아 앱 설계를 진행하지 않았습니다. ({reason_text})",
+                    image_reference_summary=image_reference_summary,
+                    image_conflict_note=image_conflict_note,
+                )
+                record_assistant_response(
+                    task_id=task_id,
+                    message_type="web_research_quality_error",
+                    endpoint="/generate",
+                    content=response["message"],
+                    payload={
+                        **response,
+                        "research_quality_passed": quality.get("research_quality_passed"),
+                        "research_quality_reason": quality.get("research_quality_reason"),
+                        "used_external_sources": quality.get("used_external_sources", []),
+                    },
+                )
+                return response
+
+        auth_required = _source_has_auth_requirement(selected_source_payload)
+        auth_resolution: Dict[str, Any] = {}
+        if auth_required:
+            auth_resolution, auth_resolution_usage = assess_api_auth_resolution_with_llm(
+                task_id=task_id,
+                raw_user_message=raw_user_message,
+                user_prompt=user_prompt,
+                tool_args=tool_args,
+                selected_source_payload=selected_source_payload,
+                quality=quality,
+            )
+            log_token_usage(task_id, "API_Auth_Resolution", auth_resolution_usage)
+
+        auth_handling = (auth_resolution.get("api_key_handling") or "").strip()
+        auth_needs_clarification = (
+            auth_required
+            and (
+                not auth_resolution.get("api_auth_resolved")
+                or auth_handling in {"server_proxy_required", "unknown"}
+            )
+        )
+        if (api_search or api_reference_fetch or openapi_reference_fetch) and auth_needs_clarification:
+            fallback_applied = apply_public_api_or_web_fallback("auth_required")
+            if fallback_applied:
+                runtime_web_data_request = fallback_mode == "web_scrape"
+                auth_required = _source_has_auth_requirement(selected_source_payload)
+                auth_resolution = {}
+                quality = evaluate_research_quality(
+                    research_query,
+                    research_result.get("results", []),
+                    fetched_pages,
+                    direct_fetch=False,
+                    task_id=task_id,
+                    build_spec=tool_args.get("build_spec") or {},
+                )
+                append_log(
+                    task_id,
+                    f"🔁 인증 필요 소스 대신 fallback 출처 사용\n"
+                    f"- mode={fallback_mode or 'unknown'}\n"
+                    f"- auth_required={auth_required}"
+                )
+                if not quality.get("research_quality_passed"):
+                    return build_api_research_clarification_response(
+                        task_id=task_id,
+                        reason="quality_failed",
+                        research_query=research_query,
+                        user_prompt=user_prompt,
+                        image_reference_summary=image_reference_summary,
+                        image_conflict_note=image_conflict_note,
+                        used_external_sources=quality.get("used_external_sources", []),
+                        auth_required=auth_required,
+                    )
+            if auth_required:
                 return build_api_research_clarification_response(
                     task_id=task_id,
-                    reason="quality_failed",
+                    reason="auth_required",
                     research_query=research_query,
                     user_prompt=user_prompt,
                     image_reference_summary=image_reference_summary,
                     image_conflict_note=image_conflict_note,
                     used_external_sources=quality.get("used_external_sources", []),
+                    auth_required=True,
                 )
-            update_task(
-                task_id,
-                status=TaskStatus.ERROR,
-                app_name="외부 정보 품질 부족",
-                build_success=0,
+        if auth_required and auth_resolution.get("api_auth_resolved"):
+            current_build_spec = normalize_runtime_build_spec(tool_args.get("build_spec") or {})
+            auth_updates = auth_resolution.get("build_spec_updates")
+            if isinstance(auth_updates, dict):
+                current_build_spec.update(auth_updates)
+            current_build_spec["api_key_handling"] = (
+                current_build_spec.get("api_key_handling")
+                or auth_resolution.get("api_key_handling")
+                or "unknown"
             )
-            reason_text = quality.get("research_quality_reason") or "research_quality_failed"
-            response = build_generate_response(
-                task_id=task_id,
-                status=TaskStatus.ERROR,
-                tool=tool_name,
-                message=f"외부 참고 정보의 관련성이나 본문 품질이 충분하지 않아 앱 설계를 진행하지 않았습니다. ({reason_text})",
-                image_reference_summary=image_reference_summary,
-                image_conflict_note=image_conflict_note,
+            current_build_spec["api_auth_strategy"] = (
+                current_build_spec.get("api_auth_strategy")
+                or auth_resolution.get("api_key_handling")
+                or "unknown"
             )
-            record_assistant_response(
-                task_id=task_id,
-                message_type="web_research_quality_error",
-                endpoint="/generate",
-                content=response["message"],
-                payload={
-                    **response,
-                    "research_quality_passed": quality.get("research_quality_passed"),
-                    "research_quality_reason": quality.get("research_quality_reason"),
-                    "used_external_sources": quality.get("used_external_sources", []),
-                },
-            )
-            return response
-
-        auth_required = _source_has_auth_requirement(selected_source_payload)
-        if (api_search or api_reference_fetch or openapi_reference_fetch) and auth_required:
-            return build_api_research_clarification_response(
-                task_id=task_id,
-                reason="auth_required",
-                research_query=research_query,
-                user_prompt=user_prompt,
-                image_reference_summary=image_reference_summary,
-                image_conflict_note=image_conflict_note,
-                used_external_sources=quality.get("used_external_sources", []),
-                auth_required=True,
-            )
+            if current_build_spec.get("api_key_handling") == "user_provided_in_app":
+                current_build_spec["requires_api_key_input_screen"] = True
+                current_build_spec["secret_storage_policy"] = "store_user_provided_key_locally_never_hardcode"
+                current_build_spec["api_key_error_handling_required"] = True
+            tool_args["build_spec"] = current_build_spec
 
         researched_build, research_usage, research_error = synthesize_researched_build(
             user_prompt,
@@ -3996,6 +5370,7 @@ def route_generate_decision(
                 "decision_summary": tool_args.get("summary") or "",
                 "research_query": research_query,
                 "research_reason": research_reason,
+                "api_source_strategy": api_source_strategy,
                 "results": research_result.get("results", []),
                 "fetched_pages": fetched_pages,
                 "openapi_references": [
@@ -4043,22 +5418,59 @@ def route_generate_decision(
             )
             return response
 
+        enriched_build_spec = _enrich_build_spec_with_selected_source(
+            _enrich_build_spec_with_web_data_contract(
+                researched_build.get("build_spec") or {},
+                _best_web_data_analysis(web_data_analyses),
+            ),
+            selected_source_payload,
+            runtime_web_data_request=runtime_web_data_request,
+            api_request=bool(api_search or api_reference_fetch or openapi_reference_fetch),
+        )
+        enriched_build_spec["source_selection_constraints"] = intent_source_constraints
         tool_args = {
             "summary": researched_build.get("summary") or tool_args.get("summary") or "",
-            "build_spec": _enrich_build_spec_with_selected_source(
-                _enrich_build_spec_with_web_data_contract(
-                    researched_build.get("build_spec") or {},
-                    _best_web_data_analysis(web_data_analyses),
-                ),
-                selected_source_payload,
-                runtime_web_data_request=runtime_web_data_request,
-                api_request=bool(api_search or api_reference_fetch or openapi_reference_fetch),
-            ),
+            "build_spec": enriched_build_spec,
             "research_query": research_query,
             "research_reason": research_reason,
             "research_results": research_result.get("results", []),
+            "research_context": _compact_research_context(
+                api_source_strategy=api_source_strategy,
+                selected_source_payload=selected_source_payload,
+                supporting_sources=supporting_sources,
+                fetched_pages=fetched_pages,
+                web_data_analyses=web_data_analyses,
+                http_probe_result=http_probe_result,
+                quality=quality,
+            ),
         }
         normalized_build_spec = normalize_runtime_build_spec(tool_args.get("build_spec") or {})
+        if auth_required and auth_resolution.get("api_auth_resolved"):
+            auth_updates = auth_resolution.get("build_spec_updates")
+            if isinstance(auth_updates, dict):
+                normalized_build_spec.update(auth_updates)
+            normalized_build_spec["api_key_handling"] = (
+                normalized_build_spec.get("api_key_handling")
+                or auth_resolution.get("api_key_handling")
+                or "unknown"
+            )
+            normalized_build_spec["api_auth_strategy"] = (
+                normalized_build_spec.get("api_auth_strategy")
+                or auth_resolution.get("api_key_handling")
+                or "unknown"
+            )
+            if normalized_build_spec.get("api_key_handling") == "user_provided_in_app":
+                normalized_build_spec["requires_api_key_input_screen"] = True
+                normalized_build_spec["secret_storage_policy"] = "store_user_provided_key_locally_never_hardcode"
+                normalized_build_spec["api_key_error_handling_required"] = True
+        if (
+            (api_search or api_reference_fetch or openapi_reference_fetch)
+            and selected_source_payload
+            and not _source_has_auth_requirement(selected_source_payload)
+        ):
+            normalized_build_spec["api_key_handling"] = normalized_build_spec.get("api_key_handling") or "public_no_key"
+            normalized_build_spec["api_auth_strategy"] = normalized_build_spec.get("api_auth_strategy") or "public_no_key"
+            normalized_build_spec["prefer_public_no_key_api"] = True
         tool_args["build_spec"] = normalized_build_spec
         if (runtime_web_data_request or api_search or api_reference_fetch or openapi_reference_fetch) and not normalized_build_spec.get("source_url_candidates"):
             update_task(
@@ -4240,7 +5652,6 @@ async def generate(req: BuildRequest, background_tasks: BackgroundTasks):
         emit_log_entry=False,
     )
 
-    record_task_state_history(task_id, event_type="task_created")
     record_user_query(
         task_id=task_id,
         device_id=req.device_id,
@@ -4316,6 +5727,12 @@ async def generate_continue(req: ContinueGenerateRequest, background_tasks: Back
         received_device_id=req.device_id,
         stored_device_id=task.get("device_id"),
         reason="access_granted"
+    )
+    maybe_rebind_task_device(
+        task,
+        device_id=req.device_id,
+        user_id=req.user_id,
+        phone_number=req.phone_number,
     )
     update_task(
         task_id,
@@ -4450,7 +5867,16 @@ async def list_tasks(device_id: Optional[str] = None, user_id: Optional[str] = N
 
     log_device_access("/tasks", received_device_id=device_id, stored_device_id=normalized_phone_number or normalized_user_id or normalized_device_id, reason=f"list_result_count_{len(rows)}")
 
-    items = [build_task_summary_payload(dict(row)) for row in rows]
+    items = []
+    for row in rows:
+        task_payload = dict(row)
+        maybe_rebind_task_device(
+            task_payload,
+            device_id=normalized_device_id,
+            user_id=normalized_user_id,
+            phone_number=normalized_phone_number,
+        )
+        items.append(build_task_summary_payload(task_payload))
 
     return {"tasks": items}
 
@@ -4518,6 +5944,12 @@ async def refine(req: RefineRequest, background_tasks: BackgroundTasks):
         received_device_id=req.device_id,
         stored_device_id=task.get("device_id"),
         reason="access_granted"
+    )
+    maybe_rebind_task_device(
+        task,
+        device_id=req.device_id,
+        user_id=req.user_id,
+        phone_number=req.phone_number,
     )
     update_task(
         task_id,
@@ -4626,6 +6058,12 @@ async def route_feedback(req: FeedbackRouteRequest):
             )
         )
 
+    maybe_rebind_task_device(
+        task,
+        device_id=req.device_id,
+        user_id=req.user_id,
+        phone_number=req.phone_number,
+    )
     update_task(
         task_id,
         user_id=req.user_id or task.get("user_id"),
@@ -4799,6 +6237,12 @@ async def runtime_error_summary(req: RuntimeErrorSummaryRequest):
             )
         )
 
+    maybe_rebind_task_device(
+        task,
+        device_id=req.device_id,
+        user_id=req.user_id,
+        phone_number=req.phone_number,
+    )
     task_context = build_feedback_route_context(
         task,
         RuntimeErrorContext(
@@ -4860,6 +6304,12 @@ async def runtime_error_report(req: RuntimeErrorReportRequest):
             )
         )
 
+    maybe_rebind_task_device(
+        task,
+        device_id=req.device_id,
+        user_id=req.user_id,
+        phone_number=req.phone_number,
+    )
     normalized_phone_number = normalize_phone_number(req.phone_number or task.get("phone_number"))
     update_task(
         task_id,
@@ -4934,6 +6384,12 @@ async def refine_plan(req: RefineRequest):
         received_device_id=req.device_id,
         stored_device_id=task.get("device_id"),
         reason="access_granted"
+    )
+    maybe_rebind_task_device(
+        task,
+        device_id=req.device_id,
+        user_id=req.user_id,
+        phone_number=req.phone_number,
     )
     update_task(
         task_id,
@@ -5031,6 +6487,12 @@ async def retry(req: RetryRequest, background_tasks: BackgroundTasks):
             )
         )
 
+    maybe_rebind_task_device(
+        task,
+        device_id=req.device_id,
+        user_id=req.user_id,
+        phone_number=req.phone_number,
+    )
     if task.get("status") not in {TaskStatus.FAILED, TaskStatus.ERROR}:
         emit_task_log(task_id, f"⛔ /retry 거부: 현재 상태={task.get('status')}")
         raise HTTPException(status_code=409, detail="status_not_retryable")
@@ -5136,6 +6598,12 @@ async def report_crash(report: CrashReport, background_tasks: BackgroundTasks):
             )
         )
 
+    maybe_rebind_task_device(
+        task,
+        device_id=report.device_id,
+        user_id=report.user_id,
+        phone_number=report.phone_number,
+    )
     logger.info(
         f"[crash] resolved canonical_task_id={task_id} "
         f"lookup_source=task_id package_name={report.package_name}"
@@ -5243,54 +6711,14 @@ async def status(
         stored_device_id=task.get("device_id"),
         reason="access_granted"
     )
-
-    return build_status_payload(task)
-
-
-@app.get("/conversation/{task_id}")
-async def conversation_history(
-    task_id: str,
-    device_id: Optional[str] = None,
-    user_id: Optional[str] = None,
-    phone_number: Optional[str] = None,
-):
-    log_device_access("/conversation", task_id=task_id, received_device_id=device_id, reason="lookup_start")
-    task = get_task(task_id)
-    if not task:
-        log_device_access("/conversation", task_id=task_id, received_device_id=device_id, reason="task_not_found")
-        raise HTTPException(status_code=404, detail="task_not_found")
-    if not can_access_task(
+    maybe_rebind_task_device(
         task,
         device_id=device_id,
         user_id=user_id,
         phone_number=phone_number,
-    ):
-        reason = build_access_denied_reason(
-            task,
-            device_id=device_id,
-            user_id=user_id,
-            phone_number=phone_number,
-        )
-        log_device_access(
-            "/conversation",
-            task_id=task_id,
-            received_device_id=device_id,
-            stored_device_id=task.get("device_id"),
-            reason=reason
-        )
-        raise HTTPException(status_code=404, detail=reason)
-
-    log_device_access(
-        "/conversation",
-        task_id=task_id,
-        received_device_id=device_id,
-        stored_device_id=task.get("device_id"),
-        reason="access_granted"
     )
-    return {
-        "task_id": task_id,
-        "messages": build_conversation_timeline(task),
-    }
+
+    return build_status_payload(task)
 
 @app.get("/download/{task_id}")
 async def download(
@@ -5341,6 +6769,12 @@ async def download(
         received_device_id=device_id,
         stored_device_id=task.get("device_id"),
         reason="access_granted"
+    )
+    maybe_rebind_task_device(
+        task,
+        device_id=device_id,
+        user_id=user_id,
+        phone_number=phone_number,
     )
 
     apk_path = task["apk_path"]
@@ -5417,6 +6851,12 @@ def vibe_worker(task_id, prompt, device_info, is_refine=False, project_path=None
             )
 
         result = enforce_release_verification_result(task_before_work, result)
+        if isinstance(result, dict) and result.get("status") != "success":
+            result = reconcile_failed_result_with_verified_artifact(
+                task_before_work,
+                result,
+                callback_log=callback_log,
+            )
 
         if result["status"] == "success":
             result_project_path = result.get("project_path") or project_path
@@ -5444,7 +6884,7 @@ def vibe_worker(task_id, prompt, device_info, is_refine=False, project_path=None
                 app_name=result.get("app_name", get_task(task_id).get("app_name", "생성 앱")),
                 generated_app_name=result.get("app_name", get_task(task_id).get("generated_app_name") or get_task(task_id).get("app_name", "생성 앱")),
                 apk_path=result["apk_path"],
-                apk_url=f"/download/{task_id}",
+                apk_url=build_download_url(get_task(task_id) or {"task_id": task_id}),
                 project_path=result["project_path"],
                 package_name=result.get("package_name") or package_name,
                 active_flow="",
@@ -5480,7 +6920,6 @@ def vibe_worker(task_id, prompt, device_info, is_refine=False, project_path=None
                 verification_report=result.get("verification_report") or {},
                 verification_passed=0 if result.get("verification_report") else None,
             )
-            emit_task_log(task_id, f"❌ 실패: {error_log}")
             record_conversation_message(
                 task_id=task_id,
                 role="system",
@@ -5505,6 +6944,10 @@ def vibe_worker(task_id, prompt, device_info, is_refine=False, project_path=None
             )
             log_token_usage(task_id, "Build_Failure_Summarizer", usage)
             summary_payload = summary_decision if summary_decision and not summary_error else build_failure_summary_fallback(failure_stage, failure_type)
+            primary_failure_line = extract_primary_failure_line(error_log)
+            emit_task_log(task_id, f"❌ 실패 ({failure_stage}/{failure_type})")
+            if primary_failure_line:
+                emit_task_log(task_id, f"🔎 핵심 로그: {primary_failure_line}")
             record_assistant_response(
                 task_id=task_id,
                 message_type="build_failure_summary",
@@ -5517,6 +6960,7 @@ def vibe_worker(task_id, prompt, device_info, is_refine=False, project_path=None
                     "failure_type": failure_type,
                 },
             )
+            emit_task_log(task_id, f"🧾 원인 요약: {summary_payload['summary']}")
             update_task(
                 task_id,
                 status=TaskStatus.FAILED,
@@ -5548,7 +6992,21 @@ def vibe_worker(task_id, prompt, device_info, is_refine=False, project_path=None
             package_name=package_name or fallback_task.get("package_name"),
             active_flow=""
         )
-        emit_task_log(task_id, f"🚨 치명적인 시스템 오류: {str(e)}")
+        error_text = trim_context_text(str(e), 280)
+        emit_task_log(task_id, f"🚨 치명적인 시스템 오류: {error_text}")
+        record_assistant_response(
+            task_id=task_id,
+            message_type="fatal_worker_error",
+            endpoint=f"/{flow_type}",
+            content=f"작업 중 서버 내부 오류가 발생했습니다. {error_text}",
+            payload={
+                "task_id": task_id,
+                "status": TaskStatus.ERROR,
+                "flow_type": flow_type,
+                "error": str(e),
+                "project_path": persisted_project_path,
+            },
+        )
 
 # ------------------------------------------------
 # SELF-HEALING (RUNTIME AUTO FIX)
@@ -5565,46 +7023,75 @@ def auto_fix_runtime_error(task_id, stack_trace):
     update_task(task_id, status=TaskStatus.REPAIRING, active_flow="repair")
     
     emit_task_log(task_id, "🧠 디버거 에이전트가 스택 트레이스를 분석 중입니다.")
-    
-    # 1. 현재 소스 코드 스냅샷 확보
-    snapshot = get_current_project_snapshot(project_path)
-    
-    # 2. Debugger 에이전트에게 수리 요청
-    debug_context = {
+
+    build_spec = parse_json_object_field(task.get("final_app_spec")) or {}
+    repair_error_log = stack_trace
+    last_failure_payload: Dict[str, Any] = {
+        "failure_stage": "runtime",
+        "failure_type": "runtime_crash",
         "error_log": stack_trace,
-        "code_snapshot": snapshot,
-        "package_name": package_name,
-        "ui_contract": get_ui_contract(task),
     }
-    
-    fix_result = call_agent_with_tools(
-        DEBUGGER_SYSTEM,
-        "런타임 크래시를 수정하고 앱 안정성을 복구하세요.",
-        context=debug_context,
-        trace={"task_id": task_id, "flow_type": "repair", "agent_name": "Runtime_Debugger", "stage": "runtime_fix"},
-        tools=FILE_CHANGE_TOOL_SCHEMAS,
-        validator=validate_file_change_payload,
-        parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
-        fallback_parser=legacy_agent_response_detailed,
-    )
-    fix_response = fix_result.get("parsed_output")
-    usage = fix_result.get("usage")
-    if usage:
-        log_token_usage(task_id, "Runtime_Debugger", usage)
-    
-    if not fix_response or "files" not in fix_response:
-        emit_task_log(task_id, "❌ 디버거가 유효한 수정 패치를 생성하지 못했습니다.")
-        return
 
-    # 3. 수정 패치 적용
-    save_project_files(project_path, fix_response["files"])
-    emit_task_log(task_id, "🔧 패치를 적용했습니다. 검증 빌드를 시작합니다.")
+    for attempt in range(1, 4):
+        emit_task_log(task_id, f"🛠 런타임 자가 복구 시도 중 ({attempt}/3)")
+        snapshot = get_current_project_snapshot(project_path)
+        debug_context = {
+            "error_log": repair_error_log,
+            "original_stack_trace": stack_trace,
+            "code_snapshot": snapshot,
+            "package_name": package_name,
+            "previous_failure": last_failure_payload,
+            "ui_contract": get_ui_contract(get_task(task_id) or task),
+        }
 
-    # 4. 검증 빌드 수행
-    success, build_res = run_flutter_build(project_path)
-    
-    if success:
-        build_spec = parse_json_object_field(task.get("final_app_spec")) or {}
+        fix_result = call_agent_with_tools(
+            DEBUGGER_SYSTEM,
+            "런타임 크래시 또는 복구 빌드 실패를 분석하고 최소 패치로 앱 안정성을 복구하세요.",
+            context=debug_context,
+            trace={"task_id": task_id, "flow_type": "repair", "agent_name": "Runtime_Debugger", "stage": f"runtime_fix_attempt_{attempt}"},
+            tools=FILE_CHANGE_TOOL_SCHEMAS,
+            validator=validate_file_change_payload,
+            parsed_output_builder=lambda tool_name, tool_arguments: normalize_file_change_payload(tool_arguments),
+            fallback_parser=legacy_agent_response_detailed,
+        )
+        fix_response = fix_result.get("parsed_output")
+        usage = fix_result.get("usage")
+        if usage:
+            log_token_usage(task_id, f"Runtime_Debugger_Attempt_{attempt}", usage)
+
+        if not fix_response or "files" not in fix_response:
+            repair_error_log = "디버거가 유효한 수정 패치를 생성하지 못했습니다."
+            last_failure_payload = {
+                "failure_stage": "runtime_fix",
+                "failure_type": "invalid_patch",
+                "error_log": repair_error_log,
+            }
+            emit_task_log(task_id, f"❌ {repair_error_log}")
+            continue
+
+        ok, touched_paths, apply_error = apply_project_files_safely(project_path, fix_response["files"])
+        if not ok:
+            repair_error_log = apply_error
+            last_failure_payload = {
+                "failure_stage": "runtime_fix",
+                "failure_type": "invalid_patch",
+                "error_log": trim_context_text(apply_error, 2000),
+            }
+            emit_task_log(task_id, f"❌ 런타임 복구 패치 적용 실패: {trim_context_text(apply_error, 280)}")
+            continue
+        emit_task_log(task_id, f"🔧 런타임 복구 패치 적용: {json.dumps(touched_paths, ensure_ascii=False)}")
+
+        success, build_res = run_flutter_build(project_path)
+        if not success:
+            repair_error_log = build_res
+            last_failure_payload = {
+                "failure_stage": "build",
+                "failure_type": classify_failure_type(build_res),
+                "error_log": trim_context_text(build_res, 2000),
+            }
+            emit_task_log(task_id, f"❌ 복구 빌드 실패 ({last_failure_payload['failure_type']})")
+            continue
+
         verification = verify_release_external_data_gate(
             project_path,
             build_spec=build_spec,
@@ -5615,33 +7102,15 @@ def auto_fix_runtime_error(task_id, stack_trace):
         if verification.get("status") not in {"pass", "not_applicable"}:
             verification_summary = verification.get("summary") or "외부 데이터 핵심 기능 검증에 실패했습니다."
             verification_issues = verification.get("issues") if isinstance(verification.get("issues"), list) else []
-            error_log = verification_summary + ("\n" + "\n".join(verification_issues) if verification_issues else "")
+            repair_error_log = verification_summary + ("\n" + "\n".join(verification_issues) if verification_issues else "")
+            last_failure_payload = {
+                "failure_stage": "verification",
+                "failure_type": "external_data_verification",
+                "error_log": repair_error_log,
+                "verification_report": verification,
+            }
             emit_task_log(task_id, f"❌ 복구 후 핵심 기능 검증 실패: {verification_summary}")
-            update_workspace_revision_status(project_path, TaskStatus.FAILED)
-            update_task(
-                task_id,
-                status=TaskStatus.FAILED,
-                build_success=0,
-                active_flow="",
-                verification_summary=verification_summary,
-                verification_report=verification,
-                verification_passed=0,
-            )
-            record_assistant_response(
-                task_id=task_id,
-                message_type="runtime_repair_failed",
-                endpoint="/crash",
-                content="런타임 오류 수정 패치는 적용했지만 핵심 기능 검증이 실패했습니다.",
-                payload={
-                    "task_id": task_id,
-                    "status": TaskStatus.FAILED,
-                    "stack_trace": stack_trace,
-                    "failure_stage": "verification",
-                    "failure_type": "external_data_verification",
-                    "error_log": error_log,
-                },
-            )
-            return
+            continue
 
         ui_contract = refresh_task_ui_contract(
             task_id=task_id,
@@ -5653,7 +7122,7 @@ def auto_fix_runtime_error(task_id, stack_trace):
             task_id,
             status=TaskStatus.SUCCESS,
             apk_path=build_res,
-            apk_url=f"/download/{task_id}",
+            apk_url=build_download_url(get_task(task_id) or {"task_id": task_id}),
             active_flow="",
             build_success=1,
             verification_summary=verification.get("summary") or "",
@@ -5671,26 +7140,35 @@ def auto_fix_runtime_error(task_id, stack_trace):
             payload={
                 "task_id": task_id,
                 "status": TaskStatus.SUCCESS,
-                "apk_url": f"/download/{task_id}",
+                "apk_url": build_download_url(get_task(task_id) or {"task_id": task_id}),
+                "repair_attempts": attempt,
             },
         )
-    else:
-        emit_task_log(task_id, f"❌ 복구 빌드 실패: {build_res[:200]}")
-        update_workspace_revision_status(project_path, TaskStatus.FAILED)
-        update_task(task_id, status=TaskStatus.FAILED, build_success=0, active_flow="")
-        emit_task_log(task_id, "재빌드 중 자가 복구에 실패했습니다.")
-        record_assistant_response(
-            task_id=task_id,
-            message_type="runtime_repair_failed",
-            endpoint="/crash",
-            content="런타임 오류 수정 패치는 적용했지만 검증 빌드가 실패했습니다.",
-            payload={
-                "task_id": task_id,
-                "status": TaskStatus.FAILED,
-                "stack_trace": stack_trace,
-                "build_error_excerpt": trim_context_text(build_res, 1200),
-            },
-        )
+        return
+
+    update_workspace_revision_status(project_path, TaskStatus.FAILED)
+    update_task(
+        task_id,
+        status=TaskStatus.FAILED,
+        build_success=0,
+        active_flow="",
+        verification_summary=(last_failure_payload.get("verification_report") or {}).get("summary", ""),
+        verification_report=last_failure_payload.get("verification_report") or {},
+        verification_passed=0 if last_failure_payload.get("verification_report") else None,
+    )
+    emit_task_log(task_id, "재빌드 중 자가 복구에 실패했습니다.")
+    record_assistant_response(
+        task_id=task_id,
+        message_type="runtime_repair_failed",
+        endpoint="/crash",
+        content="런타임 오류 수정 패치를 반복 적용했지만 검증 빌드 또는 핵심 기능 검증이 실패했습니다.",
+        payload={
+            "task_id": task_id,
+            "status": TaskStatus.FAILED,
+            "stack_trace": stack_trace,
+            **last_failure_payload,
+        },
+    )
 
 # ------------------------------------------------
 # SERVER RUNNER
