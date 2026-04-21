@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="bg_app">#F3F6F2</color>
+    <color name="bg_panel">#FFFDF8</color>
+    <color name="bg_panel_alt">#E8EFE5</color>
+    <color name="bg_composer">#F9FBF7</color>
+    <color name="text_primary">#17211B</color>
+    <color name="text_secondary">#5F6B63</color>
+    <color name="text_inverse">#FCFEFC</color>
+    <color name="accent_primary">#1F6B4F</color>
+    <color name="accent_primary_dark">#174D39</color>
+    <color name="assistant_bubble">#FFFFFF</color>
+    <color name="user_bubble">#1F6B4F</color>
+    <color name="status_bubble">#DCEEE5</color>
+    <color name="log_bubble">#F3E8BF</color>
+    <color name="divider_soft">#D7E0D4</color>
+    <color name="task_runtime_error_bg">#FCE4E4</color>
+    <color name="task_runtime_error_bg_selected">#F6C7C7</color>
+</resources>
