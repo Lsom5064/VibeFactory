@@ -2,7 +2,7 @@
 <resources>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
-    <color name="bg_app">#F3F6F2</color>
+    <color name="bg_app">#FAFAF8</color>
     <color name="bg_panel">#FFFDF8</color>
     <color name="bg_panel_alt">#E8EFE5</color>
     <color name="bg_composer">#F9FBF7</color>

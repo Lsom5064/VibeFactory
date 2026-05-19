@@ -30,6 +30,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -71,6 +72,10 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneId
 import java.util.Date
 import java.util.Locale
 
@@ -92,10 +97,11 @@ class MainActivity : AppCompatActivity() {
     private val gson: Gson = GsonBuilder().create()
     private val serverTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
     private val displayTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+    private val bubbleTimestampFormat = SimpleDateFormat("a h:mm", Locale.KOREA)
 
     private lateinit var apiService: VibeApiService
     private lateinit var drawerLayout: DrawerLayout
-    private lateinit var mainContent: LinearLayout
+    private lateinit var mainContent: FrameLayout
     private lateinit var topBar: LinearLayout
     private lateinit var chatCard: View
     private lateinit var recyclerTasks: RecyclerView
@@ -139,7 +145,7 @@ class MainActivity : AppCompatActivity() {
     private val chatAdapter by lazy {
         ChatMessageAdapter(
             messageSelectionActionModeCallback = messageSelectionActionModeCallback,
-            formatMessageTimestamp = ::formatMessageTimestamp,
+            formatMessageTimestamp = ::formatMessageTimestampForBubble,
             isConfirmationHandled = handledConfirmationMessageIds::contains,
             onConfirmationAccept = ::handleConfirmationAccepted,
             onConfirmationDismiss = ::handleConfirmationDismissed
@@ -323,10 +329,10 @@ class MainActivity : AppCompatActivity() {
             )
 
             (chatCard.layoutParams as ViewGroup.MarginLayoutParams).apply {
-                leftMargin = dp(12) + systemBars.left
-                rightMargin = dp(12) + systemBars.right
-                topMargin = dp(12)
-                bottomMargin = dp(10)
+                leftMargin = systemBars.left
+                rightMargin = systemBars.right
+                topMargin = 0
+                bottomMargin = 0
             }
             chatCard.requestLayout()
 
@@ -449,9 +455,7 @@ class MainActivity : AppCompatActivity() {
         recyclerTasks.layoutManager = LinearLayoutManager(this)
         recyclerTasks.adapter = taskAdapter
 
-        recyclerMessages.layoutManager = LinearLayoutManager(this).apply {
-            stackFromEnd = true
-        }
+        recyclerMessages.layoutManager = LinearLayoutManager(this)
         recyclerMessages.adapter = chatAdapter
     }
 
@@ -2099,7 +2103,7 @@ ${record.stackTrace}
         val selectedTaskId = screenState.selectedTaskId
         if (visibleMessages.isNotEmpty() && !selectedTaskId.isNullOrBlank() && pendingInitialChatScrollTaskId == selectedTaskId) {
             recyclerMessages.post {
-                recyclerMessages.scrollToPosition(visibleMessages.lastIndex)
+                recyclerMessages.scrollToPosition(0)
             }
             pendingInitialChatScrollTaskId = null
         } else if (shouldAutoScrollNewMessage) {
@@ -3754,6 +3758,23 @@ ${record.stackTrace}
         return runCatching {
             displayTimestampFormat.format(serverTimestampFormat.parse(raw) ?: return raw)
         }.getOrElse { raw }
+    }
+
+    private fun formatMessageTimestampForBubble(value: String?): String? {
+        val parsed = parseMessageTimestamp(value) ?: return null
+        return bubbleTimestampFormat.format(parsed)
+    }
+
+    private fun parseMessageTimestamp(value: String?): Date? {
+        val raw = value?.trim().orEmpty()
+        if (raw.isBlank()) return null
+
+        return runCatching { serverTimestampFormat.parse(raw) }.getOrNull()
+            ?: runCatching { Date.from(Instant.parse(raw)) }.getOrNull()
+            ?: runCatching { Date.from(OffsetDateTime.parse(raw).toInstant()) }.getOrNull()
+            ?: runCatching {
+                Date.from(LocalDateTime.parse(raw).atZone(ZoneId.systemDefault()).toInstant())
+            }.getOrNull()
     }
 
     private fun buildLogPanelText(taskId: String?, messages: List<ChatMessage>): String {

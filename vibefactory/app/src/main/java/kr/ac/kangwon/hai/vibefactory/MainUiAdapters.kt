@@ -117,6 +117,7 @@ class ChatMessageAdapter(
     override fun getItemCount(): Int = items.size
 
     inner class ChatViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        private val block: LinearLayout = view.findViewById(R.id.messageBlock)
         private val container: LinearLayout = view.findViewById(R.id.messageBubble)
         private val title: TextView = view.findViewById(R.id.messageTitle)
         private val body: TextView = view.findViewById(R.id.messageBody)
@@ -146,12 +147,21 @@ class ChatMessageAdapter(
             bindImagePreview(item, context)
             bindConfirmationActions(item)
 
-            val params = container.layoutParams as LinearLayout.LayoutParams
+            val blockParams = block.layoutParams as LinearLayout.LayoutParams
+            val bubbleParams = container.layoutParams as LinearLayout.LayoutParams
+            val timestampParams = timestamp.layoutParams as LinearLayout.LayoutParams
             when (item.kind) {
                 MessageKind.USER -> {
-                    params.gravity = Gravity.END
-                    params.marginStart = dp(context, 44)
-                    params.marginEnd = 0
+                    blockParams.gravity = Gravity.END
+                    blockParams.marginStart = dp(context, 44)
+                    blockParams.marginEnd = 0
+                    bubbleParams.gravity = Gravity.END
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
+                    timestampParams.gravity = Gravity.END
+                    timestampParams.marginStart = 0
+                    timestampParams.marginEnd = 0
+                    timestampParams.topMargin = dp(context, 4)
                     container.setBackgroundResource(R.drawable.bg_message_user)
                     title.setTextColor(ContextCompat.getColor(context, R.color.bg_panel_alt))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_inverse))
@@ -161,9 +171,16 @@ class ChatMessageAdapter(
                 }
                 MessageKind.ASSISTANT,
                 MessageKind.CONFIRMATION -> {
-                    params.gravity = Gravity.START
-                    params.marginStart = 0
-                    params.marginEnd = dp(context, 44)
+                    blockParams.gravity = Gravity.START
+                    blockParams.marginStart = 0
+                    blockParams.marginEnd = dp(context, 44)
+                    bubbleParams.gravity = Gravity.START
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
+                    timestampParams.gravity = Gravity.START
+                    timestampParams.marginStart = 0
+                    timestampParams.marginEnd = 0
+                    timestampParams.topMargin = dp(context, 4)
                     container.setBackgroundResource(R.drawable.bg_message_assistant)
                     title.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
@@ -172,9 +189,16 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.BUILD_LOG -> {
-                    params.gravity = Gravity.CENTER_HORIZONTAL
-                    params.marginStart = dp(context, 56)
-                    params.marginEnd = dp(context, 56)
+                    blockParams.gravity = Gravity.CENTER_HORIZONTAL
+                    blockParams.marginStart = dp(context, 56)
+                    blockParams.marginEnd = dp(context, 56)
+                    bubbleParams.gravity = Gravity.CENTER_HORIZONTAL
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
+                    timestampParams.gravity = Gravity.CENTER_HORIZONTAL
+                    timestampParams.marginStart = 0
+                    timestampParams.marginEnd = 0
+                    timestampParams.topMargin = dp(context, 4)
                     container.setBackgroundResource(R.drawable.bg_message_status)
                     title.setTextColor(ContextCompat.getColor(context, R.color.accent_primary_dark))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
@@ -183,9 +207,16 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.STATUS -> {
-                    params.gravity = Gravity.CENTER_HORIZONTAL
-                    params.marginStart = dp(context, 72)
-                    params.marginEnd = dp(context, 72)
+                    blockParams.gravity = Gravity.CENTER_HORIZONTAL
+                    blockParams.marginStart = dp(context, 72)
+                    blockParams.marginEnd = dp(context, 72)
+                    bubbleParams.gravity = Gravity.CENTER_HORIZONTAL
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
+                    timestampParams.gravity = Gravity.CENTER_HORIZONTAL
+                    timestampParams.marginStart = 0
+                    timestampParams.marginEnd = 0
+                    timestampParams.topMargin = dp(context, 4)
                     container.setBackgroundResource(R.drawable.bg_message_status)
                     title.setTextColor(ContextCompat.getColor(context, R.color.accent_primary_dark))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
@@ -194,9 +225,16 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.LOG -> {
-                    params.gravity = Gravity.CENTER_HORIZONTAL
-                    params.marginStart = dp(context, 72)
-                    params.marginEnd = dp(context, 72)
+                    blockParams.gravity = Gravity.CENTER_HORIZONTAL
+                    blockParams.marginStart = dp(context, 72)
+                    blockParams.marginEnd = dp(context, 72)
+                    bubbleParams.gravity = Gravity.CENTER_HORIZONTAL
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
+                    timestampParams.gravity = Gravity.CENTER_HORIZONTAL
+                    timestampParams.marginStart = 0
+                    timestampParams.marginEnd = 0
+                    timestampParams.topMargin = dp(context, 4)
                     container.setBackgroundResource(R.drawable.bg_message_log)
                     title.setTextColor(ContextCompat.getColor(context, R.color.accent_primary_dark))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
@@ -205,7 +243,9 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
             }
-            container.layoutParams = params
+            block.layoutParams = blockParams
+            container.layoutParams = bubbleParams
+            timestamp.layoutParams = timestampParams
         }
 
         private fun bindExpandableAssistantMessage(item: ChatMessage) {
