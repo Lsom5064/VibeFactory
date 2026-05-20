@@ -12,8 +12,8 @@
     <color name="accent_primary">#1F6B4F</color>
     <color name="accent_primary_dark">#174D39</color>
     <color name="assistant_bubble">#FFFFFF</color>
-    <color name="user_bubble">#1F6B4F</color>
-    <color name="status_bubble">#DCEEE5</color>
+    <color name="user_bubble">#DCEEE5</color>
+    <color name="status_bubble">#FFFFFF</color>
     <color name="log_bubble">#F3E8BF</color>
     <color name="divider_soft">#D7E0D4</color>
     <color name="task_runtime_error_bg">#FCE4E4</color>

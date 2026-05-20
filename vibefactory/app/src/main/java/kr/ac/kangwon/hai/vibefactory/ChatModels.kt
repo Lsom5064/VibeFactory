@@ -40,7 +40,11 @@ data class ChatMessage(
     val imagePreviewName: String? = null,
     val confirmAction: String? = null,
     val confirmTaskId: String? = null,
-    val confirmPayload: String? = null
+    val confirmPayload: String? = null,
+    val artifactTaskId: String? = null,
+    val artifactCanDownload: Boolean = false,
+    val artifactCanInstall: Boolean = false,
+    val artifactDownloading: Boolean = false
 )
 
 data class RuntimeErrorRecord(

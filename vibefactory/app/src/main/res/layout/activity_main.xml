@@ -118,38 +118,6 @@
             </LinearLayout>
 
             <LinearLayout
-                android:id="@+id/downloadArea"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginHorizontal="12dp"
-                android:layout_marginBottom="10dp"
-                android:background="@drawable/bg_surface_alt"
-                android:orientation="horizontal"
-                android:padding="10dp"
-                android:visibility="gone">
-
-                <Button
-                    android:id="@+id/btnDownloadManual"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:background="@drawable/bg_button_secondary"
-                    android:textColor="@color/text_primary"
-                    android:text="@string/download_apk" />
-
-                <Button
-                    android:id="@+id/btnInstallLatest"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:layout_weight="1"
-                    android:background="@drawable/bg_button_primary"
-                    android:textColor="@color/text_inverse"
-                    android:text="@string/install_apk"
-                    android:visibility="gone" />
-            </LinearLayout>
-
-            <LinearLayout
                 android:id="@+id/composerBar"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -280,8 +248,7 @@
                         android:text="@string/app_title"
                         android:textColor="@color/text_primary"
                         android:textIsSelectable="true"
-                        android:textSize="18sp"
-                        android:textStyle="bold" />
+                        android:textSize="18sp" />
 
                     <TextView
                         android:id="@+id/inputModeLabel"
@@ -315,8 +282,7 @@
                     android:text="@string/show_logs"
                     android:textColor="@color/text_primary"
                     android:textIsSelectable="true"
-                    android:textSize="12sp"
-                    android:textStyle="bold" />
+                    android:textSize="15sp" />
 
                 <androidx.appcompat.widget.SwitchCompat
                     android:id="@+id/switchShowLogs"

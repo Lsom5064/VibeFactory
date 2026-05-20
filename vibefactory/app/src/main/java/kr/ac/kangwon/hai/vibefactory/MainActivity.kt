@@ -114,9 +114,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnNewChat: Button
     private lateinit var btnSavePhoneGate: Button
     private lateinit var btnOpenDrawer: ImageButton
-    private lateinit var downloadArea: LinearLayout
-    private lateinit var btnDownloadManual: Button
-    private lateinit var btnInstallLatest: Button
     private lateinit var composerBar: LinearLayout
     private lateinit var logPanel: LinearLayout
     private lateinit var logPanelScroll: ScrollView
@@ -148,7 +145,9 @@ class MainActivity : AppCompatActivity() {
             formatMessageTimestamp = ::formatMessageTimestampForBubble,
             isConfirmationHandled = handledConfirmationMessageIds::contains,
             onConfirmationAccept = ::handleConfirmationAccepted,
-            onConfirmationDismiss = ::handleConfirmationDismissed
+            onConfirmationDismiss = ::handleConfirmationDismissed,
+            onArtifactDownload = ::handleArtifactDownloadRequested,
+            onArtifactInstall = ::handleArtifactInstallRequested
         )
     }
 
@@ -291,9 +290,6 @@ class MainActivity : AppCompatActivity() {
         btnNewChat = findViewById(R.id.btnNewChat)
         btnSavePhoneGate = findViewById(R.id.btnSavePhoneGate)
         btnOpenDrawer = findViewById(R.id.btnOpenDrawer)
-        downloadArea = findViewById(R.id.downloadArea)
-        btnDownloadManual = findViewById(R.id.btnDownloadManual)
-        btnInstallLatest = findViewById(R.id.btnInstallLatest)
         composerBar = findViewById(R.id.composerBar)
         logPanel = findViewById(R.id.logPanel)
         logPanelScroll = findViewById(R.id.logPanelScroll)
@@ -335,12 +331,6 @@ class MainActivity : AppCompatActivity() {
                 bottomMargin = 0
             }
             chatCard.requestLayout()
-
-            downloadArea.updateLayoutParams<ViewGroup.MarginLayoutParams> {
-                leftMargin = dp(12) + systemBars.left
-                rightMargin = dp(12) + systemBars.right
-                bottomMargin = dp(10)
-            }
 
             composerBar.updateLayoutParams<ViewGroup.MarginLayoutParams> {
                 leftMargin = dp(12) + systemBars.left
@@ -559,19 +549,6 @@ class MainActivity : AppCompatActivity() {
                     switchShowLogs.isChecked = false
                 }
             }
-        }
-
-        btnDownloadManual.setOnClickListener {
-            if (isDownloadingApk) return@setOnClickListener
-            val selectedTaskId = screenState.selectedTaskId?.trim().orEmpty()
-            if (selectedTaskId.isBlank()) return@setOnClickListener
-            persistedApkUrlForTask(selectedTaskId)?.let { downloadAndInstall(selectedTaskId, it) }
-        }
-
-        btnInstallLatest.setOnClickListener {
-            val selectedTaskId = screenState.selectedTaskId?.trim().orEmpty()
-            if (selectedTaskId.isBlank()) return@setOnClickListener
-            persistedDownloadedApkFileForTask(selectedTaskId)?.let { installApk(it) }
         }
 
         switchShowLogs.setOnCheckedChangeListener { _, isChecked ->
@@ -1954,7 +1931,8 @@ ${record.stackTrace}
                     screenState = screenState.copy(
                         currentStatus = getString(R.string.status_downloaded),
                         statusDetail = apkFile.absolutePath,
-                        canInstall = screenState.selectedTaskId?.let(::persistedDownloadedApkFileForTask) != null
+                        canInstall = screenState.selectedTaskId?.let(::persistedDownloadedApkFileForTask) != null,
+                        canDownload = false
                     )
                     renderState()
                     installApk(apkFile)
@@ -2020,12 +1998,15 @@ ${record.stackTrace}
             screenState.taskList.map { it.copy(hasRuntimeError = it.taskId in runtimeErrorTaskIds) },
             screenState.selectedTaskId
         )
-        val baseVisibleMessages = screenState.messages.filter { it.kind != MessageKind.LOG }
-        val visibleMessages = if (shouldAnimateProcessingStatus(screenState.messages)) {
+        val baseVisibleMessages = screenState.messages
+            .filter { it.kind != MessageKind.LOG }
+            .filterNot(::isRedundantDownloadedStatusMessage)
+        val timelineVisibleMessages = if (shouldAnimateProcessingStatus(screenState.messages)) {
             animateProcessingStatusBubble(baseVisibleMessages)
         } else {
             baseVisibleMessages
         }
+        val visibleMessages = appendArtifactCardMessage(timelineVisibleMessages)
         val shouldAutoScrollNewMessage = shouldAutoScrollMessages(visibleMessages)
         val aggregatedLogText = buildLogPanelText(screenState.selectedTaskId, screenState.messages)
         if (!isMessageTextSelectionActive) {
@@ -2049,15 +2030,6 @@ ${record.stackTrace}
                 restoreLogPanelScrollAfterLayout(previousLogScrollY)
             }
         }
-        downloadArea.visibility = if (screenState.canDownload || screenState.canInstall) View.VISIBLE else View.GONE
-        btnDownloadManual.visibility = if (screenState.canDownload) View.VISIBLE else View.GONE
-        btnInstallLatest.visibility = if (screenState.canInstall) View.VISIBLE else View.GONE
-        btnDownloadManual.isEnabled = screenState.canDownload && !isDownloadingApk
-        btnDownloadManual.alpha = if (btnDownloadManual.isEnabled) 1.0f else 0.6f
-        btnDownloadManual.text = if (isDownloadingApk) getString(R.string.download_apk_in_progress) else getString(R.string.download_apk)
-        btnInstallLatest.isEnabled = screenState.canInstall && !isDownloadingApk
-        btnInstallLatest.alpha = if (btnInstallLatest.isEnabled) 1.0f else 0.6f
-
         syncProcessingStatusAnimation(screenState.messages)
 
         if (phoneGateVisible) {
@@ -2125,6 +2097,55 @@ ${record.stackTrace}
         val currentCount = chatAdapter.itemCount
         if (currentCount <= 0) return true
         return lastVisible >= currentCount - 2
+    }
+
+    private fun appendArtifactCardMessage(messages: List<ChatMessage>): List<ChatMessage> {
+        val selectedTaskId = screenState.selectedTaskId?.trim().orEmpty()
+        if (selectedTaskId.isBlank()) return messages
+        if (!screenState.canDownload && !screenState.canInstall && !isDownloadingApk) return messages
+        val fileName = "예시용_앱"
+        val sizeLabel = "10 MB · apk"
+        val artifactMessage = ChatMessage(
+            id = "artifact-$selectedTaskId",
+            kind = MessageKind.STATUS,
+            title = null,
+            body = fileName,
+            detail = sizeLabel,
+            createdAt = messages.lastOrNull()?.createdAt ?: currentTimestampString(),
+            artifactTaskId = selectedTaskId,
+            artifactCanDownload = screenState.canDownload,
+            artifactCanInstall = screenState.canInstall,
+            artifactDownloading = isDownloadingApk
+        )
+        return messages + artifactMessage
+    }
+
+    private fun isRedundantDownloadedStatusMessage(message: ChatMessage): Boolean {
+        return message.kind == MessageKind.STATUS && message.body == getString(R.string.status_downloaded)
+    }
+
+    private fun handleArtifactDownloadRequested(message: ChatMessage) {
+        handleArtifactInstallRequested(message)
+    }
+
+    private fun handleArtifactInstallRequested(message: ChatMessage) {
+        if (isDownloadingApk) return
+        val taskId = message.artifactTaskId?.trim().orEmpty()
+        if (taskId.isBlank()) return
+        val downloadedFile = persistedDownloadedApkFileForTask(taskId)
+        if (downloadedFile != null) {
+            installApk(downloadedFile)
+            return
+        }
+        persistedApkUrlForTask(taskId)?.let { downloadAndInstall(taskId, it) }
+    }
+
+    private fun formatFileSize(bytes: Long): String {
+        if (bytes <= 0L) return getString(R.string.artifact_size_pending)
+        val kb = bytes / 1024.0
+        if (kb < 1024.0) return String.format(Locale.US, "%.0f KB", kb)
+        val mb = kb / 1024.0
+        return String.format(Locale.US, "%.2f MB", mb)
     }
 
     private fun setComposerEnabled(enabled: Boolean) {

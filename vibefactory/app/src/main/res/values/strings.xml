@@ -1,6 +1,6 @@
 <resources>
     <string name="app_name">vibefactory</string>
-    <string name="app_title">VibeFactory</string>
+    <string name="app_title">바이브 팩토리</string>
     <string name="app_subtitle">이전 작업을 다시 열고, 새 채팅으로 앱 빌드를 시작할 수 있습니다.</string>
     <string name="history_title">이전 작업 / 채팅방</string>
     <string name="drawer_subtitle">기존 채팅방을 열거나 새 채팅을 시작하세요.</string>
@@ -26,6 +26,9 @@
     <string name="download_apk">APK 다운로드</string>
     <string name="download_apk_in_progress">다운로드 중...</string>
     <string name="install_apk">설치</string>
+    <string name="message_title_apk">APK</string>
+    <string name="artifact_file_label">APK 파일</string>
+    <string name="artifact_size_pending">크기 확인 전</string>
     <string name="show_logs">로그 보기</string>
     <string name="crash_title">런타임 에러 감지됨</string>
     <string name="fix_runtime">AI에게 즉시 수리 요청하기</string>
