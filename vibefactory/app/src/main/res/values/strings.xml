@@ -18,8 +18,10 @@
     <string name="open_menu">메뉴 열기</string>
     <string name="attach_reference_image">참고 이미지 선택</string>
     <string name="attach_file">첨부 추가</string>
+    <string name="attachment_menu_camera">카메라</string>
     <string name="attachment_menu_photo">사진</string>
     <string name="attachment_menu_file">파일</string>
+    <string name="attachment_camera_unavailable">카메라 첨부를 준비하지 못했어요.</string>
     <string name="reference_image_selected">참고 이미지: %1$s</string>
     <string name="reference_image_attached_message">참고 이미지를 함께 전달했어요.</string>
     <string name="reference_image_preview_content_description">전송된 참고 이미지 미리보기</string>

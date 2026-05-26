@@ -21,6 +21,7 @@ import android.text.Editable
 import android.text.TextWatcher
 import android.util.Log
 import android.view.ActionMode
+import android.view.Gravity
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
@@ -29,9 +30,9 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -58,6 +59,7 @@ import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
+import com.google.android.material.bottomsheet.BottomSheetDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -187,6 +189,7 @@ class MainActivity : AppCompatActivity() {
     private val notifiedBuildSuccessTaskIds = mutableSetOf<String>()
     private var isMessageTextSelectionActive = false
     private var selectedAttachment: SelectedAttachment? = null
+    private var pendingCameraImageUri: Uri? = null
     private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
 
     private data class TimelineEventSnapshot(
@@ -206,6 +209,15 @@ class MainActivity : AppCompatActivity() {
     private val pickReferenceImageLauncher =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
             if (uri != null) {
+                handleAttachmentSelected(uri, SelectedAttachmentKind.IMAGE)
+            }
+        }
+
+    private val captureImageLauncher =
+        registerForActivityResult(ActivityResultContracts.TakePicture()) { saved: Boolean ->
+            val uri = pendingCameraImageUri
+            pendingCameraImageUri = null
+            if (saved && uri != null) {
                 handleAttachmentSelected(uri, SelectedAttachmentKind.IMAGE)
             }
         }
@@ -2232,38 +2244,101 @@ ${record.stackTrace}
     }
 
     private fun showAttachmentMenu() {
-        PopupMenu(this, btnAttachReferenceImage).apply {
-            menu.add(0, 1, 0, R.string.attachment_menu_photo)
-                .setIcon(android.R.drawable.ic_menu_gallery)
-            menu.add(0, 2, 1, R.string.attachment_menu_file)
-                .setIcon(R.drawable.ic_artifact_file)
-            setOnMenuItemClickListener { item ->
-                when (item.itemId) {
-                    1 -> {
-                        pickReferenceImageLauncher.launch("image/*")
-                        true
-                    }
-                    2 -> {
-                        pickDocumentAttachmentLauncher.launch(arrayOf("application/pdf", "text/*"))
-                        true
-                    }
-                    else -> false
-                }
+        val dialog = BottomSheetDialog(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(18), dp(20), dp(28))
+        }
+        val grabber = View(this).apply {
+            setBackgroundColor(0xFFE0E0E0.toInt())
+        }
+        content.addView(
+            grabber,
+            LinearLayout.LayoutParams(dp(42), dp(4)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(18)
             }
-            forceShowMenuIcons()
-            show()
+        )
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        row.addView(
+            buildAttachmentSheetTile(
+                title = getString(R.string.attachment_menu_camera),
+                iconRes = android.R.drawable.ic_menu_camera
+            ) {
+                dialog.dismiss()
+                launchCameraAttachment()
+            }
+        )
+        row.addView(
+            buildAttachmentSheetTile(
+                title = getString(R.string.attachment_menu_photo),
+                iconRes = android.R.drawable.ic_menu_gallery
+            ) {
+                dialog.dismiss()
+                pickReferenceImageLauncher.launch("image/*")
+            }
+        )
+        row.addView(
+            buildAttachmentSheetTile(
+                title = getString(R.string.attachment_menu_file),
+                iconRes = R.drawable.ic_artifact_file
+            ) {
+                dialog.dismiss()
+                pickDocumentAttachmentLauncher.launch(arrayOf("application/pdf", "text/*"))
+            }
+        )
+        content.addView(row)
+        dialog.setContentView(content)
+        dialog.show()
+    }
+
+    private fun buildAttachmentSheetTile(title: String, iconRes: Int, onClick: () -> Unit): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(16), dp(12), dp(14))
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_surface_alt)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onClick() }
+            addView(
+                ImageView(this@MainActivity).apply {
+                    setImageResource(iconRes)
+                    imageTintList = ContextCompat.getColorStateList(this@MainActivity, R.color.text_primary)
+                },
+                LinearLayout.LayoutParams(dp(32), dp(32))
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = title
+                    gravity = Gravity.CENTER
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                    textSize = 16f
+                },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = dp(10)
+                }
+            )
+            layoutParams = LinearLayout.LayoutParams(0, dp(118), 1f).apply {
+                marginStart = dp(6)
+                marginEnd = dp(6)
+            }
         }
     }
 
-    private fun PopupMenu.forceShowMenuIcons() {
-        runCatching {
-            val popupField = PopupMenu::class.java.getDeclaredField("mPopup")
-            popupField.isAccessible = true
-            val popup = popupField.get(this)
-            popup.javaClass
-                .getDeclaredMethod("setForceShowIcon", Boolean::class.javaPrimitiveType)
-                .invoke(popup, true)
+    private fun launchCameraAttachment() {
+        val cacheRoot = externalCacheDir
+        if (cacheRoot == null) {
+            Toast.makeText(this, R.string.attachment_camera_unavailable, Toast.LENGTH_SHORT).show()
+            return
         }
+        val imageFile = File.createTempFile("camera_attachment_", ".jpg", cacheRoot)
+        val uri = FileProvider.getUriForFile(this, "${packageName}.provider", imageFile)
+        pendingCameraImageUri = uri
+        captureImageLauncher.launch(uri)
     }
 
     private fun handleAttachmentSelected(uri: Uri, kind: SelectedAttachmentKind) {
