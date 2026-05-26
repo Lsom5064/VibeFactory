@@ -113,7 +113,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recyclerMessages: RecyclerView
     private lateinit var inputPrompt: EditText
     private lateinit var inputPhoneGate: EditText
-    private lateinit var btnAttachReferenceImage: Button
+    private lateinit var btnAttachReferenceImage: TextView
     private lateinit var selectedAttachmentChip: TextView
     private lateinit var btnSend: Button
     private lateinit var btnNewChat: Button

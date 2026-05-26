@@ -131,24 +131,21 @@
                 android:paddingEnd="10dp"
                 android:paddingBottom="10dp">
 
-                <Button
+                <TextView
                     android:id="@+id/btnAttachReferenceImage"
                     android:layout_width="46dp"
                     android:layout_height="46dp"
                     android:layout_marginEnd="8dp"
                     android:background="@drawable/bg_top_chip"
+                    android:clickable="true"
                     android:contentDescription="@string/attach_file"
-                    android:elevation="0dp"
+                    android:focusable="true"
                     android:foreground="?attr/selectableItemBackground"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:stateListAnimator="@null"
+                    android:gravity="center"
                     android:text="+"
                     android:textColor="@color/text_primary"
                     android:textSize="26sp"
-                    android:textStyle="bold"
-                    android:translationZ="0dp" />
+                    android:textStyle="bold" />
 
                 <LinearLayout
                     android:layout_width="0dp"
