@@ -20,7 +20,6 @@
     <string name="attach_file">첨부 추가</string>
     <string name="attachment_menu_photo">사진</string>
     <string name="attachment_menu_file">파일</string>
-    <string name="attachment_menu_cancel">취소</string>
     <string name="reference_image_selected">참고 이미지: %1$s</string>
     <string name="reference_image_attached_message">참고 이미지를 함께 전달했어요.</string>
     <string name="reference_image_preview_content_description">전송된 참고 이미지 미리보기</string>

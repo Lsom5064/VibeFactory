@@ -36,7 +36,6 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.result.ActivityResult
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
@@ -212,15 +211,16 @@ class MainActivity : AppCompatActivity() {
         }
 
     private val pickDocumentAttachmentLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result: ActivityResult ->
-            val uri = result.data?.data ?: return@registerForActivityResult
-            val mimeType = contentResolver.getType(uri).orEmpty()
-            val kind = if (mimeType == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true)) {
-                SelectedAttachmentKind.PDF
-            } else {
-                SelectedAttachmentKind.TEXT
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+            if (uri != null) {
+                val mimeType = contentResolver.getType(uri).orEmpty()
+                val kind = if (mimeType == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true)) {
+                    SelectedAttachmentKind.PDF
+                } else {
+                    SelectedAttachmentKind.TEXT
+                }
+                handleAttachmentSelected(uri, kind)
             }
-            handleAttachmentSelected(uri, kind)
         }
 
     private val crashReceiver = object : BroadcastReceiver() {
@@ -2234,8 +2234,9 @@ ${record.stackTrace}
     private fun showAttachmentMenu() {
         PopupMenu(this, btnAttachReferenceImage).apply {
             menu.add(0, 1, 0, R.string.attachment_menu_photo)
+                .setIcon(android.R.drawable.ic_menu_gallery)
             menu.add(0, 2, 1, R.string.attachment_menu_file)
-            menu.add(0, 3, 2, R.string.attachment_menu_cancel)
+                .setIcon(R.drawable.ic_artifact_file)
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     1 -> {
@@ -2243,22 +2244,25 @@ ${record.stackTrace}
                         true
                     }
                     2 -> {
-                        pickDocumentAttachmentLauncher.launch(buildDocumentAttachmentIntent())
+                        pickDocumentAttachmentLauncher.launch(arrayOf("application/pdf", "text/*"))
                         true
                     }
-                    3 -> true
                     else -> false
                 }
             }
+            forceShowMenuIcons()
             show()
         }
     }
 
-    private fun buildDocumentAttachmentIntent(): Intent {
-        return Intent(Intent.ACTION_GET_CONTENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/pdf", "text/*"))
+    private fun PopupMenu.forceShowMenuIcons() {
+        runCatching {
+            val popupField = PopupMenu::class.java.getDeclaredField("mPopup")
+            popupField.isAccessible = true
+            val popup = popupField.get(this)
+            popup.javaClass
+                .getDeclaredMethod("setForceShowIcon", Boolean::class.javaPrimitiveType)
+                .invoke(popup, true)
         }
     }
 
