@@ -137,6 +137,23 @@
                     android:layout_weight="1"
                     android:orientation="vertical">
 
+                    <TextView
+                        android:id="@+id/selectedAttachmentChip"
+                        android:layout_width="wrap_content"
+                        android:layout_height="32dp"
+                        android:layout_marginStart="8dp"
+                        android:layout_marginBottom="4dp"
+                        android:background="@drawable/bg_surface_alt"
+                        android:ellipsize="middle"
+                        android:gravity="center_vertical"
+                        android:maxWidth="260dp"
+                        android:maxLines="1"
+                        android:paddingStart="10dp"
+                        android:paddingEnd="10dp"
+                        android:textColor="@color/text_primary"
+                        android:textSize="12sp"
+                        android:visibility="gone" />
+
                     <EditText
                         android:id="@+id/inputPrompt"
                         android:layout_width="match_parent"
@@ -149,28 +166,19 @@
                         android:padding="12dp" />
                 </LinearLayout>
 
-                <ImageButton
+                <Button
                     android:id="@+id/btnAttachReferenceImage"
                     android:layout_width="40dp"
                     android:layout_height="40dp"
                     android:layout_marginStart="8dp"
                     android:background="@android:color/transparent"
-                    android:contentDescription="@string/attach_reference_image"
-                    android:padding="8dp"
-                    android:src="@android:drawable/ic_menu_gallery"
-                    android:tint="@color/text_secondary" />
-
-                <ImageView
-                    android:id="@+id/selectedReferenceImagePreview"
-                    android:layout_width="40dp"
-                    android:layout_height="40dp"
-                    android:layout_marginStart="6dp"
-                    android:background="@drawable/bg_surface_alt"
-                    android:clipToOutline="true"
-                    android:contentDescription="@string/reference_image_preview_content_description"
-                    android:padding="2dp"
-                    android:scaleType="centerCrop"
-                    android:visibility="gone" />
+                    android:contentDescription="@string/attach_file"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:padding="0dp"
+                    android:text="+"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="26sp" />
 
                 <Button
                     android:id="@+id/btnSend"

@@ -29,13 +29,14 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageButton
-import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.ActivityResult
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
@@ -91,7 +92,10 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_PHONE_NUMBER_PERMISSION = 7001
         private const val REQUEST_NOTIFICATION_PERMISSION = 7002
         private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete"
-        private const val MAX_REFERENCE_IMAGE_BYTES = 5_000_000
+        private const val MAX_ATTACHMENT_IMAGE_ORIGINAL_BYTES = 15 * 1024 * 1024
+        private const val MAX_ATTACHMENT_IMAGE_PAYLOAD_BYTES = 4 * 1024 * 1024
+        private const val MAX_ATTACHMENT_PDF_BYTES = 10 * 1024 * 1024
+        private const val MAX_ATTACHMENT_TEXT_BYTES = 2 * 1024 * 1024
     }
 
     private val gson: Gson = GsonBuilder().create()
@@ -108,8 +112,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recyclerMessages: RecyclerView
     private lateinit var inputPrompt: EditText
     private lateinit var inputPhoneGate: EditText
-    private lateinit var btnAttachReferenceImage: ImageButton
-    private lateinit var selectedReferenceImagePreview: ImageView
+    private lateinit var btnAttachReferenceImage: Button
+    private lateinit var selectedAttachmentChip: TextView
     private lateinit var btnSend: Button
     private lateinit var btnNewChat: Button
     private lateinit var btnSavePhoneGate: Button
@@ -183,7 +187,7 @@ class MainActivity : AppCompatActivity() {
     private var pendingInitialChatScrollTaskId: String? = null
     private val notifiedBuildSuccessTaskIds = mutableSetOf<String>()
     private var isMessageTextSelectionActive = false
-    private var selectedReferenceImage: ReferenceImageAttachment? = null
+    private var selectedAttachment: SelectedAttachment? = null
     private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
 
     private data class TimelineEventSnapshot(
@@ -203,8 +207,20 @@ class MainActivity : AppCompatActivity() {
     private val pickReferenceImageLauncher =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
             if (uri != null) {
-                handleReferenceImageSelected(uri)
+                handleAttachmentSelected(uri, SelectedAttachmentKind.IMAGE)
             }
+        }
+
+    private val pickDocumentAttachmentLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result: ActivityResult ->
+            val uri = result.data?.data ?: return@registerForActivityResult
+            val mimeType = contentResolver.getType(uri).orEmpty()
+            val kind = if (mimeType == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true)) {
+                SelectedAttachmentKind.PDF
+            } else {
+                SelectedAttachmentKind.TEXT
+            }
+            handleAttachmentSelected(uri, kind)
         }
 
     private val crashReceiver = object : BroadcastReceiver() {
@@ -285,7 +301,7 @@ class MainActivity : AppCompatActivity() {
         inputPrompt = findViewById(R.id.inputPrompt)
         inputPhoneGate = findViewById(R.id.inputPhoneGate)
         btnAttachReferenceImage = findViewById(R.id.btnAttachReferenceImage)
-        selectedReferenceImagePreview = findViewById(R.id.selectedReferenceImagePreview)
+        selectedAttachmentChip = findViewById(R.id.selectedAttachmentChip)
         btnSend = findViewById(R.id.btnSend)
         btnNewChat = findViewById(R.id.btnNewChat)
         btnSavePhoneGate = findViewById(R.id.btnSavePhoneGate)
@@ -539,7 +555,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnAttachReferenceImage.setOnClickListener {
-            pickReferenceImageLauncher.launch("image/*")
+            showAttachmentMenu()
         }
 
         inputPrompt.setOnFocusChangeListener { _, hasFocus ->
@@ -634,7 +650,7 @@ class MainActivity : AppCompatActivity() {
         latestApkUrl = null
         latestDownloadedApkFile = null
         latestDownloadedTaskId = null
-        selectedReferenceImage = null
+        selectedAttachment = null
         inputPrompt.setText("")
         screenState = screenState.copy(
             selectedTaskId = null,
@@ -691,30 +707,28 @@ class MainActivity : AppCompatActivity() {
     private fun submitMessage() {
         val prompt = inputPrompt.text.toString().trim()
         if (prompt.isBlank()) return
-        val attachedImagePreview = selectedReferenceImage?.toChatPreview()
+        val attachment = selectedAttachment
+        val attachedImagePreview = attachment?.toChatImagePreview()
         inputPrompt.setText("")
-        if (attachedImagePreview != null) {
-            clearSelectedReferenceImage()
-        }
 
         when (screenState.inputMode) {
-            InputMode.NEW_GENERATE -> startAppSynthesis(prompt, attachedImagePreview)
+            InputMode.NEW_GENERATE -> startAppSynthesis(prompt, attachedImagePreview, attachment = attachment)
             InputMode.CONTINUE_CLARIFICATION -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    continueClarification(taskId, prompt)
+                    continueClarification(taskId, prompt, attachment = attachment)
                 }
             }
             InputMode.REFINE_EXISTING -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview)
+                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachment)
                 }
             }
             InputMode.RETRY_FAILED -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview)
+                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachment)
                 }
             }
             InputMode.READ_ONLY -> {
@@ -723,23 +737,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun currentReferenceImageName(): String? = selectedReferenceImage?.displayName
+    private fun currentReferenceImageName(): String? = selectedAttachment?.takeIf { it.kind == SelectedAttachmentKind.IMAGE }?.displayName
 
-    private fun currentReferenceImageBase64(): String? = selectedReferenceImage?.base64
+    private fun currentReferenceImageBase64(): String? = selectedAttachment?.takeIf { it.kind == SelectedAttachmentKind.IMAGE }?.base64
 
-    private fun clearSelectedReferenceImage() {
-        selectedReferenceImage = null
+    private fun clearSelectedAttachment() {
+        selectedAttachment = null
         renderState()
     }
 
     private fun dispatchLatestTaskFeedback(
         taskId: String,
         feedback: String,
-        imagePreview: ChatImagePreview? = null
+        imagePreview: ChatImagePreview? = null,
+        attachment: SelectedAttachment? = selectedAttachment
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/status/{task_id}") ?: return
         val referenceImagePreview = if (screenState.inputMode == InputMode.REFINE_EXISTING) {
-            imagePreview ?: selectedReferenceImage?.toChatPreview()
+            imagePreview ?: selectedAttachment?.toChatImagePreview()
         } else {
             null
         }
@@ -747,6 +762,7 @@ class MainActivity : AppCompatActivity() {
             taskId = apiTaskId,
             prompt = feedback,
             imagePreview = referenceImagePreview,
+            attachment = attachment,
             mode = screenState.inputMode
         )
     }
@@ -853,13 +869,15 @@ class MainActivity : AppCompatActivity() {
     private fun startAppSynthesis(
         prompt: String,
         imagePreview: ChatImagePreview? = null,
+        attachment: SelectedAttachment? = selectedAttachment,
         sourceTaskId: String? = null,
         displayPrompt: String? = null
     ) {
         val deviceInfo = collectDeviceInfo()
-        val referenceImagePreview = imagePreview ?: selectedReferenceImage?.toChatPreview()
+        val referenceImagePreview = imagePreview ?: attachment?.toChatImagePreview()
         val referenceImageName = referenceImagePreview?.displayName
         val referenceImageBase64 = referenceImagePreview?.base64
+        val attachments = attachment?.let { listOf(it.toPayload()) }
         val visiblePrompt = displayPrompt ?: prompt
         if (sourceTaskId == null) {
             appendLocalUserMessage(visiblePrompt, referenceImagePreview)
@@ -884,10 +902,11 @@ class MainActivity : AppCompatActivity() {
                         user_id = null,
                         phone_number = userIdentity.phoneNumber,
                         reference_image_name = referenceImageName,
-                        reference_image_base64 = referenceImageBase64
+                        reference_image_base64 = referenceImageBase64,
+                        attachments = attachments
                     )
                 )
-                clearSelectedReferenceImage()
+                clearSelectedAttachment()
                 if (sourceTaskId == null) {
                     moveLocalConversationToTask(response.task_id)
                 }
@@ -931,8 +950,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun continueClarification(taskId: String, prompt: String, appendUserMessage: Boolean = true) {
-        startFollowupSynthesis(taskId, prompt, mode = InputMode.CONTINUE_CLARIFICATION, appendUserMessage = appendUserMessage)
+    private fun continueClarification(
+        taskId: String,
+        prompt: String,
+        appendUserMessage: Boolean = true,
+        attachment: SelectedAttachment? = selectedAttachment
+    ) {
+        startFollowupSynthesis(
+            taskId,
+            prompt,
+            imagePreview = attachment?.toChatImagePreview(),
+            attachment = attachment,
+            mode = InputMode.CONTINUE_CLARIFICATION,
+            appendUserMessage = appendUserMessage
+        )
     }
 
     private fun selectTask(taskId: String, autoInstallOnSuccess: Boolean) {
@@ -1215,7 +1246,8 @@ class MainActivity : AppCompatActivity() {
         startFollowupSynthesis(
             taskId = taskId,
             prompt = feedback,
-            imagePreview = selectedReferenceImage?.toChatPreview(),
+            imagePreview = selectedAttachment?.toChatImagePreview(),
+            attachment = selectedAttachment,
             mode = InputMode.REFINE_EXISTING
         )
     }
@@ -1474,6 +1506,7 @@ class MainActivity : AppCompatActivity() {
         taskId: String,
         prompt: String,
         imagePreview: ChatImagePreview? = null,
+        attachment: SelectedAttachment? = selectedAttachment,
         mode: InputMode,
         appendUserMessage: Boolean = true
     ) {
@@ -1532,6 +1565,7 @@ class MainActivity : AppCompatActivity() {
         startAppSynthesis(
             prompt = prompt,
             imagePreview = imagePreview,
+            attachment = attachment,
             sourceTaskId = apiTaskId,
             displayPrompt = prompt
         )
@@ -2066,11 +2100,11 @@ ${record.stackTrace}
                 setComposerEnabled(false)
             }
         }
-        bindInlineImagePreview(
-            imageView = selectedReferenceImagePreview,
-            imageBase64 = selectedReferenceImage?.base64,
-            fallbackVisibility = View.GONE
-        )
+        selectedAttachmentChip.text = selectedAttachment?.chipLabel().orEmpty()
+        selectedAttachmentChip.visibility = if (selectedAttachment == null) View.GONE else View.VISIBLE
+        selectedAttachmentChip.setOnClickListener {
+            clearSelectedAttachment()
+        }
 
         val selectedTaskId = screenState.selectedTaskId
         if (visibleMessages.isNotEmpty() && !selectedTaskId.isNullOrBlank() && pendingInitialChatScrollTaskId == selectedTaskId) {
@@ -2197,26 +2231,66 @@ ${record.stackTrace}
         renderState()
     }
 
-    private fun handleReferenceImageSelected(uri: Uri) {
+    private fun showAttachmentMenu() {
+        PopupMenu(this, btnAttachReferenceImage).apply {
+            menu.add(0, 1, 0, R.string.attachment_menu_photo)
+            menu.add(0, 2, 1, R.string.attachment_menu_file)
+            menu.add(0, 3, 2, R.string.attachment_menu_cancel)
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    1 -> {
+                        pickReferenceImageLauncher.launch("image/*")
+                        true
+                    }
+                    2 -> {
+                        pickDocumentAttachmentLauncher.launch(buildDocumentAttachmentIntent())
+                        true
+                    }
+                    3 -> true
+                    else -> false
+                }
+            }
+            show()
+        }
+    }
+
+    private fun buildDocumentAttachmentIntent(): Intent {
+        return Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/pdf", "text/*"))
+        }
+    }
+
+    private fun handleAttachmentSelected(uri: Uri, kind: SelectedAttachmentKind) {
         lifecycleScope.launch {
             try {
                 val attachment = withContext(Dispatchers.IO) {
-                    buildReferenceImageAttachment(
+                    buildSelectedAttachment(
                         contentResolver = contentResolver,
                         uri = uri,
-                        maxBytes = MAX_REFERENCE_IMAGE_BYTES
+                        requestedKind = kind,
+                        maxOriginalImageBytes = MAX_ATTACHMENT_IMAGE_ORIGINAL_BYTES,
+                        maxImagePayloadBytes = MAX_ATTACHMENT_IMAGE_PAYLOAD_BYTES,
+                        maxPdfBytes = MAX_ATTACHMENT_PDF_BYTES,
+                        maxTextBytes = MAX_ATTACHMENT_TEXT_BYTES
                     )
                 }
                 if (attachment == null) {
-                    Toast.makeText(this@MainActivity, R.string.reference_image_too_large, Toast.LENGTH_SHORT).show()
+                    val messageRes = when (kind) {
+                        SelectedAttachmentKind.IMAGE -> R.string.attachment_image_too_large
+                        SelectedAttachmentKind.PDF -> R.string.attachment_pdf_too_large
+                        SelectedAttachmentKind.TEXT -> R.string.attachment_text_too_large
+                    }
+                    Toast.makeText(this@MainActivity, messageRes, Toast.LENGTH_SHORT).show()
                     return@launch
                 }
-                selectedReferenceImage = attachment
+                selectedAttachment = attachment
                 renderState()
             } catch (e: Exception) {
                 Toast.makeText(
                     this@MainActivity,
-                    getString(R.string.reference_image_pick_failed, userVisibleErrorMessage(e)),
+                    getString(R.string.attachment_pick_failed, userVisibleErrorMessage(e)),
                     Toast.LENGTH_SHORT
                 ).show()
             }

@@ -27,7 +27,15 @@ data class BuildRequest(
     val interview_consent: Boolean? = null,
     val reference_image_path: String? = null,
     val reference_image_name: String? = null,
-    val reference_image_base64: String? = null
+    val reference_image_base64: String? = null,
+    val attachments: List<AttachmentPayload>? = null
+)
+
+data class AttachmentPayload(
+    val type: String,
+    val mime_type: String,
+    val name: String,
+    val base64: String
 )
 
 data class BuildResponse(
