@@ -78,28 +78,20 @@ class LibraryActivity : AppCompatActivity() {
 
             val versionName = item.versionName?.trim()?.takeIf { it.isNotBlank() }
             val sizeLabel = fileSizeLabel(item, filePath, fileName.orEmpty())
-            content.addView(LinearLayout(this@LibraryActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = android.view.Gravity.TOP
+            if (!fileName.isNullOrBlank()) {
+                content.addView(fileTile(fileName, sizeLabel))
+            }
 
-                if (!fileName.isNullOrBlank()) {
-                    addView(fileTile(fileName, sizeLabel).apply {
-                        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                            rightMargin = dp(12)
-                        }
-                    })
-                }
-
-                addView(LinearLayout(this@LibraryActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    layoutParams = LinearLayout.LayoutParams(dp(132), LinearLayout.LayoutParams.WRAP_CONTENT)
-                    addView(detailStackItem(getString(R.string.library_version_label), versionName ?: getString(R.string.token_usage_value_unavailable)))
-                    item.createdAt?.trim()?.takeIf { it.isNotBlank() }?.let(::formatCreatedAt)?.let { timestamp ->
-                        addView(detailStackItem(getString(R.string.library_created_label), timestamp).withTopMargin(10))
-                    }
-                    addView(detailStackItem(getString(R.string.library_size_label), sizeLabel ?: getString(R.string.token_usage_value_unavailable)).withTopMargin(10))
-                })
-            })
+            val versionLabel = "${getString(R.string.library_version_label)} ${versionName ?: getString(R.string.token_usage_value_unavailable)}"
+            item.createdAt?.trim()?.takeIf { it.isNotBlank() }?.let(::formatCreatedAt)?.let { timestamp ->
+                content.addView(
+                    textView(
+                        "$versionLabel / ${getString(R.string.library_created_label)} $timestamp",
+                        13f,
+                        R.color.text_secondary
+                    ).withTopMargin(10)
+                )
+            } ?: content.addView(textView(versionLabel, 13f, R.color.text_secondary).withTopMargin(10))
         }
     }
 
@@ -171,29 +163,6 @@ class LibraryActivity : AppCompatActivity() {
                 content.visibility = if (willExpand) View.VISIBLE else View.GONE
                 chevron.text = if (willExpand) "▴" else "▾"
             }
-        }
-    }
-
-    private fun detailStackItem(label: String, value: String): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = android.view.Gravity.END
-
-            addView(textView(label, 13f, R.color.text_secondary).apply {
-                gravity = android.view.Gravity.END
-            })
-
-            addView(textView(value, 13f, R.color.text_primary, bold = true).apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    topMargin = dp(2)
-                }
-                gravity = android.view.Gravity.END
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-            })
         }
     }
 
