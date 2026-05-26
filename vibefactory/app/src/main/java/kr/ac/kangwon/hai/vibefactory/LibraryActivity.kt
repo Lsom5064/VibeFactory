@@ -66,7 +66,7 @@ class LibraryActivity : AppCompatActivity() {
             }
             orientation = LinearLayout.VERTICAL
             setBackgroundResource(R.drawable.bg_library_item)
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setPadding(dp(16), dp(16), dp(16), dp(18))
 
             val content = LinearLayout(this@LibraryActivity).apply {
                 orientation = LinearLayout.VERTICAL
@@ -82,16 +82,13 @@ class LibraryActivity : AppCompatActivity() {
                 content.addView(fileTile(fileName, sizeLabel))
             }
 
-            val versionLabel = "${getString(R.string.library_version_label)} ${versionName ?: getString(R.string.token_usage_value_unavailable)}"
+            content.addView(
+                metaLine(getString(R.string.library_version_label), versionName ?: getString(R.string.token_usage_value_unavailable))
+                    .withTopMargin(14)
+            )
             item.createdAt?.trim()?.takeIf { it.isNotBlank() }?.let(::formatCreatedAt)?.let { timestamp ->
-                content.addView(
-                    textView(
-                        "$versionLabel / ${getString(R.string.library_created_label)} $timestamp",
-                        13f,
-                        R.color.text_secondary
-                    ).withTopMargin(10)
-                )
-            } ?: content.addView(textView(versionLabel, 13f, R.color.text_secondary).withTopMargin(10))
+                content.addView(metaLine(getString(R.string.library_created_label), timestamp).withTopMargin(6))
+            }
         }
     }
 
@@ -142,6 +139,8 @@ class LibraryActivity : AppCompatActivity() {
 
             addView(textView(item.title, 18f, R.color.text_primary, bold = true).apply {
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
             })
 
             item.subtitle?.substringAfterLast('·')?.trim()?.takeIf { it.isNotBlank() }?.let { status ->
@@ -177,6 +176,13 @@ class LibraryActivity : AppCompatActivity() {
         }
     }
 
+    private fun metaLine(label: String, value: String): TextView {
+        return textView("$label : $value", 13f, R.color.text_secondary).apply {
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+    }
+
     private fun statusChip(status: String): TextView {
         return TextView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -208,14 +214,14 @@ class LibraryActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
             setBackgroundResource(R.drawable.bg_library_file_tile)
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setPadding(dp(14), dp(14), dp(14), dp(14))
 
             addView(ImageView(this@LibraryActivity).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(34), dp(34))
+                layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
                 setBackgroundResource(R.drawable.bg_artifact_icon)
                 setImageResource(R.drawable.ic_artifact_file)
                 imageTintList = android.content.res.ColorStateList.valueOf(getColor(R.color.text_inverse))
-                setPadding(dp(9), dp(9), dp(9), dp(9))
+                setPadding(dp(10), dp(10), dp(10), dp(10))
             })
 
             addView(LinearLayout(this@LibraryActivity).apply {
@@ -223,7 +229,7 @@ class LibraryActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                     leftMargin = dp(12)
                 }
-                addView(textView(fileName, 14f, R.color.text_primary, bold = true).apply {
+                addView(textView(fileName, 15f, R.color.text_primary, bold = true).apply {
                     maxLines = 1
                     ellipsize = android.text.TextUtils.TruncateAt.END
                 })
