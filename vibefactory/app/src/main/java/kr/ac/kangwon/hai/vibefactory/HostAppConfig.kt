@@ -21,6 +21,8 @@ object HostAppConfig {
     const val PREF_MONITORED_TASK_APP_NAMES = "foreground_monitored_task_app_names"
     const val PREF_NOTIFIED_TERMINAL_TASK_IDS = "foreground_notified_terminal_task_ids"
     const val PREF_TASK_ARTIFACT_STATES = "task_artifact_states"
+    const val PREF_TOKEN_LIMIT = "token_limit"
+    const val PREF_DARK_MODE_ENABLED = "dark_mode_enabled"
 }
 
 fun createVibeApiService(

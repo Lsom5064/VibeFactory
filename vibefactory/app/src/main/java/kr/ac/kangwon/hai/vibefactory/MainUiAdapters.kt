@@ -62,7 +62,7 @@ class TaskSummaryAdapter(
             itemView.setBackgroundColor(
                 when {
                     selected && item.hasRuntimeError -> ContextCompat.getColor(context, R.color.task_runtime_error_bg_selected)
-                    selected -> ContextCompat.getColor(context, android.R.color.darker_gray)
+                    selected -> ContextCompat.getColor(context, R.color.drawer_history_item_selected)
                     item.hasRuntimeError -> ContextCompat.getColor(context, R.color.task_runtime_error_bg)
                     else -> ContextCompat.getColor(context, android.R.color.transparent)
                 }
@@ -208,7 +208,7 @@ class ChatMessageAdapter(
                     bubbleParams.marginStart = 0
                     bubbleParams.marginEnd = 0
                     container.setBackgroundResource(
-                        if (isArtifactCard) R.drawable.bg_message_user else R.drawable.bg_message_status
+                        if (isArtifactCard) R.drawable.bg_message_assistant else R.drawable.bg_message_status
                     )
                     title.setTextColor(ContextCompat.getColor(context, R.color.accent_primary_dark))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))

@@ -6,6 +6,10 @@
     <color name="bg_panel">#FFFDF8</color>
     <color name="bg_panel_alt">#E8EFE5</color>
     <color name="bg_composer">#F9FBF7</color>
+    <color name="drawer_surface">#FFFDFC</color>
+    <color name="drawer_row_selected">#F3F5F2</color>
+    <color name="drawer_history_item">#FFFFFF</color>
+    <color name="drawer_history_item_selected">#F2F4F1</color>
     <color name="text_primary">#17211B</color>
     <color name="text_secondary">#5F6B63</color>
     <color name="text_inverse">#FCFEFC</color>
@@ -16,6 +20,14 @@
     <color name="status_bubble">#FFFFFF</color>
     <color name="log_bubble">#F3E8BF</color>
     <color name="divider_soft">#D7E0D4</color>
+    <color name="token_usage_track">#E3EADF</color>
     <color name="task_runtime_error_bg">#FCE4E4</color>
     <color name="task_runtime_error_bg_selected">#F6C7C7</color>
+    <color name="task_runtime_badge_bg">#FFF0F0</color>
+    <color name="task_runtime_badge_text">#C62828</color>
+    <color name="artifact_bubble">#EEF1EE</color>
+    <color name="artifact_icon_bg">#F2F4F2</color>
+    <color name="top_chip">#FFFFFFFF</color>
+    <color name="bg_app_fade_center">#E6FAFAF8</color>
+    <color name="bg_app_fade_end">#00FAFAF8</color>
 </resources>

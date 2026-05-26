@@ -117,6 +117,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var selectedAttachmentChip: TextView
     private lateinit var btnSend: Button
     private lateinit var btnNewChat: Button
+    private lateinit var btnOpenLibrary: Button
+    private lateinit var btnOpenSettings: Button
     private lateinit var btnSavePhoneGate: Button
     private lateinit var btnOpenDrawer: ImageButton
     private lateinit var composerBar: LinearLayout
@@ -316,6 +318,8 @@ class MainActivity : AppCompatActivity() {
         selectedAttachmentChip = findViewById(R.id.selectedAttachmentChip)
         btnSend = findViewById(R.id.btnSend)
         btnNewChat = findViewById(R.id.btnNewChat)
+        btnOpenLibrary = findViewById(R.id.btnOpenLibrary)
+        btnOpenSettings = findViewById(R.id.btnOpenSettings)
         btnSavePhoneGate = findViewById(R.id.btnSavePhoneGate)
         btnOpenDrawer = findViewById(R.id.btnOpenDrawer)
         composerBar = findViewById(R.id.composerBar)
@@ -385,6 +389,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        val darkModeEnabled = preferencesStore.loadDarkModeEnabled()
+        AppThemeController.applyDarkModePreference(darkModeEnabled)
+        if (AppThemeController.shouldRecreateForPreference(this, darkModeEnabled)) {
+            recreate()
+            return
+        }
         loadPersistedArtifactStates()
         loadPersistedRuntimeErrors()
         if (!hasRequiredPhoneNumber() && hasPhoneNumberPermissionGranted()) {
@@ -416,10 +426,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun restoreCurrentTaskState(trigger: String) {
         if (!hasRequiredPhoneNumber()) return
+        val fallbackPersistedTaskId = taskConversationMessages.keys.firstOrNull { it.isNotBlank() && !hiddenTaskIds.contains(it) }
         val taskId = currentTaskId?.takeIf { it.isNotBlank() }
             ?: screenState.selectedTaskId?.takeIf { it.isNotBlank() }
             ?: pendingTaskSelectionKey?.takeIf { it.isNotBlank() }
             ?: getLastSelectedTaskId()?.takeIf { it.isNotBlank() }
+            ?: fallbackPersistedTaskId
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
         val selectionGeneration = advanceTaskSelectionGeneration()
@@ -556,6 +568,18 @@ class MainActivity : AppCompatActivity() {
             resetForNewChat()
             drawerLayout.closeDrawer(GravityCompat.START)
         }
+
+        btnOpenSettings.setOnClickListener {
+            drawerLayout.closeDrawer(GravityCompat.START)
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
+        val openLibrary = View.OnClickListener {
+            drawerLayout.closeDrawer(GravityCompat.START)
+            startActivity(Intent(this, LibraryActivity::class.java))
+        }
+        btnOpenLibrary.setOnClickListener(openLibrary)
+        findViewById<LinearLayout>(R.id.drawerLibraryRow).setOnClickListener(openLibrary)
 
         btnSavePhoneGate.setOnClickListener {
             requestPhoneNumberPermissionIfNeeded()
@@ -2036,6 +2060,8 @@ ${record.stackTrace}
         }
         btnOpenDrawer.isEnabled = !phoneGateVisible
         btnNewChat.isEnabled = !phoneGateVisible
+        btnOpenLibrary.isEnabled = !phoneGateVisible
+        btnOpenSettings.isEnabled = !phoneGateVisible
         inputPhoneGate.isEnabled = false
         inputPhoneGate.visibility = if (phoneGateVisible) View.GONE else View.VISIBLE
         btnSavePhoneGate.isEnabled = true

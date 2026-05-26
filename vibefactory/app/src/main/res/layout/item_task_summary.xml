@@ -2,22 +2,26 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:layout_marginBottom="8dp"
-    android:background="#EEF3F8"
+    android:layout_marginBottom="4dp"
+    android:background="@android:color/transparent"
     android:clickable="true"
     android:focusable="true"
+    android:foreground="?attr/selectableItemBackground"
     android:orientation="vertical"
-    android:padding="12dp">
+    android:paddingStart="4dp"
+    android:paddingTop="10dp"
+    android:paddingEnd="4dp"
+    android:paddingBottom="10dp">
 
     <TextView
         android:id="@+id/taskRuntimeBadge"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:background="#FFE2E2"
+        android:background="@color/task_runtime_badge_bg"
         android:paddingHorizontal="8dp"
         android:paddingVertical="4dp"
         android:text="@string/runtime_badge"
-        android:textColor="#C62828"
+        android:textColor="@color/task_runtime_badge_text"
         android:textSize="11sp"
         android:textStyle="bold"
         android:visibility="gone" />
@@ -25,7 +29,7 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
+        android:layout_marginTop="2dp"
         android:gravity="center_vertical"
         android:orientation="horizontal">
 
@@ -35,8 +39,9 @@
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:maxLines="2"
-            android:textColor="#1C1E21"
-            android:textStyle="bold" />
+            android:textColor="@color/text_primary"
+            android:textSize="15sp"
+            android:textStyle="normal" />
 
         <ImageButton
             android:id="@+id/btnHideTask"
@@ -54,16 +59,16 @@
         android:id="@+id/taskSubtitle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:textColor="#666666"
+        android:layout_marginTop="3dp"
+        android:textColor="@color/text_secondary"
         android:textSize="12sp" />
 
     <TextView
         android:id="@+id/taskStatus"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
-        android:textColor="#007AFF"
+        android:layout_marginTop="4dp"
+        android:textColor="@color/text_secondary"
         android:textSize="12sp"
-        android:textStyle="bold" />
+        android:textStyle="normal" />
 </LinearLayout>
