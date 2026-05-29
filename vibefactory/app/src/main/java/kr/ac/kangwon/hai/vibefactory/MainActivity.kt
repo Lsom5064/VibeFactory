@@ -1192,30 +1192,23 @@ class MainActivity : AppCompatActivity() {
                 setComposerEnabled(true)
                 return
             }
-            val clarificationMessages = buildList {
-                message.takeIf { it.isNotBlank() }?.let(::add)
-                if (isEmpty()) {
-                    response.reason?.trim()?.takeIf { it.isNotBlank() }?.let(::add)
-                }
-                questions.forEach { question ->
-                    if (question !in this) {
-                        add(question)
-                    }
-                }
-            }
-
-            clarificationMessages.forEachIndexed { index, clarification ->
+            val clarificationBody = buildClarificationBubbleBody(
+                message = message,
+                reason = response.reason,
+                questions = questions
+            )
+            if (!clarificationBody.isNullOrBlank()) {
                 appendOptimisticTaskMessage(
                     taskId,
                     ChatMessage(
-                        id = "decision-clarification-$taskId-$index-${System.currentTimeMillis()}",
+                        id = "decision-clarification-$taskId-${System.currentTimeMillis()}",
                         kind = MessageKind.ASSISTANT,
                         title = getString(R.string.message_title_assistant),
-                        body = clarification
+                        body = clarificationBody
                     )
                 )
             }
-            val clarificationDetail = clarificationMessages.firstOrNull()
+            val clarificationDetail = clarificationBody
                 ?: response.reason?.trim()?.takeIf { it.isNotBlank() }
                 ?: getString(R.string.status_no_detail)
             screenState = screenState.copy(
@@ -1229,14 +1222,19 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        questions.forEachIndexed { index, question ->
+        val questionBody = buildClarificationBubbleBody(
+            message = null,
+            reason = null,
+            questions = questions
+        )
+        if (!questionBody.isNullOrBlank()) {
             appendOptimisticTaskMessage(
                 taskId,
                 ChatMessage(
-                    id = "decision-question-$taskId-$index-${System.currentTimeMillis()}",
+                    id = "decision-question-$taskId-${System.currentTimeMillis()}",
                     kind = MessageKind.ASSISTANT,
                     title = getString(R.string.message_title_assistant),
-                    body = question
+                    body = questionBody
                 )
             )
         }
@@ -2530,15 +2528,22 @@ ${record.stackTrace}
                         )
                     }
             } else {
-                latestQuestions.forEachIndexed { index, question ->
-                    if (question.isBlank() || timelineContainsBody(taskId, question)) return@forEachIndexed
+                val questionBody = buildClarificationBubbleBody(
+                    message = null,
+                    reason = null,
+                    questions = latestQuestions
+                )
+                if (!questionBody.isNullOrBlank() &&
+                    !timelineContainsBody(taskId, questionBody) &&
+                    latestQuestions.none { question -> question.isNotBlank() && timelineContainsBody(taskId, question) }
+                ) {
                     appendTaskTimelineMessage(
                         taskId,
                         ChatMessage(
-                            id = "seed-question-$taskId-$index",
+                            id = "seed-question-$taskId",
                             kind = MessageKind.ASSISTANT,
                             title = getString(R.string.message_title_assistant),
-                            body = question,
+                            body = questionBody,
                             createdAt = currentTimestampString()
                         )
                     )
@@ -2595,6 +2600,22 @@ ${record.stackTrace}
 
     private fun timelineContainsBody(taskId: String, body: String): Boolean {
         return buildTaskTimeline(taskId).any { hasSameMessageText(it.body, body) }
+    }
+
+    private fun buildClarificationBubbleBody(message: String?, reason: String?, questions: List<String>): String? {
+        val intro = message?.trim()?.takeIf { it.isNotBlank() }
+            ?: reason?.trim()?.takeIf { it.isNotBlank() }
+        val seen = linkedSetOf<String>()
+        intro?.let { seen += it }
+        val numberedQuestions = questions
+            .mapNotNull { it.trim().takeIf { question -> question.isNotBlank() } }
+            .filter { seen.add(it) }
+            .mapIndexed { index, question -> "${index + 1}. $question" }
+            .joinToString("\n")
+
+        return listOfNotNull(intro, numberedQuestions.takeIf { it.isNotBlank() })
+            .joinToString("\n")
+            .takeIf { it.isNotBlank() }
     }
 
     private fun extractTimelineEvents(response: StatusResponse): List<TimelineEventSnapshot> {
