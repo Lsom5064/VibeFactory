@@ -285,6 +285,39 @@ def format_codex_rate_limit_summary(snapshot: "CodexRateLimitSnapshot", *, now_t
     )
 
 
+def codex_quota_exceeded_message(snapshot: "CodexRateLimitSnapshot", *, now_ts: Optional[int] = None) -> Optional[str]:
+    windows = [window for window in (snapshot.primary, snapshot.secondary) if window is not None]
+    exhausted_windows = [window for window in windows if int(window.used_percent) >= 100]
+    if not exhausted_windows:
+        return None
+
+    current_ts = int(now_ts if now_ts is not None else time.time())
+    reset_candidates = [window.resets_at for window in exhausted_windows if window.resets_at is not None]
+    if reset_candidates:
+        reset_after = format_duration_korean(max(0, min(reset_candidates) - current_ts))
+        return f"지금은 앱 생성 한도를 모두 사용했어요. 약 {reset_after} 후 다시 시도할 수 있어요."
+    return "지금은 앱 생성 한도를 모두 사용했어요. 한도가 초기화된 뒤 다시 시도해 주세요."
+
+
+def looks_like_codex_quota_error(text: str) -> bool:
+    normalized = text.lower()
+    if not normalized.strip():
+        return False
+    markers = (
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "usage limit",
+        "limit exceeded",
+        "too many requests",
+        "429",
+        "한도",
+        "호출량",
+        "사용량",
+    )
+    return any(marker in normalized for marker in markers)
+
+
 def build_rate_limit_window_payload(label: str, window: Optional["CodexRateLimitWindow"]) -> Optional[dict[str, Any]]:
     if window is None:
         return None
@@ -560,6 +593,35 @@ def log_codex_rate_limits_to_server_log(
         print(f"[codex-limit] task_id={task_id} {format_codex_rate_limit_summary(snapshot)}", flush=True)
     except Exception as exc:
         print(f"[codex-limit] task_id={task_id} 한도 조회 실패: {exc}", flush=True)
+
+
+def check_codex_quota_before_build(db: "Database", settings: "Settings", task_id: str) -> Optional[str]:
+    try:
+        snapshot = fetch_codex_rate_limits(settings.codex_command)
+    except Exception as exc:
+        db.log_event(
+            task_id,
+            actor="system",
+            event_type="codex_limit_probe_failed",
+            message_text="Codex 한도 조회에 실패했지만 작업을 계속 진행합니다.",
+            payload={"error": str(exc)},
+        )
+        return None
+
+    message = codex_quota_exceeded_message(snapshot)
+    if message:
+        db.log_event(
+            task_id,
+            actor="system",
+            event_type="codex_quota_exceeded",
+            message_text=message,
+            payload={
+                "limit_name": snapshot.limit_name,
+                "primary_window": build_rate_limit_window_payload("5시간 한도", snapshot.primary),
+                "secondary_window": build_rate_limit_window_payload("주간 한도", snapshot.secondary),
+            },
+        )
+    return message
 
 
 def ensure_within_root(path: Path, root: Path) -> bool:
@@ -2023,6 +2085,21 @@ def build_pre_build_confirmation_decision(decision: IntentDecision, *, existing_
         confirmation_payload="네, 이 내용으로 앱 생성을 시작해줘" if not existing_task else "네, 이 내용으로 앱 수정을 시작해줘",
         image_reference_summary=decision.image_reference_summary,
         image_conflict_note=decision.image_conflict_note,
+    )
+
+
+def build_codex_quota_decision(decision: IntentDecision, message: str) -> IntentDecision:
+    return replace(
+        decision,
+        mode="answer_question",
+        status="RateLimited",
+        tool="answer_question",
+        message=message,
+        summary="",
+        questions=[],
+        reason="codex_quota_exceeded",
+        confirmation_action="",
+        confirmation_payload="",
     )
 
 
@@ -3922,6 +3999,8 @@ def status_display_text(status: str, message: Optional[str] = None) -> str:
         return "앱 생성에 실패했어요."
     if normalized == "error":
         return "서버 오류가 발생했어요."
+    if normalized == "ratelimited":
+        return "앱 생성 한도를 모두 사용했어요."
     return (message or status).strip() or "상태를 확인하고 있어요."
 
 
@@ -4356,6 +4435,8 @@ def derive_current_build_stage(task: dict[str, Any], timeline_events: list[dict[
         return "작업 대기 중", message or status_display_text(status, message)
     if status == "Pending Decision":
         return "명세 확인 중", message or status_display_text(status, message)
+    if status == "RateLimited":
+        return "앱 생성 한도 초과", message or status_display_text(status, message)
     return "", ""
 
 
@@ -5037,6 +5118,32 @@ class CodexTaskRunner:
 
         if not result_path.exists():
             log_text = collect_task_logs(workspace_path, "logs/build.log")
+            if looks_like_codex_quota_error(log_text):
+                message = "지금은 앱 생성 한도를 모두 사용했어요. 한도가 초기화된 뒤 다시 시도해 주세요."
+                self.db.update_task(
+                    task_id,
+                    status="RateLimited",
+                    message=message,
+                    log=log_text,
+                    codex_result_json=json.dumps(
+                        make_error_result(task_id, message),
+                        ensure_ascii=False,
+                    ),
+                    **usage_update_fields,
+                )
+                task = self.db.get_task(task_id)
+                if task:
+                    log_task_status_event(self.db, task, event_type="codex_quota_exceeded")
+                    if usage:
+                        log_token_usage_event(self.db, task_id, usage, model=codex_model)
+                log_build_stage_event(
+                    self.db,
+                    task_id,
+                    stage="앱 생성 한도",
+                    phase="failed",
+                    body=message,
+                )
+                return
             message = "결과 파일이 생성되지 않았습니다."
             if exit_code not in (0, None):
                 message = f"{message} worker exit code: {exit_code}"
@@ -5620,6 +5727,44 @@ def create_app() -> FastAPI:
                 )
                 return build_decision_response(followup_task_id, decision)
 
+            quota_message = check_codex_quota_before_build(db, settings, followup_task_id)
+            if quota_message:
+                quota_decision = build_codex_quota_decision(decision, quota_message)
+                db.update_task(
+                    followup_task_id,
+                    status=quota_decision.status,
+                    message=quota_decision.message,
+                    device_id=request.device_id,
+                    phone_number=request.phone_number,
+                    codex_result_json=json.dumps(
+                        make_decision_state(
+                            {
+                                **task,
+                                "device_info": request_device_info or previous_conversation_state.get("device_info") or {},
+                                "reference_image_name": effective_reference_image_name,
+                                "reference_image_base64": effective_reference_image_base64,
+                                "reference_image_workspace_path": previous_conversation_state.get("reference_image_workspace_path") or "",
+                                "attachments": effective_attachments,
+                                "attachment_text": effective_attachment_text,
+                            },
+                            quota_decision,
+                            request.prompt,
+                        ),
+                        ensure_ascii=False,
+                    ),
+                )
+                rate_limited_task = db.get_task(followup_task_id)
+                if rate_limited_task:
+                    log_task_status_event(db, rate_limited_task, event_type="codex_quota_exceeded")
+                db.log_event(
+                    followup_task_id,
+                    actor="assistant",
+                    event_type="assistant_message",
+                    message_text=quota_decision.message,
+                    payload=build_assistant_response_payload(quota_decision),
+                )
+                return build_decision_response(followup_task_id, quota_decision)
+
             resolved_app_name = decision.app_name
             if not resolved_app_name or resolved_app_name == "맞춤 앱":
                 resolved_app_name = task.get("app_name") or resolved_app_name
@@ -5872,6 +6017,42 @@ def create_app() -> FastAPI:
             payload=build_assistant_response_payload(decision),
         )
         if decision.mode == "build":
+            quota_message = check_codex_quota_before_build(db, settings, task_id)
+            if quota_message:
+                quota_decision = build_codex_quota_decision(decision, quota_message)
+                db.update_task(
+                    task_id,
+                    status=quota_decision.status,
+                    message=quota_decision.message,
+                    codex_result_json=json.dumps(
+                        make_decision_state(
+                            {
+                                "prompt": request.prompt,
+                                "device_info": request_device_info,
+                                "reference_image_name": requested_reference_image_name,
+                                "reference_image_base64": requested_reference_image_base64,
+                                "reference_image_workspace_path": "",
+                                "attachments": requested_attachments,
+                                "attachment_text": requested_attachment_text,
+                            },
+                            quota_decision,
+                            request.prompt,
+                        ),
+                        ensure_ascii=False,
+                    ),
+                )
+                rate_limited_task = db.get_task(task_id)
+                if rate_limited_task:
+                    log_task_status_event(db, rate_limited_task, event_type="codex_quota_exceeded")
+                db.log_event(
+                    task_id,
+                    actor="assistant",
+                    event_type="assistant_message",
+                    message_text=quota_decision.message,
+                    payload=build_assistant_response_payload(quota_decision),
+                )
+                return build_decision_response(task_id, quota_decision)
+
             try:
                 workspace_path, project_path = build_task_workspace(settings, task)
             except Exception as exc:
