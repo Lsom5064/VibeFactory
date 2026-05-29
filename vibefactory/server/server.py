@@ -3369,7 +3369,8 @@ def render_task_agents_md(task_id: str) -> str:
 - iOS/Xcode는 사용하지 않는다.
 - 사용자의 명세를 반영해 `project` 폴더의 Flutter 앱을 수정한다.
 - 가급적 `project/lib/main.dart`, `project/pubspec.yaml`, `project/android/app/` 아래만 집중해서 수정한다.
-- `flutter pub get`, `flutter analyze`, `flutter build apk` 중 필요한 명령을 실행한다.
+- `flutter pub get`, `flutter analyze`, `flutter build apk --debug` 중 필요한 명령을 실행한다.
+- APK 빌드는 debug만 허용한다. `flutter build apk`를 실행할 때는 반드시 `--debug`를 붙이고, release/profile 빌드는 실행하지 않는다.
 - 사용자가 요청한 핵심 기능을 더 쉬운 대체 구현으로 바꾸지 않는다.
 - `prompt.md`에 적힌 `1차 핵심 흐름`을 이번 빌드의 최우선 범위로 본다.
 - `2차 고도화 요구`는 1차가 안정적으로 성립한 뒤에 반영한다. 시간이 부족하거나 충돌하면 1차를 우선하고, 못 넣은 2차 요구는 `known_limitations`에 남긴다.

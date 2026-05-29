@@ -12,6 +12,8 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 
 class TaskSummaryAdapter(
@@ -92,20 +94,14 @@ class ChatMessageAdapter(
     private val onConfirmationDismiss: (ChatMessage) -> Unit,
     private val onArtifactDownload: (ChatMessage) -> Unit,
     private val onArtifactInstall: (ChatMessage) -> Unit
-) : RecyclerView.Adapter<ChatMessageAdapter.ChatViewHolder>() {
+) : ListAdapter<ChatMessage, ChatMessageAdapter.ChatViewHolder>(ChatMessageDiffCallback) {
 
     companion object {
         private const val ASSISTANT_MESSAGE_COLLAPSE_CHAR_THRESHOLD = 220
         private const val ASSISTANT_MESSAGE_COLLAPSED_MAX_LINES = 8
     }
 
-    private var items: List<ChatMessage> = emptyList()
     private val expandedAssistantMessageIds = mutableSetOf<String>()
-
-    fun submitList(newItems: List<ChatMessage>) {
-        items = newItems
-        notifyDataSetChanged()
-    }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChatViewHolder {
         val view = LayoutInflater.from(parent.context).inflate(R.layout.item_chat_message, parent, false)
@@ -113,10 +109,8 @@ class ChatMessageAdapter(
     }
 
     override fun onBindViewHolder(holder: ChatViewHolder, position: Int) {
-        holder.bind(items[position])
+        holder.bind(getItem(position))
     }
-
-    override fun getItemCount(): Int = items.size
 
     inner class ChatViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         private val block: LinearLayout = view.findViewById(R.id.messageBlock)
@@ -343,6 +337,16 @@ class ChatMessageAdapter(
         private fun bindArtifactActions(item: ChatMessage, context: android.content.Context) {
             // Artifact actions are intentionally hidden in the current file-card layout.
         }
+    }
+}
+
+internal object ChatMessageDiffCallback : DiffUtil.ItemCallback<ChatMessage>() {
+    override fun areItemsTheSame(oldItem: ChatMessage, newItem: ChatMessage): Boolean {
+        return oldItem.id == newItem.id
+    }
+
+    override fun areContentsTheSame(oldItem: ChatMessage, newItem: ChatMessage): Boolean {
+        return oldItem == newItem
     }
 }
 

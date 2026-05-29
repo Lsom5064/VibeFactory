@@ -2079,9 +2079,7 @@ ${record.stackTrace}
         val visibleMessages = appendArtifactCardMessage(timelineVisibleMessages)
         val shouldAutoScrollNewMessage = shouldAutoScrollMessages(visibleMessages)
         val aggregatedLogText = buildLogPanelText(screenState.selectedTaskId, screenState.messages)
-        if (!isMessageTextSelectionActive) {
-            chatAdapter.submitList(visibleMessages)
-        }
+        submitChatMessagesWhenSafe(visibleMessages)
         emptyChatText.visibility = if (visibleMessages.isEmpty()) View.VISIBLE else View.GONE
         logPanel.visibility = if (showLogs && aggregatedLogText.isNotBlank()) View.VISIBLE else View.GONE
         btnLogScrollBottom.visibility = if (showLogs && aggregatedLogText.isNotBlank()) View.VISIBLE else View.GONE
@@ -3680,7 +3678,7 @@ ${record.stackTrace}
                 val visibleMessages = animateProcessingStatusBubble(
                     screenState.messages.filter { it.kind != MessageKind.LOG }
                 )
-                chatAdapter.submitList(visibleMessages)
+                submitChatMessagesWhenSafe(visibleMessages)
             }
         }
     }
@@ -4190,8 +4188,29 @@ ${record.stackTrace}
         override fun onActionItemClicked(mode: ActionMode?, item: MenuItem?): Boolean = false
 
         override fun onDestroyActionMode(mode: ActionMode?) {
-            isMessageTextSelectionActive = false
-            renderState()
+            recyclerMessages.post {
+                isMessageTextSelectionActive = false
+                renderStateWhenRecyclerMessagesSettled()
+            }
         }
+    }
+
+    private fun submitChatMessagesWhenSafe(visibleMessages: List<ChatMessage>) {
+        when (chooseChatMessageRefreshAction(isMessageTextSelectionActive, recyclerMessages.isComputingLayout)) {
+            ChatMessageRefreshAction.SKIP_FOR_TEXT_SELECTION -> return
+            ChatMessageRefreshAction.DEFER_FOR_RECYCLER_LAYOUT -> {
+                recyclerMessages.post { submitChatMessagesWhenSafe(visibleMessages) }
+                return
+            }
+            ChatMessageRefreshAction.SUBMIT -> chatAdapter.submitList(visibleMessages)
+        }
+    }
+
+    private fun renderStateWhenRecyclerMessagesSettled() {
+        if (recyclerMessages.isComputingLayout) {
+            recyclerMessages.post { renderStateWhenRecyclerMessagesSettled() }
+            return
+        }
+        renderState()
     }
 }
