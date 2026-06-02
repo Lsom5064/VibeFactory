@@ -408,6 +408,20 @@ def build_task_usage_snapshot(
     }
 
 
+def build_global_usage_snapshot(settings: "Settings") -> dict[str, Any]:
+    snapshot = fetch_codex_rate_limits(settings.codex_command)
+    limit_name = normalize_whitespace(str(snapshot.limit_name or "Codex")) or "Codex"
+    return {
+        "task_id": "",
+        "limit_name": limit_name,
+        "primary_window": build_rate_limit_window_payload("5시간 한도", snapshot.primary),
+        "secondary_window": build_rate_limit_window_payload("주간 한도", snapshot.secondary),
+        "usage": build_usage_payload({}, None),
+        "status": "Ready",
+        "status_message": "Codex 계정 한도를 확인했어요.",
+    }
+
+
 def _read_jsonrpc_result(process: subprocess.Popen[str], request_id: int, timeout_seconds: float) -> Any:
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("Codex app-server 표준 입출력을 열지 못했습니다.")
@@ -6098,6 +6112,14 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         log_codex_rate_limits_to_server_log(task_id, settings.codex_command)
         return serialize_task_for_status(db, task, settings.status_log_line_limit)
+
+    @app.get("/usage/codex")
+    def get_global_codex_usage() -> dict[str, Any]:
+        settings: Settings = app.state.settings
+        try:
+            return build_global_usage_snapshot(settings)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"usage unavailable: {exc}") from exc
 
     @app.get("/tasks/{task_id}/usage")
     def get_task_usage(

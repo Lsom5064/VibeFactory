@@ -48,11 +48,6 @@ class TokenUsageActivity : AppCompatActivity() {
         bindViews()
 
         val taskId = intent.getStringExtra(EXTRA_TASK_ID).orEmpty().trim()
-        if (taskId.isBlank()) {
-            bindEmptyState(getString(R.string.token_usage_empty_no_task))
-            return
-        }
-
         loadUsage(taskId)
     }
 
@@ -79,7 +74,11 @@ class TokenUsageActivity : AppCompatActivity() {
         bindLoadingState()
         lifecycleScope.launch {
             runCatching {
-                tokenUsageRepository.load(taskId)
+                if (taskId.isBlank()) {
+                    tokenUsageRepository.loadGlobal()
+                } else {
+                    tokenUsageRepository.load(taskId)
+                }
             }.onSuccess { snapshot ->
                 bindSnapshot(snapshot)
             }.onFailure { throwable ->

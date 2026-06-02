@@ -178,6 +178,9 @@ interface VibeApiService {
         @Query("phone_number") phoneNumber: String? = null
     ): TokenUsageResponse
 
+    @GET("/usage/codex")
+    suspend fun getCodexUsage(): TokenUsageResponse
+
     @POST("/tasks/{task_id}/runtime-error")
     suspend fun reportRuntimeError(
         @Path("task_id") taskId: String,
