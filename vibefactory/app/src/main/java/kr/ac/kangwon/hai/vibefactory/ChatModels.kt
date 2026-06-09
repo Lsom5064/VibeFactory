@@ -2,6 +2,7 @@ package kr.ac.kangwon.hai.vibefactory
 
 enum class InputMode {
     NEW_GENERATE,
+    CHAT,
     CONTINUE_CLARIFICATION,
     REFINE_EXISTING,
     RETRY_FAILED,
@@ -36,15 +37,22 @@ data class ChatMessage(
     val body: String,
     val detail: String? = null,
     val createdAt: String? = null,
+    val eventType: String? = null,
     val imagePreviewBase64: String? = null,
     val imagePreviewName: String? = null,
     val confirmAction: String? = null,
     val confirmTaskId: String? = null,
     val confirmPayload: String? = null,
     val artifactTaskId: String? = null,
+    val artifactApkUrl: String? = null,
+    val artifactApkPath: String? = null,
+    val artifactDownloadedPath: String? = null,
+    val artifactRevisionLabel: String? = null,
+    val artifactBuildAttempt: Int? = null,
     val artifactCanDownload: Boolean = false,
     val artifactCanInstall: Boolean = false,
-    val artifactDownloading: Boolean = false
+    val artifactDownloading: Boolean = false,
+    val isLoading: Boolean = false
 )
 
 data class RuntimeErrorRecord(

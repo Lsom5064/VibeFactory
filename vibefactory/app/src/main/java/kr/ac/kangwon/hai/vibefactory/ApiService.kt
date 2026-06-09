@@ -48,6 +48,7 @@ data class BuildResponse(
     val confirmation_action: String? = null,
     val confirmation_payload: String? = null,
     val interaction_type: String? = null,
+    val request_scope: String? = null,
     val render_mode: String? = null,
     val requires_user_input: Boolean? = null,
     val requires_confirmation: Boolean? = null,
@@ -76,6 +77,8 @@ data class StatusResponse(
     val generated_app_name: String? = "",
     val package_name: String? = "",
     val apk_url: String? = "",
+    val apk_path: String? = "",
+    val apk_size_bytes: Long? = null,
     val build_success: Boolean = false,
     val build_attempts: Int = 0,
     val conversation_state: JsonElement? = null,
@@ -194,6 +197,7 @@ interface VibeApiService {
         @Path("task_id") taskId: String,
         @Query("device_id") deviceId: String,
         @Query("user_id") userId: String? = null,
-        @Query("phone_number") phoneNumber: String? = null
+        @Query("phone_number") phoneNumber: String? = null,
+        @Query("artifact_path") artifactPath: String? = null
     ): Response<ResponseBody>
 }
