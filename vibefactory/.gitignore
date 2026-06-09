@@ -13,3 +13,14 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Local runtime data and generated task workspaces
+tasks.db
+server/tasks.db
+server/workspaces/
+
+# Tool caches
+.kotlin/
+__pycache__/
+server/__pycache__/
+server/tests/__pycache__/
