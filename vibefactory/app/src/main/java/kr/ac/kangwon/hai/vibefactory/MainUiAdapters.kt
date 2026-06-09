@@ -1,5 +1,6 @@
 package kr.ac.kangwon.hai.vibefactory
 
+import android.content.Intent
 import android.text.TextUtils
 import android.view.ActionMode
 import android.view.Gravity
@@ -95,13 +96,10 @@ class ChatMessageAdapter(
     private val onArtifactDownload: (ChatMessage) -> Unit,
     private val onArtifactInstall: (ChatMessage) -> Unit
 ) : ListAdapter<ChatMessage, ChatMessageAdapter.ChatViewHolder>(ChatMessageDiffCallback) {
-
     companion object {
-        private const val ASSISTANT_MESSAGE_COLLAPSE_CHAR_THRESHOLD = 220
-        private const val ASSISTANT_MESSAGE_COLLAPSED_MAX_LINES = 8
+        private const val CHAT_MESSAGE_COLLAPSE_CHAR_THRESHOLD = 420
+        private const val CHAT_MESSAGE_COLLAPSED_MAX_LINES = 14
     }
-
-    private val expandedAssistantMessageIds = mutableSetOf<String>()
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChatViewHolder {
         val view = LayoutInflater.from(parent.context).inflate(R.layout.item_chat_message, parent, false)
@@ -118,8 +116,11 @@ class ChatMessageAdapter(
         private val artifactCard: LinearLayout = view.findViewById(R.id.messageArtifactCard)
         private val artifactMeta: TextView = view.findViewById(R.id.messageArtifactMeta)
         private val artifactName: TextView = view.findViewById(R.id.messageArtifactName)
+        private val artifactAction: TextView = view.findViewById(R.id.messageArtifactAction)
         private val title: TextView = view.findViewById(R.id.messageTitle)
         private val body: TextView = view.findViewById(R.id.messageBody)
+        private val loadingRow: LinearLayout = view.findViewById(R.id.messageLoadingRow)
+        private val loadingText: TextView = view.findViewById(R.id.messageLoadingText)
         private val imageLabel: TextView = view.findViewById(R.id.messageImageLabel)
         private val imagePreview: ImageView = view.findViewById(R.id.messageImagePreview)
         private val expandToggle: TextView = view.findViewById(R.id.messageExpandToggle)
@@ -135,15 +136,16 @@ class ChatMessageAdapter(
             title.customSelectionActionModeCallback = messageSelectionActionModeCallback
             body.customSelectionActionModeCallback = messageSelectionActionModeCallback
             detail.customSelectionActionModeCallback = messageSelectionActionModeCallback
-            title.text = item.title ?: ""
+            title.text = ""
             title.visibility = View.GONE
-            body.text = item.body
+            bindLoadingState(item)
             detail.text = item.detail
             detail.visibility = if (item.detail.isNullOrBlank()) View.GONE else View.VISIBLE
             val formattedTimestamp = formatMessageTimestamp(item.createdAt)
             timestamp.text = formattedTimestamp
             timestamp.visibility = if (formattedTimestamp.isNullOrBlank()) View.GONE else View.VISIBLE
-            bindExpandableAssistantMessage(item)
+            bindArtifactCard(item, context)
+            bindExpandableChatMessage(item)
             bindImagePreview(item, context)
             bindConfirmationActions(item)
             bindArtifactActions(item, context)
@@ -152,6 +154,7 @@ class ChatMessageAdapter(
             val bubbleParams = container.layoutParams as LinearLayout.LayoutParams
             when (item.kind) {
                 MessageKind.USER -> {
+                    container.setPadding(dp(context, 14), dp(context, 12), dp(context, 14), dp(context, 12))
                     blockParams.gravity = Gravity.END
                     blockParams.marginStart = dp(context, 44)
                     blockParams.marginEnd = 0
@@ -159,14 +162,15 @@ class ChatMessageAdapter(
                     bubbleParams.marginStart = 0
                     bubbleParams.marginEnd = 0
                     container.setBackgroundResource(R.drawable.bg_message_user)
-                    title.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
-                    body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
-                    imageLabel.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
-                    detail.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
-                    timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
+                    title.setTextColor(ContextCompat.getColor(context, R.color.user_bubble_meta))
+                    body.setTextColor(ContextCompat.getColor(context, R.color.user_bubble_text))
+                    imageLabel.setTextColor(ContextCompat.getColor(context, R.color.user_bubble_meta))
+                    detail.setTextColor(ContextCompat.getColor(context, R.color.user_bubble_meta))
+                    timestamp.setTextColor(ContextCompat.getColor(context, R.color.user_bubble_meta))
                 }
                 MessageKind.ASSISTANT,
                 MessageKind.CONFIRMATION -> {
+                    container.setPadding(dp(context, 14), dp(context, 10), dp(context, 14), dp(context, 10))
                     blockParams.gravity = Gravity.START
                     blockParams.marginStart = 0
                     blockParams.marginEnd = dp(context, 44)
@@ -181,6 +185,7 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.BUILD_LOG -> {
+                    container.setPadding(dp(context, 14), dp(context, 10), dp(context, 14), dp(context, 10))
                     blockParams.gravity = Gravity.START
                     blockParams.marginStart = 0
                     blockParams.marginEnd = dp(context, 56)
@@ -195,6 +200,7 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.STATUS -> {
+                    container.setPadding(dp(context, 14), dp(context, 10), dp(context, 14), dp(context, 10))
                     blockParams.gravity = Gravity.START
                     blockParams.marginStart = 0
                     blockParams.marginEnd = dp(context, 72)
@@ -211,6 +217,7 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.LOG -> {
+                    container.setPadding(dp(context, 14), dp(context, 10), dp(context, 14), dp(context, 10))
                     blockParams.gravity = Gravity.START
                     blockParams.marginStart = 0
                     blockParams.marginEnd = dp(context, 72)
@@ -227,7 +234,18 @@ class ChatMessageAdapter(
             }
             block.layoutParams = blockParams
             container.layoutParams = bubbleParams
-            bindArtifactCard(item, context)
+        }
+
+        private fun bindLoadingState(item: ChatMessage) {
+            if (item.isLoading) {
+                body.visibility = View.GONE
+                loadingRow.visibility = View.VISIBLE
+                loadingText.text = item.body
+            } else {
+                loadingRow.visibility = View.GONE
+                body.visibility = View.VISIBLE
+                body.text = item.body
+            }
         }
 
         private fun bindArtifactCard(item: ChatMessage, context: android.content.Context) {
@@ -236,8 +254,9 @@ class ChatMessageAdapter(
                 artifactCard.visibility = View.GONE
                 artifactMeta.text = ""
                 artifactName.text = ""
-                title.visibility = if (item.title.isNullOrBlank()) View.GONE else View.VISIBLE
-                body.visibility = View.VISIBLE
+                artifactAction.text = ""
+                title.visibility = View.GONE
+                body.visibility = if (item.isLoading) View.GONE else View.VISIBLE
                 body.maxLines = Int.MAX_VALUE
                 body.ellipsize = null
                 detail.visibility = if (item.detail.isNullOrBlank()) View.GONE else View.VISIBLE
@@ -245,8 +264,14 @@ class ChatMessageAdapter(
             }
 
             artifactCard.visibility = View.VISIBLE
-            artifactName.text = item.body
-            artifactMeta.text = item.detail ?: ""
+            artifactName.text = artifactDisplayTitle(item)
+            artifactMeta.text = artifactDisplayMeta(item, context)
+            artifactAction.visibility = View.GONE
+            artifactAction.text = when {
+                item.artifactDownloading -> context.getString(R.string.download_apk_in_progress)
+                item.artifactCanInstall -> context.getString(R.string.install_apk)
+                else -> context.getString(R.string.artifact_download_action)
+            }
             imageLabel.visibility = View.GONE
             imagePreview.visibility = View.GONE
             imagePreview.setImageDrawable(null)
@@ -259,10 +284,58 @@ class ChatMessageAdapter(
             timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
         }
 
-        private fun bindExpandableAssistantMessage(item: ChatMessage) {
-            val isLongAssistantMessage =
-                item.kind == MessageKind.ASSISTANT && item.body.length > ASSISTANT_MESSAGE_COLLAPSE_CHAR_THRESHOLD
-            if (!isLongAssistantMessage) {
+        private fun artifactDisplayTitle(item: ChatMessage): String {
+            val revision = artifactRevisionLabel(item)
+            val rawName = item.body
+                .trim()
+                .removeSuffix(".apk")
+                .removeSuffix(".APK")
+                .replace(Regex("""[-\s]+v\d+$""", RegexOption.IGNORE_CASE), "")
+                .ifBlank { "APK" }
+            return "$rawName $revision"
+        }
+
+        private fun artifactDisplayMeta(item: ChatMessage, context: android.content.Context): String {
+            val revision = artifactRevisionLabel(item)
+            val versionNumber = revision.removePrefix("v").toIntOrNull() ?: 1
+            val versionKind = if (versionNumber <= 1) "최초 생성" else "수정본"
+            val existingParts = item.detail
+                .orEmpty()
+                .split("·")
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .filterNot { it.equals("apk", ignoreCase = true) }
+                .filterNot { it.matches(Regex("""v\d+""", RegexOption.IGNORE_CASE)) }
+                .filterNot { it == "최초 생성" || it == "수정본" }
+            return listOf(revision, versionKind, context.getString(R.string.library_file_type_apk))
+                .plus(existingParts)
+                .joinToString(" · ")
+        }
+
+        private fun artifactRevisionLabel(item: ChatMessage): String {
+            item.artifactRevisionLabel
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { label ->
+                    label.removePrefix("build-").toIntOrNull()?.let { return "v$it" }
+                    if (label.matches(Regex("""v\d+""", RegexOption.IGNORE_CASE))) return label.lowercase()
+                }
+            Regex("""(?:^|/)rev_0*(\d+)(?:/|$)""")
+                .find(item.artifactApkPath.orEmpty())
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+                ?.let { return "v$it" }
+            item.artifactBuildAttempt?.takeIf { it > 0 }?.let { return "v$it" }
+            return "v1"
+        }
+
+        private fun bindExpandableChatMessage(item: ChatMessage) {
+            val supportsExpansion = item.kind == MessageKind.USER ||
+                item.kind == MessageKind.ASSISTANT ||
+                item.kind == MessageKind.CONFIRMATION
+            val isLongChatMessage = supportsExpansion && item.body.length > CHAT_MESSAGE_COLLAPSE_CHAR_THRESHOLD
+            if (!isLongChatMessage) {
                 body.maxLines = Int.MAX_VALUE
                 body.ellipsize = null
                 expandToggle.visibility = View.GONE
@@ -270,18 +343,17 @@ class ChatMessageAdapter(
                 return
             }
 
-            val isExpanded = expandedAssistantMessageIds.contains(item.id)
-            body.maxLines = if (isExpanded) Int.MAX_VALUE else ASSISTANT_MESSAGE_COLLAPSED_MAX_LINES
-            body.ellipsize = if (isExpanded) null else TextUtils.TruncateAt.END
+            body.maxLines = CHAT_MESSAGE_COLLAPSED_MAX_LINES
+            body.ellipsize = TextUtils.TruncateAt.END
             expandToggle.visibility = View.VISIBLE
-            expandToggle.text = if (isExpanded) "줄이기" else "더보기"
+            expandToggle.text = "전체보기"
+            expandToggle.contentDescription = "전체보기"
             expandToggle.setOnClickListener {
-                if (expandedAssistantMessageIds.contains(item.id)) {
-                    expandedAssistantMessageIds.remove(item.id)
-                } else {
-                    expandedAssistantMessageIds.add(item.id)
-                }
-                bindingAdapterPosition.takeIf { it != RecyclerView.NO_POSITION }?.let(::notifyItemChanged)
+                val context = itemView.context
+                context.startActivity(
+                    Intent(context, FullMessageActivity::class.java)
+                        .putExtra(FullMessageActivity.EXTRA_BODY, item.body)
+                )
             }
         }
 
@@ -335,7 +407,26 @@ class ChatMessageAdapter(
         }
 
         private fun bindArtifactActions(item: ChatMessage, context: android.content.Context) {
-            // Artifact actions are intentionally hidden in the current file-card layout.
+            val isArtifactCard = item.kind == MessageKind.STATUS && !item.artifactTaskId.isNullOrBlank()
+            if (!isArtifactCard) {
+                artifactCard.setOnClickListener(null)
+                artifactAction.setOnClickListener(null)
+                artifactCard.isClickable = false
+                artifactAction.isClickable = false
+                return
+            }
+
+            val clickListener = View.OnClickListener {
+                if (item.artifactCanInstall) {
+                    onArtifactInstall(item)
+                } else {
+                    onArtifactDownload(item)
+                }
+            }
+            artifactCard.isClickable = true
+            artifactAction.isClickable = true
+            artifactCard.setOnClickListener(clickListener)
+            artifactAction.setOnClickListener(clickListener)
         }
     }
 }

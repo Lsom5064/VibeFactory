@@ -42,9 +42,12 @@ class LibraryActivity : AppCompatActivity() {
 
         val appVersions = snapshot?.appVersions.orEmpty()
         appVersionsEmpty.visibility = if (appVersions.isEmpty()) TextView.VISIBLE else TextView.GONE
-        appVersions.forEach { item ->
-            appVersionsContainer.addView(createLibraryRow(item))
-        }
+        appVersions
+            .groupBy { it.title.trim().ifBlank { it.title } }
+            .values
+            .forEach { items ->
+                appVersionsContainer.addView(createLibraryRow(items))
+            }
 
         val attachments = snapshot?.attachments.orEmpty()
         attachmentsEmpty.visibility = if (attachments.isEmpty()) TextView.VISIBLE else TextView.GONE
@@ -53,10 +56,9 @@ class LibraryActivity : AppCompatActivity() {
         }
     }
 
-    private fun createLibraryRow(item: LibraryItem): LinearLayout {
-        val detail = item.detail?.trim().orEmpty()
-        val filePath = detail.substringAfter("APK:", detail).trim()
-        val fileName = filePath.substringAfterLast('/').takeIf { it.isNotBlank() }
+    private fun createLibraryRow(items: List<LibraryItem>): LinearLayout {
+        val sortedItems = items.sortedByDescending { it.createdAt.orEmpty() }
+        val headerItem = sortedItems.firstOrNull() ?: return LinearLayout(this)
         return LinearLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -73,22 +75,53 @@ class LibraryActivity : AppCompatActivity() {
                 visibility = View.GONE
             }
 
-            addView(dropdownHeader(item, content))
+            addView(dropdownHeader(headerItem, content, sortedItems.size))
             addView(content.withTopMargin(14))
+
+            sortedItems.forEachIndexed { index, item ->
+                if (index > 0) content.addView(sectionDivider())
+                content.addView(createVersionContent(item))
+            }
+        }
+    }
+
+    private fun createVersionContent(item: LibraryItem): LinearLayout {
+        val detail = item.detail?.trim().orEmpty()
+        val filePath = detail.substringAfter("APK:", detail).trim()
+        val fileName = filePath.substringAfterLast('/').takeIf { it.isNotBlank() }
+        return LinearLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            orientation = LinearLayout.VERTICAL
 
             val versionName = item.versionName?.trim()?.takeIf { it.isNotBlank() }
             val sizeLabel = fileSizeLabel(item, filePath, fileName.orEmpty())
             if (!fileName.isNullOrBlank()) {
-                content.addView(fileTile(fileName, sizeLabel))
+                addView(fileTile(fileName, sizeLabel))
             }
 
-            content.addView(
+            addView(
                 metaLine(getString(R.string.library_version_label), versionName ?: getString(R.string.token_usage_value_unavailable))
                     .withTopMargin(14)
             )
             item.createdAt?.trim()?.takeIf { it.isNotBlank() }?.let(::formatCreatedAt)?.let { timestamp ->
-                content.addView(metaLine(getString(R.string.library_created_label), timestamp).withTopMargin(6))
+                addView(metaLine(getString(R.string.library_created_label), timestamp).withTopMargin(6))
             }
+        }
+    }
+
+    private fun sectionDivider(): View {
+        return View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(1)
+            ).apply {
+                topMargin = dp(18)
+                bottomMargin = dp(18)
+            }
+            setBackgroundColor(getColor(R.color.divider_soft))
         }
     }
 
@@ -130,7 +163,7 @@ class LibraryActivity : AppCompatActivity() {
         }
     }
 
-    private fun dropdownHeader(item: LibraryItem, content: View): LinearLayout {
+    private fun dropdownHeader(item: LibraryItem, content: View, versionCount: Int): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
@@ -143,9 +176,7 @@ class LibraryActivity : AppCompatActivity() {
                 ellipsize = android.text.TextUtils.TruncateAt.END
             })
 
-            item.subtitle?.substringAfterLast('·')?.trim()?.takeIf { it.isNotBlank() }?.let { status ->
-                addView(statusChip(status))
-            }
+            addView(statusChip("${versionCount}개 버전"))
 
             val chevron = textView("▾", 18f, R.color.text_secondary, bold = true).apply {
                 layoutParams = LinearLayout.LayoutParams(
