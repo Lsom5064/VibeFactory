@@ -32,7 +32,7 @@
                 android:background="@drawable/bg_surface_alt"
                 android:contentDescription="@string/open_menu"
                 android:padding="8dp"
-                android:src="@android:drawable/ic_menu_sort_by_size" />
+                android:src="@drawable/ic_menu_rounded" />
 
             <LinearLayout
                 android:layout_width="0dp"
