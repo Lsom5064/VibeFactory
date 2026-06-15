@@ -177,4 +177,24 @@ class HostPreferencesStore(
             Log.e(logTag, "Failed to persist task artifact states", it)
         }
     }
+
+    fun loadTokenLimit(): String? {
+        return prefs.getString(HostAppConfig.PREF_TOKEN_LIMIT, null)?.trim()?.ifBlank { null }
+    }
+
+    fun saveTokenLimit(tokenLimit: String?) {
+        prefs.edit()
+            .putString(HostAppConfig.PREF_TOKEN_LIMIT, tokenLimit?.trim()?.ifBlank { null })
+            .apply()
+    }
+
+    fun loadDarkModeEnabled(): Boolean {
+        return prefs.getBoolean(HostAppConfig.PREF_DARK_MODE_ENABLED, false)
+    }
+
+    fun saveDarkModeEnabled(enabled: Boolean) {
+        prefs.edit()
+            .putBoolean(HostAppConfig.PREF_DARK_MODE_ENABLED, enabled)
+            .apply()
+    }
 }

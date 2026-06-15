@@ -48,4 +48,6 @@ dependencies {
 
     // ⚡ Coroutines (비동기 처리)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4")
+
+    testImplementation("junit:junit:4.13.2")
 }

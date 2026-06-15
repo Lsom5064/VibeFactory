@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="bg_app">#101611</color>
+    <color name="bg_panel">#182018</color>
+    <color name="bg_panel_alt">#223026</color>
+    <color name="bg_composer">#18231B</color>
+    <color name="drawer_surface">#151C16</color>
+    <color name="drawer_row_selected">#223026</color>
+    <color name="drawer_history_item">#182018</color>
+    <color name="drawer_history_item_selected">#26362B</color>
+    <color name="text_primary">#EDF4EE</color>
+    <color name="text_secondary">#AEBCAF</color>
+    <color name="text_inverse">#101611</color>
+    <color name="accent_primary">#79D8A8</color>
+    <color name="accent_primary_dark">#9BE3BD</color>
+    <color name="assistant_bubble">#1B241D</color>
+    <color name="user_bubble">#173928</color>
+    <color name="status_bubble">#1E2B23</color>
+    <color name="log_bubble">#3A321D</color>
+    <color name="divider_soft">#334238</color>
+    <color name="token_usage_track">#2A382D</color>
+    <color name="task_runtime_error_bg">#4A2527</color>
+    <color name="task_runtime_error_bg_selected">#633336</color>
+    <color name="task_runtime_badge_bg">#4A2527</color>
+    <color name="task_runtime_badge_text">#FFB4B4</color>
+    <color name="artifact_bubble">#232D26</color>
+    <color name="artifact_icon_bg">#2A352D</color>
+    <color name="top_chip">#1D271F</color>
+    <color name="bg_app_fade_center">#E6101611</color>
+    <color name="bg_app_fade_end">#00101611</color>
+</resources>

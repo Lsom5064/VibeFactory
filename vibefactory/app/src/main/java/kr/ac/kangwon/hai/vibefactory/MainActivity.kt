@@ -21,6 +21,7 @@ import android.text.Editable
 import android.text.TextWatcher
 import android.util.Log
 import android.view.ActionMode
+import android.view.Gravity
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
@@ -30,6 +31,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -57,6 +59,7 @@ import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
+import com.google.android.material.bottomsheet.BottomSheetDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -71,6 +74,10 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneId
 import java.util.Date
 import java.util.Locale
 
@@ -86,31 +93,34 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_PHONE_NUMBER_PERMISSION = 7001
         private const val REQUEST_NOTIFICATION_PERMISSION = 7002
         private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete"
-        private const val MAX_REFERENCE_IMAGE_BYTES = 5_000_000
+        private const val MAX_ATTACHMENT_IMAGE_ORIGINAL_BYTES = 15 * 1024 * 1024
+        private const val MAX_ATTACHMENT_IMAGE_PAYLOAD_BYTES = 4 * 1024 * 1024
+        private const val MAX_ATTACHMENT_PDF_BYTES = 10 * 1024 * 1024
+        private const val MAX_ATTACHMENT_TEXT_BYTES = 2 * 1024 * 1024
     }
 
     private val gson: Gson = GsonBuilder().create()
     private val serverTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
     private val displayTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+    private val bubbleTimestampFormat = SimpleDateFormat("a h:mm", Locale.KOREA)
 
     private lateinit var apiService: VibeApiService
     private lateinit var drawerLayout: DrawerLayout
-    private lateinit var mainContent: LinearLayout
+    private lateinit var mainContent: FrameLayout
     private lateinit var topBar: LinearLayout
     private lateinit var chatCard: View
     private lateinit var recyclerTasks: RecyclerView
     private lateinit var recyclerMessages: RecyclerView
     private lateinit var inputPrompt: EditText
     private lateinit var inputPhoneGate: EditText
-    private lateinit var btnAttachReferenceImage: ImageButton
-    private lateinit var selectedReferenceImagePreview: ImageView
+    private lateinit var btnAttachReferenceImage: TextView
+    private lateinit var selectedAttachmentChip: TextView
     private lateinit var btnSend: Button
     private lateinit var btnNewChat: Button
+    private lateinit var btnOpenLibrary: Button
+    private lateinit var btnOpenSettings: Button
     private lateinit var btnSavePhoneGate: Button
     private lateinit var btnOpenDrawer: ImageButton
-    private lateinit var downloadArea: LinearLayout
-    private lateinit var btnDownloadManual: Button
-    private lateinit var btnInstallLatest: Button
     private lateinit var composerBar: LinearLayout
     private lateinit var logPanel: LinearLayout
     private lateinit var logPanelScroll: ScrollView
@@ -139,10 +149,12 @@ class MainActivity : AppCompatActivity() {
     private val chatAdapter by lazy {
         ChatMessageAdapter(
             messageSelectionActionModeCallback = messageSelectionActionModeCallback,
-            formatMessageTimestamp = ::formatMessageTimestamp,
+            formatMessageTimestamp = ::formatMessageTimestampForBubble,
             isConfirmationHandled = handledConfirmationMessageIds::contains,
             onConfirmationAccept = ::handleConfirmationAccepted,
-            onConfirmationDismiss = ::handleConfirmationDismissed
+            onConfirmationDismiss = ::handleConfirmationDismissed,
+            onArtifactDownload = ::handleArtifactDownloadRequested,
+            onArtifactInstall = ::handleArtifactInstallRequested
         )
     }
 
@@ -178,7 +190,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingInitialChatScrollTaskId: String? = null
     private val notifiedBuildSuccessTaskIds = mutableSetOf<String>()
     private var isMessageTextSelectionActive = false
-    private var selectedReferenceImage: ReferenceImageAttachment? = null
+    private var selectedAttachment: SelectedAttachment? = null
+    private var pendingCameraImageUri: Uri? = null
     private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
 
     private data class TimelineEventSnapshot(
@@ -198,7 +211,29 @@ class MainActivity : AppCompatActivity() {
     private val pickReferenceImageLauncher =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
             if (uri != null) {
-                handleReferenceImageSelected(uri)
+                handleAttachmentSelected(uri, SelectedAttachmentKind.IMAGE)
+            }
+        }
+
+    private val captureImageLauncher =
+        registerForActivityResult(ActivityResultContracts.TakePicture()) { saved: Boolean ->
+            val uri = pendingCameraImageUri
+            pendingCameraImageUri = null
+            if (saved && uri != null) {
+                handleAttachmentSelected(uri, SelectedAttachmentKind.IMAGE)
+            }
+        }
+
+    private val pickDocumentAttachmentLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+            if (uri != null) {
+                val mimeType = contentResolver.getType(uri).orEmpty()
+                val kind = if (mimeType == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true)) {
+                    SelectedAttachmentKind.PDF
+                } else {
+                    SelectedAttachmentKind.TEXT
+                }
+                handleAttachmentSelected(uri, kind)
             }
         }
 
@@ -280,14 +315,13 @@ class MainActivity : AppCompatActivity() {
         inputPrompt = findViewById(R.id.inputPrompt)
         inputPhoneGate = findViewById(R.id.inputPhoneGate)
         btnAttachReferenceImage = findViewById(R.id.btnAttachReferenceImage)
-        selectedReferenceImagePreview = findViewById(R.id.selectedReferenceImagePreview)
+        selectedAttachmentChip = findViewById(R.id.selectedAttachmentChip)
         btnSend = findViewById(R.id.btnSend)
         btnNewChat = findViewById(R.id.btnNewChat)
+        btnOpenLibrary = findViewById(R.id.btnOpenLibrary)
+        btnOpenSettings = findViewById(R.id.btnOpenSettings)
         btnSavePhoneGate = findViewById(R.id.btnSavePhoneGate)
         btnOpenDrawer = findViewById(R.id.btnOpenDrawer)
-        downloadArea = findViewById(R.id.downloadArea)
-        btnDownloadManual = findViewById(R.id.btnDownloadManual)
-        btnInstallLatest = findViewById(R.id.btnInstallLatest)
         composerBar = findViewById(R.id.composerBar)
         logPanel = findViewById(R.id.logPanel)
         logPanelScroll = findViewById(R.id.logPanelScroll)
@@ -323,18 +357,12 @@ class MainActivity : AppCompatActivity() {
             )
 
             (chatCard.layoutParams as ViewGroup.MarginLayoutParams).apply {
-                leftMargin = dp(12) + systemBars.left
-                rightMargin = dp(12) + systemBars.right
-                topMargin = dp(12)
-                bottomMargin = dp(10)
+                leftMargin = systemBars.left
+                rightMargin = systemBars.right
+                topMargin = 0
+                bottomMargin = 0
             }
             chatCard.requestLayout()
-
-            downloadArea.updateLayoutParams<ViewGroup.MarginLayoutParams> {
-                leftMargin = dp(12) + systemBars.left
-                rightMargin = dp(12) + systemBars.right
-                bottomMargin = dp(10)
-            }
 
             composerBar.updateLayoutParams<ViewGroup.MarginLayoutParams> {
                 leftMargin = dp(12) + systemBars.left
@@ -361,6 +389,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        val darkModeEnabled = preferencesStore.loadDarkModeEnabled()
+        AppThemeController.applyDarkModePreference(darkModeEnabled)
+        if (AppThemeController.shouldRecreateForPreference(this, darkModeEnabled)) {
+            recreate()
+            return
+        }
         loadPersistedArtifactStates()
         loadPersistedRuntimeErrors()
         if (!hasRequiredPhoneNumber() && hasPhoneNumberPermissionGranted()) {
@@ -392,10 +426,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun restoreCurrentTaskState(trigger: String) {
         if (!hasRequiredPhoneNumber()) return
+        val fallbackPersistedTaskId = taskConversationMessages.keys.firstOrNull { it.isNotBlank() && !hiddenTaskIds.contains(it) }
         val taskId = currentTaskId?.takeIf { it.isNotBlank() }
             ?: screenState.selectedTaskId?.takeIf { it.isNotBlank() }
             ?: pendingTaskSelectionKey?.takeIf { it.isNotBlank() }
             ?: getLastSelectedTaskId()?.takeIf { it.isNotBlank() }
+            ?: fallbackPersistedTaskId
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
         val selectionGeneration = advanceTaskSelectionGeneration()
@@ -449,9 +485,7 @@ class MainActivity : AppCompatActivity() {
         recyclerTasks.layoutManager = LinearLayoutManager(this)
         recyclerTasks.adapter = taskAdapter
 
-        recyclerMessages.layoutManager = LinearLayoutManager(this).apply {
-            stackFromEnd = true
-        }
+        recyclerMessages.layoutManager = LinearLayoutManager(this)
         recyclerMessages.adapter = chatAdapter
     }
 
@@ -535,6 +569,18 @@ class MainActivity : AppCompatActivity() {
             drawerLayout.closeDrawer(GravityCompat.START)
         }
 
+        btnOpenSettings.setOnClickListener {
+            drawerLayout.closeDrawer(GravityCompat.START)
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
+        val openLibrary = View.OnClickListener {
+            drawerLayout.closeDrawer(GravityCompat.START)
+            startActivity(Intent(this, LibraryActivity::class.java))
+        }
+        btnOpenLibrary.setOnClickListener(openLibrary)
+        findViewById<LinearLayout>(R.id.drawerLibraryRow).setOnClickListener(openLibrary)
+
         btnSavePhoneGate.setOnClickListener {
             requestPhoneNumberPermissionIfNeeded()
         }
@@ -545,7 +591,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnAttachReferenceImage.setOnClickListener {
-            pickReferenceImageLauncher.launch("image/*")
+            showAttachmentMenu()
         }
 
         inputPrompt.setOnFocusChangeListener { _, hasFocus ->
@@ -555,19 +601,6 @@ class MainActivity : AppCompatActivity() {
                     switchShowLogs.isChecked = false
                 }
             }
-        }
-
-        btnDownloadManual.setOnClickListener {
-            if (isDownloadingApk) return@setOnClickListener
-            val selectedTaskId = screenState.selectedTaskId?.trim().orEmpty()
-            if (selectedTaskId.isBlank()) return@setOnClickListener
-            persistedApkUrlForTask(selectedTaskId)?.let { downloadAndInstall(selectedTaskId, it) }
-        }
-
-        btnInstallLatest.setOnClickListener {
-            val selectedTaskId = screenState.selectedTaskId?.trim().orEmpty()
-            if (selectedTaskId.isBlank()) return@setOnClickListener
-            persistedDownloadedApkFileForTask(selectedTaskId)?.let { installApk(it) }
         }
 
         switchShowLogs.setOnCheckedChangeListener { _, isChecked ->
@@ -653,7 +686,7 @@ class MainActivity : AppCompatActivity() {
         latestApkUrl = null
         latestDownloadedApkFile = null
         latestDownloadedTaskId = null
-        selectedReferenceImage = null
+        selectedAttachment = null
         inputPrompt.setText("")
         screenState = screenState.copy(
             selectedTaskId = null,
@@ -710,30 +743,28 @@ class MainActivity : AppCompatActivity() {
     private fun submitMessage() {
         val prompt = inputPrompt.text.toString().trim()
         if (prompt.isBlank()) return
-        val attachedImagePreview = selectedReferenceImage?.toChatPreview()
+        val attachment = selectedAttachment
+        val attachedImagePreview = attachment?.toChatImagePreview()
         inputPrompt.setText("")
-        if (attachedImagePreview != null) {
-            clearSelectedReferenceImage()
-        }
 
         when (screenState.inputMode) {
-            InputMode.NEW_GENERATE -> startAppSynthesis(prompt, attachedImagePreview)
+            InputMode.NEW_GENERATE -> startAppSynthesis(prompt, attachedImagePreview, attachment = attachment)
             InputMode.CONTINUE_CLARIFICATION -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    continueClarification(taskId, prompt)
+                    continueClarification(taskId, prompt, attachment = attachment)
                 }
             }
             InputMode.REFINE_EXISTING -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview)
+                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachment)
                 }
             }
             InputMode.RETRY_FAILED -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview)
+                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachment)
                 }
             }
             InputMode.READ_ONLY -> {
@@ -742,23 +773,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun currentReferenceImageName(): String? = selectedReferenceImage?.displayName
+    private fun currentReferenceImageName(): String? = selectedAttachment?.takeIf { it.kind == SelectedAttachmentKind.IMAGE }?.displayName
 
-    private fun currentReferenceImageBase64(): String? = selectedReferenceImage?.base64
+    private fun currentReferenceImageBase64(): String? = selectedAttachment?.takeIf { it.kind == SelectedAttachmentKind.IMAGE }?.base64
 
-    private fun clearSelectedReferenceImage() {
-        selectedReferenceImage = null
+    private fun clearSelectedAttachment() {
+        selectedAttachment = null
         renderState()
     }
 
     private fun dispatchLatestTaskFeedback(
         taskId: String,
         feedback: String,
-        imagePreview: ChatImagePreview? = null
+        imagePreview: ChatImagePreview? = null,
+        attachment: SelectedAttachment? = selectedAttachment
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/status/{task_id}") ?: return
         val referenceImagePreview = if (screenState.inputMode == InputMode.REFINE_EXISTING) {
-            imagePreview ?: selectedReferenceImage?.toChatPreview()
+            imagePreview ?: selectedAttachment?.toChatImagePreview()
         } else {
             null
         }
@@ -766,6 +798,7 @@ class MainActivity : AppCompatActivity() {
             taskId = apiTaskId,
             prompt = feedback,
             imagePreview = referenceImagePreview,
+            attachment = attachment,
             mode = screenState.inputMode
         )
     }
@@ -872,13 +905,15 @@ class MainActivity : AppCompatActivity() {
     private fun startAppSynthesis(
         prompt: String,
         imagePreview: ChatImagePreview? = null,
+        attachment: SelectedAttachment? = selectedAttachment,
         sourceTaskId: String? = null,
         displayPrompt: String? = null
     ) {
         val deviceInfo = collectDeviceInfo()
-        val referenceImagePreview = imagePreview ?: selectedReferenceImage?.toChatPreview()
+        val referenceImagePreview = imagePreview ?: attachment?.toChatImagePreview()
         val referenceImageName = referenceImagePreview?.displayName
         val referenceImageBase64 = referenceImagePreview?.base64
+        val attachments = attachment?.let { listOf(it.toPayload()) }
         val visiblePrompt = displayPrompt ?: prompt
         if (sourceTaskId == null) {
             appendLocalUserMessage(visiblePrompt, referenceImagePreview)
@@ -903,10 +938,11 @@ class MainActivity : AppCompatActivity() {
                         user_id = null,
                         phone_number = userIdentity.phoneNumber,
                         reference_image_name = referenceImageName,
-                        reference_image_base64 = referenceImageBase64
+                        reference_image_base64 = referenceImageBase64,
+                        attachments = attachments
                     )
                 )
-                clearSelectedReferenceImage()
+                clearSelectedAttachment()
                 if (sourceTaskId == null) {
                     moveLocalConversationToTask(response.task_id)
                 }
@@ -950,8 +986,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun continueClarification(taskId: String, prompt: String, appendUserMessage: Boolean = true) {
-        startFollowupSynthesis(taskId, prompt, mode = InputMode.CONTINUE_CLARIFICATION, appendUserMessage = appendUserMessage)
+    private fun continueClarification(
+        taskId: String,
+        prompt: String,
+        appendUserMessage: Boolean = true,
+        attachment: SelectedAttachment? = selectedAttachment
+    ) {
+        startFollowupSynthesis(
+            taskId,
+            prompt,
+            imagePreview = attachment?.toChatImagePreview(),
+            attachment = attachment,
+            mode = InputMode.CONTINUE_CLARIFICATION,
+            appendUserMessage = appendUserMessage
+        )
     }
 
     private fun selectTask(taskId: String, autoInstallOnSuccess: Boolean) {
@@ -1144,30 +1192,23 @@ class MainActivity : AppCompatActivity() {
                 setComposerEnabled(true)
                 return
             }
-            val clarificationMessages = buildList {
-                message.takeIf { it.isNotBlank() }?.let(::add)
-                if (isEmpty()) {
-                    response.reason?.trim()?.takeIf { it.isNotBlank() }?.let(::add)
-                }
-                questions.forEach { question ->
-                    if (question !in this) {
-                        add(question)
-                    }
-                }
-            }
-
-            clarificationMessages.forEachIndexed { index, clarification ->
+            val clarificationBody = buildClarificationBubbleBody(
+                message = message,
+                reason = response.reason,
+                questions = questions
+            )
+            if (!clarificationBody.isNullOrBlank()) {
                 appendOptimisticTaskMessage(
                     taskId,
                     ChatMessage(
-                        id = "decision-clarification-$taskId-$index-${System.currentTimeMillis()}",
+                        id = "decision-clarification-$taskId-${System.currentTimeMillis()}",
                         kind = MessageKind.ASSISTANT,
                         title = getString(R.string.message_title_assistant),
-                        body = clarification
+                        body = clarificationBody
                     )
                 )
             }
-            val clarificationDetail = clarificationMessages.firstOrNull()
+            val clarificationDetail = clarificationBody
                 ?: response.reason?.trim()?.takeIf { it.isNotBlank() }
                 ?: getString(R.string.status_no_detail)
             screenState = screenState.copy(
@@ -1181,14 +1222,19 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        questions.forEachIndexed { index, question ->
+        val questionBody = buildClarificationBubbleBody(
+            message = null,
+            reason = null,
+            questions = questions
+        )
+        if (!questionBody.isNullOrBlank()) {
             appendOptimisticTaskMessage(
                 taskId,
                 ChatMessage(
-                    id = "decision-question-$taskId-$index-${System.currentTimeMillis()}",
+                    id = "decision-question-$taskId-${System.currentTimeMillis()}",
                     kind = MessageKind.ASSISTANT,
                     title = getString(R.string.message_title_assistant),
-                    body = question
+                    body = questionBody
                 )
             )
         }
@@ -1234,7 +1280,8 @@ class MainActivity : AppCompatActivity() {
         startFollowupSynthesis(
             taskId = taskId,
             prompt = feedback,
-            imagePreview = selectedReferenceImage?.toChatPreview(),
+            imagePreview = selectedAttachment?.toChatImagePreview(),
+            attachment = selectedAttachment,
             mode = InputMode.REFINE_EXISTING
         )
     }
@@ -1493,6 +1540,7 @@ class MainActivity : AppCompatActivity() {
         taskId: String,
         prompt: String,
         imagePreview: ChatImagePreview? = null,
+        attachment: SelectedAttachment? = selectedAttachment,
         mode: InputMode,
         appendUserMessage: Boolean = true
     ) {
@@ -1551,6 +1599,7 @@ class MainActivity : AppCompatActivity() {
         startAppSynthesis(
             prompt = prompt,
             imagePreview = imagePreview,
+            attachment = attachment,
             sourceTaskId = apiTaskId,
             displayPrompt = prompt
         )
@@ -1950,7 +1999,8 @@ ${record.stackTrace}
                     screenState = screenState.copy(
                         currentStatus = getString(R.string.status_downloaded),
                         statusDetail = apkFile.absolutePath,
-                        canInstall = screenState.selectedTaskId?.let(::persistedDownloadedApkFileForTask) != null
+                        canInstall = screenState.selectedTaskId?.let(::persistedDownloadedApkFileForTask) != null,
+                        canDownload = false
                     )
                     renderState()
                     installApk(apkFile)
@@ -2008,6 +2058,8 @@ ${record.stackTrace}
         }
         btnOpenDrawer.isEnabled = !phoneGateVisible
         btnNewChat.isEnabled = !phoneGateVisible
+        btnOpenLibrary.isEnabled = !phoneGateVisible
+        btnOpenSettings.isEnabled = !phoneGateVisible
         inputPhoneGate.isEnabled = false
         inputPhoneGate.visibility = if (phoneGateVisible) View.GONE else View.VISIBLE
         btnSavePhoneGate.isEnabled = true
@@ -2016,17 +2068,18 @@ ${record.stackTrace}
             screenState.taskList.map { it.copy(hasRuntimeError = it.taskId in runtimeErrorTaskIds) },
             screenState.selectedTaskId
         )
-        val baseVisibleMessages = screenState.messages.filter { it.kind != MessageKind.LOG }
-        val visibleMessages = if (shouldAnimateProcessingStatus(screenState.messages)) {
+        val baseVisibleMessages = screenState.messages
+            .filter { it.kind != MessageKind.LOG }
+            .filterNot(::isRedundantDownloadedStatusMessage)
+        val timelineVisibleMessages = if (shouldAnimateProcessingStatus(screenState.messages)) {
             animateProcessingStatusBubble(baseVisibleMessages)
         } else {
             baseVisibleMessages
         }
+        val visibleMessages = appendArtifactCardMessage(timelineVisibleMessages)
         val shouldAutoScrollNewMessage = shouldAutoScrollMessages(visibleMessages)
         val aggregatedLogText = buildLogPanelText(screenState.selectedTaskId, screenState.messages)
-        if (!isMessageTextSelectionActive) {
-            chatAdapter.submitList(visibleMessages)
-        }
+        submitChatMessagesWhenSafe(visibleMessages)
         emptyChatText.visibility = if (visibleMessages.isEmpty()) View.VISIBLE else View.GONE
         logPanel.visibility = if (showLogs && aggregatedLogText.isNotBlank()) View.VISIBLE else View.GONE
         btnLogScrollBottom.visibility = if (showLogs && aggregatedLogText.isNotBlank()) View.VISIBLE else View.GONE
@@ -2045,15 +2098,6 @@ ${record.stackTrace}
                 restoreLogPanelScrollAfterLayout(previousLogScrollY)
             }
         }
-        downloadArea.visibility = if (screenState.canDownload || screenState.canInstall) View.VISIBLE else View.GONE
-        btnDownloadManual.visibility = if (screenState.canDownload) View.VISIBLE else View.GONE
-        btnInstallLatest.visibility = if (screenState.canInstall) View.VISIBLE else View.GONE
-        btnDownloadManual.isEnabled = screenState.canDownload && !isDownloadingApk
-        btnDownloadManual.alpha = if (btnDownloadManual.isEnabled) 1.0f else 0.6f
-        btnDownloadManual.text = if (isDownloadingApk) getString(R.string.download_apk_in_progress) else getString(R.string.download_apk)
-        btnInstallLatest.isEnabled = screenState.canInstall && !isDownloadingApk
-        btnInstallLatest.alpha = if (btnInstallLatest.isEnabled) 1.0f else 0.6f
-
         syncProcessingStatusAnimation(screenState.messages)
 
         if (phoneGateVisible) {
@@ -2090,16 +2134,16 @@ ${record.stackTrace}
                 setComposerEnabled(false)
             }
         }
-        bindInlineImagePreview(
-            imageView = selectedReferenceImagePreview,
-            imageBase64 = selectedReferenceImage?.base64,
-            fallbackVisibility = View.GONE
-        )
+        selectedAttachmentChip.text = selectedAttachment?.chipLabel().orEmpty()
+        selectedAttachmentChip.visibility = if (selectedAttachment == null) View.GONE else View.VISIBLE
+        selectedAttachmentChip.setOnClickListener {
+            clearSelectedAttachment()
+        }
 
         val selectedTaskId = screenState.selectedTaskId
         if (visibleMessages.isNotEmpty() && !selectedTaskId.isNullOrBlank() && pendingInitialChatScrollTaskId == selectedTaskId) {
             recyclerMessages.post {
-                recyclerMessages.scrollToPosition(visibleMessages.lastIndex)
+                recyclerMessages.scrollToPosition(0)
             }
             pendingInitialChatScrollTaskId = null
         } else if (shouldAutoScrollNewMessage) {
@@ -2121,6 +2165,55 @@ ${record.stackTrace}
         val currentCount = chatAdapter.itemCount
         if (currentCount <= 0) return true
         return lastVisible >= currentCount - 2
+    }
+
+    private fun appendArtifactCardMessage(messages: List<ChatMessage>): List<ChatMessage> {
+        val selectedTaskId = screenState.selectedTaskId?.trim().orEmpty()
+        if (selectedTaskId.isBlank()) return messages
+        if (!screenState.canDownload && !screenState.canInstall && !isDownloadingApk) return messages
+        val fileName = "예시용_앱"
+        val sizeLabel = "10 MB · apk"
+        val artifactMessage = ChatMessage(
+            id = "artifact-$selectedTaskId",
+            kind = MessageKind.STATUS,
+            title = null,
+            body = fileName,
+            detail = sizeLabel,
+            createdAt = messages.lastOrNull()?.createdAt ?: currentTimestampString(),
+            artifactTaskId = selectedTaskId,
+            artifactCanDownload = screenState.canDownload,
+            artifactCanInstall = screenState.canInstall,
+            artifactDownloading = isDownloadingApk
+        )
+        return messages + artifactMessage
+    }
+
+    private fun isRedundantDownloadedStatusMessage(message: ChatMessage): Boolean {
+        return message.kind == MessageKind.STATUS && message.body == getString(R.string.status_downloaded)
+    }
+
+    private fun handleArtifactDownloadRequested(message: ChatMessage) {
+        handleArtifactInstallRequested(message)
+    }
+
+    private fun handleArtifactInstallRequested(message: ChatMessage) {
+        if (isDownloadingApk) return
+        val taskId = message.artifactTaskId?.trim().orEmpty()
+        if (taskId.isBlank()) return
+        val downloadedFile = persistedDownloadedApkFileForTask(taskId)
+        if (downloadedFile != null) {
+            installApk(downloadedFile)
+            return
+        }
+        persistedApkUrlForTask(taskId)?.let { downloadAndInstall(taskId, it) }
+    }
+
+    private fun formatFileSize(bytes: Long): String {
+        if (bytes <= 0L) return getString(R.string.artifact_size_pending)
+        val kb = bytes / 1024.0
+        if (kb < 1024.0) return String.format(Locale.US, "%.0f KB", kb)
+        val mb = kb / 1024.0
+        return String.format(Locale.US, "%.2f MB", mb)
     }
 
     private fun setComposerEnabled(enabled: Boolean) {
@@ -2172,26 +2265,133 @@ ${record.stackTrace}
         renderState()
     }
 
-    private fun handleReferenceImageSelected(uri: Uri) {
+    private fun showAttachmentMenu() {
+        val dialog = BottomSheetDialog(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(18), dp(20), dp(28))
+        }
+        val grabber = View(this).apply {
+            setBackgroundColor(0xFFE0E0E0.toInt())
+        }
+        content.addView(
+            grabber,
+            LinearLayout.LayoutParams(dp(42), dp(4)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(18)
+            }
+        )
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        row.addView(
+            buildAttachmentSheetTile(
+                title = getString(R.string.attachment_menu_camera),
+                iconRes = android.R.drawable.ic_menu_camera
+            ) {
+                dialog.dismiss()
+                launchCameraAttachment()
+            }
+        )
+        row.addView(
+            buildAttachmentSheetTile(
+                title = getString(R.string.attachment_menu_photo),
+                iconRes = android.R.drawable.ic_menu_gallery
+            ) {
+                dialog.dismiss()
+                pickReferenceImageLauncher.launch("image/*")
+            }
+        )
+        row.addView(
+            buildAttachmentSheetTile(
+                title = getString(R.string.attachment_menu_file),
+                iconRes = R.drawable.ic_artifact_file
+            ) {
+                dialog.dismiss()
+                pickDocumentAttachmentLauncher.launch(arrayOf("application/pdf", "text/*"))
+            }
+        )
+        content.addView(row)
+        dialog.setContentView(content)
+        dialog.show()
+    }
+
+    private fun buildAttachmentSheetTile(title: String, iconRes: Int, onClick: () -> Unit): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(16), dp(12), dp(14))
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_surface_alt)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onClick() }
+            addView(
+                ImageView(this@MainActivity).apply {
+                    setImageResource(iconRes)
+                    imageTintList = ContextCompat.getColorStateList(this@MainActivity, R.color.text_primary)
+                },
+                LinearLayout.LayoutParams(dp(32), dp(32))
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = title
+                    gravity = Gravity.CENTER
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                    textSize = 16f
+                },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = dp(10)
+                }
+            )
+            layoutParams = LinearLayout.LayoutParams(0, dp(118), 1f).apply {
+                marginStart = dp(6)
+                marginEnd = dp(6)
+            }
+        }
+    }
+
+    private fun launchCameraAttachment() {
+        val cacheRoot = externalCacheDir
+        if (cacheRoot == null) {
+            Toast.makeText(this, R.string.attachment_camera_unavailable, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val imageFile = File.createTempFile("camera_attachment_", ".jpg", cacheRoot)
+        val uri = FileProvider.getUriForFile(this, "${packageName}.provider", imageFile)
+        pendingCameraImageUri = uri
+        captureImageLauncher.launch(uri)
+    }
+
+    private fun handleAttachmentSelected(uri: Uri, kind: SelectedAttachmentKind) {
         lifecycleScope.launch {
             try {
                 val attachment = withContext(Dispatchers.IO) {
-                    buildReferenceImageAttachment(
+                    buildSelectedAttachment(
                         contentResolver = contentResolver,
                         uri = uri,
-                        maxBytes = MAX_REFERENCE_IMAGE_BYTES
+                        requestedKind = kind,
+                        maxOriginalImageBytes = MAX_ATTACHMENT_IMAGE_ORIGINAL_BYTES,
+                        maxImagePayloadBytes = MAX_ATTACHMENT_IMAGE_PAYLOAD_BYTES,
+                        maxPdfBytes = MAX_ATTACHMENT_PDF_BYTES,
+                        maxTextBytes = MAX_ATTACHMENT_TEXT_BYTES
                     )
                 }
                 if (attachment == null) {
-                    Toast.makeText(this@MainActivity, R.string.reference_image_too_large, Toast.LENGTH_SHORT).show()
+                    val messageRes = when (kind) {
+                        SelectedAttachmentKind.IMAGE -> R.string.attachment_image_too_large
+                        SelectedAttachmentKind.PDF -> R.string.attachment_pdf_too_large
+                        SelectedAttachmentKind.TEXT -> R.string.attachment_text_too_large
+                    }
+                    Toast.makeText(this@MainActivity, messageRes, Toast.LENGTH_SHORT).show()
                     return@launch
                 }
-                selectedReferenceImage = attachment
+                selectedAttachment = attachment
                 renderState()
             } catch (e: Exception) {
                 Toast.makeText(
                     this@MainActivity,
-                    getString(R.string.reference_image_pick_failed, userVisibleErrorMessage(e)),
+                    getString(R.string.attachment_pick_failed, userVisibleErrorMessage(e)),
                     Toast.LENGTH_SHORT
                 ).show()
             }
@@ -2326,15 +2526,22 @@ ${record.stackTrace}
                         )
                     }
             } else {
-                latestQuestions.forEachIndexed { index, question ->
-                    if (question.isBlank() || timelineContainsBody(taskId, question)) return@forEachIndexed
+                val questionBody = buildClarificationBubbleBody(
+                    message = null,
+                    reason = null,
+                    questions = latestQuestions
+                )
+                if (!questionBody.isNullOrBlank() &&
+                    !timelineContainsBody(taskId, questionBody) &&
+                    latestQuestions.none { question -> question.isNotBlank() && timelineContainsBody(taskId, question) }
+                ) {
                     appendTaskTimelineMessage(
                         taskId,
                         ChatMessage(
-                            id = "seed-question-$taskId-$index",
+                            id = "seed-question-$taskId",
                             kind = MessageKind.ASSISTANT,
                             title = getString(R.string.message_title_assistant),
-                            body = question,
+                            body = questionBody,
                             createdAt = currentTimestampString()
                         )
                     )
@@ -2391,6 +2598,22 @@ ${record.stackTrace}
 
     private fun timelineContainsBody(taskId: String, body: String): Boolean {
         return buildTaskTimeline(taskId).any { hasSameMessageText(it.body, body) }
+    }
+
+    private fun buildClarificationBubbleBody(message: String?, reason: String?, questions: List<String>): String? {
+        val intro = message?.trim()?.takeIf { it.isNotBlank() }
+            ?: reason?.trim()?.takeIf { it.isNotBlank() }
+        val seen = linkedSetOf<String>()
+        intro?.let { seen += it }
+        val numberedQuestions = questions
+            .mapNotNull { it.trim().takeIf { question -> question.isNotBlank() } }
+            .filter { seen.add(it) }
+            .mapIndexed { index, question -> "${index + 1}. $question" }
+            .joinToString("\n")
+
+        return listOfNotNull(intro, numberedQuestions.takeIf { it.isNotBlank() })
+            .joinToString("\n")
+            .takeIf { it.isNotBlank() }
     }
 
     private fun extractTimelineEvents(response: StatusResponse): List<TimelineEventSnapshot> {
@@ -3455,7 +3678,7 @@ ${record.stackTrace}
                 val visibleMessages = animateProcessingStatusBubble(
                     screenState.messages.filter { it.kind != MessageKind.LOG }
                 )
-                chatAdapter.submitList(visibleMessages)
+                submitChatMessagesWhenSafe(visibleMessages)
             }
         }
     }
@@ -3756,6 +3979,23 @@ ${record.stackTrace}
         }.getOrElse { raw }
     }
 
+    private fun formatMessageTimestampForBubble(value: String?): String? {
+        val parsed = parseMessageTimestamp(value) ?: return null
+        return bubbleTimestampFormat.format(parsed)
+    }
+
+    private fun parseMessageTimestamp(value: String?): Date? {
+        val raw = value?.trim().orEmpty()
+        if (raw.isBlank()) return null
+
+        return runCatching { serverTimestampFormat.parse(raw) }.getOrNull()
+            ?: runCatching { Date.from(Instant.parse(raw)) }.getOrNull()
+            ?: runCatching { Date.from(OffsetDateTime.parse(raw).toInstant()) }.getOrNull()
+            ?: runCatching {
+                Date.from(LocalDateTime.parse(raw).atZone(ZoneId.systemDefault()).toInstant())
+            }.getOrNull()
+    }
+
     private fun buildLogPanelText(taskId: String?, messages: List<ChatMessage>): String {
         val timelineText = messages.mapNotNull { message ->
             if (message.kind == MessageKind.BUILD_LOG) return@mapNotNull null
@@ -3948,8 +4188,29 @@ ${record.stackTrace}
         override fun onActionItemClicked(mode: ActionMode?, item: MenuItem?): Boolean = false
 
         override fun onDestroyActionMode(mode: ActionMode?) {
-            isMessageTextSelectionActive = false
-            renderState()
+            recyclerMessages.post {
+                isMessageTextSelectionActive = false
+                renderStateWhenRecyclerMessagesSettled()
+            }
         }
+    }
+
+    private fun submitChatMessagesWhenSafe(visibleMessages: List<ChatMessage>) {
+        when (chooseChatMessageRefreshAction(isMessageTextSelectionActive, recyclerMessages.isComputingLayout)) {
+            ChatMessageRefreshAction.SKIP_FOR_TEXT_SELECTION -> return
+            ChatMessageRefreshAction.DEFER_FOR_RECYCLER_LAYOUT -> {
+                recyclerMessages.post { submitChatMessagesWhenSafe(visibleMessages) }
+                return
+            }
+            ChatMessageRefreshAction.SUBMIT -> chatAdapter.submitList(visibleMessages)
+        }
+    }
+
+    private fun renderStateWhenRecyclerMessagesSettled() {
+        if (recyclerMessages.isComputingLayout) {
+            recyclerMessages.post { renderStateWhenRecyclerMessagesSettled() }
+            return
+        }
+        renderState()
     }
 }

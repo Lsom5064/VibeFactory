@@ -27,7 +27,15 @@ data class BuildRequest(
     val interview_consent: Boolean? = null,
     val reference_image_path: String? = null,
     val reference_image_name: String? = null,
-    val reference_image_base64: String? = null
+    val reference_image_base64: String? = null,
+    val attachments: List<AttachmentPayload>? = null
+)
+
+data class AttachmentPayload(
+    val type: String,
+    val mime_type: String,
+    val name: String,
+    val base64: String
 )
 
 data class BuildResponse(
@@ -115,6 +123,33 @@ data class TasksEnvelope(
     val tasks: List<TaskSummaryDto>? = null
 )
 
+data class TokenUsageWindowDto(
+    val window_label: String? = null,
+    val used_percent: Int? = null,
+    val remaining_percent: Int? = null,
+    val resets_at: Long? = null,
+    val window_duration_mins: Int? = null
+)
+
+data class TokenUsageStatsDto(
+    val input_tokens: Int? = null,
+    val cached_input_tokens: Int? = null,
+    val output_tokens: Int? = null,
+    val cached_output_tokens: Int? = null,
+    val reasoning_output_tokens: Int? = null,
+    val total_tokens: Int? = null
+)
+
+data class TokenUsageResponse(
+    val task_id: String = "",
+    val limit_name: String? = null,
+    val primary_window: TokenUsageWindowDto? = null,
+    val secondary_window: TokenUsageWindowDto? = null,
+    val usage: TokenUsageStatsDto? = null,
+    val status: String? = null,
+    val status_message: String? = null
+)
+
 interface VibeApiService {
 
     @GET("/tasks")
@@ -134,6 +169,14 @@ interface VibeApiService {
         @Query("user_id") userId: String? = null,
         @Query("phone_number") phoneNumber: String? = null
     ): StatusResponse
+
+    @GET("/tasks/{task_id}/usage")
+    suspend fun getTaskUsage(
+        @Path("task_id") taskId: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): TokenUsageResponse
 
     @POST("/tasks/{task_id}/runtime-error")
     suspend fun reportRuntimeError(

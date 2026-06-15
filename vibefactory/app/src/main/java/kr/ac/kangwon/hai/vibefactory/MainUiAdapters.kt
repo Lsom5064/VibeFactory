@@ -12,6 +12,8 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 
 class TaskSummaryAdapter(
@@ -62,7 +64,7 @@ class TaskSummaryAdapter(
             itemView.setBackgroundColor(
                 when {
                     selected && item.hasRuntimeError -> ContextCompat.getColor(context, R.color.task_runtime_error_bg_selected)
-                    selected -> ContextCompat.getColor(context, android.R.color.darker_gray)
+                    selected -> ContextCompat.getColor(context, R.color.drawer_history_item_selected)
                     item.hasRuntimeError -> ContextCompat.getColor(context, R.color.task_runtime_error_bg)
                     else -> ContextCompat.getColor(context, android.R.color.transparent)
                 }
@@ -89,21 +91,17 @@ class ChatMessageAdapter(
     private val formatMessageTimestamp: (String?) -> String?,
     private val isConfirmationHandled: (String) -> Boolean,
     private val onConfirmationAccept: (ChatMessage) -> Unit,
-    private val onConfirmationDismiss: (ChatMessage) -> Unit
-) : RecyclerView.Adapter<ChatMessageAdapter.ChatViewHolder>() {
+    private val onConfirmationDismiss: (ChatMessage) -> Unit,
+    private val onArtifactDownload: (ChatMessage) -> Unit,
+    private val onArtifactInstall: (ChatMessage) -> Unit
+) : ListAdapter<ChatMessage, ChatMessageAdapter.ChatViewHolder>(ChatMessageDiffCallback) {
 
     companion object {
         private const val ASSISTANT_MESSAGE_COLLAPSE_CHAR_THRESHOLD = 220
         private const val ASSISTANT_MESSAGE_COLLAPSED_MAX_LINES = 8
     }
 
-    private var items: List<ChatMessage> = emptyList()
     private val expandedAssistantMessageIds = mutableSetOf<String>()
-
-    fun submitList(newItems: List<ChatMessage>) {
-        items = newItems
-        notifyDataSetChanged()
-    }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChatViewHolder {
         val view = LayoutInflater.from(parent.context).inflate(R.layout.item_chat_message, parent, false)
@@ -111,13 +109,15 @@ class ChatMessageAdapter(
     }
 
     override fun onBindViewHolder(holder: ChatViewHolder, position: Int) {
-        holder.bind(items[position])
+        holder.bind(getItem(position))
     }
 
-    override fun getItemCount(): Int = items.size
-
     inner class ChatViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        private val block: LinearLayout = view.findViewById(R.id.messageBlock)
         private val container: LinearLayout = view.findViewById(R.id.messageBubble)
+        private val artifactCard: LinearLayout = view.findViewById(R.id.messageArtifactCard)
+        private val artifactMeta: TextView = view.findViewById(R.id.messageArtifactMeta)
+        private val artifactName: TextView = view.findViewById(R.id.messageArtifactName)
         private val title: TextView = view.findViewById(R.id.messageTitle)
         private val body: TextView = view.findViewById(R.id.messageBody)
         private val imageLabel: TextView = view.findViewById(R.id.messageImageLabel)
@@ -131,11 +131,12 @@ class ChatMessageAdapter(
 
         fun bind(item: ChatMessage) {
             val context = itemView.context
+            val isArtifactCard = item.kind == MessageKind.STATUS && !item.artifactTaskId.isNullOrBlank()
             title.customSelectionActionModeCallback = messageSelectionActionModeCallback
             body.customSelectionActionModeCallback = messageSelectionActionModeCallback
             detail.customSelectionActionModeCallback = messageSelectionActionModeCallback
             title.text = item.title ?: ""
-            title.visibility = if (item.title.isNullOrBlank()) View.GONE else View.VISIBLE
+            title.visibility = View.GONE
             body.text = item.body
             detail.text = item.detail
             detail.visibility = if (item.detail.isNullOrBlank()) View.GONE else View.VISIBLE
@@ -145,25 +146,33 @@ class ChatMessageAdapter(
             bindExpandableAssistantMessage(item)
             bindImagePreview(item, context)
             bindConfirmationActions(item)
+            bindArtifactActions(item, context)
 
-            val params = container.layoutParams as LinearLayout.LayoutParams
+            val blockParams = block.layoutParams as LinearLayout.LayoutParams
+            val bubbleParams = container.layoutParams as LinearLayout.LayoutParams
             when (item.kind) {
                 MessageKind.USER -> {
-                    params.gravity = Gravity.END
-                    params.marginStart = dp(context, 44)
-                    params.marginEnd = 0
+                    blockParams.gravity = Gravity.END
+                    blockParams.marginStart = dp(context, 44)
+                    blockParams.marginEnd = 0
+                    bubbleParams.gravity = Gravity.END
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
                     container.setBackgroundResource(R.drawable.bg_message_user)
-                    title.setTextColor(ContextCompat.getColor(context, R.color.bg_panel_alt))
-                    body.setTextColor(ContextCompat.getColor(context, R.color.text_inverse))
-                    imageLabel.setTextColor(ContextCompat.getColor(context, R.color.bg_panel_alt))
-                    detail.setTextColor(ContextCompat.getColor(context, R.color.bg_panel_alt))
-                    timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_inverse))
+                    title.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
+                    body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
+                    imageLabel.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
+                    detail.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
+                    timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.ASSISTANT,
                 MessageKind.CONFIRMATION -> {
-                    params.gravity = Gravity.START
-                    params.marginStart = 0
-                    params.marginEnd = dp(context, 44)
+                    blockParams.gravity = Gravity.START
+                    blockParams.marginStart = 0
+                    blockParams.marginEnd = dp(context, 44)
+                    bubbleParams.gravity = Gravity.START
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
                     container.setBackgroundResource(R.drawable.bg_message_assistant)
                     title.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
@@ -172,9 +181,12 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.BUILD_LOG -> {
-                    params.gravity = Gravity.CENTER_HORIZONTAL
-                    params.marginStart = dp(context, 56)
-                    params.marginEnd = dp(context, 56)
+                    blockParams.gravity = Gravity.START
+                    blockParams.marginStart = 0
+                    blockParams.marginEnd = dp(context, 56)
+                    bubbleParams.gravity = Gravity.START
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
                     container.setBackgroundResource(R.drawable.bg_message_status)
                     title.setTextColor(ContextCompat.getColor(context, R.color.accent_primary_dark))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
@@ -183,10 +195,15 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.STATUS -> {
-                    params.gravity = Gravity.CENTER_HORIZONTAL
-                    params.marginStart = dp(context, 72)
-                    params.marginEnd = dp(context, 72)
-                    container.setBackgroundResource(R.drawable.bg_message_status)
+                    blockParams.gravity = Gravity.START
+                    blockParams.marginStart = 0
+                    blockParams.marginEnd = dp(context, 72)
+                    bubbleParams.gravity = Gravity.START
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
+                    container.setBackgroundResource(
+                        if (isArtifactCard) R.drawable.bg_message_assistant else R.drawable.bg_message_status
+                    )
                     title.setTextColor(ContextCompat.getColor(context, R.color.accent_primary_dark))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
                     imageLabel.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
@@ -194,9 +211,12 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
                 MessageKind.LOG -> {
-                    params.gravity = Gravity.CENTER_HORIZONTAL
-                    params.marginStart = dp(context, 72)
-                    params.marginEnd = dp(context, 72)
+                    blockParams.gravity = Gravity.START
+                    blockParams.marginStart = 0
+                    blockParams.marginEnd = dp(context, 72)
+                    bubbleParams.gravity = Gravity.START
+                    bubbleParams.marginStart = 0
+                    bubbleParams.marginEnd = 0
                     container.setBackgroundResource(R.drawable.bg_message_log)
                     title.setTextColor(ContextCompat.getColor(context, R.color.accent_primary_dark))
                     body.setTextColor(ContextCompat.getColor(context, R.color.text_primary))
@@ -205,7 +225,38 @@ class ChatMessageAdapter(
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
             }
-            container.layoutParams = params
+            block.layoutParams = blockParams
+            container.layoutParams = bubbleParams
+            bindArtifactCard(item, context)
+        }
+
+        private fun bindArtifactCard(item: ChatMessage, context: android.content.Context) {
+            val isArtifactCard = item.kind == MessageKind.STATUS && !item.artifactTaskId.isNullOrBlank()
+            if (!isArtifactCard) {
+                artifactCard.visibility = View.GONE
+                artifactMeta.text = ""
+                artifactName.text = ""
+                title.visibility = if (item.title.isNullOrBlank()) View.GONE else View.VISIBLE
+                body.visibility = View.VISIBLE
+                body.maxLines = Int.MAX_VALUE
+                body.ellipsize = null
+                detail.visibility = if (item.detail.isNullOrBlank()) View.GONE else View.VISIBLE
+                return
+            }
+
+            artifactCard.visibility = View.VISIBLE
+            artifactName.text = item.body
+            artifactMeta.text = item.detail ?: ""
+            imageLabel.visibility = View.GONE
+            imagePreview.visibility = View.GONE
+            imagePreview.setImageDrawable(null)
+            title.visibility = View.GONE
+            title.text = ""
+            body.visibility = View.GONE
+            body.maxLines = 1
+            body.ellipsize = TextUtils.TruncateAt.END
+            detail.visibility = View.GONE
+            timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
         }
 
         private fun bindExpandableAssistantMessage(item: ChatMessage) {
@@ -282,6 +333,20 @@ class ChatMessageAdapter(
                 }
             }
         }
+
+        private fun bindArtifactActions(item: ChatMessage, context: android.content.Context) {
+            // Artifact actions are intentionally hidden in the current file-card layout.
+        }
+    }
+}
+
+internal object ChatMessageDiffCallback : DiffUtil.ItemCallback<ChatMessage>() {
+    override fun areItemsTheSame(oldItem: ChatMessage, newItem: ChatMessage): Boolean {
+        return oldItem.id == newItem.id
+    }
+
+    override fun areContentsTheSame(oldItem: ChatMessage, newItem: ChatMessage): Boolean {
+        return oldItem == newItem
     }
 }
 

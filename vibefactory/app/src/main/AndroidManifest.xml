@@ -17,13 +17,14 @@
     </queries>
 
     <application
+        android:name=".VibeFactoryApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@drawable/logo3"
         android:label="Vibe Factory"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AppCompat.Light.NoActionBar"
+        android:theme="@style/Theme.Vibefactory"
         android:usesCleartextTraffic="true">
 
         <activity
@@ -40,6 +41,18 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".LibraryActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".TokenUsageActivity"
+            android:exported="false" />
 
         <service
             android:name=".BuildMonitorService"

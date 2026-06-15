@@ -6,80 +6,293 @@
     android:layout_height="match_parent"
     android:background="@color/bg_app">
 
-    <LinearLayout
+    <FrameLayout
         android:id="@+id/mainContent"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:background="@color/bg_app"
-        android:orientation="vertical">
+        android:clipChildren="false"
+        android:clipToPadding="false">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:paddingTop="0dp">
+
+            <FrameLayout
+                android:id="@+id/chatCard"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:layout_marginHorizontal="0dp"
+                android:layout_marginTop="0dp"
+                android:layout_marginBottom="0dp"
+                android:background="@android:color/transparent">
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/recyclerMessages"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:clipToPadding="false"
+                    android:paddingHorizontal="24dp"
+                    android:paddingTop="128dp"
+                    android:paddingBottom="18dp" />
+
+                <TextView
+                    android:id="@+id/emptyChatText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center"
+                    android:textIsSelectable="true"
+                    android:text="@string/empty_chat"
+                    android:textColor="@color/text_secondary" />
+            </FrameLayout>
+
+            <LinearLayout
+                android:id="@+id/logPanel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="12dp"
+                android:layout_marginBottom="10dp"
+                android:background="@drawable/bg_message_log"
+                android:orientation="vertical"
+                android:paddingStart="14dp"
+                android:paddingTop="12dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="12dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/logPanelTitle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textIsSelectable="true"
+                    android:text="@string/message_title_log"
+                    android:textColor="@color/accent_primary_dark"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <FrameLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="160dp"
+                    android:layout_marginTop="6dp">
+
+                    <ScrollView
+                        android:id="@+id/logPanelScroll"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:fadeScrollbars="false"
+                        android:fillViewport="true"
+                        android:overScrollMode="always"
+                        android:scrollbarAlwaysDrawVerticalTrack="true"
+                        android:scrollbarStyle="insideInset"
+                        android:scrollbars="vertical">
+
+                        <TextView
+                            android:id="@+id/logPanelBody"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:paddingEnd="10dp"
+                            android:textIsSelectable="true"
+                            android:textColor="@color/text_primary"
+                            android:textSize="13sp" />
+                    </ScrollView>
+
+                    <Button
+                        android:id="@+id/btnLogScrollBottom"
+                        android:layout_width="44dp"
+                        android:layout_height="36dp"
+                        android:layout_gravity="bottom|end"
+                        android:layout_marginEnd="8dp"
+                        android:layout_marginBottom="8dp"
+                        android:background="@drawable/bg_button_secondary"
+                        android:contentDescription="@string/log_scroll_bottom"
+                        android:minWidth="0dp"
+                        android:minHeight="0dp"
+                        android:padding="0dp"
+                        android:text="↓"
+                        android:textColor="@color/text_primary"
+                        android:textSize="18sp" />
+                </FrameLayout>
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/composerBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="12dp"
+                android:layout_marginBottom="14dp"
+                android:background="@drawable/bg_composer"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingTop="10dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="10dp">
+
+                <TextView
+                    android:id="@+id/btnAttachReferenceImage"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
+                    android:layout_marginEnd="8dp"
+                    android:background="@drawable/bg_top_chip"
+                    android:clickable="true"
+                    android:contentDescription="@string/attach_file"
+                    android:focusable="true"
+                    android:foreground="?attr/selectableItemBackground"
+                    android:gravity="center"
+                    android:text="+"
+                    android:textColor="@color/text_primary"
+                    android:textSize="26sp"
+                    android:textStyle="bold" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/selectedAttachmentChip"
+                        android:layout_width="wrap_content"
+                        android:layout_height="32dp"
+                        android:layout_marginStart="8dp"
+                        android:layout_marginBottom="4dp"
+                        android:background="@drawable/bg_surface_alt"
+                        android:ellipsize="middle"
+                        android:gravity="center_vertical"
+                        android:maxWidth="260dp"
+                        android:maxLines="1"
+                        android:paddingStart="10dp"
+                        android:paddingEnd="10dp"
+                        android:textColor="@color/text_primary"
+                        android:textSize="12sp"
+                        android:visibility="gone" />
+
+                    <EditText
+                        android:id="@+id/inputPrompt"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@android:color/transparent"
+                        android:hint="@string/prompt_hint_new"
+                        android:minHeight="48dp"
+                        android:padding="12dp"
+                        android:textColor="@color/text_primary"
+                        android:textColorHint="@color/text_secondary" />
+                </LinearLayout>
+
+                <Button
+                    android:id="@+id/btnSend"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:background="@drawable/bg_button_primary"
+                    android:minWidth="72dp"
+                    android:text="@string/send"
+                    android:textColor="@color/text_inverse" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <View
+            android:id="@+id/topContentFade"
+            android:layout_width="match_parent"
+            android:layout_height="118dp"
+            android:background="@drawable/bg_top_content_fade"
+            android:elevation="7dp"
+            android:importantForAccessibility="no" />
 
         <LinearLayout
             android:id="@+id/topBar"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:background="@drawable/bg_top_bar"
+            android:background="@android:color/transparent"
+            android:elevation="8dp"
             android:gravity="center_vertical"
             android:orientation="horizontal"
             android:paddingStart="12dp"
-            android:paddingTop="16dp"
-            android:paddingEnd="16dp"
-            android:paddingBottom="14dp">
-
-            <ImageButton
-                android:id="@+id/btnOpenDrawer"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:background="@drawable/bg_surface_alt"
-                android:contentDescription="@string/open_menu"
-                android:padding="8dp"
-                android:src="@drawable/ic_menu_rounded" />
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:textIsSelectable="true"
-                    android:text="@string/app_title"
-                    android:textColor="@color/text_primary"
-                    android:textSize="24sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/inputModeLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="2dp"
-                    android:textIsSelectable="true"
-                    android:textColor="@color/text_secondary"
-                    android:textSize="12sp"
-                    android:visibility="gone" />
-            </LinearLayout>
+            android:paddingTop="0dp"
+            android:paddingEnd="12dp"
+            android:paddingBottom="8dp">
 
             <LinearLayout
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:background="@drawable/bg_surface_alt"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <LinearLayout
+                    android:id="@+id/topMenuChip"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
+                    android:background="@drawable/bg_top_chip"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:padding="0dp">
+
+                    <ImageButton
+                        android:id="@+id/btnOpenDrawer"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:background="@android:color/transparent"
+                        android:contentDescription="@string/open_menu"
+                        android:padding="12dp"
+                        android:src="@drawable/ic_menu_rounded" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/topTitleChip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="46dp"
+                    android:layout_marginStart="8dp"
+                    android:background="@drawable/bg_top_chip"
+                    android:gravity="center_vertical"
+                    android:orientation="vertical"
+                    android:paddingStart="16dp"
+                    android:paddingEnd="16dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:maxLines="1"
+                        android:text="@string/app_title"
+                        android:textColor="@color/text_primary"
+                        android:textIsSelectable="true"
+                        android:textSize="18sp" />
+
+                    <TextView
+                        android:id="@+id/inputModeLabel"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="1dp"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="11sp"
+                        android:visibility="gone" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <View
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:layout_weight="1" />
+
+            <LinearLayout
+                android:id="@+id/topLogChip"
+                android:layout_width="wrap_content"
+                android:layout_height="46dp"
+                android:background="@drawable/bg_top_chip"
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
-                android:paddingStart="12dp"
-                android:paddingTop="6dp"
-                android:paddingEnd="8dp"
-                android:paddingBottom="6dp">
+                android:paddingStart="16dp"
+                android:paddingEnd="8dp">
 
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:textIsSelectable="true"
                     android:text="@string/show_logs"
                     android:textColor="@color/text_primary"
-                    android:textSize="12sp"
-                    android:textStyle="bold" />
+                    android:textIsSelectable="true"
+                    android:textSize="15sp" />
 
                 <androidx.appcompat.widget.SwitchCompat
                     android:id="@+id/switchShowLogs"
@@ -87,248 +300,179 @@
                     android:layout_height="wrap_content"
                     android:layout_marginStart="8dp"
                     android:checked="false"
+                    android:scaleX="0.88"
+                    android:scaleY="0.88"
                     app:showText="false" />
             </LinearLayout>
         </LinearLayout>
-
-        <FrameLayout
-            android:id="@+id/chatCard"
-            android:layout_width="match_parent"
-            android:layout_height="0dp"
-            android:layout_weight="1"
-            android:layout_marginHorizontal="12dp"
-            android:layout_marginTop="12dp"
-            android:layout_marginBottom="10dp"
-            android:background="@drawable/bg_surface_card">
-
-            <androidx.recyclerview.widget.RecyclerView
-                android:id="@+id/recyclerMessages"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:clipToPadding="false"
-                android:paddingHorizontal="12dp"
-                android:paddingTop="16dp"
-                android:paddingBottom="18dp" />
-
-            <TextView
-                android:id="@+id/emptyChatText"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="center"
-                android:textIsSelectable="true"
-                android:text="@string/empty_chat"
-                android:textColor="@color/text_secondary" />
-        </FrameLayout>
-
-        <LinearLayout
-            android:id="@+id/logPanel"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginHorizontal="12dp"
-            android:layout_marginBottom="10dp"
-            android:background="@drawable/bg_message_log"
-            android:orientation="vertical"
-            android:paddingStart="14dp"
-            android:paddingTop="12dp"
-            android:paddingEnd="14dp"
-            android:paddingBottom="12dp"
-            android:visibility="gone">
-
-            <TextView
-                android:id="@+id/logPanelTitle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textIsSelectable="true"
-                android:text="@string/message_title_log"
-                android:textColor="@color/accent_primary_dark"
-                android:textSize="12sp"
-                android:textStyle="bold" />
-
-            <FrameLayout
-                android:layout_width="match_parent"
-                android:layout_height="160dp"
-                android:layout_marginTop="6dp">
-
-                <ScrollView
-                    android:id="@+id/logPanelScroll"
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent"
-                    android:fadeScrollbars="false"
-                    android:fillViewport="true"
-                    android:overScrollMode="always"
-                    android:scrollbarAlwaysDrawVerticalTrack="true"
-                    android:scrollbarStyle="insideInset"
-                    android:scrollbars="vertical">
-
-                    <TextView
-                        android:id="@+id/logPanelBody"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:paddingEnd="10dp"
-                        android:textIsSelectable="true"
-                        android:textColor="@color/text_primary"
-                        android:textSize="13sp" />
-                </ScrollView>
-
-                <Button
-                    android:id="@+id/btnLogScrollBottom"
-                    android:layout_width="44dp"
-                    android:layout_height="36dp"
-                    android:layout_gravity="bottom|end"
-                    android:layout_marginEnd="8dp"
-                    android:layout_marginBottom="8dp"
-                    android:background="@drawable/bg_button_secondary"
-                    android:contentDescription="@string/log_scroll_bottom"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:text="↓"
-                    android:textColor="@color/text_primary"
-                    android:textSize="18sp" />
-            </FrameLayout>
-        </LinearLayout>
-
-        <LinearLayout
-            android:id="@+id/downloadArea"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginHorizontal="12dp"
-            android:layout_marginBottom="10dp"
-            android:background="@drawable/bg_surface_alt"
-            android:orientation="horizontal"
-            android:padding="10dp"
-            android:visibility="gone">
-
-            <Button
-                android:id="@+id/btnDownloadManual"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:background="@drawable/bg_button_secondary"
-                android:textColor="@color/text_primary"
-                android:text="@string/download_apk" />
-
-            <Button
-                android:id="@+id/btnInstallLatest"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_button_primary"
-                android:textColor="@color/text_inverse"
-                android:text="@string/install_apk"
-                android:visibility="gone" />
-        </LinearLayout>
-
-        <LinearLayout
-            android:id="@+id/composerBar"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginHorizontal="12dp"
-            android:layout_marginBottom="14dp"
-            android:background="@drawable/bg_composer"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:paddingStart="12dp"
-            android:paddingTop="10dp"
-            android:paddingEnd="10dp"
-            android:paddingBottom="10dp">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <EditText
-                    android:id="@+id/inputPrompt"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:background="@android:color/transparent"
-                    android:hint="@string/prompt_hint_new"
-                    android:minHeight="48dp"
-                    android:textColor="@color/text_primary"
-                    android:textColorHint="@color/text_secondary"
-                    android:padding="12dp" />
-            </LinearLayout>
-
-            <ImageButton
-                android:id="@+id/btnAttachReferenceImage"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:layout_marginStart="8dp"
-                android:background="@android:color/transparent"
-                android:contentDescription="@string/attach_reference_image"
-                android:padding="8dp"
-                android:src="@android:drawable/ic_menu_gallery"
-                android:tint="@color/text_secondary" />
-
-            <ImageView
-                android:id="@+id/selectedReferenceImagePreview"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:layout_marginStart="6dp"
-                android:background="@drawable/bg_surface_alt"
-                android:clipToOutline="true"
-                android:contentDescription="@string/reference_image_preview_content_description"
-                android:padding="2dp"
-                android:scaleType="centerCrop"
-                android:visibility="gone" />
-
-            <Button
-                android:id="@+id/btnSend"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:background="@drawable/bg_button_primary"
-                android:minWidth="72dp"
-                android:text="@string/send"
-                android:textColor="@color/text_inverse" />
-        </LinearLayout>
-
-    </LinearLayout>
+    </FrameLayout>
 
     <LinearLayout
         android:id="@+id/drawerContent"
         android:layout_width="300dp"
         android:layout_height="match_parent"
         android:layout_gravity="start"
-        android:background="@color/bg_panel"
+        android:background="@color/drawer_surface"
         android:elevation="16dp"
         android:orientation="vertical"
-        android:padding="16dp">
+        android:paddingStart="20dp"
+        android:paddingTop="20dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="16dp">
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:textIsSelectable="true"
-            android:text="@string/history_title"
+            android:text="@string/app_title"
             android:textColor="@color/text_primary"
-            android:textSize="20sp"
+            android:textIsSelectable="true"
+            android:textSize="28sp"
             android:textStyle="bold" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:textIsSelectable="true"
+            android:layout_marginTop="6dp"
             android:text="@string/drawer_subtitle"
-            android:textColor="@color/text_secondary" />
+            android:textColor="@color/text_secondary"
+            android:textIsSelectable="true"
+            android:textSize="13sp" />
 
-        <Button
-            android:id="@+id/btnNewChat"
+        <LinearLayout
+            android:id="@+id/drawerSettingsRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
+            android:layout_marginTop="20dp"
+            android:background="@android:color/transparent"
+            android:clickable="true"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:gravity="center_vertical"
+            android:minHeight="48dp"
+            android:orientation="horizontal"
+            android:paddingStart="4dp"
+            android:paddingTop="10dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="10dp">
+
+            <ImageView
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:src="@drawable/ic_settings_gear"
+                android:tint="@color/text_secondary" />
+
+            <Button
+                android:id="@+id/btnOpenSettings"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:background="@android:color/transparent"
+                android:gravity="start|center_vertical"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/settings"
+                android:textAllCaps="false"
+                android:textColor="@color/text_primary"
+                android:textSize="16sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/drawerLibraryRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:background="@android:color/transparent"
+            android:clickable="true"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:gravity="center_vertical"
+            android:minHeight="48dp"
+            android:orientation="horizontal"
+            android:paddingStart="4dp"
+            android:paddingTop="10dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="10dp">
+
+            <ImageView
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:src="@drawable/ic_artifact_file"
+                android:tint="@color/text_secondary" />
+
+            <Button
+                android:id="@+id/btnOpenLibrary"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:background="@android:color/transparent"
+                android:gravity="start|center_vertical"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/library_title"
+                android:textAllCaps="false"
+                android:textColor="@color/text_primary"
+                android:textSize="16sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/drawerNewChatRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
             android:background="@drawable/bg_button_primary"
-            android:text="@string/new_chat"
-            android:textColor="@color/text_inverse" />
+            android:clickable="true"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:gravity="center_vertical"
+            android:minHeight="56dp"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="14dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="14dp">
+
+            <ImageView
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:src="@drawable/ic_square_pen"
+                android:tint="@color/text_inverse" />
+
+            <Button
+                android:id="@+id/btnNewChat"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:background="@android:color/transparent"
+                android:gravity="start|center_vertical"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/new_chat"
+                android:textAllCaps="false"
+                android:textColor="@color/text_inverse"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/drawerRecentTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="22dp"
+            android:layout_marginBottom="10dp"
+            android:text="@string/drawer_recent_title"
+            android:textAllCaps="true"
+            android:textColor="@color/text_secondary"
+            android:textIsSelectable="true"
+            android:textSize="12sp"
+            android:textStyle="bold" />
 
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/recyclerTasks"
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_marginTop="12dp"
             android:layout_weight="1"
             android:clipToPadding="false"
             android:paddingBottom="8dp" />
@@ -368,9 +512,9 @@
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:textIsSelectable="true"
                         android:text="@string/phone_gate_title"
                         android:textColor="@color/text_primary"
+                        android:textIsSelectable="true"
                         android:textSize="22sp"
                         android:textStyle="bold" />
 
@@ -378,9 +522,9 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
-                        android:textIsSelectable="true"
                         android:text="@string/phone_gate_subtitle"
-                        android:textColor="@color/text_secondary" />
+                        android:textColor="@color/text_secondary"
+                        android:textIsSelectable="true" />
 
                     <EditText
                         android:id="@+id/inputPhoneGate"
