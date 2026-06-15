@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VibeFactory Task</title>
+    <link rel="stylesheet" href="/admin/dashboard/assets/styles.css" />
+  </head>
+  <body>
+    <div class="detail-page">
+      <header class="detail-page-header">
+        <a class="back-link" href="/admin/dashboard">← 대시보드</a>
+        <label class="token-field compact-token">
+          <span>Admin token</span>
+          <input id="adminToken" type="password" autocomplete="off" placeholder="optional" />
+        </label>
+      </header>
+
+      <main class="main detail-main">
+        <section class="panel task-detail-panel visible">
+          <div class="panel-head">
+            <div>
+              <h1 id="taskDetailTitle">작업 상세</h1>
+              <div id="taskDetailMeta" class="subtle">불러오는 중입니다.</div>
+            </div>
+            <button id="refreshTaskButton" class="secondary-button" type="button">새로고침</button>
+          </div>
+          <div id="taskDetailSummary" class="detail-summary"></div>
+          <div class="detail-layout">
+            <div>
+              <h3>채팅 / 상태 타임라인</h3>
+              <div id="taskConversation" class="conversation"></div>
+            </div>
+            <div>
+              <h3>사용량 / 버전</h3>
+              <div id="taskUsageRecords" class="compact-list"></div>
+              <div id="taskSnapshots" class="compact-list snapshots"></div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/admin/dashboard/assets/task.js"></script>
+  </body>
+</html>

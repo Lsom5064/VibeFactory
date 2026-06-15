@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VibeFactory Admin</title>
+    <link rel="stylesheet" href="/admin/dashboard/assets/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">VF</div>
+          <div>
+            <div class="brand-title">VibeFactory</div>
+            <div class="brand-subtitle">Admin Dashboard</div>
+          </div>
+        </div>
+
+        <label class="token-field">
+          <span>Admin token</span>
+          <input id="adminToken" type="password" autocomplete="off" placeholder="optional" />
+        </label>
+
+        <button id="refreshButton" class="primary-button" type="button">새로고침</button>
+
+        <nav class="nav">
+          <a href="#overview">개요</a>
+          <a href="#users">사용자</a>
+          <a href="#tasks">작업</a>
+          <a href="#app-ai">앱 AI API</a>
+          <a href="#events">이벤트</a>
+          <a href="#errors">오류</a>
+        </nav>
+
+        <div class="sidebar-note">
+          <div id="dbStatus">로컬 DB 대기 중</div>
+          <div id="updatedAt">-</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <section id="overview" class="topbar">
+          <div>
+            <h1>관리자 대시보드</h1>
+            <p>생성 작업, 사용자별 사용량, 토큰, 런타임 오류를 한 화면에서 확인합니다.</p>
+          </div>
+          <div class="filter-bar">
+            <input id="searchInput" type="search" placeholder="앱, 전화번호, prompt 검색" />
+            <select id="statusFilter">
+              <option value="">전체 상태</option>
+            </select>
+          </div>
+        </section>
+
+        <section class="metric-grid" aria-label="요약 지표">
+          <article class="metric-card">
+            <span>총 작업</span>
+            <strong id="totalTasks">-</strong>
+            <small id="statusSummary">-</small>
+          </article>
+          <article class="metric-card">
+            <span>사용자</span>
+            <strong id="userCount">-</strong>
+            <small>phone/user/device 기준</small>
+          </article>
+          <article class="metric-card">
+            <span>총 토큰</span>
+            <strong id="totalTokens">-</strong>
+            <small id="usageRecords">-</small>
+          </article>
+          <article class="metric-card">
+            <span>평균 완료 시간</span>
+            <strong id="avgDuration">-</strong>
+            <small>Success/Failed/Error 기준</small>
+          </article>
+        </section>
+
+        <section class="split-grid">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>상태 분포</h2>
+            </div>
+            <div id="statusBars" class="bar-list"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>토큰 추이</h2>
+            </div>
+            <div id="tokenTimeline" class="timeline"></div>
+          </article>
+        </section>
+
+        <section id="users" class="panel">
+          <div class="panel-head">
+            <h2>사용자별 사용량</h2>
+            <span id="userCountLabel" class="subtle"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>사용자</th>
+                  <th>작업</th>
+                  <th>성공</th>
+                  <th>실패</th>
+                  <th>토큰</th>
+                  <th>마지막 사용</th>
+                </tr>
+              </thead>
+              <tbody id="usersBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="tasks" class="panel">
+          <div class="panel-head">
+            <h2>최근 작업</h2>
+            <span id="taskCountLabel" class="subtle"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>앱</th>
+                  <th>사용자</th>
+                  <th>상태</th>
+                  <th>요청</th>
+                  <th>토큰</th>
+                  <th>시간</th>
+                  <th>APK</th>
+                </tr>
+              </thead>
+              <tbody id="tasksBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="taskDetailPanel" class="panel task-detail-panel">
+          <div class="panel-head">
+            <div>
+              <h2 id="taskDetailTitle">작업 상세</h2>
+              <div id="taskDetailMeta" class="subtle">최근 작업에서 앱을 선택하세요.</div>
+            </div>
+            <button id="closeTaskDetail" class="secondary-button" type="button">닫기</button>
+          </div>
+          <div id="taskDetailSummary" class="detail-summary"></div>
+          <div class="detail-layout">
+            <div>
+              <h3>채팅 / 상태 타임라인</h3>
+              <div id="taskConversation" class="conversation"></div>
+            </div>
+            <div>
+              <h3>사용량 / 버전</h3>
+              <div id="taskUsageRecords" class="compact-list"></div>
+              <div id="taskSnapshots" class="compact-list snapshots"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="app-ai" class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>앱 AI API 사용량</h2>
+              <span id="appAiSummary" class="subtle"></span>
+            </div>
+          </div>
+          <div class="app-ai-metrics">
+            <article>
+              <span>활성 앱</span>
+              <strong id="appAiEnabledApps">-</strong>
+            </article>
+            <article>
+              <span>오늘 요청</span>
+              <strong id="appAiTodayRequests">-</strong>
+            </article>
+            <article>
+              <span>오늘 토큰</span>
+              <strong id="appAiTodayTokens">-</strong>
+            </article>
+            <article>
+              <span>제한 오류</span>
+              <strong id="appAiLimitErrors">-</strong>
+            </article>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>앱</th>
+                  <th>사용자</th>
+                  <th>상태</th>
+                  <th>오늘 요청</th>
+                  <th>오늘 토큰</th>
+                  <th>전체</th>
+                  <th>마지막 호출</th>
+                </tr>
+              </thead>
+              <tbody id="appAiUsageBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="split-grid">
+          <article id="events" class="panel">
+            <div class="panel-head">
+              <h2>이벤트 Top</h2>
+            </div>
+            <div id="eventList" class="event-list"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>토큰 Top 작업</h2>
+            </div>
+            <div id="topTokenTasks" class="compact-list"></div>
+          </article>
+        </section>
+
+        <section id="errors" class="panel">
+          <div class="panel-head">
+            <h2>최근 런타임 오류</h2>
+            <span id="runtimeErrorCount" class="subtle"></span>
+          </div>
+          <div id="runtimeErrors" class="error-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>앱 내부 LLM 호출</h2>
+          </div>
+          <div id="appLlmUsage" class="compact-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/admin/dashboard/assets/app.js"></script>
+  </body>
+</html>
