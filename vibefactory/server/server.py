@@ -1,5 +1,6 @@
 import base64
 import binascii
+import hashlib
 import io
 import json
 import os
@@ -932,6 +933,176 @@ def sanitize_user_visible_text(text: str) -> str:
     return sanitized
 
 
+def stable_payload_hash(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def compact_codex_command(command: str) -> str:
+    command = normalize_whitespace(command)
+    command = re.sub(r"^/bin/(?:zsh|bash)\s+-lc\s+", "", command).strip()
+    command = command.strip("'\"")
+    lowered = command.lower()
+    if "flutter pub get" in lowered:
+        return "flutter pub get"
+    if "flutter analyze" in lowered:
+        return "flutter analyze"
+    if "flutter build apk" in lowered:
+        return "flutter build apk"
+    if "dart format" in lowered:
+        return "dart format"
+    if command.startswith("sed "):
+        return "파일 확인"
+    if command.startswith("rg "):
+        return "코드 검색"
+    if command.startswith("ls "):
+        return "파일 목록 확인"
+    if len(command) > 90:
+        return command[:87].rstrip() + "..."
+    return command or "명령"
+
+
+def compact_workspace_path(path_value: str, workspace_path: Path) -> str:
+    raw = normalize_whitespace(path_value)
+    if not raw:
+        return "파일"
+    try:
+        path = Path(raw)
+        if path.is_absolute():
+            resolved = path.resolve()
+            if ensure_within_root(resolved, workspace_path):
+                return resolved.relative_to(workspace_path).as_posix().replace("project/", "", 1)
+    except Exception:
+        pass
+    marker = "/project/"
+    if marker in raw:
+        return raw.split(marker, 1)[1]
+    return raw.split("/")[-1] or raw
+
+
+def codex_command_progress_copy(command: str, phase: str) -> tuple[str, str]:
+    normalized = normalize_whitespace(command).lower()
+    in_progress = phase == "started"
+    failed = phase == "failed"
+    if "pub get" in normalized or "package get" in normalized:
+        title = "준비"
+        body = "필요한 패키지 준비" if in_progress else "필요한 패키지 준비 완료"
+    elif "analyze" in normalized:
+        title = "점검"
+        body = "앱 코드 점검" if in_progress else "앱 코드 점검 완료"
+    elif "build apk" in normalized or "assemble" in normalized:
+        title = "빌드"
+        body = "설치 파일 생성" if in_progress else "설치 파일 생성 완료"
+    elif "test" in normalized:
+        title = "테스트"
+        body = "앱 동작 테스트" if in_progress else "앱 동작 테스트 완료"
+    else:
+        title = "작업"
+        body = "작업 진행" if in_progress else "작업 완료"
+    if failed:
+        body = f"{title} 단계에서 문제가 발생했어요."
+    return title, body
+
+
+def codex_agent_progress_copy(text: str) -> str:
+    normalized = normalize_whitespace(text).lower()
+    if "flutter" in normalized and ("구조" in text or "화면" in text):
+        return "앱 구조를 확인하고 화면 구성을 준비하고 있어요."
+    if "핵심 화면" in text or "apk" in normalized or "빌드" in text:
+        return "핵심 화면 파일을 수정했고 점검 단계로 넘어갑니다."
+    return text
+
+
+def build_codex_progress_event(
+    item: dict[str, Any],
+    *,
+    task_id: str,
+    workspace_path: Path,
+) -> Optional[dict[str, Any]]:
+    item_type = str(item.get("type") or "")
+    item_id = str(item.get("id") or "")
+    status = str(item.get("status") or "").strip().lower()
+    if item_type == "agent_message":
+        text = codex_agent_progress_copy(sanitize_user_visible_text(str(item.get("text") or "")).strip())
+        if not text:
+            return None
+        return {
+            "task_id": task_id,
+            "actor": "assistant",
+            "event_type": "agent_message",
+            "message_text": text,
+            "payload": {
+                "item_id": item_id,
+                "source": "codex_stdout",
+                "item_type": item_type,
+            },
+        }
+
+    if item_type == "file_change":
+        changes = item.get("changes")
+        if not isinstance(changes, list) or not changes:
+            return None
+        paths = []
+        kinds = []
+        for change in changes[:4]:
+            if not isinstance(change, dict):
+                continue
+            path = compact_workspace_path(str(change.get("path") or ""), workspace_path)
+            if path:
+                paths.append(path)
+            kind = normalize_whitespace(str(change.get("kind") or ""))
+            if kind:
+                kinds.append(kind)
+        if not paths:
+            return None
+        phase = "completed" if status in {"completed", "success"} else "started"
+        label = ", ".join(paths[:3])
+        if len(paths) > 3:
+            label += f" 외 {len(paths) - 3}개"
+        body = "앱 파일 수정 완료" if phase == "completed" else "앱 파일 수정"
+        return {
+            "task_id": task_id,
+            "actor": "system",
+            "event_type": "file_change",
+            "message_text": body,
+            "payload": {
+                "item_id": item_id,
+                "source": "codex_stdout",
+                "phase": phase,
+                "paths": paths,
+                "kinds": kinds,
+                "summary": body,
+            },
+        }
+
+    if item_type == "command_execution":
+        command = compact_codex_command(str(item.get("command") or ""))
+        exit_code = item.get("exit_code")
+        if status in {"completed", "success"} or exit_code == 0:
+            phase = "completed"
+        elif status in {"failed", "error"} or (isinstance(exit_code, int) and exit_code != 0):
+            phase = "failed"
+        else:
+            phase = "started"
+        title, body = codex_command_progress_copy(command, phase)
+        return {
+            "task_id": task_id,
+            "actor": "system",
+            "event_type": "command_execution",
+            "message_text": body,
+            "payload": {
+                "item_id": item_id,
+                "source": "codex_stdout",
+                "phase": phase,
+                "command": command,
+                "exit_code": exit_code,
+                "summary": body,
+                "title": title,
+            },
+        }
+    return None
+
+
 @dataclass(frozen=True)
 class Settings:
     base_project_path: Path
@@ -1199,9 +1370,16 @@ def slugify_package_segment(value: str) -> str:
     segments = [segment for segment in cleaned.split(".") if segment]
     if not segments:
         return "customapp"
-    if segments[0][0].isdigit():
-        segments[0] = f"app{segments[0]}"
-    return ".".join(segments[:4])
+    return ".".join(normalize_android_package_segment(segment) for segment in segments[:4])
+
+
+def normalize_android_package_segment(value: str, fallback: str = "app") -> str:
+    segment = re.sub(r"[^a-z0-9_]", "", value.lower())
+    if not segment:
+        segment = fallback
+    if not segment[0].isalpha():
+        segment = f"{fallback}{segment}"
+    return segment
 
 
 def extract_explicit_app_name(prompt: str) -> str:
@@ -1265,7 +1443,8 @@ def infer_app_name(prompt: str) -> str:
 
 def infer_package_name(app_name: str, task_id: str) -> str:
     slug = slugify_package_segment(app_name)
-    return f"kr.ac.kangwon.hai.generated.{slug}.{task_id[:8].lower()}"
+    task_segment = normalize_android_package_segment(task_id[:8], fallback="task")
+    return f"kr.ac.kangwon.hai.generated.{slug}.{task_segment}"
 
 
 def extract_feature_points(prompt: str) -> list[str]:
@@ -1343,6 +1522,8 @@ def looks_like_generic_confirmation(prompt: str) -> bool:
         "네, 시작해줘",
         "네 이 내용으로 앱 생성을 시작해줘",
         "네, 이 내용으로 앱 생성을 시작해줘",
+        "네 이 내용으로 앱 수정을 시작해줘",
+        "네, 이 내용으로 앱 수정을 시작해줘",
     }
     return normalized in generic_confirmations
 
@@ -1441,6 +1622,46 @@ def make_answer_message(prompt: str) -> str:
     if "무엇을 할 수" in normalized or "뭐가 가능" in normalized:
         return "이 서버는 Flutter Android 앱 생성을 위한 작업을 처리해요. 원하는 화면, 기능, 앱 분위기를 말해주면 실제 APK 빌드까지 이어갈 수 있어요."
     return "이 메시지는 바로 앱 빌드로 보내기보다 먼저 대화로 정리하는 편이 좋아 보여요. 원하는 앱의 목적, 핵심 화면, 꼭 필요한 기능을 조금 더 구체적으로 알려주세요."
+
+
+def make_existing_app_answer_message(prompt: str, state: dict[str, Any]) -> str:
+    normalized = normalize_whitespace(prompt)
+    app_name = normalize_whitespace(str(state.get("app_name") or state.get("pending_app_name") or ""))
+    primary_flow = normalize_whitespace(
+        str(state.get("latest_primary_user_flow") or state.get("pending_primary_user_flow") or "")
+    )
+    initial_prompt = normalize_whitespace(str(state.get("initial_user_prompt") or state.get("latest_effective_user_prompt") or ""))
+    if primary_flow == initial_prompt or primary_flow.endswith("만들어줘"):
+        primary_flow = ""
+    if not primary_flow:
+        if "계산" in app_name:
+            primary_flow = "숫자와 연산자를 입력해 사칙연산과 소수점 계산 결과를 확인하는"
+        elif any(token in app_name for token in ("투두", "할 일", "TODO", "Todo")):
+            primary_flow = "할 일을 추가하고 완료 여부를 관리하는"
+        elif "메모" in app_name:
+            primary_flow = "메모를 작성하고 저장해 다시 확인하는"
+    acceptance_criteria = normalize_acceptance_criteria(
+        state.get("latest_acceptance_criteria") or state.get("pending_acceptance_criteria")
+    )
+    acceptance_criteria = [
+        item for item in acceptance_criteria
+        if "더미" not in item and "예시 문구" not in item and "대체하면 안" not in item and "기능이 실제로 동작" not in item
+    ]
+    if not app_name and not primary_flow and not acceptance_criteria:
+        return ""
+    if any(token in normalized for token in ("다운로드", "설치", "apk", "APK")):
+        target = f"{app_name} APK" if app_name else "완성된 APK"
+        return f"{target}는 채팅창의 다운로드 카드에서 받을 수 있어요. 수정 빌드를 새로 시작하지 않아도 기존 버전 다운로드는 유지됩니다."
+    if any(token in normalized for token in ("뭐하는", "무슨 앱", "어떤 앱", "기능", "들어있", "뭐야")):
+        subject = f"{app_name}는" if app_name else "이 앱은"
+        if primary_flow:
+            message = f"{subject} {primary_flow} 앱이에요."
+        else:
+            message = f"{subject} 요청한 기능을 실행할 수 있게 만든 앱이에요."
+        if acceptance_criteria:
+            message += " 주요 동작은 " + ", ".join(acceptance_criteria[:3]) + "입니다."
+        return message
+    return ""
 
 
 def detect_unsupported_android_request(prompt: str) -> Optional[str]:
@@ -1750,6 +1971,58 @@ def looks_like_substantive_clarification_answer(prompt: str) -> bool:
     return True
 
 
+def looks_like_existing_app_selection_answer(prompt: str) -> bool:
+    normalized = normalize_whitespace(prompt)
+    lowered = normalized.lower()
+    if looks_like_generic_confirmation(normalized):
+        return True
+    existing_tokens = (
+        "기존",
+        "이전",
+        "저번",
+        "아까",
+        "이어",
+        "수정",
+        "반영",
+        "existing",
+        "modify",
+        "same app",
+        "use existing",
+    )
+    if any(token in lowered for token in existing_tokens):
+        return True
+    return looks_like_substantive_clarification_answer(normalized)
+
+
+def build_pending_existing_modification_decision(
+    prompt: str,
+    task_id: str,
+    *,
+    existing_task: bool,
+    existing_workspace_ready: bool,
+    pending_prompt: str,
+    pending_acceptance_criteria: Optional[list[str]] = None,
+    previous_request_scope: str = "",
+    requires_existing_task_context: bool = False,
+) -> IntentDecision:
+    return build_intent_decision(
+        mode="build",
+        task_id=task_id,
+        existing_task=existing_task,
+        existing_workspace_ready=existing_workspace_ready,
+        user_prompt=prompt,
+        effective_user_prompt=merge_clarification_into_prompt(pending_prompt, prompt),
+        reason="기존 앱 수정 확인 답변으로 인식해 같은 요청을 다시 묻지 않고 수정 빌드를 시작합니다.",
+        used_previous_pending_prompt=True,
+        request_scope=effective_followup_request_scope(
+            previous_request_scope,
+            existing_workspace_ready=existing_workspace_ready,
+        ),
+        requires_existing_task_context=requires_existing_task_context,
+        acceptance_criteria=pending_acceptance_criteria,
+    )
+
+
 def should_preserve_unbuilt_new_app_scope(
     *,
     existing_workspace_ready: bool,
@@ -2032,7 +2305,11 @@ def build_intent_decision(
             image_reference_summary=image_reference_summary,
             image_conflict_note=image_conflict_note,
         )
-    clarification_questions = questions or build_clarification_questions(effective_prompt)
+    clarification_questions = questions or (
+        build_clarification_questions(effective_prompt)
+        if resolved_request_scope == "new_app"
+        else []
+    )
     clarification_message = "수정을 시작하기 전에 몇 가지만 확인할게요." if resolved_request_scope == "existing_app_modification" else "앱 생성을 시작하기 전에 몇 가지만 확인할게요."
     clarification_summary = "수정 방향은 파악됐지만, 바로 반영하기엔 명세가 조금 더 필요해요." if resolved_request_scope == "existing_app_modification" else "앱 목적은 파악됐지만, 바로 빌드하기엔 명세가 조금 더 필요해요."
     return IntentDecision(
@@ -2138,6 +2415,23 @@ def fallback_decide_intent(
         for item in previous_state.get("latest_assistant_questions", [])
         if normalize_whitespace(str(item))
     ]
+    if (
+        existing_task
+        and existing_workspace_ready
+        and awaiting_confirmation
+        and pending_prompt
+        and previous_request_scope == "existing_app_modification"
+        and looks_like_existing_app_selection_answer(prompt)
+    ):
+        return build_pending_existing_modification_decision(
+            prompt,
+            task_id,
+            existing_task=existing_task,
+            existing_workspace_ready=existing_workspace_ready,
+            pending_prompt=pending_prompt,
+            previous_request_scope=previous_request_scope,
+            requires_existing_task_context=requires_existing_task_context,
+        )
     if existing_task and awaiting_confirmation and pending_prompt and looks_like_generic_confirmation(prompt):
         followup_scope = effective_followup_request_scope(
             previous_request_scope,
@@ -2272,6 +2566,15 @@ def fallback_decide_intent(
             existing_workspace_ready=existing_workspace_ready,
             user_prompt=prompt,
             image_reference_summary=build_reference_image_summary(normalize_reference_image_name(reference_image_name)),
+        )
+
+    if existing_workspace_ready:
+        return build_intent_decision(
+            mode="answer_question",
+            task_id=task_id,
+            existing_task=existing_task,
+            existing_workspace_ready=existing_workspace_ready,
+            user_prompt=prompt,
         )
 
     return build_intent_decision(
@@ -2605,6 +2908,24 @@ def decide_intent(
     ]
     previous_request_scope = normalize_whitespace(str(previous_state.get("request_scope") or ""))
     requires_existing_task_context = bool(previous_state.get("requires_existing_task_context"))
+    if (
+        existing_task
+        and existing_workspace_ready
+        and bool(previous_state.get("awaiting_confirmation"))
+        and pending_prompt
+        and previous_request_scope == "existing_app_modification"
+        and looks_like_existing_app_selection_answer(prompt)
+    ):
+        return build_pending_existing_modification_decision(
+            prompt,
+            task_id,
+            existing_task=existing_task,
+            existing_workspace_ready=existing_workspace_ready,
+            pending_prompt=pending_prompt,
+            pending_acceptance_criteria=pending_acceptance_criteria,
+            previous_request_scope=previous_request_scope,
+            requires_existing_task_context=requires_existing_task_context,
+        )
     if existing_task and looks_like_runtime_repair_request(prompt):
         return build_intent_decision(
             mode="build",
@@ -2754,7 +3075,11 @@ def decide_intent(
                         "질문이나 상담 요청으로 보여서 바로 빌드하지 않고 먼저 대화로 정리합니다.",
                     ),
                     assistant_message=korean_text_or_fallback(
-                        str(spec_payload.get("assistant_reply") or ""),
+                        (
+                            make_existing_app_answer_message(prompt, previous_state)
+                            if existing_task
+                            else ""
+                        ) or str(spec_payload.get("assistant_reply") or ""),
                         make_answer_message(prompt),
                     ),
                     suggested_app_name=spec_app_name,
@@ -2783,6 +3108,30 @@ def decide_intent(
                 request_scope = "new_app"
                 spec_payload["requires_existing_task_context"] = False
             if spec_mode in {"build", "ask_confirmation"} and request_scope in {"new_app", "existing_app_modification"}:
+                if (
+                    spec_mode == "ask_confirmation"
+                    and request_scope == "existing_app_modification"
+                    and not questions
+                    and not bool(spec_payload.get("requires_existing_task_context"))
+                    and looks_like_build_request(prompt, existing_task)
+                ):
+                    return build_intent_decision(
+                        mode="build",
+                        task_id=task_id,
+                        existing_task=existing_task,
+                        existing_workspace_ready=existing_workspace_ready,
+                        user_prompt=prompt,
+                        effective_user_prompt=effective_user_prompt_raw or prompt,
+                        reason="기존 앱 수정 요청이 충분히 명확해 추가 질문 없이 바로 수정 빌드를 시작합니다.",
+                        used_previous_pending_prompt=used_previous_pending_request,
+                        request_scope=request_scope,
+                        requires_existing_task_context=False,
+                        suggested_app_name=spec_app_name,
+                        primary_user_flow=spec_primary_user_flow,
+                        secondary_requirements=spec_secondary_requirements,
+                        secondary_scope_confirmed=spec_secondary_scope_confirmed,
+                        acceptance_criteria=spec_acceptance_criteria,
+                    )
                 if (
                     spec_mode == "ask_confirmation"
                     and not existing_task
@@ -3452,6 +3801,18 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def query_queued_task_ids(self) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_id
+                FROM tasks
+                WHERE status = 'Queued'
+                ORDER BY updated_at ASC, created_at ASC
+                """
+            ).fetchall()
+            return [str(row["task_id"]) for row in rows]
+
 
 def render_task_agents_md(task_id: str) -> str:
     return f"""# Task Workspace Instructions
@@ -4099,12 +4460,69 @@ def load_task_state_payload(task: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def enrich_existing_task_conversation_state(
+    task: dict[str, Any],
+    state: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    enriched = dict(state or {})
+    task_app_name = normalize_whitespace(str(task.get("app_name") or ""))
+    task_package_name = normalize_whitespace(str(task.get("package_name") or ""))
+    task_prompt = normalize_whitespace(str(task.get("prompt") or ""))
+    has_app_context = bool(task_app_name or task_package_name or task.get("workspace_path") or task.get("project_path"))
+    if not has_app_context:
+        return enriched
+
+    if task_app_name:
+        enriched.setdefault("app_name", task_app_name)
+        if not normalize_whitespace(str(enriched.get("pending_app_name") or "")):
+            enriched["pending_app_name"] = task_app_name
+    if task_package_name:
+        enriched.setdefault("package_name", task_package_name)
+        if not normalize_whitespace(str(enriched.get("pending_package_name") or "")):
+            enriched["pending_package_name"] = task_package_name
+    if task_prompt and not normalize_whitespace(str(enriched.get("initial_user_prompt") or "")):
+        enriched["initial_user_prompt"] = task_prompt
+    if task_prompt and not normalize_whitespace(str(enriched.get("latest_effective_user_prompt") or "")):
+        enriched["latest_effective_user_prompt"] = task_prompt
+    if task_prompt and not normalize_whitespace(str(enriched.get("latest_primary_user_flow") or "")):
+        enriched["latest_primary_user_flow"] = infer_primary_user_flow(
+            task_prompt,
+            extract_feature_points(task_prompt),
+            task_app_name,
+        )
+    if not normalize_acceptance_criteria(enriched.get("latest_acceptance_criteria")) and task_prompt:
+        enriched["latest_acceptance_criteria"] = infer_acceptance_criteria(
+            task_prompt,
+            extract_feature_points(task_prompt),
+        )
+    return enriched
+
+
 def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_prompt: Optional[str] = None) -> dict[str, Any]:
+    previous_state_payload = load_task_state_payload(task)
+    previous_conversation_state = previous_state_payload.get("conversation_state")
+    if not isinstance(previous_conversation_state, dict):
+        previous_conversation_state = {}
+    preserved_state = enrich_existing_task_conversation_state(task, previous_conversation_state)
     latest_user_prompt = user_prompt or task.get("prompt") or ""
     pending_prompt = decision.effective_user_prompt if decision.mode == "ask_confirmation" else ""
     pending_normalized_prompt = decision.normalized_prompt if decision.mode == "ask_confirmation" else ""
-    pending_app_name = decision.app_name if decision.mode == "ask_confirmation" else ""
-    pending_package_name = decision.package_name if decision.mode == "ask_confirmation" else ""
+    preserved_app_name = normalize_whitespace(str(preserved_state.get("app_name") or preserved_state.get("pending_app_name") or task.get("app_name") or ""))
+    preserved_package_name = normalize_whitespace(str(preserved_state.get("package_name") or preserved_state.get("pending_package_name") or task.get("package_name") or ""))
+    preserved_primary_user_flow = normalize_whitespace(str(preserved_state.get("latest_primary_user_flow") or preserved_state.get("pending_primary_user_flow") or ""))
+    preserved_secondary_requirements = normalize_secondary_requirements(
+        preserved_state.get("latest_secondary_requirements") or preserved_state.get("pending_secondary_requirements")
+    )
+    preserved_acceptance_criteria = normalize_acceptance_criteria(
+        preserved_state.get("latest_acceptance_criteria") or preserved_state.get("pending_acceptance_criteria")
+    )
+    resolved_app_name = decision.app_name or preserved_app_name
+    resolved_package_name = decision.package_name or preserved_package_name
+    resolved_primary_user_flow = decision.primary_user_flow or preserved_primary_user_flow
+    resolved_secondary_requirements = decision.secondary_requirements or preserved_secondary_requirements
+    resolved_acceptance_criteria = decision.acceptance_criteria or preserved_acceptance_criteria
+    pending_app_name = decision.app_name if decision.mode == "ask_confirmation" else preserved_app_name
+    pending_package_name = decision.package_name if decision.mode == "ask_confirmation" else preserved_package_name
     pending_acceptance_criteria = decision.acceptance_criteria if decision.mode == "ask_confirmation" else []
     device_info = serialize_device_info(task.get("device_info"))
     reference_image_name = normalize_reference_image_name(task.get("reference_image_name"))
@@ -4122,12 +4540,12 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
         "reason": decision.reason,
         "request_scope": decision.request_scope,
         "requires_existing_task_context": decision.requires_existing_task_context,
-        "app_name": decision.app_name,
-        "package_name": decision.package_name,
-        "primary_user_flow": decision.primary_user_flow,
-        "secondary_requirements": decision.secondary_requirements,
+        "app_name": resolved_app_name,
+        "package_name": resolved_package_name,
+        "primary_user_flow": resolved_primary_user_flow,
+        "secondary_requirements": resolved_secondary_requirements,
         "secondary_scope_confirmed": decision.secondary_scope_confirmed,
-        "acceptance_criteria": decision.acceptance_criteria,
+        "acceptance_criteria": resolved_acceptance_criteria,
         "confirmation_action": decision.confirmation_action,
         "confirmation_payload": decision.confirmation_payload,
         "image_reference_summary": decision.image_reference_summary,
@@ -4139,10 +4557,10 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "latest_effective_user_prompt": decision.effective_user_prompt,
             "latest_summary": decision.summary,
             "latest_assistant_questions": decision.questions,
-            "latest_primary_user_flow": decision.primary_user_flow,
-            "latest_secondary_requirements": decision.secondary_requirements,
+            "latest_primary_user_flow": resolved_primary_user_flow,
+            "latest_secondary_requirements": resolved_secondary_requirements,
             "latest_secondary_scope_confirmed": decision.secondary_scope_confirmed,
-            "latest_acceptance_criteria": decision.acceptance_criteria,
+            "latest_acceptance_criteria": resolved_acceptance_criteria,
             "awaiting_confirmation": decision.mode == "ask_confirmation",
             "confirmation_action": decision.confirmation_action,
             "confirmation_payload": decision.confirmation_payload,
@@ -4151,8 +4569,8 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "pending_normalized_prompt": pending_normalized_prompt,
             "pending_app_name": pending_app_name,
             "pending_package_name": pending_package_name,
-            "pending_primary_user_flow": decision.primary_user_flow if decision.mode == "ask_confirmation" else "",
-            "pending_secondary_requirements": decision.secondary_requirements if decision.mode == "ask_confirmation" else [],
+            "pending_primary_user_flow": decision.primary_user_flow if decision.mode == "ask_confirmation" else preserved_primary_user_flow,
+            "pending_secondary_requirements": decision.secondary_requirements if decision.mode == "ask_confirmation" else preserved_secondary_requirements,
             "pending_secondary_scope_confirmed": decision.secondary_scope_confirmed if decision.mode == "ask_confirmation" else False,
             "pending_acceptance_criteria": pending_acceptance_criteria,
             "used_previous_pending_prompt": decision.used_previous_pending_prompt,
@@ -4361,16 +4779,34 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
         body = sanitize_user_visible_text(
             str(payload.get("message") or payload.get("status") or message_text or "상태가 바뀌었습니다.")
         )
-        detail = sanitize_user_visible_text(str(payload.get("status") or ""))
+        if event_type == "task_succeeded":
+            body = "앱 생성이 완료되었어요."
+            detail = ""
+        elif event_type in {"task_failed", "task_error", "task_timeout"}:
+            detail = sanitize_user_visible_text(str(payload.get("status") or ""))
+        else:
+            detail = ""
     elif event_type.startswith("build_stage_"):
-        kind = "log"
+        kind = "status"
         title = "빌드"
-        stage = sanitize_user_visible_text(str(payload.get("stage") or ""))
-        phase = sanitize_user_visible_text(str(payload.get("phase") or ""))
-        detail = sanitize_user_visible_text(str(payload.get("detail") or ""))
         body = message_text or "빌드 단계가 진행 중입니다."
-        if stage and phase:
-            detail = "\n".join(part for part in [f"단계: {stage}", f"상태: {phase}", detail] if part).strip()
+        if event_type == "build_stage_succeeded":
+            body = "설치 파일 준비가 완료되었어요."
+        detail = ""
+    elif event_type == "agent_message":
+        kind = "assistant"
+        title = "AI"
+        body = message_text
+    elif event_type == "file_change":
+        kind = "status"
+        title = "파일"
+        body = message_text or sanitize_user_visible_text(str(payload.get("summary") or "")) or "앱 파일을 수정하고 있어요."
+    elif event_type == "command_execution":
+        kind = "status"
+        command = sanitize_user_visible_text(str(payload.get("command") or ""))
+        phase = sanitize_user_visible_text(str(payload.get("phase") or ""))
+        title = sanitize_user_visible_text(str(payload.get("title") or "")) or codex_command_progress_copy(command, phase)[0]
+        body = message_text or sanitize_user_visible_text(str(payload.get("summary") or "")) or codex_command_progress_copy(command, phase)[1]
     elif event_type == "user_interaction":
         kind = "status"
         title = "상호작용"
@@ -4765,6 +5201,14 @@ class CodexTaskRunner:
         args = shlex.split(command_text)
         env = self.build_task_env(workspace_path)
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+            progress_stop_event = threading.Event()
+            progress_thread = threading.Thread(
+                target=self.tail_codex_progress_events,
+                args=(str(task["task_id"]), stdout_path, workspace_path, progress_stop_event),
+                name=f"codex-progress-tail-{task['task_id']}",
+                daemon=True,
+            )
+            progress_thread.start()
             process = subprocess.Popen(
                 args,
                 cwd=workspace_path,
@@ -4780,7 +5224,94 @@ class CodexTaskRunner:
                 process.wait()
                 return process.returncode, True
             finally:
+                progress_stop_event.set()
+                progress_thread.join(timeout=2)
                 self.unregister_process(process)
+
+    def tail_codex_progress_events(
+        self,
+        task_id: str,
+        stdout_path: Path,
+        workspace_path: Path,
+        stop_event: threading.Event,
+    ) -> None:
+        seen_keys: set[str] = set()
+        position = 0
+        while True:
+            position = self.read_codex_progress_lines(
+                task_id=task_id,
+                stdout_path=stdout_path,
+                workspace_path=workspace_path,
+                position=position,
+                seen_keys=seen_keys,
+            )
+            if stop_event.is_set():
+                position = self.read_codex_progress_lines(
+                    task_id=task_id,
+                    stdout_path=stdout_path,
+                    workspace_path=workspace_path,
+                    position=position,
+                    seen_keys=seen_keys,
+                )
+                return
+            time.sleep(0.5)
+
+    def read_codex_progress_lines(
+        self,
+        *,
+        task_id: str,
+        stdout_path: Path,
+        workspace_path: Path,
+        position: int,
+        seen_keys: set[str],
+    ) -> int:
+        if not stdout_path.exists():
+            return position
+        with stdout_path.open("r", encoding="utf-8", errors="replace") as output:
+            output.seek(position)
+            lines = output.readlines()
+            next_position = output.tell()
+        for line in lines:
+            self.log_codex_progress_line(task_id, workspace_path, line, seen_keys)
+        return next_position
+
+    def log_codex_progress_line(
+        self,
+        task_id: str,
+        workspace_path: Path,
+        line: str,
+        seen_keys: set[str],
+    ) -> None:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return
+        event = build_codex_progress_event(item, task_id=task_id, workspace_path=workspace_path)
+        if not event:
+            return
+        event_payload = event["payload"]
+        dedupe_payload = {
+            "event_type": event["event_type"],
+            "message_text": event["message_text"],
+            "payload": event_payload,
+        }
+        dedupe_key = stable_payload_hash(dedupe_payload)
+        if dedupe_key in seen_keys:
+            return
+        seen_keys.add(dedupe_key)
+        event_payload["payload_hash"] = dedupe_key
+        self.db.log_event(
+            task_id,
+            actor=str(event["actor"]),
+            event_type=str(event["event_type"]),
+            message_text=str(event["message_text"]),
+            payload=event_payload,
+        )
 
     def wait_for_process(self, process: subprocess.Popen[Any]) -> int:
         timeout_seconds = self.settings.codex_timeout_seconds
@@ -5420,6 +5951,14 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
     status_text = status_display_text(task["status"], task.get("message"))
     timeline_events = build_task_timeline_events(db, str(task["task_id"]))
     current_build_stage, current_build_stage_detail = derive_current_build_stage(task, timeline_events)
+    apk_path_value = str(task.get("apk_path") or "")
+    apk_size_bytes = 0
+    if apk_path_value:
+        apk_path = Path(apk_path_value)
+        if not apk_path.is_absolute() and task.get("workspace_path"):
+            apk_path = Path(str(task["workspace_path"])) / apk_path
+        if apk_path.exists() and apk_path.is_file():
+            apk_size_bytes = apk_path.stat().st_size
     raw_log_sections: list[dict[str, str]] = []
     workspace_value = (task.get("workspace_path") or "").strip()
     if workspace_value:
@@ -5444,6 +5983,8 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
         "message": sanitize_user_visible_text(str(task["message"] or "")),
         "status_message": sanitize_user_visible_text(str(task["message"] or "")),
         "apk_url": task.get("apk_url") or "",
+        "apk_path": apk_path_value,
+        "apk_size_bytes": apk_size_bytes,
         "app_name": task.get("app_name") or "",
         "generated_app_name": task.get("app_name") or "",
         "package_name": task.get("package_name") or "",
@@ -5518,6 +6059,8 @@ async def lifespan(app: FastAPI):
     db.init_db()
     runner = CodexTaskRunner(settings, db)
     runner.start()
+    for queued_task_id in db.query_queued_task_ids():
+        runner.enqueue(queued_task_id)
 
     app.state.settings = settings
     app.state.db = db
@@ -5664,6 +6207,7 @@ def create_app() -> FastAPI:
             previous_conversation_state = previous_state_payload.get("conversation_state")
             if not isinstance(previous_conversation_state, dict):
                 previous_conversation_state = {}
+            previous_conversation_state = enrich_existing_task_conversation_state(task, previous_conversation_state)
             effective_reference_image_name = requested_reference_image_name or normalize_reference_image_name(
                 previous_conversation_state.get("reference_image_name")
             )
@@ -5706,31 +6250,40 @@ def create_app() -> FastAPI:
                     },
                 )
             if decision.mode != "build":
-                db.update_task(
-                    followup_task_id,
-                    status=decision.status,
-                    message=decision.message,
-                    device_id=request.device_id,
-                    phone_number=request.phone_number,
-                    codex_result_json=json.dumps(
-                        make_decision_state(
-                            {
-                                **task,
-                                "device_info": request_device_info or previous_conversation_state.get("device_info") or {},
-                                "reference_image_name": effective_reference_image_name,
-                                "reference_image_base64": effective_reference_image_base64,
-                                "reference_image_workspace_path": previous_conversation_state.get("reference_image_workspace_path") or "",
-                                "attachments": effective_attachments,
-                                "attachment_text": effective_attachment_text,
-                            },
-                            decision,
-                            request.prompt,
-                        ),
-                        ensure_ascii=False,
+                decision_state_json = json.dumps(
+                    make_decision_state(
+                        {
+                            **task,
+                            "device_info": request_device_info or previous_conversation_state.get("device_info") or {},
+                            "reference_image_name": effective_reference_image_name,
+                            "reference_image_base64": effective_reference_image_base64,
+                            "reference_image_workspace_path": previous_conversation_state.get("reference_image_workspace_path") or "",
+                            "attachments": effective_attachments,
+                            "attachment_text": effective_attachment_text,
+                        },
+                        decision,
+                        request.prompt,
                     ),
+                    ensure_ascii=False,
                 )
+                if str(task.get("status") or "").strip().lower() == "success":
+                    db.update_task(
+                        followup_task_id,
+                        device_id=request.device_id,
+                        phone_number=request.phone_number,
+                        codex_result_json=decision_state_json,
+                    )
+                else:
+                    db.update_task(
+                        followup_task_id,
+                        status=decision.status,
+                        message=decision.message,
+                        device_id=request.device_id,
+                        phone_number=request.phone_number,
+                        codex_result_json=decision_state_json,
+                    )
                 task_after_update = db.get_task(followup_task_id)
-                if task_after_update:
+                if task_after_update and str(task.get("status") or "").strip().lower() != "success":
                     log_task_status_event(db, task_after_update)
                 db.log_event(
                     followup_task_id,
@@ -5779,10 +6332,14 @@ def create_app() -> FastAPI:
                 )
                 return build_decision_response(followup_task_id, quota_decision)
 
-            resolved_app_name = decision.app_name
-            if not resolved_app_name or resolved_app_name == "맞춤 앱":
-                resolved_app_name = task.get("app_name") or resolved_app_name
-            resolved_package_name = task.get("package_name") or decision.package_name
+            if decision.request_scope == "existing_app_modification":
+                resolved_app_name = task.get("app_name") or decision.app_name
+                resolved_package_name = task.get("package_name") or decision.package_name
+            else:
+                resolved_app_name = decision.app_name
+                if not resolved_app_name or resolved_app_name == "맞춤 앱":
+                    resolved_app_name = task.get("app_name") or resolved_app_name
+                resolved_package_name = task.get("package_name") or decision.package_name
             if not resolved_package_name and resolved_app_name:
                 resolved_package_name = infer_package_name(resolved_app_name, followup_task_id)
 
@@ -5874,8 +6431,6 @@ def create_app() -> FastAPI:
                 app_name=resolved_app_name,
                 package_name=resolved_package_name,
                 project_path=project_path_value,
-                apk_path=None,
-                apk_url=None,
                 codex_result_json=json.dumps(
                     make_decision_state(
                         {
@@ -6388,6 +6943,7 @@ def create_app() -> FastAPI:
         device_id: Optional[str] = Query(default=None),
         phone_number: Optional[str] = Query(default=None),
         user_id: Optional[str] = Query(default=None),
+        artifact_path: Optional[str] = Query(default=None),
     ) -> FileResponse:
         db: Database = app.state.db
         task = db.get_task(task_id)
@@ -6395,11 +6951,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         if not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
             raise HTTPException(status_code=404, detail="task not found")
-        if task["status"] != "Success" or not task.get("apk_path") or not task.get("workspace_path"):
+        if not task.get("workspace_path"):
             raise HTTPException(status_code=404, detail="apk not available")
 
         workspace_path = Path(task["workspace_path"])
-        apk_path = Path(task["apk_path"]).resolve()
+        apk_path_value = normalize_whitespace(str(artifact_path or task.get("apk_path") or ""))
+        if not apk_path_value:
+            raise HTTPException(status_code=404, detail="apk not available")
+        apk_path = Path(apk_path_value)
+        if not apk_path.is_absolute():
+            apk_path = workspace_path / apk_path
+        apk_path = apk_path.resolve()
         if not ensure_within_root(apk_path, workspace_path):
             raise HTTPException(status_code=403, detail="invalid apk path")
         if not apk_path.exists() or apk_path.suffix.lower() != ".apk":
