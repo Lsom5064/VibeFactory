@@ -67,13 +67,13 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun refreshTokenUsageSummary(tokenLimitSummary: TextView) {
         val currentTaskId = preferencesStore.loadLastSelectedTaskId().orEmpty().trim()
-        if (currentTaskId.isBlank()) {
-            tokenLimitSummary.text = getString(R.string.settings_token_limit_summary_empty)
-            return
-        }
         lifecycleScope.launch {
             runCatching {
-                tokenUsageRepository.load(currentTaskId)
+                if (currentTaskId.isBlank()) {
+                    tokenUsageRepository.loadGlobal()
+                } else {
+                    tokenUsageRepository.load(currentTaskId)
+                }
             }.onSuccess { snapshot ->
                 tokenLimitSummary.text = getString(
                     R.string.settings_token_limit_summary_template,

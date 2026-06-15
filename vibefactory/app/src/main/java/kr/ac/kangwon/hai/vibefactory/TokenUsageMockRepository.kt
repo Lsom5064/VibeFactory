@@ -5,6 +5,7 @@ import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import retrofit2.HttpException
 
 data class TokenUsageSnapshot(
     val currentModel: String,
@@ -59,14 +60,28 @@ class TokenUsageRepository(
     private val apiService: VibeApiService,
     private val preferencesStore: HostPreferencesStore
 ) {
+    suspend fun loadGlobal(): TokenUsageSnapshot {
+        return apiService.getCodexUsage().toSnapshot(context)
+    }
+
     suspend fun load(taskId: String): TokenUsageSnapshot {
+        if (taskId.isBlank()) {
+            return loadGlobal()
+        }
         val deviceId = preferencesStore.getOrCreateDeviceId()
-        val response = apiService.getTaskUsage(
-            taskId = taskId,
-            deviceId = deviceId,
-            userId = null,
-            phoneNumber = preferencesStore.loadPhoneNumber()
-        )
+        val response = try {
+            apiService.getTaskUsage(
+                taskId = taskId,
+                deviceId = deviceId,
+                userId = null,
+                phoneNumber = preferencesStore.loadPhoneNumber()
+            )
+        } catch (e: HttpException) {
+            if (e.code() == 404) {
+                return loadGlobal()
+            }
+            throw e
+        }
         return response.toSnapshot(context)
     }
 }

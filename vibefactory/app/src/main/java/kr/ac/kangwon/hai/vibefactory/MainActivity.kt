@@ -3138,6 +3138,7 @@ ${record.stackTrace}
             "reviewing" -> "결과를 점검하고 있어요"
             "repairing" -> "오류를 수정하고 있어요"
             "failed", "error" -> "앱 생성에 실패했어요"
+            "ratelimited" -> "앱 생성 한도를 모두 사용했어요"
             "success" -> "앱 생성이 완료되었어요"
             "rejected" -> "요청을 처리할 수 없어요"
             "not found" -> "작업을 찾을 수 없어요"
@@ -3363,6 +3364,7 @@ ${record.stackTrace}
     private fun userVisibleErrorMessage(throwable: Throwable): String {
         val rootCause = generateSequence(throwable) { it.cause }.last()
         return when {
+            throwable is HttpException && throwable.code() == 429 -> "앱 생성 한도를 모두 사용했어요. 잠시 후 다시 시도해 주세요."
             throwable is HttpException && throwable.code() == 409 -> "현재 상태에서는 이 요청을 바로 처리할 수 없어요."
             throwable is HttpException && throwable.code() in 500..599 -> "서버 처리 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요."
             rootCause is SocketTimeoutException -> "응답이 지연되고 있어요. 잠시 후 다시 시도해 주세요."
