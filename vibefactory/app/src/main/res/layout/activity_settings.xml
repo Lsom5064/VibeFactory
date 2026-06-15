@@ -5,7 +5,7 @@
     android:background="@color/bg_app"
     android:fillViewport="true"
     android:clipToPadding="false"
-    android:paddingTop="58dp">
+    android:paddingTop="0dp">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -22,6 +22,7 @@
             android:layout_height="46dp"
             android:background="@drawable/bg_top_chip"
             android:contentDescription="@string/settings_back"
+            android:foreground="?attr/selectableItemBackgroundBorderless"
             android:padding="12dp"
             android:src="@drawable/ic_arrow_back_settings"
             android:tint="@color/text_primary" />
@@ -137,44 +138,6 @@
                 android:id="@+id/switchDarkMode"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content" />
-        </LinearLayout>
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="28dp"
-            android:text="@string/settings_section_account"
-            android:textColor="@color/text_secondary"
-            android:textSize="14sp" />
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:background="@drawable/bg_surface_card"
-            android:gravity="center_vertical"
-            android:minHeight="86dp"
-            android:orientation="horizontal"
-            android:paddingStart="20dp"
-            android:paddingTop="18dp"
-            android:paddingEnd="20dp"
-            android:paddingBottom="18dp">
-
-            <TextView
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/settings_workspace"
-                android:textColor="@color/text_primary"
-                android:textSize="18sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/settings_workspace_value"
-                android:textColor="@color/text_secondary"
-                android:textSize="16sp" />
         </LinearLayout>
 
         <Button

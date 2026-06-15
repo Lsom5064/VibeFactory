@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
@@ -25,24 +26,24 @@
             android:paddingEnd="14dp"
             android:paddingBottom="12dp">
 
-        <LinearLayout
-            android:id="@+id/messageArtifactCard"
-            android:layout_width="220dp"
-            android:layout_height="wrap_content"
-            android:background="@drawable/bg_message_artifact"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:paddingStart="10dp"
-            android:paddingTop="9dp"
-            android:paddingEnd="10dp"
-            android:paddingBottom="9dp"
-            android:visibility="gone">
+            <LinearLayout
+                android:id="@+id/messageArtifactCard"
+                android:layout_width="236dp"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_message_artifact"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="10dp"
+                android:paddingTop="9dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="9dp"
+                android:visibility="gone">
 
             <ImageView
                 android:id="@+id/messageArtifactIcon"
-                android:layout_width="36dp"
-                android:layout_height="36dp"
-                android:layout_marginEnd="12dp"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:layout_marginEnd="10dp"
                 android:background="@drawable/bg_artifact_icon"
                 android:contentDescription="@string/message_title_apk"
                 android:padding="6dp"
@@ -74,6 +75,20 @@
                     android:textColor="@color/text_secondary"
                     android:textSize="11sp" />
             </LinearLayout>
+
+            <TextView
+                android:id="@+id/messageArtifactAction"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:gravity="center"
+                android:minWidth="0dp"
+                android:paddingStart="0dp"
+                android:paddingEnd="0dp"
+                android:textColor="@color/artifact_action_text"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
         </LinearLayout>
 
         <TextView
@@ -111,19 +126,50 @@
             android:id="@+id/messageBody"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:lineSpacingExtra="3dp"
+            android:layout_marginTop="0dp"
+            android:lineSpacingExtra="2dp"
+            android:maxWidth="252dp"
             android:textIsSelectable="true"
             android:textColor="@color/text_primary"
             android:textSize="15sp" />
 
-        <TextView
-            android:id="@+id/messageExpandToggle"
+        <LinearLayout
+            android:id="@+id/messageLoadingRow"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:textColor="@color/accent_primary_dark"
-            android:textSize="12sp"
+            android:layout_marginTop="0dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/messageLoadingText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/status_thinking"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp" />
+
+            <com.google.android.material.progressindicator.CircularProgressIndicator
+                android:id="@+id/messageLoadingSpinner"
+                android:layout_width="24dp"
+                android:layout_height="24dp"
+                android:layout_marginStart="8dp"
+                android:indeterminate="true"
+                app:indicatorColor="@color/accent_primary"
+                app:indicatorSize="24dp"
+                app:trackThickness="3dp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/messageExpandToggle"
+            android:layout_width="match_parent"
+            android:layout_height="38dp"
+            android:layout_marginTop="10dp"
+            android:drawableEnd="@drawable/ic_chevron_right"
+            android:gravity="center_vertical"
+            android:textColor="@color/text_primary"
+            android:textSize="13sp"
             android:textStyle="bold"
             android:visibility="gone" />
 
@@ -132,6 +178,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
+            android:maxWidth="252dp"
             android:textIsSelectable="true"
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
