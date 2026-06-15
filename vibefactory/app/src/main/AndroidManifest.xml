@@ -54,6 +54,14 @@
             android:name=".TokenUsageActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".FullMessageActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".TaskLogDetailActivity"
+            android:exported="false" />
+
         <service
             android:name=".BuildMonitorService"
             android:exported="false"
