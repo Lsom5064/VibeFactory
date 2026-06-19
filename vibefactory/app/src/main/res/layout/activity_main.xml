@@ -150,6 +150,8 @@
             android:layout_height="118dp"
             android:background="@drawable/bg_top_content_fade"
             android:elevation="7dp"
+            android:clickable="false"
+            android:focusable="false"
             android:importantForAccessibility="no" />
 
         <LinearLayout
@@ -166,10 +168,11 @@
             android:paddingBottom="8dp">
 
             <LinearLayout
-                android:layout_width="wrap_content"
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
+                android:layout_weight="1"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
 
                 <LinearLayout
                     android:id="@+id/topMenuChip"
@@ -193,9 +196,10 @@
 
                 <LinearLayout
                     android:id="@+id/topTitleChip"
-                    android:layout_width="wrap_content"
+                    android:layout_width="0dp"
                     android:layout_height="46dp"
                     android:layout_marginStart="8dp"
+                    android:layout_weight="1"
                     android:background="@drawable/bg_top_chip"
                     android:gravity="center_vertical"
                     android:orientation="vertical"
@@ -203,8 +207,10 @@
                     android:paddingEnd="16dp">
 
                     <TextView
-                        android:layout_width="wrap_content"
+                        android:id="@+id/topTitleText"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
+                        android:ellipsize="end"
                         android:maxLines="1"
                         android:text="@string/app_title"
                         android:textColor="@color/text_primary"
@@ -213,9 +219,11 @@
 
                     <TextView
                         android:id="@+id/inputModeLabel"
-                        android:layout_width="wrap_content"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="1dp"
+                        android:ellipsize="end"
+                        android:maxLines="1"
                         android:textColor="@color/text_secondary"
                         android:textSize="11sp"
                         android:visibility="gone" />
@@ -223,9 +231,9 @@
             </LinearLayout>
 
             <View
-                android:layout_width="0dp"
+                android:layout_width="8dp"
                 android:layout_height="0dp"
-                android:layout_weight="1" />
+                android:layout_weight="0" />
 
             <LinearLayout
                 android:id="@+id/topLogChip"

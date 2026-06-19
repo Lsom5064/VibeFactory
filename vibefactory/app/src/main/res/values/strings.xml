@@ -204,6 +204,10 @@
     <string name="runtime_error_body">앱 %1$s 에서 런타임 에러가 발생했습니다.</string>
     <string name="notification_channel_builds">앱 빌드 완료</string>
     <string name="notification_channel_build_monitor">앱 빌드 진행</string>
+    <string name="notification_permission_rationale_title">빌드 완료 알림을 허용할까요?</string>
+    <string name="notification_permission_rationale_message">앱 빌드가 끝났을 때 화면 위 팝업과 상태바 알림으로 바로 알려드리기 위해 알림 권한이 필요해요.</string>
+    <string name="notification_permission_rationale_positive">권한 허용</string>
+    <string name="notification_permission_rationale_negative">나중에</string>
     <string name="notification_build_monitor_title">앱을 빌드하는 중이에요</string>
     <string name="notification_build_monitor_body">%1$s 작업 상태를 확인하고 있어요.</string>
     <string name="notification_build_monitor_body_multiple">%1$d개 작업 상태를 확인하고 있어요.</string>

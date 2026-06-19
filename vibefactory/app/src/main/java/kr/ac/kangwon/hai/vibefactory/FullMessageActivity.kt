@@ -72,7 +72,7 @@ class FullMessageActivity : AppCompatActivity() {
         )
 
         val body = TextView(this).apply {
-            text = bodyText
+            text = ChatMarkdownRenderer.render(this@FullMessageActivity, bodyText)
             textSize = 17f
             setLineSpacing(dp(8).toFloat(), 1.0f)
             setTextColor(ContextCompat.getColor(this@FullMessageActivity, R.color.text_primary))

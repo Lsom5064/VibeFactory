@@ -61,7 +61,11 @@ class TokenUsageRepository(
     private val preferencesStore: HostPreferencesStore
 ) {
     suspend fun loadGlobal(): TokenUsageSnapshot {
-        return apiService.getCodexUsage().toSnapshot(context)
+        return apiService.getCodexUsage(
+            deviceId = preferencesStore.getOrCreateDeviceId(),
+            userId = null,
+            phoneNumber = preferencesStore.loadPhoneNumber()
+        ).toSnapshot(context)
     }
 
     suspend fun load(taskId: String): TokenUsageSnapshot {

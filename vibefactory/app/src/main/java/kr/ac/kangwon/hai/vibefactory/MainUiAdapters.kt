@@ -138,7 +138,7 @@ class ChatMessageAdapter(
             detail.customSelectionActionModeCallback = messageSelectionActionModeCallback
             title.text = ""
             title.visibility = View.GONE
-            bindLoadingState(item)
+            bindLoadingState(item, context)
             detail.text = item.detail
             detail.visibility = if (item.detail.isNullOrBlank()) View.GONE else View.VISIBLE
             val formattedTimestamp = formatMessageTimestamp(item.createdAt)
@@ -236,7 +236,7 @@ class ChatMessageAdapter(
             container.layoutParams = bubbleParams
         }
 
-        private fun bindLoadingState(item: ChatMessage) {
+        private fun bindLoadingState(item: ChatMessage, context: android.content.Context) {
             if (item.isLoading) {
                 body.visibility = View.GONE
                 loadingRow.visibility = View.VISIBLE
@@ -244,7 +244,15 @@ class ChatMessageAdapter(
             } else {
                 loadingRow.visibility = View.GONE
                 body.visibility = View.VISIBLE
-                body.text = item.body
+                body.text = chatMessageBodyText(item, context)
+            }
+        }
+
+        private fun chatMessageBodyText(item: ChatMessage, context: android.content.Context): CharSequence {
+            return if (item.kind == MessageKind.ASSISTANT || item.kind == MessageKind.CONFIRMATION) {
+                ChatMarkdownRenderer.render(context, item.body)
+            } else {
+                item.body
             }
         }
 
@@ -266,7 +274,7 @@ class ChatMessageAdapter(
             artifactCard.visibility = View.VISIBLE
             artifactName.text = artifactDisplayTitle(item)
             artifactMeta.text = artifactDisplayMeta(item, context)
-            artifactAction.visibility = View.GONE
+            artifactAction.visibility = View.VISIBLE
             artifactAction.text = when {
                 item.artifactDownloading -> context.getString(R.string.download_apk_in_progress)
                 item.artifactCanInstall -> context.getString(R.string.install_apk)
@@ -413,6 +421,22 @@ class ChatMessageAdapter(
                 artifactAction.setOnClickListener(null)
                 artifactCard.isClickable = false
                 artifactAction.isClickable = false
+                artifactCard.isEnabled = true
+                artifactAction.isEnabled = true
+                artifactCard.alpha = 1.0f
+                artifactAction.alpha = 1.0f
+                return
+            }
+
+            if (item.artifactDownloading) {
+                artifactCard.setOnClickListener(null)
+                artifactAction.setOnClickListener(null)
+                artifactCard.isClickable = false
+                artifactAction.isClickable = false
+                artifactCard.isEnabled = false
+                artifactAction.isEnabled = false
+                artifactCard.alpha = 0.72f
+                artifactAction.alpha = 1.0f
                 return
             }
 
@@ -423,6 +447,10 @@ class ChatMessageAdapter(
                     onArtifactDownload(item)
                 }
             }
+            artifactCard.isEnabled = true
+            artifactAction.isEnabled = true
+            artifactCard.alpha = 1.0f
+            artifactAction.alpha = 1.0f
             artifactCard.isClickable = true
             artifactAction.isClickable = true
             artifactCard.setOnClickListener(clickListener)

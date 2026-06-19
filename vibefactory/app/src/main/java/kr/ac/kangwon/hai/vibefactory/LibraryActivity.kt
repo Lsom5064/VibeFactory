@@ -18,6 +18,7 @@ class LibraryActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_library)
+        applyRootSystemBarPadding()
 
         findViewById<ImageButton>(R.id.btnBackLibrary).setOnClickListener { finish() }
         bindSnapshot(loadSnapshot())

@@ -1,0 +1,17 @@
+[Unit]
+Description=VibeFactory Flutter APK Builder
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/vibefactory/flutter_apk_server
+EnvironmentFile=/etc/vibefactory-server.env
+Environment=PATH=/opt/flutter/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=ANDROID_SDK_ROOT=/opt/android-sdk
+Environment=ANDROID_HOME=/opt/android-sdk
+ExecStart=/opt/vibefactory/flutter_apk_server/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

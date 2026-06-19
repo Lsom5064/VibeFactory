@@ -854,12 +854,20 @@ def parse_response_usage_payload(payload: dict[str, Any]) -> dict[str, Optional[
 
     input_tokens = as_optional_int(usage_payload.get("input_tokens"))
     cached_input_tokens = as_optional_int(
-        input_details.get("cached_tokens", input_details.get("cached_input_tokens"))
+        input_details.get(
+            "cached_tokens",
+            input_details.get("cached_input_tokens", usage_payload.get("cached_input_tokens")),
+        )
     )
     output_tokens = as_optional_int(usage_payload.get("output_tokens"))
-    cached_output_tokens = as_optional_int(output_details.get("cached_tokens"))
+    cached_output_tokens = as_optional_int(
+        output_details.get("cached_tokens", output_details.get("cached_output_tokens", usage_payload.get("cached_output_tokens")))
+    )
     reasoning_output_tokens = as_optional_int(
-        output_details.get("reasoning_tokens", output_details.get("reasoning_output_tokens"))
+        output_details.get(
+            "reasoning_tokens",
+            output_details.get("reasoning_output_tokens", usage_payload.get("reasoning_output_tokens")),
+        )
     )
     total_tokens = as_optional_int(usage_payload.get("total_tokens"))
     if total_tokens is None and (input_tokens is not None or output_tokens is not None):
@@ -946,7 +954,12 @@ def infer_app_name(prompt: str) -> str:
 
 def infer_package_name(app_name: str, task_id: str) -> str:
     slug = slugify_package_segment(app_name)
-    return f"kr.ac.kangwon.hai.generated.{slug}.{task_id[:8].lower()}"
+    task_suffix = re.sub(r"[^a-z0-9]+", "", task_id[:8].lower()) or "task"
+    segments = [segment for segment in slug.split(".") if segment]
+    if not segments:
+        segments = ["customapp"]
+    segments[-1] = f"{segments[-1]}{task_suffix}"
+    return f"kr.ac.kangwon.hai.generated.{'.'.join(segments[:4])}"
 
 
 def extract_feature_points(prompt: str) -> list[str]:
@@ -1234,14 +1247,14 @@ def build_clarification_questions(prompt: str) -> list[str]:
     lowered = prompt.lower()
     questions = [
         "앱 이름을 어떻게 할까요?",
-        "첫 화면에서 가장 중요한 기능은 무엇인가요?",
-        "로그인이나 데이터 저장이 필요한가요?",
+        "첫 화면은 입력 중심으로 할까요, 목록이나 대시보드 중심으로 할까요?",
+        "등록한 항목은 작성만 있으면 될까요, 수정과 삭제도 같이 필요할까요?",
     ]
     if "sns" in lowered or "대화" in lowered:
         questions = [
             "묶고 싶은 SNS나 메신저 종류는 무엇인가요?",
-            "한 화면에서 통합 피드를 볼지, 서비스별 탭으로 나눌지 정해주세요.",
-            "로그인 정보 저장이나 알림 기능이 필요한가요?",
+            "한 화면 통합 피드로 볼까요, 서비스별 탭으로 나눌까요?",
+            "이번 버전은 보기 중심이면 될까요, 답장이나 작성 흐름도 필요할까요?",
         ]
     return questions
 
@@ -1352,15 +1365,15 @@ def build_scope_clarification_questions(
     )
     if any(token in combined_text for token in ("메모", "노트", "일기")):
         return [
-            "메모는 스마트폰에만 저장할까요, 로그인해서 서버에도 저장할까요?",
             "메모 작성만 있으면 될까요, 수정과 삭제도 같이 필요할까요?",
             "검색이나 폴더·태그 같은 정리 기능도 이번에 필요할까요?",
+            "첫 화면은 메모 목록으로 할까요, 빠른 작성 화면으로 할까요?",
         ]
 
     return [
-        "데이터는 이 기기에만 저장할까요, 로그인해서 여러 기기에서 함께 쓸까요?",
         "기본 등록 기능만 있으면 될까요, 수정과 삭제도 같이 필요할까요?",
-        "검색이나 정리 기능도 이번에 같이 넣을까요?",
+        "첫 화면은 입력 중심으로 할까요, 목록이나 대시보드 중심으로 할까요?",
+        "검색, 필터, 알림 중 이번에 꼭 필요한 보조 기능이 있을까요?",
     ]
 
 
@@ -1635,6 +1648,9 @@ def build_intent_decision(
     resolved_request_scope = request_scope or ("existing_app_modification" if existing_task else "new_app")
     if mode == "answer_question":
         answer_message = assistant_message or make_answer_message(user_prompt)
+        answer_request_scope = resolved_request_scope if existing_task else "non_app_request"
+        if answer_request_scope not in {"new_app", "existing_app_modification"}:
+            answer_request_scope = "non_app_request"
         return IntentDecision(
             mode="answer_question",
             status="Pending Decision",
@@ -1643,7 +1659,7 @@ def build_intent_decision(
             summary="",
             questions=[],
             reason=reason or "질문 또는 상담으로 해석됐어요.",
-            request_scope="non_app_request",
+            request_scope=answer_request_scope,
             requires_existing_task_context=False,
             app_name="",
             package_name="",
@@ -1922,12 +1938,18 @@ def fallback_decide_intent(
         )
 
     if looks_like_question(prompt) and not explicit_build_request:
+        followup_scope = effective_followup_request_scope(
+            previous_request_scope,
+            existing_workspace_ready=existing_workspace_ready,
+        ) if existing_task else "non_app_request"
         return build_intent_decision(
             mode="answer_question",
             task_id=task_id,
             existing_task=existing_task,
             existing_workspace_ready=existing_workspace_ready,
             user_prompt=prompt,
+            request_scope=followup_scope,
+            assistant_message=build_contextual_app_answer_message(prompt, previous_state),
         )
 
     if looks_like_build_request(prompt, existing_task):
@@ -2060,6 +2082,7 @@ def run_spec_clarification_agent(
         "latest_user_prompt": prompt,
         "device_info": device_info or {},
         "previous_conversation_state": previous_conversation_state or {},
+        "current_app_context": build_current_app_context(previous_conversation_state),
         "reference_image_attached": bool(normalized_reference_image_base64),
         "reference_image_name": normalized_reference_image_name,
     }
@@ -2130,7 +2153,9 @@ If the end goal is still app creation or app modification, stay in the app-spec 
 
 Rules:
 - mode=answer_question when the user is asking a question, chatting, asking for explanation, or discussing possibilities and the server should not build yet.
-- For mode=answer_question, set request_scope=non_app_request, keep questions empty, and write a natural Korean assistant_reply in 1-3 short sentences.
+- For mode=answer_question, keep questions empty, and write a natural Korean assistant_reply in 1-3 short sentences.
+- If existing_task=true and the user asks about the current app, its usage, what was built, limitations, APK, or previous conversation, answer from current_app_context and previous_conversation_state. Do not say there is no completed app information when current_app_context has app_name, implemented_requirements, latest_effective_user_prompt, or build_success=true.
+- For answer_question about the current app, set request_scope=existing_app_modification so the app thread keeps its context. For unrelated general chat, set request_scope=non_app_request.
 - Never use mode=answer_question merely because the user included schema, formatting, or downstream-agent instructions inside an app request.
 - Distinguish carefully between:
   - a question/discussion about what is possible,
@@ -2157,9 +2182,13 @@ Rules:
   2. secondary_scope_confirmed is true and secondary_requirements are either explicitly listed or explicitly confirmed as none for now.
 - If the user's message does not clearly separate first-release core flow from second-phase enhancements, use mode=ask_confirmation and propose 2-3 short feature questions yourself.
 - Do not ask the user to write or organize 1차 핵심 흐름 and 2차 고도화 요구 from scratch.
+- This build system does not provide a backend database, account system, cloud storage, or multi-device sync for each generated app by default.
+- Do not ask whether login, account creation, server storage, cloud sync, or multi-device sync is needed unless the user explicitly requested login, accounts, sharing across users, teams, cloud sync, or multi-device use.
+- If persistent storage is implied or requested, assume local on-device persistence by default.
+- Do not ask where data should be stored. Only ask what user-visible data or actions must be saved when that materially changes the app.
 - Ask concrete option questions about user-visible behavior, such as:
-  - 이 기기에만 저장할까요, 로그인해서 서버에도 저장할까요?
   - 작성만 있으면 될까요, 수정과 삭제도 같이 필요할까요?
+  - 첫 화면은 입력 중심으로 할까요, 목록이나 대시보드 중심으로 할까요?
   - 검색 기능도 이번에 필요할까요?
 - Keep the questions short and easy for non-technical users to answer.
 - Do not guess the second-phase scope silently when the user has not decided it yet, but do guide the user with concrete feature questions first.
@@ -2192,6 +2221,9 @@ Rules:
 - If you must mention a technical term or product name, keep the surrounding sentence in Korean.
 - Write user-facing text for non-technical users.
 - Keep user-facing sentences short, plain, and easy to understand.
+- The host app can render limited Markdown in assistant_reply: short paragraphs, "- " bullet lists, "1. " numbered lists, **bold**, and short inline `code`.
+- Do not use Markdown tables, images, HTML, or long fenced code blocks in user-facing replies.
+- Keep questions as plain Korean question strings without Markdown bullets or numbering. The host app formats the question list.
 - Avoid developer-facing wording such as schema, JSON, YAML, agent, prompt format, internal workflow, or output policy unless the user explicitly asked about those topics.
 - effective_user_prompt is internal machine input, so preserve the user's requested app details faithfully there, but keep all explanatory text fields in Korean.
 - For build or ask_confirmation, assistant_reply should be an empty string.
@@ -2382,6 +2414,16 @@ def decide_intent(
                 )
             if spec_mode == "answer_question":
                 structured_effective_prompt = normalize_whitespace(str(spec_payload.get("effective_user_prompt") or prompt))
+                answer_request_scope = normalize_whitespace(str(spec_payload.get("request_scope") or ""))
+                if answer_request_scope not in {"new_app", "existing_app_modification", "non_app_request"}:
+                    answer_request_scope = (
+                        effective_followup_request_scope(
+                            previous_request_scope,
+                            existing_workspace_ready=existing_workspace_ready,
+                        )
+                        if existing_task
+                        else "non_app_request"
+                    )
                 if (
                     not existing_task
                     and looks_like_structured_agent_spec_prompt(prompt)
@@ -2416,8 +2458,9 @@ def decide_intent(
                     ),
                     assistant_message=korean_text_or_fallback(
                         str(spec_payload.get("assistant_reply") or ""),
-                        make_answer_message(prompt),
+                        build_contextual_app_answer_message(prompt, previous_state) or make_answer_message(prompt),
                     ),
+                    request_scope=answer_request_scope,
                     suggested_app_name=spec_app_name,
                     primary_user_flow=spec_primary_user_flow,
                     secondary_requirements=spec_secondary_requirements,
@@ -3120,7 +3163,9 @@ def render_task_agents_md(task_id: str) -> str:
 - iOS/Xcode는 사용하지 않는다.
 - 사용자의 명세를 반영해 `project` 폴더의 Flutter 앱을 수정한다.
 - 가급적 `project/lib/main.dart`, `project/pubspec.yaml`, `project/android/app/` 아래만 집중해서 수정한다.
-- `flutter pub get`, `flutter analyze`, `flutter build apk` 중 필요한 명령을 실행한다.
+- `flutter pub get`, `flutter analyze`, `flutter build apk --debug` 중 필요한 명령을 실행한다.
+- APK가 필요하면 release 대신 debug APK만 만든다.
+- `assembleRelease`나 `flutter build apk --release`는 실행하지 않는다.
 - 사용자가 요청한 핵심 기능을 더 쉬운 대체 구현으로 바꾸지 않는다.
 - `prompt.md`에 적힌 `1차 핵심 흐름`을 이번 빌드의 최우선 범위로 본다.
 - `2차 고도화 요구`는 1차가 안정적으로 성립한 뒤에 반영한다. 시간이 부족하거나 충돌하면 1차를 우선하고, 못 넣은 2차 요구는 `known_limitations`에 남긴다.
@@ -3726,8 +3771,155 @@ def load_task_state_payload(task: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def normalize_context_list(value: Any, max_items: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = normalize_whitespace(str(item or ""))
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        items.append(text)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def task_has_app_context(task: dict[str, Any], state_payload: Optional[dict[str, Any]] = None) -> bool:
+    payload = state_payload if isinstance(state_payload, dict) else load_task_state_payload(task)
+    return any(
+        normalize_whitespace(str(value or ""))
+        for value in (
+            task.get("workspace_path"),
+            task.get("project_path"),
+            task.get("apk_url"),
+            task.get("app_name"),
+            payload.get("app_name"),
+            payload.get("package_name"),
+        )
+    )
+
+
+def build_task_conversation_state(task: dict[str, Any]) -> dict[str, Any]:
+    state_payload = load_task_state_payload(task)
+    existing_state = state_payload.get("conversation_state") if isinstance(state_payload.get("conversation_state"), dict) else {}
+    conversation_state = dict(existing_state)
+
+    initial_prompt = normalize_whitespace(
+        str(conversation_state.get("initial_user_prompt") or task.get("prompt") or "")
+    )
+    if initial_prompt:
+        conversation_state["initial_user_prompt"] = initial_prompt
+
+    build_request_prompt = normalize_whitespace(
+        str(task.get("build_request_prompt") or conversation_state.get("latest_effective_user_prompt") or task.get("prompt") or "")
+    )
+    if build_request_prompt:
+        conversation_state.setdefault("latest_effective_user_prompt", build_request_prompt)
+
+    normalized_prompt = normalize_whitespace(str(task.get("normalized_prompt") or state_payload.get("normalized_prompt") or ""))
+    if normalized_prompt:
+        conversation_state.setdefault("latest_normalized_prompt", normalized_prompt)
+
+    app_name = normalize_whitespace(str(task.get("app_name") or state_payload.get("app_name") or conversation_state.get("app_name") or ""))
+    package_name = normalize_whitespace(str(task.get("package_name") or state_payload.get("package_name") or conversation_state.get("package_name") or ""))
+    if app_name:
+        conversation_state["app_name"] = app_name
+        conversation_state["generated_app_name"] = app_name
+    if package_name:
+        conversation_state["package_name"] = package_name
+
+    task_status = normalize_whitespace(str(task.get("status") or ""))
+    result_status = normalize_whitespace(str(state_payload.get("status") or ""))
+    build_success = task_status == "Success" or result_status.lower() == "success"
+    conversation_state["build_success"] = build_success
+    if task_status:
+        conversation_state["task_status"] = task_status
+        conversation_state["status_display_text"] = status_display_text(task_status, task.get("message"))
+    if task.get("apk_url"):
+        conversation_state["apk_url"] = task.get("apk_url")
+
+    for source_key, target_key in (
+        ("implemented_requirements", "implemented_requirements"),
+        ("verification_notes", "verification_notes"),
+        ("known_limitations", "known_limitations"),
+    ):
+        items = normalize_context_list(state_payload.get(source_key))
+        if items:
+            conversation_state[target_key] = items
+
+    for key in ("app_llm_enabled", "app_llm_model", "app_llm_system_prompt"):
+        if key in state_payload and state_payload.get(key) not in (None, ""):
+            conversation_state[key] = state_payload.get(key)
+
+    request_scope = normalize_whitespace(str(conversation_state.get("request_scope") or ""))
+    if request_scope not in {"new_app", "existing_app_modification", "non_app_request"}:
+        request_scope = "existing_app_modification" if task_has_app_context(task, state_payload) else "new_app"
+    if task_has_app_context(task, state_payload) and request_scope == "non_app_request":
+        request_scope = "existing_app_modification"
+    conversation_state["request_scope"] = request_scope
+    return conversation_state
+
+
+def build_current_app_context(conversation_state: Optional[dict[str, Any]]) -> dict[str, Any]:
+    state = conversation_state or {}
+    return {
+        "app_name": state.get("generated_app_name") or state.get("app_name") or "",
+        "package_name": state.get("package_name") or "",
+        "build_success": bool(state.get("build_success")),
+        "task_status": state.get("task_status") or "",
+        "initial_user_prompt": state.get("initial_user_prompt") or "",
+        "latest_effective_user_prompt": state.get("latest_effective_user_prompt") or "",
+        "primary_user_flow": state.get("latest_primary_user_flow") or state.get("pending_primary_user_flow") or "",
+        "secondary_requirements": normalize_context_list(
+            state.get("latest_secondary_requirements") or state.get("pending_secondary_requirements")
+        ),
+        "acceptance_criteria": normalize_context_list(
+            state.get("latest_acceptance_criteria") or state.get("pending_acceptance_criteria")
+        ),
+        "implemented_requirements": normalize_context_list(state.get("implemented_requirements")),
+        "verification_notes": normalize_context_list(state.get("verification_notes")),
+        "known_limitations": normalize_context_list(state.get("known_limitations")),
+    }
+
+
+def build_contextual_app_answer_message(prompt: str, conversation_state: Optional[dict[str, Any]]) -> str:
+    context = build_current_app_context(conversation_state)
+    app_name = normalize_whitespace(str(context.get("app_name") or ""))
+    feature_items = (
+        normalize_context_list(context.get("implemented_requirements"))
+        or normalize_context_list(context.get("acceptance_criteria"))
+        or normalize_context_list(context.get("secondary_requirements"))
+    )
+    primary_flow = normalize_whitespace(str(context.get("primary_user_flow") or ""))
+    latest_effective_prompt = normalize_whitespace(str(context.get("latest_effective_user_prompt") or ""))
+    has_context = bool(app_name or feature_items or primary_flow or latest_effective_prompt)
+    if not has_context:
+        return ""
+
+    lowered = prompt.lower()
+    asks_usage = any(token in lowered for token in ("사용법", "쓰는 법", "사용 방법", "어떻게 써", "어떻게 사용", "어떻게 하면"))
+    asks_built = any(token in lowered for token in ("뭐 만들", "무슨 앱", "어떤 앱", "기능", "설명", "알려"))
+    if not (asks_usage or asks_built):
+        return ""
+
+    title = app_name or "이 앱"
+    feature_summary = ", ".join(feature_items[:3])
+    if not feature_summary:
+        feature_summary = primary_flow or latest_effective_prompt
+    limitation_items = normalize_context_list(context.get("known_limitations"), max_items=2)
+    limitation_sentence = f" 현재 제한사항은 {', '.join(limitation_items)}입니다." if limitation_items else ""
+
+    if asks_usage:
+        return f"{title}은 {feature_summary}을 중심으로 쓰는 앱이에요. 앱을 열고 첫 화면의 주요 입력이나 목록에서 필요한 항목을 추가한 뒤, 저장된 기록이나 결과 화면을 확인하면 됩니다.{limitation_sentence}"
+    return f"{title}은 {feature_summary}을 위해 만들어진 앱이에요.{limitation_sentence}"
+
+
 def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_prompt: Optional[str] = None) -> dict[str, Any]:
     latest_user_prompt = user_prompt or task.get("prompt") or ""
+    previous_conversation_state = build_task_conversation_state(task)
     pending_prompt = decision.effective_user_prompt if decision.mode == "ask_confirmation" else ""
     pending_normalized_prompt = decision.normalized_prompt if decision.mode == "ask_confirmation" else ""
     pending_app_name = decision.app_name if decision.mode == "ask_confirmation" else ""
@@ -3738,6 +3930,18 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
     reference_image_base64 = normalize_reference_image_base64(task.get("reference_image_base64"))
     reference_image_workspace_path = normalize_whitespace(str(task.get("reference_image_workspace_path") or ""))
     ui_flags = decision_ui_flags(decision)
+    state_request_scope = decision.request_scope
+    previous_request_scope = normalize_whitespace(str(previous_conversation_state.get("request_scope") or ""))
+    if decision.mode == "answer_question" and previous_request_scope in {"new_app", "existing_app_modification"}:
+        state_request_scope = previous_request_scope
+    latest_primary_user_flow = decision.primary_user_flow or str(previous_conversation_state.get("latest_primary_user_flow") or "")
+    latest_secondary_requirements = decision.secondary_requirements or normalize_context_list(
+        previous_conversation_state.get("latest_secondary_requirements")
+    )
+    latest_acceptance_criteria = decision.acceptance_criteria or normalize_context_list(
+        previous_conversation_state.get("latest_acceptance_criteria")
+    )
+    latest_summary = decision.summary or str(previous_conversation_state.get("latest_summary") or "")
     return {
         "status": decision.status,
         "tool": decision.tool,
@@ -3759,15 +3963,16 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
         "image_conflict_note": decision.image_conflict_note,
         **ui_flags,
         "conversation_state": {
-            "initial_user_prompt": task.get("prompt") or "",
+            **previous_conversation_state,
+            "initial_user_prompt": previous_conversation_state.get("initial_user_prompt") or task.get("prompt") or "",
             "latest_user_prompt": latest_user_prompt,
             "latest_effective_user_prompt": decision.effective_user_prompt,
-            "latest_summary": decision.summary,
+            "latest_summary": latest_summary,
             "latest_assistant_questions": decision.questions,
-            "latest_primary_user_flow": decision.primary_user_flow,
-            "latest_secondary_requirements": decision.secondary_requirements,
-            "latest_secondary_scope_confirmed": decision.secondary_scope_confirmed,
-            "latest_acceptance_criteria": decision.acceptance_criteria,
+            "latest_primary_user_flow": latest_primary_user_flow,
+            "latest_secondary_requirements": latest_secondary_requirements,
+            "latest_secondary_scope_confirmed": decision.secondary_scope_confirmed or bool(previous_conversation_state.get("latest_secondary_scope_confirmed")),
+            "latest_acceptance_criteria": latest_acceptance_criteria,
             "awaiting_confirmation": decision.mode == "ask_confirmation",
             "confirmation_action": decision.confirmation_action,
             "confirmation_payload": decision.confirmation_payload,
@@ -3781,7 +3986,7 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "pending_secondary_scope_confirmed": decision.secondary_scope_confirmed if decision.mode == "ask_confirmation" else False,
             "pending_acceptance_criteria": pending_acceptance_criteria,
             "used_previous_pending_prompt": decision.used_previous_pending_prompt,
-            "request_scope": decision.request_scope,
+            "request_scope": state_request_scope,
             "requires_existing_task_context": decision.requires_existing_task_context,
             "device_info": device_info,
             "reference_image_name": reference_image_name,
@@ -4110,6 +4315,21 @@ def infer_project_package_name(project_root: Path) -> str:
     return "com.example.generatedapp"
 
 
+def project_looks_like_placeholder_app(project_root: Path) -> bool:
+    main_dart_path = project_root / "lib" / "main.dart"
+    main_dart_text = read_text_if_exists(main_dart_path, limit=200_000)
+    if not main_dart_text:
+        return False
+    normalized = re.sub(r"\s+", " ", main_dart_text)
+    placeholder_markers = (
+        'Text("Generated App")',
+        "Text('Generated App')",
+        'title: "Generated App"',
+        "title: 'Generated App'",
+    )
+    return any(marker in normalized for marker in placeholder_markers)
+
+
 def make_error_result(task_id: str, message: str, build_log_path: str = "logs/build.log") -> dict[str, Any]:
     return {
         "status": "failed",
@@ -4147,16 +4367,34 @@ def parse_codex_usage_from_jsonl(path: Path) -> Optional[CodexUsage]:
             info = payload.get("info")
             if isinstance(info, dict):
                 usage_container = info.get("total_token_usage") or info.get("last_token_usage")
+        elif isinstance(payload.get("usage"), dict):
+            usage_container = payload.get("usage")
+        elif isinstance(payload.get("response"), dict) and isinstance(payload.get("response", {}).get("usage"), dict):
+            usage_container = payload.get("response", {}).get("usage")
+        elif isinstance(payload.get("payload"), dict) and isinstance(payload.get("payload", {}).get("usage"), dict):
+            usage_container = payload.get("payload", {}).get("usage")
+        elif isinstance(payload.get("item"), dict) and isinstance(payload.get("item", {}).get("usage"), dict):
+            usage_container = payload.get("item", {}).get("usage")
 
         if not isinstance(usage_container, dict):
             continue
 
+        normalized_usage = parse_response_usage_payload({"usage": usage_container})
+        if all(normalized_usage.get(field) is None for field in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+        )):
+            continue
+
         latest_usage = CodexUsage(
-            input_tokens=int(usage_container.get("input_tokens") or 0),
-            cached_input_tokens=int(usage_container.get("cached_input_tokens") or 0),
-            output_tokens=int(usage_container.get("output_tokens") or 0),
-            reasoning_output_tokens=int(usage_container.get("reasoning_output_tokens") or 0),
-            total_tokens=int(usage_container.get("total_tokens") or 0),
+            input_tokens=int(normalized_usage.get("input_tokens") or 0),
+            cached_input_tokens=int(normalized_usage.get("cached_input_tokens") or 0),
+            output_tokens=int(normalized_usage.get("output_tokens") or 0),
+            reasoning_output_tokens=int(normalized_usage.get("reasoning_output_tokens") or 0),
+            total_tokens=int(normalized_usage.get("total_tokens") or 0),
         )
     return latest_usage
 
@@ -4373,9 +4611,10 @@ class CodexTaskRunner:
     ) -> tuple[Optional[int], bool]:
         prompt = (workspace_path / "prompt.md").read_text(encoding="utf-8")
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
+        prompt_placeholder = "__CODEX_PROMPT_PLACEHOLDER_6F4A1F45__"
         try:
             command_text = self.settings.codex_command.format(
-                prompt=prompt,
+                prompt=prompt_placeholder,
                 task_id=task["task_id"],
                 workspace=str(workspace_path),
                 project=str(project_path),
@@ -4384,6 +4623,7 @@ class CodexTaskRunner:
             raise RuntimeError(f"CODEX_COMMAND placeholder error: {exc}") from exc
 
         args = shlex.split(command_text)
+        args = [part.replace(prompt_placeholder, prompt) for part in args]
         env = self.build_task_env(workspace_path)
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             process = subprocess.Popen(
@@ -4620,6 +4860,19 @@ class CodexTaskRunner:
                 phase="succeeded",
                 body=f"Flutter {stage_labels[stage_key]} 단계가 완료되었어요.",
             )
+
+        if project_looks_like_placeholder_app(project_path):
+            write_result_json(
+                result_path,
+                {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error_stage": "codex",
+                    "message": "Codex가 앱 내용을 만들지 못해 기본 템플릿 화면만 남았습니다.",
+                    "build_log_path": "logs/build.log",
+                },
+            )
+            return
 
         apk_relative = Path("project/build/app/outputs/flutter-apk/app-debug.apk")
         write_result_json(
@@ -4863,6 +5116,29 @@ class CodexTaskRunner:
                 codex_result_json = json.dumps(result, ensure_ascii=False)
                 log_text = collect_task_logs(workspace_path, build_log_hint)
 
+                if project_looks_like_placeholder_app(current_project_path):
+                    self.db.update_task(
+                        task_id,
+                        status="Failed",
+                        message="생성 결과가 기본 템플릿 화면에서 벗어나지 않았어요.",
+                        log=log_text,
+                        codex_result_json=codex_result_json,
+                        **usage_update_fields,
+                    )
+                    failed_task = self.db.get_task(task_id)
+                    if failed_task:
+                        log_task_status_event(self.db, failed_task, event_type="task_failed")
+                        if usage:
+                            log_token_usage_event(self.db, task_id, usage, model=codex_model)
+                    log_build_stage_event(
+                        self.db,
+                        task_id,
+                        stage="결과 확인",
+                        phase="failed",
+                        body="생성 결과가 기본 템플릿 화면에서 벗어나지 않았어요.",
+                    )
+                    return
+
             if apk_path.suffix.lower() != ".apk":
                 self.db.update_task(
                     task_id,
@@ -5022,9 +5298,7 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
         if workspace_root.exists() and workspace_root.is_dir():
             raw_log_sections = collect_raw_log_sections(workspace_root, "logs/build.log")
     state_payload = load_task_state_payload(task)
-    conversation_state = state_payload.get("conversation_state") if isinstance(state_payload.get("conversation_state"), dict) else {}
-    if "initial_user_prompt" not in conversation_state:
-        conversation_state["initial_user_prompt"] = task.get("prompt") or ""
+    conversation_state = build_task_conversation_state(task)
     latest_assistant_message = sanitize_user_visible_text(str(state_payload.get("message") or task.get("message") or ""))
     latest_assistant_message_type = str(state_payload.get("tool") or "status")
     latest_failure_message = (
@@ -5079,9 +5353,7 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
 def serialize_task_summary(task: dict[str, Any]) -> dict[str, Any]:
     success = task["status"] == "Success"
     state_payload = load_task_state_payload(task)
-    conversation_state = state_payload.get("conversation_state") if isinstance(state_payload.get("conversation_state"), dict) else {}
-    if "initial_user_prompt" not in conversation_state:
-        conversation_state["initial_user_prompt"] = task["prompt"]
+    conversation_state = build_task_conversation_state(task)
     return {
         "task_id": task["task_id"],
         "status": task["status"],
@@ -5106,6 +5378,126 @@ def serialize_task_summary(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+TOKEN_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "cached_output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def optional_int_value(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def aggregate_usage_rows(rows: list[dict[str, Any]]) -> dict[str, Optional[int]]:
+    totals: dict[str, int] = {field: 0 for field in TOKEN_USAGE_FIELDS}
+    seen: set[str] = set()
+    for row in rows:
+        for field in TOKEN_USAGE_FIELDS:
+            value = optional_int_value(row.get(field))
+            if value is None:
+                continue
+            totals[field] += value
+            seen.add(field)
+    return {field: totals[field] if field in seen else None for field in TOKEN_USAGE_FIELDS}
+
+
+def aggregate_task_token_usage(db: Database, task: dict[str, Any]) -> dict[str, Optional[int]]:
+    records = db.list_task_usage_records(str(task["task_id"]))
+    if records:
+        return aggregate_usage_rows(records)
+    return {
+        "input_tokens": optional_int_value(task.get("input_tokens")),
+        "cached_input_tokens": optional_int_value(task.get("cached_input_tokens")),
+        "output_tokens": optional_int_value(task.get("output_tokens")),
+        "cached_output_tokens": None,
+        "reasoning_output_tokens": optional_int_value(task.get("reasoning_output_tokens")),
+        "total_tokens": optional_int_value(task.get("total_tokens")),
+    }
+
+
+def aggregate_tasks_token_usage(db: Database, tasks: list[dict[str, Any]]) -> dict[str, Optional[int]]:
+    return aggregate_usage_rows([aggregate_task_token_usage(db, task) for task in tasks])
+
+
+def query_usage_tasks(
+    db: Database,
+    *,
+    user_id: Optional[str],
+    device_id: Optional[str],
+    phone_number: Optional[str],
+) -> list[dict[str, Any]]:
+    if any((user_id, device_id, phone_number)):
+        return db.query_tasks(user_id=user_id, device_id=device_id, phone_number=phone_number)
+    return [
+        task
+        for task_id in db.list_all_task_ids()
+        for task in [db.get_task(task_id)]
+        if task is not None
+    ]
+
+
+def usage_window_payload(label: str, window: Optional[CodexRateLimitWindow]) -> Optional[dict[str, Any]]:
+    if window is None:
+        return None
+    used_percent = max(0, min(100, int(window.used_percent)))
+    return {
+        "window_label": label,
+        "used_percent": used_percent,
+        "remaining_percent": max(0, 100 - used_percent),
+        "resets_at": window.resets_at,
+        "window_duration_mins": window.window_duration_mins,
+    }
+
+
+def mock_rate_limit_snapshot() -> CodexRateLimitSnapshot:
+    now = int(time.time())
+    return CodexRateLimitSnapshot(
+        limit_name="codex",
+        primary=CodexRateLimitWindow(used_percent=28, window_duration_mins=300, resets_at=now + 2 * 60 * 60),
+        secondary=CodexRateLimitWindow(used_percent=46, window_duration_mins=7 * 24 * 60, resets_at=now + 3 * 24 * 60 * 60),
+    )
+
+
+def load_usage_rate_limits(settings: Settings) -> tuple[Optional[CodexRateLimitSnapshot], Optional[str]]:
+    if settings.mock_codex:
+        return mock_rate_limit_snapshot(), None
+    try:
+        return fetch_codex_rate_limits(settings.codex_command, timeout_seconds=8.0), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def build_token_usage_response(
+    *,
+    settings: Settings,
+    usage: dict[str, Optional[int]],
+    task_id: str = "",
+) -> dict[str, Any]:
+    limits, limit_error = load_usage_rate_limits(settings)
+    return {
+        "task_id": task_id,
+        "limit_name": limits.limit_name if limits and limits.limit_name else "codex",
+        "primary_window": usage_window_payload("5시간 한도", limits.primary if limits else None),
+        "secondary_window": usage_window_payload("주간 한도", limits.secondary if limits else None),
+        "usage": usage,
+        "status": "ready" if limit_error is None else "partial",
+        "status_message": (
+            "최신 토큰 사용량을 보여주고 있어요."
+            if limit_error is None
+            else f"DB 토큰 사용량은 표시했지만 Codex 한도 조회는 실패했어요. {limit_error}"
+        ),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = load_settings()
@@ -5125,6 +5517,12 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Flutter APK Builder Server", lifespan=lifespan)
+    try:
+        from admin_dashboard import register_admin_dashboard_routes
+    except ModuleNotFoundError:
+        from .admin_dashboard import register_admin_dashboard_routes
+
+    register_admin_dashboard_routes(app, require_admin_token)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -5239,10 +5637,7 @@ def create_app() -> FastAPI:
                     "raw_prompt": request.prompt,
                 },
             )
-            previous_state_payload = load_task_state_payload(task)
-            previous_conversation_state = previous_state_payload.get("conversation_state")
-            if not isinstance(previous_conversation_state, dict):
-                previous_conversation_state = {}
+            previous_conversation_state = build_task_conversation_state(task)
             effective_reference_image_name = requested_reference_image_name or normalize_reference_image_name(
                 previous_conversation_state.get("reference_image_name")
             )
@@ -5599,6 +5994,45 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         log_codex_rate_limits_to_server_log(task_id, settings.codex_command)
         return serialize_task_for_status(db, task, settings.status_log_line_limit)
+
+    @app.get("/tasks/{task_id}/usage")
+    def get_task_usage(
+        task_id: str,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        db: Database = app.state.db
+        settings: Settings = app.state.settings
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="task not found")
+        if not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
+            raise HTTPException(status_code=404, detail="task not found")
+        return build_token_usage_response(
+            settings=settings,
+            task_id=task_id,
+            usage=aggregate_task_token_usage(db, task),
+        )
+
+    @app.get("/usage/codex")
+    def get_codex_usage(
+        user_id: Optional[str] = Query(default=None),
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        db: Database = app.state.db
+        settings: Settings = app.state.settings
+        tasks = query_usage_tasks(
+            db,
+            user_id=user_id,
+            device_id=device_id,
+            phone_number=phone_number,
+        )
+        return build_token_usage_response(
+            settings=settings,
+            usage=aggregate_tasks_token_usage(db, tasks),
+        )
 
     @app.post("/tasks/{task_id}/runtime-error")
     def report_runtime_error(

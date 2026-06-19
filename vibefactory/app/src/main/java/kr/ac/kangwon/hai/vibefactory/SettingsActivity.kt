@@ -29,6 +29,7 @@ class SettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
+        applyRootSystemBarPadding()
 
         val btnBack = findViewById<ImageButton>(R.id.btnBackSettings)
         val btnSave = findViewById<Button>(R.id.btnSaveSettings)

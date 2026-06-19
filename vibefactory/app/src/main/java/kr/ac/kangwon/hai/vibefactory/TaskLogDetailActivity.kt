@@ -35,6 +35,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_task_log_detail)
+        applyRootSystemBarPadding()
 
         val payload = intent.getStringExtra(EXTRA_PAYLOAD)
             ?.let { runCatching { gson.fromJson(it, TaskLogDetailPayload::class.java) }.getOrNull() }
