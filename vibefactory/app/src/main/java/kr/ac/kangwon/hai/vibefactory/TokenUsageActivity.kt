@@ -43,6 +43,7 @@ class TokenUsageActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_token_usage)
+        applyRootSystemBarPadding()
 
         findViewById<ImageButton>(R.id.btnBackTokenUsage).setOnClickListener { finish() }
         bindViews()

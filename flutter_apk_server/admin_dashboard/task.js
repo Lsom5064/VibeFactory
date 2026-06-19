@@ -1,23 +1,41 @@
 const el = (id) => document.getElementById(id);
+const AUTO_REFRESH_INTERVAL_MS = 10000;
+let taskLoadInFlight = false;
+let taskRefreshTimer = null;
 
 document.addEventListener("DOMContentLoaded", () => {
   el("adminToken").value = localStorage.getItem("vf_admin_token") || "";
   el("adminToken").addEventListener("input", () => {
     localStorage.setItem("vf_admin_token", el("adminToken").value.trim());
   });
-  el("refreshTaskButton").addEventListener("click", loadTask);
-  loadTask();
+  el("refreshTaskButton").addEventListener("click", () => loadTask({ silent: false }));
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) loadTask({ silent: true });
+  });
+  startAutoRefresh();
+  loadTask({ silent: false });
 });
 
-async function loadTask() {
+function startAutoRefresh() {
+  if (taskRefreshTimer) window.clearInterval(taskRefreshTimer);
+  taskRefreshTimer = window.setInterval(() => {
+    if (!document.hidden) loadTask({ silent: true });
+  }, AUTO_REFRESH_INTERVAL_MS);
+}
+
+async function loadTask({ silent = false } = {}) {
+  if (taskLoadInFlight) return;
   const taskId = taskIdFromPath();
   if (!taskId) {
     renderLoadError("task_id를 찾을 수 없습니다.");
     return;
   }
 
-  el("taskDetailTitle").textContent = "작업 상세 로딩 중";
-  el("taskConversation").innerHTML = '<div class="muted">불러오는 중입니다.</div>';
+  taskLoadInFlight = true;
+  if (!silent) {
+    el("taskDetailTitle").textContent = "작업 상세 로딩 중";
+    el("taskConversation").innerHTML = '<div class="muted">불러오는 중입니다.</div>';
+  }
 
   const headers = {};
   const token = el("adminToken").value.trim();
@@ -29,6 +47,8 @@ async function loadTask() {
     renderTaskDetail(await response.json());
   } catch (error) {
     renderLoadError(String(error.message || error));
+  } finally {
+    taskLoadInFlight = false;
   }
 }
 
@@ -48,7 +68,7 @@ function renderTaskDetail(detail) {
   document.title = `${task.app_name || "Task"} · VibeFactory Admin`;
   el("taskDetailTitle").textContent = task.app_name || "앱 이름 없음";
   el("taskDetailMeta").textContent =
-    `${task.task_id || ""} · ${task.identity || ""} · ${formatDate(task.created_at)} · ${formatDuration(task.duration_seconds)}`;
+    `${task.task_id || ""} · ${task.identity || ""} · ${formatDate(task.created_at)} · ${formatDuration(task.duration_seconds)} · 자동 갱신 ${AUTO_REFRESH_INTERVAL_MS / 1000}초 · ${new Date().toLocaleString("ko-KR")}`;
   el("taskDetailSummary").innerHTML = `
     <div>${statusPill(task.status)}</div>
     <div><strong>패키지</strong><span class="mono">${escapeHtml(task.package_name || "-")}</span></div>

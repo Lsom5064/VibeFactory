@@ -29,6 +29,7 @@
     <color name="status_bubble">#1E2B23</color>
     <color name="log_bubble">#3A321D</color>
     <color name="divider_soft">#334238</color>
+    <color name="usage_status_pill_bg">#1E2B23</color>
     <color name="token_usage_track">#2A382D</color>
     <color name="task_runtime_error_bg">#4A2527</color>
     <color name="task_runtime_error_bg_selected">#633336</color>

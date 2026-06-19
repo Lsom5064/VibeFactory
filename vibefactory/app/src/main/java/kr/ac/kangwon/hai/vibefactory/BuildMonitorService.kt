@@ -38,7 +38,7 @@ class BuildMonitorService : Service() {
         private const val ACTION_STOP_TASK = "kr.ac.kangwon.hai.vibefactory.STOP_MONITORING_TASK"
         private const val EXTRA_TASK_ID = "task_id"
         private const val MONITOR_CHANNEL_ID = "build_monitor"
-        private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete"
+        private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete_alerts"
         private const val FOREGROUND_NOTIFICATION_ID = 2601
 
         fun startMonitoring(context: Context, taskId: String) {
@@ -131,8 +131,12 @@ class BuildMonitorService : Service() {
             NotificationChannel(
                 BUILD_NOTIFICATION_CHANNEL_ID,
                 getString(R.string.notification_channel_builds),
-                NotificationManager.IMPORTANCE_DEFAULT
-            )
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                enableVibration(true)
+                setShowBadge(true)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
         )
     }
 
@@ -262,7 +266,9 @@ class BuildMonitorService : Service() {
             .setContentTitle(getString(titleRes))
             .setContentText(getString(bodyRes, taskName))
             .setAutoCancel(true)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
             .setContentIntent(pendingIntent)
             .build()
 

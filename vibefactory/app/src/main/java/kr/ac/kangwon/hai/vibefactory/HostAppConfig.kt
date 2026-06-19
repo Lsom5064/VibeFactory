@@ -7,7 +7,7 @@ import retrofit2.converter.gson.GsonConverterFactory
 import java.util.concurrent.TimeUnit
 
 object HostAppConfig {
-    const val BASE_URL = "http://192.168.0.82:8000"
+    const val BASE_URL = "http://15.165.191.202"
     const val PREFS_NAME = "vibefactory_prefs"
     const val PREF_DEVICE_ID = "device_id"
     const val PREF_PHONE_NUMBER = "phone_number"

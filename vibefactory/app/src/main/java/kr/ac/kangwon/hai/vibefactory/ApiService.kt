@@ -44,6 +44,9 @@ data class BuildResponse(
     val tool: String? = null,
     val message: String? = null,
     val summary: String? = null,
+    val app_name: String? = "",
+    val generated_app_name: String? = "",
+    val package_name: String? = "",
     val questions: List<String>? = null,
     val confirmation_action: String? = null,
     val confirmation_payload: String? = null,
@@ -182,7 +185,11 @@ interface VibeApiService {
     ): TokenUsageResponse
 
     @GET("/usage/codex")
-    suspend fun getCodexUsage(): TokenUsageResponse
+    suspend fun getCodexUsage(
+        @Query("device_id") deviceId: String? = null,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): TokenUsageResponse
 
     @POST("/tasks/{task_id}/runtime-error")
     suspend fun reportRuntimeError(

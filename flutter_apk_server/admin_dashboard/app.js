@@ -5,6 +5,10 @@ const state = {
   selectedTaskId: "",
 };
 
+const AUTO_REFRESH_INTERVAL_MS = 10000;
+let dashboardLoadInFlight = false;
+let dashboardRefreshTimer = null;
+
 const el = (id) => document.getElementById(id);
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -12,7 +16,7 @@ document.addEventListener("DOMContentLoaded", () => {
   el("adminToken").addEventListener("input", () => {
     localStorage.setItem("vf_admin_token", el("adminToken").value.trim());
   });
-  el("refreshButton").addEventListener("click", loadDashboard);
+  el("refreshButton").addEventListener("click", () => loadDashboard({ silent: false }));
   el("searchInput").addEventListener("input", (event) => {
     state.search = event.target.value.trim().toLowerCase();
     render();
@@ -25,11 +29,24 @@ document.addEventListener("DOMContentLoaded", () => {
     state.selectedTaskId = "";
     el("taskDetailPanel").classList.remove("visible");
   });
-  loadDashboard();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) loadDashboard({ silent: true });
+  });
+  startAutoRefresh();
+  loadDashboard({ silent: false });
 });
 
-async function loadDashboard() {
-  el("dbStatus").textContent = "로딩 중";
+function startAutoRefresh() {
+  if (dashboardRefreshTimer) window.clearInterval(dashboardRefreshTimer);
+  dashboardRefreshTimer = window.setInterval(() => {
+    if (!document.hidden) loadDashboard({ silent: true });
+  }, AUTO_REFRESH_INTERVAL_MS);
+}
+
+async function loadDashboard({ silent = false } = {}) {
+  if (dashboardLoadInFlight) return;
+  dashboardLoadInFlight = true;
+  if (!silent) el("dbStatus").textContent = "로딩 중";
   const headers = {};
   const token = el("adminToken").value.trim();
   if (token) headers["x-admin-token"] = token;
@@ -38,13 +55,15 @@ async function loadDashboard() {
     const response = await fetch("/admin/dashboard/data", { headers });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     state.data = await response.json();
-    el("dbStatus").textContent = "DB 연결됨";
+    el("dbStatus").textContent = `DB 연결됨 · 자동 갱신 ${AUTO_REFRESH_INTERVAL_MS / 1000}초`;
     el("updatedAt").textContent = new Date().toLocaleString("ko-KR");
     syncStatusFilter();
     render();
   } catch (error) {
     el("dbStatus").textContent = "로드 실패";
     el("updatedAt").textContent = String(error.message || error);
+  } finally {
+    dashboardLoadInFlight = false;
   }
 }
 

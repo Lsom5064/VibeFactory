@@ -6073,12 +6073,6 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Flutter APK Builder Server", lifespan=lifespan)
-    try:
-        from admin_dashboard import register_admin_dashboard_routes
-    except ModuleNotFoundError:
-        from .admin_dashboard import register_admin_dashboard_routes
-
-    register_admin_dashboard_routes(app, require_admin_token)
 
     @app.get("/health")
     def health() -> dict[str, str]:

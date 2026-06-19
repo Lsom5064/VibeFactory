@@ -2,7 +2,6 @@ package kr.ac.kangwon.hai.vibefactory
 
 import android.content.Context
 import android.content.res.Configuration
-import android.content.res.Resources
 import androidx.appcompat.app.AppCompatDelegate
 
 object AppThemeController {
@@ -25,17 +24,13 @@ object AppThemeController {
         return if (enabled) {
             AppCompatDelegate.MODE_NIGHT_YES
         } else {
-            AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+            AppCompatDelegate.MODE_NIGHT_NO
         }
     }
 
     fun shouldRecreateForPreference(context: Context, enabled: Boolean): Boolean {
         val currentNight = isNightMode(context.resources.configuration)
-        val targetNight = if (enabled) {
-            true
-        } else {
-            isNightMode(Resources.getSystem().configuration)
-        }
+        val targetNight = enabled
         return currentNight != targetNight
     }
 
