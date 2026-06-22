@@ -445,10 +445,10 @@ class MainActivity : AppCompatActivity() {
     private fun restoreCurrentTaskState(trigger: String) {
         if (!hasRequiredPhoneNumber()) return
         val fallbackPersistedTaskId = taskConversationMessages.keys.firstOrNull { it.isNotBlank() && !hiddenTaskIds.contains(it) }
-        val taskId = currentTaskId?.takeIf { it.isNotBlank() }
-            ?: screenState.selectedTaskId?.takeIf { it.isNotBlank() }
-            ?: pendingTaskSelectionKey?.takeIf { it.isNotBlank() }
-            ?: getLastSelectedTaskId()?.takeIf { it.isNotBlank() }
+        val taskId = visibleTaskIdOrNull(currentTaskId)
+            ?: visibleTaskIdOrNull(screenState.selectedTaskId)
+            ?: visibleTaskIdOrNull(pendingTaskSelectionKey)
+            ?: visibleTaskIdOrNull(getLastSelectedTaskId())
             ?: fallbackPersistedTaskId
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
@@ -1470,6 +1470,7 @@ class MainActivity : AppCompatActivity() {
         autoInstallOnSuccess: Boolean,
         syncPolling: Boolean
     ) {
+        if (taskId in hiddenTaskIds) return
         currentTaskId = taskId
         val normalizedStatus = response.status.trim()
         val isSuccess = isSuccessStatus(normalizedStatus)
@@ -2013,6 +2014,10 @@ ${record.stackTrace}
         hiddenTaskIds += preferencesStore.loadHiddenTaskIds()
     }
 
+    private fun visibleTaskIdOrNull(rawTaskId: String?): String? {
+        return TaskSummaryListPolicy.visibleTaskIdOrNull(rawTaskId, hiddenTaskIds)
+    }
+
     private fun persistHiddenTaskIds() {
         preferencesStore.saveHiddenTaskIds(hiddenTaskIds)
     }
@@ -2119,6 +2124,7 @@ ${record.stackTrace}
     private fun showPersistedTaskPreview(taskId: String) {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank()) return
+        if (normalizedTaskId in hiddenTaskIds) return
         val hasPersistedMessages = taskConversationMessages[normalizedTaskId].orEmpty().isNotEmpty()
         if (!hasPersistedMessages) return
         pendingInitialChatScrollTaskId = normalizedTaskId
@@ -3613,6 +3619,7 @@ ${record.stackTrace}
         statusText: String,
         hasApk: Boolean
     ) {
+        if (taskId.isBlank() || taskId in hiddenTaskIds) return
         val existing = taskSummaryById[taskId]
         val updatedTitle = buildTaskContentTitle(
             initialPrompt = response.conversation_state
@@ -3634,7 +3641,7 @@ ${record.stackTrace}
             hasApk = hasApk || existing?.hasApk == true,
             hasRuntimeError = existing?.hasRuntimeError ?: (taskId in runtimeErrorTaskIds)
         )
-        val updatedList = TaskSummaryListPolicy.upsert(screenState.taskList, updated)
+        val updatedList = TaskSummaryListPolicy.upsertVisible(screenState.taskList, updated, hiddenTaskIds)
         taskSummaryById = (taskSummaryById + (taskId to updated))
         screenState = screenState.copy(taskList = updatedList)
     }
@@ -5138,7 +5145,7 @@ ${record.stackTrace}
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putString(STATE_SELECTED_TASK_ID, screenState.selectedTaskId ?: currentTaskId)
+        outState.putString(STATE_SELECTED_TASK_ID, visibleTaskIdOrNull(screenState.selectedTaskId ?: currentTaskId))
         outState.putString(STATE_INPUT_PROMPT, inputPrompt.text?.toString().orEmpty())
     }
 
