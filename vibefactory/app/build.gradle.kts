@@ -47,4 +47,6 @@ dependencies {
 
     // ⚡ Coroutines (비동기 처리)
     implementation(libs.kotlinx.coroutines.android)
+
+    testImplementation(libs.junit)
 }
