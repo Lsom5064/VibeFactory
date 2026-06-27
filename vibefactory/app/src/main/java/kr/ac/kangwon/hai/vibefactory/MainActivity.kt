@@ -1,6 +1,7 @@
 package kr.ac.kangwon.hai.vibefactory
 
 import android.Manifest
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -18,6 +19,8 @@ import android.provider.Settings
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import android.text.Editable
+import android.text.InputFilter
+import android.text.InputType
 import android.text.TextWatcher
 import android.util.Log
 import android.view.ActionMode
@@ -124,6 +127,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnOpenDrawer: ImageButton
     private lateinit var composerBar: LinearLayout
     private lateinit var topLogChip: LinearLayout
+    private lateinit var topTitleChip: LinearLayout
     private lateinit var phoneGateOverlay: View
     private lateinit var phoneGateContent: View
     private lateinit var drawerContent: LinearLayout
@@ -198,6 +202,7 @@ class MainActivity : AppCompatActivity() {
     private var pendingScrollLatestAfterResponse: Boolean = false
     private val pendingResponseScrollTaskIds = mutableSetOf<String>()
     private val notifiedBuildSuccessTaskIds = mutableSetOf<String>()
+    private val buildMonitorStartedTaskIds = mutableSetOf<String>()
     private var isMessageTextSelectionActive = false
     private var selectedAttachment: SelectedAttachment? = null
     private var pendingCameraImageUri: Uri? = null
@@ -345,6 +350,7 @@ class MainActivity : AppCompatActivity() {
         btnOpenDrawer = findViewById(R.id.btnOpenDrawer)
         composerBar = findViewById(R.id.composerBar)
         topLogChip = findViewById(R.id.topLogChip)
+        topTitleChip = findViewById(R.id.topTitleChip)
         phoneGateOverlay = findViewById(R.id.phoneGateOverlay)
         phoneGateContent = findViewById(R.id.phoneGateContent)
         drawerContent = findViewById(R.id.drawerContent)
@@ -521,6 +527,7 @@ class MainActivity : AppCompatActivity() {
         ).apply {
             enableVibration(true)
             setShowBadge(true)
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         }
         manager.createNotificationChannel(channel)
     }
@@ -637,6 +644,12 @@ class MainActivity : AppCompatActivity() {
         btnAttachReferenceImage.setOnClickListener {
             showAttachmentMenu()
         }
+
+        val renameTaskClick = View.OnClickListener {
+            showRenameTaskDialog()
+        }
+        topTitleChip.setOnClickListener(renameTaskClick)
+        topTitleText.setOnClickListener(renameTaskClick)
 
         inputPrompt.setOnTouchListener { view, event ->
             if (view.canScrollVertically(-1) || view.canScrollVertically(1)) {
@@ -758,7 +771,7 @@ class MainActivity : AppCompatActivity() {
         if (normalizedTaskId.isBlank()) return
         hiddenTaskIds += normalizedTaskId
         persistHiddenTaskIds()
-        BuildMonitorService.stopMonitoring(this, normalizedTaskId)
+        stopBuildCompletionMonitoring(normalizedTaskId)
         taskConversationMessages.remove(normalizedTaskId)
         taskLastStatusKeys.remove(normalizedTaskId)
         persistTaskChats()
@@ -781,6 +794,25 @@ class MainActivity : AppCompatActivity() {
                 hideTaskFromChatList(summary.taskId)
             }
             .show()
+    }
+
+    private fun startBuildCompletionMonitoring(taskId: String) {
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return
+        if (!buildMonitorStartedTaskIds.add(normalizedTaskId)) return
+        try {
+            BuildMonitorService.startMonitoring(this, normalizedTaskId)
+        } catch (e: RuntimeException) {
+            buildMonitorStartedTaskIds -= normalizedTaskId
+            Log.w(TAG, "Unable to start build completion monitor task_id=$normalizedTaskId", e)
+        }
+    }
+
+    private fun stopBuildCompletionMonitoring(taskId: String) {
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank()) return
+        buildMonitorStartedTaskIds -= normalizedTaskId
+        BuildMonitorService.stopMonitoring(this, normalizedTaskId)
     }
 
     private fun restoreUiState(savedInstanceState: Bundle?) {
@@ -1247,6 +1279,7 @@ class MainActivity : AppCompatActivity() {
             canDownload = persistedApkUrlForTask(resolvedTaskId) != null,
             canInstall = persistedDownloadedApkFileForTask(resolvedTaskId) != null
         )
+        startBuildCompletionMonitoring(resolvedTaskId)
         renderState()
 
         taskSyncJob = lifecycleScope.launch {
@@ -1573,7 +1606,11 @@ class MainActivity : AppCompatActivity() {
         }
         renderState()
 
-        BuildMonitorService.stopMonitoring(this, taskId)
+        if (isPollingStatus) {
+            startBuildCompletionMonitoring(taskId)
+        } else {
+            stopBuildCompletionMonitoring(taskId)
+        }
 
         if (isSuccess) {
             loadNotifiedBuildSuccessTaskIds()
@@ -1634,11 +1671,149 @@ class MainActivity : AppCompatActivity() {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
             .build()
 
         NotificationManagerCompat.from(this).notify(taskId.hashCode(), notification)
+    }
+
+    private fun showRenameTaskDialog() {
+        val taskId = screenState.selectedTaskId?.trim()?.takeIf { it.isNotBlank() }
+            ?: currentTaskId?.trim()?.takeIf { it.isNotBlank() }
+        if (taskId.isNullOrBlank() || taskId in hiddenTaskIds) {
+            Toast.makeText(this, R.string.rename_task_no_task, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val currentName = taskDisplayName(screenState.displayedAppName)
+            ?: taskDisplayName(taskSummaryById[taskId]?.appName)
+            ?: taskSummaryById[taskId]?.title
+            ?: getString(R.string.untitled_task)
+        val input = EditText(this).apply {
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            filters = arrayOf(InputFilter.LengthFilter(40))
+            setText(currentName)
+            setSelectAllOnFocus(true)
+        }
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.rename_task_title)
+            .setMessage(R.string.rename_task_message)
+            .setView(input)
+            .setNegativeButton(R.string.confirmation_cancel, null)
+            .setPositiveButton(R.string.rename_task_positive, null)
+            .create()
+        dialog.setOnShowListener {
+            input.requestFocus()
+            input.post {
+                input.selectAll()
+                (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)
+                    ?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+            }
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val nextName = input.text?.toString()?.trim().orEmpty()
+                when {
+                    nextName.isBlank() -> input.error = getString(R.string.rename_task_empty_error)
+                    nextName == currentName -> dialog.dismiss()
+                    else -> {
+                        dialog.dismiss()
+                        renameCurrentTask(taskId, nextName)
+                    }
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun renameCurrentTask(taskId: String, nextName: String) {
+        val normalizedTaskId = taskId.trim()
+        val normalizedName = nextName.trim()
+        if (normalizedTaskId.isBlank() || normalizedName.isBlank()) return
+        lifecycleScope.launch {
+            try {
+                val response = apiService.renameTask(
+                    taskId = normalizedTaskId,
+                    deviceId = deviceId,
+                    userId = null,
+                    phoneNumber = userIdentity.phoneNumber,
+                    request = TaskRenameRequest(app_name = normalizedName)
+                )
+                val confirmedName = taskDisplayName(response.app_name)
+                    ?: taskDisplayName(response.generated_app_name)
+                    ?: normalizedName
+                applyTaskNameLocally(
+                    taskId = normalizedTaskId,
+                    appName = confirmedName,
+                    updatedAt = response.updated_at.ifBlank { null }
+                )
+                Toast.makeText(this@MainActivity, R.string.rename_task_saved, Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                logApiFailure("/tasks/{task_id}", taskId = normalizedTaskId, deviceId = deviceId, throwable = e)
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.rename_task_failed, userVisibleErrorMessage(e)),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    private fun applyTaskNameLocally(taskId: String, appName: String, updatedAt: String? = null) {
+        val normalizedTaskId = taskId.trim()
+        val normalizedAppName = appName.trim()
+        if (normalizedTaskId.isBlank() || normalizedAppName.isBlank()) return
+        val existing = taskSummaryById[normalizedTaskId]
+        val updatedSummary = TaskSummary(
+            taskId = normalizedTaskId,
+            title = normalizedAppName,
+            appName = normalizedAppName,
+            packageName = existing?.packageName,
+            subtitle = normalizedAppName,
+            status = existing?.status ?: screenState.currentStatus,
+            updatedAt = updatedAt ?: currentTimestampString(),
+            hasApk = existing?.hasApk == true || persistedApkUrlForTask(normalizedTaskId) != null,
+            hasRuntimeError = existing?.hasRuntimeError ?: (normalizedTaskId in runtimeErrorTaskIds)
+        )
+        taskSummaryById = taskSummaryById + (normalizedTaskId to updatedSummary)
+        renameArtifactMessages(normalizedTaskId, normalizedAppName)
+        val nextMessages = if (screenState.selectedTaskId == normalizedTaskId) {
+            buildTaskTimeline(normalizedTaskId)
+        } else {
+            screenState.messages
+        }
+        screenState = screenState.copy(
+            taskList = TaskSummaryListPolicy.upsert(screenState.taskList, updatedSummary),
+            displayedAppName = if (screenState.selectedTaskId == normalizedTaskId) {
+                normalizedAppName
+            } else {
+                screenState.displayedAppName
+            },
+            messages = nextMessages
+        )
+        persistTaskChats()
+        renderState()
+    }
+
+    private fun renameArtifactMessages(taskId: String, appName: String) {
+        val timeline = taskConversationMessages[taskId] ?: return
+        var changed = false
+        val nextTimeline = timeline.map { message ->
+            if (message.artifactTaskId != taskId) return@map message
+            val revisionLabel = message.artifactRevisionLabel?.trim().orEmpty()
+            val renamedBody = if (revisionLabel.isNotBlank()) "$appName $revisionLabel" else appName
+            if (message.body == renamedBody) {
+                message
+            } else {
+                changed = true
+                message.copy(body = renamedBody)
+            }
+        }
+        if (changed) {
+            taskConversationMessages[taskId] = nextTimeline.toMutableList()
+        }
     }
 
     private fun loadNotifiedBuildSuccessTaskIds() {

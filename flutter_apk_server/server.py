@@ -279,6 +279,102 @@ def format_codex_rate_limit_summary(snapshot: "CodexRateLimitSnapshot", *, now_t
     )
 
 
+CODEX_ENGINE_CONTACT_MESSAGE = (
+    "앱 생성 서버의 작업 엔진이 요청을 완료하지 못했어요. "
+    "같은 문제가 반복되면 담당자 이정민(010-8187-6512)에게 알려주세요."
+)
+CODEX_ENGINE_AUTH_MESSAGE = (
+    "앱 생성 서버의 작업 엔진 인증이 만료되어 요청을 진행하지 못했어요. "
+    "담당자 이정민(010-8187-6512)에게 알려주세요."
+)
+CODEX_ENGINE_QUOTA_MESSAGE = (
+    "현재 앱 생성 작업 엔진의 사용 한도가 초과되어 요청을 진행하지 못했어요. "
+    "잠시 후 다시 시도하거나 담당자 이정민(010-8187-6512)에게 알려주세요."
+)
+
+
+def looks_like_codex_quota_error(text: str) -> bool:
+    normalized = text.lower()
+    if not normalized.strip():
+        return False
+    markers = (
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "usage limit",
+        "limit exceeded",
+        "too many requests",
+        "429",
+        "한도 초과",
+        "사용 한도",
+        "요청 한도",
+        "호출량 초과",
+        "사용량 한도",
+        "사용량 초과",
+        "쿼터",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def looks_like_codex_auth_error(text: str) -> bool:
+    normalized = text.lower()
+    if not normalized.strip():
+        return False
+    markers = (
+        "not logged in",
+        "not authenticated",
+        "authentication required",
+        "auth required",
+        "please login",
+        "please log in",
+        "login required",
+        "please sign in",
+        "sign in to",
+        "unauthorized",
+        "401",
+        "token expired",
+        "expired token",
+        "invalid token",
+        "access token expired",
+        "no auth credentials",
+        "codex login",
+        "인증이 만료",
+        "로그인이 필요",
+        "로그인 만료",
+        "인증 필요",
+        "인증 실패",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def codex_engine_issue_from_logs(
+    log_text: str,
+    exit_code: Optional[int],
+) -> Optional[tuple[str, str, str, str]]:
+    if looks_like_codex_quota_error(log_text):
+        return (
+            "RateLimited",
+            CODEX_ENGINE_QUOTA_MESSAGE,
+            "codex_quota_exceeded",
+            "앱 생성 한도",
+        )
+    if looks_like_codex_auth_error(log_text):
+        return (
+            "Error",
+            CODEX_ENGINE_AUTH_MESSAGE,
+            "codex_auth_error",
+            "앱 생성 작업 엔진",
+        )
+    if exit_code not in (0, None):
+        return (
+            "Error",
+            CODEX_ENGINE_CONTACT_MESSAGE,
+            "codex_engine_error",
+            "앱 생성 작업 엔진",
+        )
+    return None
+
+
 def _read_jsonrpc_result(process: subprocess.Popen[str], request_id: int, timeout_seconds: float) -> Any:
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("Codex app-server 표준 입출력을 열지 못했습니다.")
@@ -775,6 +871,10 @@ class DeviceInfoPayload(BaseModel):
 
 def normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_task_app_name(value: str) -> str:
+    return normalize_whitespace(value)[:80].strip()
 
 
 def contains_korean_text(value: str) -> bool:
@@ -2610,6 +2710,10 @@ class GenerateRequest(BaseModel):
     reference_image_base64: Optional[str] = None
 
 
+class TaskUpdateRequest(BaseModel):
+    app_name: str = Field(..., min_length=1, max_length=80)
+
+
 class AppLlmConfigRequest(BaseModel):
     enabled: bool = True
     provider: str = Field(default="openai", min_length=1)
@@ -3798,9 +3902,11 @@ def status_display_text(status: str, message: Optional[str] = None) -> str:
     if normalized == "success":
         return "앱 생성이 완료되었어요."
     if normalized == "failed":
-        return "앱 생성에 실패했어요."
+        return (message or "앱 생성에 실패했어요.").strip()
     if normalized == "error":
-        return "서버 오류가 발생했어요."
+        return (message or "서버 오류가 발생했어요.").strip()
+    if normalized == "ratelimited":
+        return (message or "앱 생성 한도를 모두 사용했어요.").strip()
     return (message or status).strip() or "상태를 확인하고 있어요."
 
 
@@ -3896,6 +4002,74 @@ def load_task_state_payload(task: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def update_task_state_app_name(task: dict[str, Any], app_name: str) -> Optional[str]:
+    state_payload = load_task_state_payload(task)
+    if not state_payload:
+        return None
+    state_payload["app_name"] = app_name
+    state_payload["generated_app_name"] = app_name
+    conversation_state = state_payload.get("conversation_state")
+    if not isinstance(conversation_state, dict):
+        conversation_state = {}
+    conversation_state["app_name"] = app_name
+    conversation_state["generated_app_name"] = app_name
+    if normalize_whitespace(str(conversation_state.get("pending_app_name") or "")):
+        conversation_state["pending_app_name"] = app_name
+    state_payload["conversation_state"] = conversation_state
+    return json.dumps(state_payload, ensure_ascii=False)
+
+
+def current_task_app_name(task: dict[str, Any], conversation_state: Optional[dict[str, Any]] = None) -> str:
+    state_payload = load_task_state_payload(task)
+    state = conversation_state if isinstance(conversation_state, dict) else state_payload.get("conversation_state")
+    if not isinstance(state, dict):
+        state = {}
+    for value in (
+        task.get("app_name"),
+        state.get("app_name"),
+        state_payload.get("app_name"),
+        state.get("generated_app_name"),
+        state_payload.get("generated_app_name"),
+        state.get("pending_app_name"),
+    ):
+        app_name = normalize_task_app_name(str(value or ""))
+        if app_name and app_name != "맞춤 앱":
+            return app_name
+    return ""
+
+
+def current_task_package_name(task: dict[str, Any], conversation_state: Optional[dict[str, Any]] = None) -> str:
+    state_payload = load_task_state_payload(task)
+    state = conversation_state if isinstance(conversation_state, dict) else state_payload.get("conversation_state")
+    if not isinstance(state, dict):
+        state = {}
+    for value in (
+        task.get("package_name"),
+        state.get("package_name"),
+        state_payload.get("package_name"),
+        state.get("pending_package_name"),
+    ):
+        package_name = normalize_whitespace(str(value or ""))
+        if package_name:
+            return package_name
+    return ""
+
+
+def preserve_followup_task_identity(
+    decision: IntentDecision,
+    task: dict[str, Any],
+    conversation_state: Optional[dict[str, Any]] = None,
+) -> IntentDecision:
+    app_name = current_task_app_name(task, conversation_state)
+    package_name = current_task_package_name(task, conversation_state)
+    replacements: dict[str, Any] = {}
+    if app_name and decision.app_name != app_name:
+        replacements["app_name"] = app_name
+    if package_name and decision.package_name != package_name:
+        replacements["package_name"] = package_name
+    return replace(decision, **replacements) if replacements else decision
 
 
 def normalize_context_list(value: Any, max_items: int = 8) -> list[str]:
@@ -4049,8 +4223,12 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
     previous_conversation_state = build_task_conversation_state(task)
     pending_prompt = decision.effective_user_prompt if decision.mode == "ask_confirmation" else ""
     pending_normalized_prompt = decision.normalized_prompt if decision.mode == "ask_confirmation" else ""
-    pending_app_name = decision.app_name if decision.mode == "ask_confirmation" else ""
-    pending_package_name = decision.package_name if decision.mode == "ask_confirmation" else ""
+    preserved_app_name = current_task_app_name(task, previous_conversation_state)
+    preserved_package_name = current_task_package_name(task, previous_conversation_state)
+    resolved_app_name = preserved_app_name or decision.app_name
+    resolved_package_name = preserved_package_name or decision.package_name
+    pending_app_name = resolved_app_name if decision.mode == "ask_confirmation" else preserved_app_name
+    pending_package_name = resolved_package_name if decision.mode == "ask_confirmation" else preserved_package_name
     pending_acceptance_criteria = decision.acceptance_criteria if decision.mode == "ask_confirmation" else []
     device_info = serialize_device_info(task.get("device_info"))
     reference_image_name = normalize_reference_image_name(task.get("reference_image_name"))
@@ -4078,8 +4256,8 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
         "reason": decision.reason,
         "request_scope": decision.request_scope,
         "requires_existing_task_context": decision.requires_existing_task_context,
-        "app_name": decision.app_name,
-        "package_name": decision.package_name,
+        "app_name": resolved_app_name,
+        "package_name": resolved_package_name,
         "primary_user_flow": decision.primary_user_flow,
         "secondary_requirements": decision.secondary_requirements,
         "secondary_scope_confirmed": decision.secondary_scope_confirmed,
@@ -4092,6 +4270,9 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
         "conversation_state": {
             **previous_conversation_state,
             "initial_user_prompt": previous_conversation_state.get("initial_user_prompt") or task.get("prompt") or "",
+            "app_name": resolved_app_name,
+            "generated_app_name": resolved_app_name,
+            "package_name": resolved_package_name,
             "latest_user_prompt": latest_user_prompt,
             "latest_effective_user_prompt": decision.effective_user_prompt,
             "latest_summary": latest_summary,
@@ -4739,7 +4920,9 @@ class CodexTaskRunner:
         else:
             exit_code, timed_out = self.run_codex(task, workspace_path, stdout_path, stderr_path)
             if not timed_out and not result_path.exists():
-                self.attempt_server_side_build(task_id, workspace_path, result_path, exit_code)
+                codex_log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
+                if codex_engine_issue_from_logs(codex_log_text, exit_code) is None:
+                    self.attempt_server_side_build(task_id, workspace_path, result_path, exit_code)
 
         self.finalize_task(task_id, workspace_path, result_path, exit_code, timed_out)
 
@@ -5149,6 +5332,33 @@ class CodexTaskRunner:
 
         if not result_path.exists():
             log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
+            engine_issue = codex_engine_issue_from_logs(log_text, exit_code)
+            if engine_issue is not None:
+                status, message, event_type, stage = engine_issue
+                self.db.update_task(
+                    task_id,
+                    status=status,
+                    message=message,
+                    log=log_text,
+                    codex_result_json=json.dumps(
+                        make_error_result(task_id, message),
+                        ensure_ascii=False,
+                    ),
+                    **usage_update_fields,
+                )
+                task = self.db.get_task(task_id)
+                if task:
+                    log_task_status_event(self.db, task, event_type=event_type)
+                    if usage:
+                        log_token_usage_event(self.db, task_id, usage, model=codex_model)
+                log_build_stage_event(
+                    self.db,
+                    task_id,
+                    stage=stage,
+                    phase="failed",
+                    body=message,
+                )
+                return
             message = "결과 파일이 생성되지 않았습니다."
             if exit_code not in (0, None):
                 message = f"{message} worker exit code: {exit_code}"
@@ -5199,6 +5409,12 @@ class CodexTaskRunner:
             )
             return
 
+        persisted_app_name = current_task_app_name(task) or normalize_task_app_name(str(result.get("app_name") or ""))
+        persisted_package_name = current_task_package_name(task) or normalize_whitespace(str(result.get("package_name") or ""))
+        if persisted_app_name:
+            result["app_name"] = persisted_app_name
+        if persisted_package_name:
+            result["package_name"] = persisted_package_name
         codex_result_json = json.dumps(result, ensure_ascii=False)
         build_log_hint = result.get("build_log_path")
         log_text = collect_task_logs(workspace_path, build_log_hint, full=True)
@@ -5810,6 +6026,7 @@ def create_app() -> FastAPI:
                     decision,
                     image_reference_summary=build_reference_image_summary(effective_reference_image_name),
                 )
+            decision = preserve_followup_task_identity(decision, task, previous_conversation_state)
             if decision.used_previous_pending_prompt:
                 db.log_event(
                     followup_task_id,
@@ -5856,10 +6073,8 @@ def create_app() -> FastAPI:
                 )
                 return build_decision_response(followup_task_id, decision)
 
-            resolved_app_name = decision.app_name
-            if not resolved_app_name or resolved_app_name == "맞춤 앱":
-                resolved_app_name = task.get("app_name") or resolved_app_name
-            resolved_package_name = task.get("package_name") or decision.package_name
+            resolved_app_name = current_task_app_name(task, previous_conversation_state) or decision.app_name
+            resolved_package_name = current_task_package_name(task, previous_conversation_state) or decision.package_name
             if not resolved_package_name and resolved_app_name:
                 resolved_package_name = infer_package_name(resolved_app_name, followup_task_id)
 
@@ -6142,6 +6357,47 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         log_codex_rate_limits_to_server_log(task_id, settings.codex_command)
         return serialize_task_for_status(db, task, settings.status_log_line_limit)
+
+    @app.patch("/tasks/{task_id}")
+    def update_task_metadata(
+        task_id: str,
+        request: TaskUpdateRequest,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        _ = user_id
+        db: Database = app.state.db
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="task not found")
+        if not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
+            raise HTTPException(status_code=404, detail="task not found")
+        app_name = normalize_task_app_name(request.app_name)
+        if not app_name:
+            raise HTTPException(status_code=400, detail="app_name is required")
+        previous_app_name = normalize_whitespace(str(task.get("app_name") or ""))
+        update_fields: dict[str, Any] = {"app_name": app_name}
+        updated_state_json = update_task_state_app_name(task, app_name)
+        if updated_state_json is not None:
+            update_fields["codex_result_json"] = updated_state_json
+        db.update_task(task_id, **update_fields)
+        db.log_event(
+            task_id,
+            actor="user",
+            event_type="task_renamed",
+            message_text=f"앱 이름 변경: {previous_app_name or '(미정)'} -> {app_name}",
+            payload={
+                "previous_app_name": previous_app_name,
+                "app_name": app_name,
+                "device_id": device_id or "",
+                "phone_number": phone_number or "",
+            },
+        )
+        updated_task = db.get_task(task_id)
+        if not updated_task:
+            raise HTTPException(status_code=404, detail="task not found")
+        return serialize_task_summary(updated_task)
 
     @app.get("/tasks/{task_id}/usage")
     def get_task_usage(

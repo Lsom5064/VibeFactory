@@ -5,6 +5,7 @@ import okhttp3.ResponseBody
 import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
@@ -156,6 +157,10 @@ data class TokenUsageResponse(
     val status_message: String? = null
 )
 
+data class TaskRenameRequest(
+    val app_name: String
+)
+
 interface VibeApiService {
 
     @GET("/tasks")
@@ -183,6 +188,15 @@ interface VibeApiService {
         @Query("user_id") userId: String? = null,
         @Query("phone_number") phoneNumber: String? = null
     ): TokenUsageResponse
+
+    @PATCH("/tasks/{task_id}")
+    suspend fun renameTask(
+        @Path("task_id") taskId: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null,
+        @Body request: TaskRenameRequest
+    ): TaskSummaryDto
 
     @GET("/usage/codex")
     suspend fun getCodexUsage(
