@@ -175,6 +175,7 @@ class MainActivity : AppCompatActivity() {
     private val runtimeErrorTaskIds = mutableSetOf<String>()
     private val pendingRuntimeErrors = mutableMapOf<String, RuntimeErrorRecord>()
     private val taskConversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
+    private val loadedTaskChatIds = mutableSetOf<String>()
     private val taskInputQueueManager by lazy {
         TaskInputQueueManager(
             isProcessingStatus = { processingAnimationBaseText(it) != null },
@@ -450,12 +451,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun restoreCurrentTaskState(trigger: String) {
         if (!hasRequiredPhoneNumber()) return
-        val fallbackPersistedTaskId = taskConversationMessages.keys.firstOrNull { it.isNotBlank() && !hiddenTaskIds.contains(it) }
         val taskId = visibleTaskIdCandidate(currentTaskId)
             ?: visibleTaskIdCandidate(screenState.selectedTaskId)
             ?: visibleTaskIdCandidate(pendingTaskSelectionKey)
             ?: visibleTaskIdCandidate(getLastSelectedTaskId())
-            ?: fallbackPersistedTaskId
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
         val selectionGeneration = advanceTaskSelectionGeneration()
@@ -670,7 +669,7 @@ class MainActivity : AppCompatActivity() {
                 summary = taskId?.let { taskSummaryById[it] },
                 currentStatus = screenState.currentStatus,
                 displayedAppName = screenState.displayedAppName,
-                messages = taskId?.let { taskConversationMessages[it].orEmpty() } ?: screenState.messages,
+                messages = taskId?.let { buildTaskTimeline(it) } ?: screenState.messages,
                 rawLogContents = taskId
                     ?.let { taskRawLogSections[it].orEmpty().map { section -> section.content } }
                     .orEmpty(),
@@ -773,8 +772,9 @@ class MainActivity : AppCompatActivity() {
         persistHiddenTaskIds()
         stopBuildCompletionMonitoring(normalizedTaskId)
         taskConversationMessages.remove(normalizedTaskId)
+        loadedTaskChatIds.remove(normalizedTaskId)
+        preferencesStore.deleteTaskChat(normalizedTaskId)
         taskLastStatusKeys.remove(normalizedTaskId)
-        persistTaskChats()
         if (currentTaskId == normalizedTaskId || screenState.selectedTaskId == normalizedTaskId) {
             resetForNewChat()
         }
@@ -1541,6 +1541,7 @@ class MainActivity : AppCompatActivity() {
         val resolvedAppName = taskDisplayName(response.generated_app_name)
             ?: taskDisplayName(response.app_name)
             ?: taskSummaryById[taskId]?.appName
+        ensureTaskChatLoaded(taskId)
         var messages = try {
             mergeConversationMessages(taskId, response)
         } catch (e: Exception) {
@@ -1793,15 +1794,17 @@ class MainActivity : AppCompatActivity() {
             },
             messages = nextMessages
         )
-        persistTaskChats()
+        persistTaskChat(normalizedTaskId)
         renderState()
     }
 
     private fun renameArtifactMessages(taskId: String, appName: String) {
-        val timeline = taskConversationMessages[taskId] ?: return
+        val normalizedTaskId = taskId.trim()
+        if (!ensureTaskChatLoaded(normalizedTaskId)) return
+        val timeline = taskConversationMessages[normalizedTaskId] ?: return
         var changed = false
         val nextTimeline = timeline.map { message ->
-            if (message.artifactTaskId != taskId) return@map message
+            if (message.artifactTaskId != normalizedTaskId) return@map message
             val revisionLabel = message.artifactRevisionLabel?.trim().orEmpty()
             val renamedBody = if (revisionLabel.isNotBlank()) "$appName $revisionLabel" else appName
             if (message.body == renamedBody) {
@@ -1812,7 +1815,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (changed) {
-            taskConversationMessages[taskId] = nextTimeline.toMutableList()
+            taskConversationMessages[normalizedTaskId] = nextTimeline.toMutableList()
+            persistTaskChat(normalizedTaskId)
         }
     }
 
@@ -2204,15 +2208,27 @@ ${record.stackTrace}
     }
 
     private fun loadPersistedTaskChats() {
-        val restoredChats = preferencesStore.loadTaskChats()
         taskConversationMessages.clear()
-        restoredChats.timelines.forEach { (taskId, messages) ->
-            if (taskId in hiddenTaskIds) return@forEach
-            taskConversationMessages[taskId] = messages.toMutableList()
+        loadedTaskChatIds.clear()
+        preferencesStore.migrateLegacyTaskChatsIfNeeded(hiddenTaskIds)
+    }
+
+    private fun ensureTaskChatLoaded(taskId: String): Boolean {
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return false
+        if (normalizedTaskId in loadedTaskChatIds) return true
+        val loadedMessages = preferencesStore.loadTaskChat(normalizedTaskId)
+        if (loadedMessages.isNotEmpty()) {
+            taskConversationMessages[normalizedTaskId] = loadedMessages.toMutableList()
         }
-        if (restoredChats.statusMessages.isNotEmpty()) {
-            persistTaskChats()
-        }
+        loadedTaskChatIds += normalizedTaskId
+        return true
+    }
+
+    private fun editableTaskTimeline(taskId: String): MutableList<ChatMessage>? {
+        val normalizedTaskId = taskId.trim()
+        if (!ensureTaskChatLoaded(normalizedTaskId)) return null
+        return taskConversationMessages.getOrPut(normalizedTaskId) { mutableListOf() }
     }
 
     private fun loadPersistedArtifactStates() {
@@ -2297,15 +2313,33 @@ ${record.stackTrace}
     }
 
     private fun persistTaskChats() {
-        val committed = preferencesStore.saveTaskChats(taskConversationMessages)
+        val taskIds = (loadedTaskChatIds + taskConversationMessages.keys)
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it !in hiddenTaskIds }
+            .toSet()
+        val committed = taskIds.all { persistTaskChat(it) }
         if (!committed) {
-            Log.w(TAG, "Failed to commit task chats")
+            Log.w(TAG, "Failed to commit one or more task chats")
         }
+    }
+
+    private fun persistTaskChat(taskId: String): Boolean {
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return true
+        val committed = preferencesStore.saveTaskChat(
+            normalizedTaskId,
+            taskConversationMessages[normalizedTaskId].orEmpty()
+        )
+        if (!committed) {
+            Log.w(TAG, "Failed to commit task chat task_id=$normalizedTaskId")
+        }
+        return committed
     }
 
     private fun showPersistedTaskPreview(taskId: String) {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return
+        ensureTaskChatLoaded(normalizedTaskId)
         val hasPersistedMessages = taskConversationMessages[normalizedTaskId].orEmpty().isNotEmpty()
         if (!hasPersistedMessages) return
         pendingInitialChatScrollTaskId = normalizedTaskId
@@ -2738,7 +2772,7 @@ ${record.stackTrace}
             createdAt = currentTimestampString()
         )
 
-        val timeline = taskConversationMessages.getOrPut(normalizedTaskId) { mutableListOf() }
+        val timeline = editableTaskTimeline(normalizedTaskId) ?: return
         if (timeline.any { it.id == artifactMessage.id }) return
         val artifactPath = artifactMessage.artifactApkPath?.trim().orEmpty()
         val artifactUrl = artifactMessage.artifactApkUrl?.trim().orEmpty()
@@ -2748,11 +2782,11 @@ ${record.stackTrace}
         }
         if (existingArtifactIndex >= 0) {
             timeline[existingArtifactIndex] = artifactMessage.withUniqueId(normalizedTaskId, existingArtifactIndex)
-            persistTaskChats()
+            persistTaskChat(normalizedTaskId)
             return
         }
         timeline += artifactMessage.withUniqueId(normalizedTaskId, timeline.size)
-        persistTaskChats()
+        persistTaskChat(normalizedTaskId)
     }
 
     private fun isSameApkArtifact(message: ChatMessage, artifactPath: String, artifactUrl: String): Boolean {
@@ -2814,6 +2848,7 @@ ${record.stackTrace}
         if (normalizedTaskId.isBlank()) return
         val normalizedPath = artifactPath?.trim().orEmpty()
         val normalizedUrl = url?.trim().orEmpty()
+        ensureTaskChatLoaded(normalizedTaskId)
         val timeline = taskConversationMessages[normalizedTaskId] ?: return
         var changed = false
         val nextTimeline = timeline.map { message ->
@@ -2830,7 +2865,7 @@ ${record.stackTrace}
         }
         if (!changed) return
         taskConversationMessages[normalizedTaskId] = nextTimeline.toMutableList()
-        persistTaskChats()
+        persistTaskChat(normalizedTaskId)
         if (screenState.selectedTaskId == normalizedTaskId) {
             screenState = screenState.copy(messages = buildTaskTimeline(normalizedTaskId))
         }
@@ -3200,7 +3235,9 @@ ${record.stackTrace}
     }
 
     private fun backfillTimelineEventTypes(taskId: String, response: StatusResponse) {
-        val timeline = taskConversationMessages[taskId] ?: return
+        val normalizedTaskId = taskId.trim()
+        if (!ensureTaskChatLoaded(normalizedTaskId)) return
+        val timeline = taskConversationMessages[normalizedTaskId] ?: return
         val changed = ChatTimelineEventTypeBackfill.backfill(
             timeline = timeline,
             sourceEvents = extractTimelineEvents(response).map { event ->
@@ -3212,7 +3249,7 @@ ${record.stackTrace}
             }
         )
         if (changed) {
-            persistTaskChats()
+            persistTaskChat(normalizedTaskId)
         }
     }
 
@@ -3544,10 +3581,10 @@ ${record.stackTrace}
             return currentMessages
         }
 
-        val timeline = taskConversationMessages.getOrPut(taskId) { mutableListOf() }
+        val timeline = editableTaskTimeline(taskId) ?: return currentMessages
         val removedStaleLoading = TaskProgressTimelinePolicy.removeActiveLoadingMessages(timeline)
         if (removedStaleLoading) {
-            persistTaskChats()
+            persistTaskChat(taskId)
         }
 
         val logLine = TaskProgressTimelinePolicy.buildProgressDetail(
@@ -3593,7 +3630,9 @@ ${record.stackTrace}
         if (!TaskProgressTimelinePolicy.isTerminalBuildStatus(response.status)) {
             return currentMessages
         }
-        val timeline = taskConversationMessages[taskId] ?: return currentMessages
+        val normalizedTaskId = taskId.trim()
+        if (!ensureTaskChatLoaded(normalizedTaskId)) return currentMessages
+        val timeline = taskConversationMessages[normalizedTaskId] ?: return currentMessages
         val progressLogs = timeline
             .filter { message ->
                 message.kind == MessageKind.STATUS &&
@@ -3631,8 +3670,8 @@ ${record.stackTrace}
             TaskProgressTimelinePolicy.shouldRemoveLoadingMessage(response.status, message)
         }
         if (!changed && !removedLoading) return currentMessages
-        persistTaskChats()
-        return buildTaskTimeline(taskId)
+        persistTaskChat(normalizedTaskId)
+        return buildTaskTimeline(normalizedTaskId)
     }
 
     private fun extractRecentAssistantMessages(
@@ -4303,11 +4342,12 @@ ${record.stackTrace}
     }
 
     private fun shouldReenterRuntimeErrorTask(taskId: String): Boolean {
-        if (taskId.isBlank()) return false
-        if (taskId in hiddenTaskIds) return false
-        if (screenState.selectedTaskId == taskId || currentTaskId == taskId) return true
-        if (taskSummaryById.containsKey(taskId)) return true
-        return taskConversationMessages[taskId].orEmpty().isNotEmpty()
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank()) return false
+        if (normalizedTaskId in hiddenTaskIds) return false
+        if (screenState.selectedTaskId == normalizedTaskId || currentTaskId == normalizedTaskId) return true
+        if (taskSummaryById.containsKey(normalizedTaskId)) return true
+        return taskConversationMessages[normalizedTaskId].orEmpty().isNotEmpty() || preferencesStore.hasTaskChat(normalizedTaskId)
     }
 
     private fun handleRuntimeError(
@@ -4318,15 +4358,16 @@ ${record.stackTrace}
         reportKind: String? = null
     ) {
         if (taskId in hiddenTaskIds) return
+        val compactStackTrace = RuntimeErrorStoragePolicy.compactStackTrace(stackTrace)
         val existing = pendingRuntimeErrors[taskId]
-        if (existing?.stackTrace == stackTrace && existing.awaitingUserConfirmation) {
+        if (existing?.stackTrace == compactStackTrace && existing.awaitingUserConfirmation) {
             return
         }
 
         runtimeErrorTaskIds += taskId
         pendingRuntimeErrors[taskId] = RuntimeErrorRecord(
             packageName = packageName,
-            stackTrace = stackTrace,
+            stackTrace = compactStackTrace,
             summary = "",
             errorMessage = errorMessage?.trim()?.ifBlank { null },
             reportKind = reportKind?.trim()?.ifBlank { null },
@@ -4344,7 +4385,7 @@ ${record.stackTrace}
                 body = getString(R.string.runtime_error_body, packageName.ifBlank { "알 수 없는 앱" }),
                 detail = buildRuntimeLogDetail(
                     errorMessage = errorMessage,
-                    stackTrace = stackTrace
+                    stackTrace = compactStackTrace
                 )
             )
         )
@@ -4361,7 +4402,7 @@ ${record.stackTrace}
         persistLastSelectedTaskId(taskId)
         reenterTaskConversation(taskId, scrollToTop = false, scrollToLatest = true)
         loadTaskList(autoSelectPendingTask = false)
-        requestRuntimeErrorSummary(taskId, packageName, stackTrace, errorMessage, reportKind)
+        requestRuntimeErrorSummary(taskId, packageName, compactStackTrace, errorMessage, reportKind)
     }
 
     private fun requestRuntimeErrorSummary(
@@ -4490,17 +4531,22 @@ ${record.stackTrace}
     }
 
     private fun clearStaleRuntimeErrorState(taskId: String, removeTimeline: Boolean) {
+        val normalizedTaskId = taskId.trim()
         var changed = false
-        if (pendingRuntimeErrors.remove(taskId) != null) {
+        if (pendingRuntimeErrors.remove(normalizedTaskId) != null) {
             changed = true
         }
-        if (runtimeErrorTaskIds.remove(taskId)) {
+        if (runtimeErrorTaskIds.remove(normalizedTaskId)) {
             changed = true
         }
-        if (removeTimeline && taskConversationMessages.remove(taskId) != null) {
-            changed = true
+        if (removeTimeline) {
+            if (taskConversationMessages.remove(normalizedTaskId) != null) {
+                changed = true
+            }
+            loadedTaskChatIds.remove(normalizedTaskId)
+            preferencesStore.deleteTaskChat(normalizedTaskId)
         }
-        if (removeTimeline && screenState.selectedTaskId == taskId) {
+        if (removeTimeline && screenState.selectedTaskId == normalizedTaskId) {
             currentTaskId = null
             screenState = screenState.copy(
                 selectedTaskId = null,
@@ -4513,14 +4559,16 @@ ${record.stackTrace}
             )
             persistLastSelectedTaskId(null)
             changed = true
-        } else if (getLastSelectedTaskId() == taskId && removeTimeline) {
+        } else if (getLastSelectedTaskId() == normalizedTaskId && removeTimeline) {
             persistLastSelectedTaskId(null)
             changed = true
         }
 
         if (changed) {
             persistPendingRuntimeErrors()
-            persistTaskChats()
+            if (!removeTimeline) {
+                persistTaskChat(normalizedTaskId)
+            }
             renderState()
         }
     }
@@ -4703,7 +4751,9 @@ ${record.stackTrace}
     }
 
     private fun buildTaskTimeline(taskId: String): List<ChatMessage> {
-        return taskConversationMessages[taskId]
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank() || !ensureTaskChatLoaded(normalizedTaskId)) return emptyList()
+        return taskConversationMessages[normalizedTaskId]
             .orEmpty()
             .filter { shouldShowChatMessage(it) }
             .mapIndexed { index, message -> index to message }
@@ -4801,12 +4851,14 @@ ${record.stackTrace}
     private fun appendTaskTimelineMessage(taskId: String, message: ChatMessage, allowDuplicateContent: Boolean = false) {
         if (isPrebuildConfirmationHeader(message.body)) return
         if (isHiddenOperationalBuildMessage(message.body)) return
-        val timeline = taskConversationMessages.getOrPut(taskId) { mutableListOf() }
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank()) return
+        val timeline = editableTaskTimeline(normalizedTaskId) ?: return
         if (!message.artifactTaskId.isNullOrBlank()) {
             val existingArtifactIndex = timeline.indexOfFirst { it.id == message.id }
             if (existingArtifactIndex >= 0) {
-                timeline[existingArtifactIndex] = message.withUniqueId(taskId, existingArtifactIndex)
-                persistTaskChats()
+                timeline[existingArtifactIndex] = message.withUniqueId(normalizedTaskId, existingArtifactIndex)
+                persistTaskChat(normalizedTaskId)
                 return
             }
         }
@@ -4816,20 +4868,20 @@ ${record.stackTrace}
                 message = message,
                 progressKey = ::progressStatusDedupeKey
             )
-            timeline += message.withUniqueId(taskId, timeline.size)
-            persistTaskChats()
+            timeline += message.withUniqueId(normalizedTaskId, timeline.size)
+            persistTaskChat(normalizedTaskId)
             return
         }
         if (mergeProgressStatusMessage(timeline, message)) {
-            persistTaskChats()
+            persistTaskChat(normalizedTaskId)
             return
         }
         if (!allowDuplicateContent && timelineContainsEquivalentClarificationMessage(timeline, message)) return
         if (timeline.lastOrNull()?.sameContentAs(message) == true) return
         val alreadyExists = timeline.any { it.sameContentAs(message) }
         if (!allowDuplicateContent && alreadyExists) return
-        timeline += message.withUniqueId(taskId, timeline.size)
-        persistTaskChats()
+        timeline += message.withUniqueId(normalizedTaskId, timeline.size)
+        persistTaskChat(normalizedTaskId)
     }
 
     private fun timelineContainsEquivalentClarificationMessage(timeline: List<ChatMessage>, message: ChatMessage): Boolean {
@@ -4941,7 +4993,9 @@ ${record.stackTrace}
         if (message.kind != MessageKind.ASSISTANT) return false
         val body = compactMessageTextForDedupe(normalizeMessageTextForDedupe(message.body))
         if (body.isBlank()) return false
-        val timeline = taskConversationMessages[taskId].orEmpty()
+        val normalizedTaskId = taskId.trim()
+        ensureTaskChatLoaded(normalizedTaskId)
+        val timeline = taskConversationMessages[normalizedTaskId].orEmpty()
         val hasConfirmation = timeline.any { it.kind == MessageKind.CONFIRMATION }
         val statusBodies = timeline
             .filter { it.kind == MessageKind.STATUS }
@@ -5240,11 +5294,12 @@ ${record.stackTrace}
             return
         }
 
-        val timeline = taskConversationMessages[normalizedTaskId] ?: mutableListOf()
+        ensureTaskChatLoaded(normalizedTaskId)
+        val timeline = taskConversationMessages[normalizedTaskId] ?: return
         val nextTimeline = timeline.filterNot { it.isLoading }
         if (nextTimeline.size == timeline.size) return
         taskConversationMessages[normalizedTaskId] = nextTimeline.toMutableList()
-        persistTaskChats()
+        persistTaskChat(normalizedTaskId)
         if (screenState.selectedTaskId == normalizedTaskId) {
             screenState = screenState.copy(messages = buildTaskTimeline(normalizedTaskId))
             renderState()

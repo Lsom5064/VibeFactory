@@ -26,6 +26,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import retrofit2.HttpException
 import java.util.Locale
 
 class BuildMonitorService : Service() {
@@ -40,6 +41,8 @@ class BuildMonitorService : Service() {
         private const val MONITOR_CHANNEL_ID = "build_monitor"
         private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete_alerts"
         private const val FOREGROUND_NOTIFICATION_ID = 2601
+        private const val MAX_MONITORING_WINDOW_MS = 90 * 60 * 1000L
+        private const val MAX_POLL_FAILURES_PER_TASK = 60
 
         fun startMonitoring(context: Context, taskId: String) {
             val normalizedTaskId = taskId.trim()
@@ -70,16 +73,15 @@ class BuildMonitorService : Service() {
     private val serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
     private val taskLock = Any()
     private val monitoredTaskIds = linkedSetOf<String>()
+    private val pollFailureCounts = mutableMapOf<String, Int>()
     private lateinit var apiService: VibeApiService
     private var monitorJob: Job? = null
+    private var foregroundStartedAtMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
         apiService = createApiService()
         createNotificationChannels()
-        synchronized(taskLock) {
-            monitoredTaskIds += loadStringSet(HostAppConfig.PREF_MONITORED_TASK_IDS)
-        }
         pruneHiddenTasks()
     }
 
@@ -96,12 +98,22 @@ class BuildMonitorService : Service() {
             return START_NOT_STICKY
         }
 
-        startAsForeground()
+        if (!startAsForeground()) {
+            return START_NOT_STICKY
+        }
         ensureMonitorLoop()
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onTimeout(startId: Int) {
+        handleForegroundServiceTimeout(startId)
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        handleForegroundServiceTimeout(startId)
+    }
 
     override fun onDestroy() {
         monitorJob?.cancel()
@@ -153,6 +165,7 @@ class BuildMonitorService : Service() {
         }
         synchronized(taskLock) {
             monitoredTaskIds += taskId
+            pollFailureCounts -= taskId
             persistMonitoredTasksLocked()
         }
         clearTerminalNotificationMarkers(taskId)
@@ -163,6 +176,7 @@ class BuildMonitorService : Service() {
         if (taskId.isBlank()) return
         synchronized(taskLock) {
             monitoredTaskIds -= taskId
+            pollFailureCounts -= taskId
             persistMonitoredTasksLocked()
         }
     }
@@ -175,6 +189,11 @@ class BuildMonitorService : Service() {
         if (monitorJob?.isActive == true) return
         monitorJob = serviceScope.launch {
             while (isActive) {
+                if (hasExceededMonitoringWindow()) {
+                    Log.w(TAG, "Build monitor exceeded safe foreground window; stopping service")
+                    withContext(Dispatchers.Main) { stopWhenIdle(clearTasks = true) }
+                    break
+                }
                 pruneHiddenTasks()
                 val taskIds = snapshotTaskIds()
                 if (taskIds.isEmpty()) {
@@ -208,12 +227,26 @@ class BuildMonitorService : Service() {
             )
             persistMonitoredTaskName(taskId, resolveMonitoredTaskName(taskId, response))
             val statusKey = normalizeStatusKey(response.status)
+            synchronized(taskLock) { pollFailureCounts -= taskId }
             if (!shouldPoll(statusKey)) {
                 removeTask(taskId)
                 showTerminalNotificationIfNeeded(taskId, response, statusKey)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Build monitor poll failed task_id=$taskId", e)
+            if (e is HttpException && e.code() in setOf(404, 410)) {
+                removeTask(taskId)
+                return
+            }
+            val failures = synchronized(taskLock) {
+                val next = (pollFailureCounts[taskId] ?: 0) + 1
+                pollFailureCounts[taskId] = next
+                next
+            }
+            if (failures >= MAX_POLL_FAILURES_PER_TASK) {
+                Log.w(TAG, "Stopping stale build monitor task_id=$taskId after $failures poll failures")
+                removeTask(taskId)
+            }
         }
     }
 
@@ -293,16 +326,26 @@ class BuildMonitorService : Service() {
         NotificationManagerCompat.from(this).cancel(taskId.hashCode())
     }
 
-    private fun startAsForeground() {
+    private fun startAsForeground(): Boolean {
         val notification = buildForegroundNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                FOREGROUND_NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(FOREGROUND_NOTIFICATION_ID, notification)
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    FOREGROUND_NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(FOREGROUND_NOTIFICATION_ID, notification)
+            }
+            if (foregroundStartedAtMs == 0L) {
+                foregroundStartedAtMs = System.currentTimeMillis()
+            }
+            true
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Foreground build monitor could not be started", e)
+            stopWhenIdle(clearTasks = true)
+            false
         }
     }
 
@@ -346,9 +389,33 @@ class BuildMonitorService : Service() {
             .build()
     }
 
-    private fun stopWhenIdle() {
+    private fun stopWhenIdle(clearTasks: Boolean = false) {
+        if (clearTasks) {
+            synchronized(taskLock) {
+                monitoredTaskIds.clear()
+                pollFailureCounts.clear()
+                persistMonitoredTasksLocked()
+            }
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun handleForegroundServiceTimeout(startId: Int) {
+        Log.w(TAG, "Foreground build monitor timed out; stopping service")
+        synchronized(taskLock) {
+            monitoredTaskIds.clear()
+            pollFailureCounts.clear()
+            persistMonitoredTasksLocked()
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf(startId)
+    }
+
+    private fun hasExceededMonitoringWindow(): Boolean {
+        val startedAt = foregroundStartedAtMs
+        if (startedAt <= 0L) return false
+        return System.currentTimeMillis() - startedAt >= MAX_MONITORING_WINDOW_MS
     }
 
     private fun shouldPoll(statusKey: String): Boolean {

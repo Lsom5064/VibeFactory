@@ -15,7 +15,9 @@ class CrashReportReceiver : BroadcastReceiver() {
         val packageName = intent.getStringExtra("package_name")?.trim().orEmpty()
         val errorMessage = intent.getStringExtra("error_message")?.trim().orEmpty()
         val reportKind = intent.getStringExtra("report_kind")?.trim().orEmpty()
-        val stackTrace = intent.getStringExtra("stack_trace")?.trim().orEmpty()
+        val stackTrace = RuntimeErrorStoragePolicy.compactStackTrace(
+            intent.getStringExtra("stack_trace").orEmpty()
+        )
         if (taskId.isBlank() || stackTrace.isBlank()) return
 
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

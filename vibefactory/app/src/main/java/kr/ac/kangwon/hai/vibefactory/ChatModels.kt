@@ -65,6 +65,19 @@ data class RuntimeErrorRecord(
     val serverReported: Boolean = false
 )
 
+object RuntimeErrorStoragePolicy {
+    private const val MAX_STACK_TRACE_CHARS = 40_000
+    private const val TRUNCATED_SUFFIX = "\n\n[긴 오류 로그는 앱 성능을 위해 일부만 저장했어요.]"
+
+    fun compactStackTrace(stackTrace: String): String {
+        val normalized = stackTrace.trim()
+        if (normalized.length <= MAX_STACK_TRACE_CHARS) return normalized
+        val keepChars = (MAX_STACK_TRACE_CHARS - TRUNCATED_SUFFIX.length)
+            .coerceAtLeast(MAX_STACK_TRACE_CHARS / 2)
+        return normalized.take(keepChars).trimEnd() + TRUNCATED_SUFFIX
+    }
+}
+
 data class ChatScreenState(
     val taskList: List<TaskSummary> = emptyList(),
     val selectedTaskId: String? = null,
