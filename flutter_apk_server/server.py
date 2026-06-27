@@ -572,14 +572,16 @@ def save_reference_image_attachment(
     return str(image_path.relative_to(workspace_root))
 
 
-def read_text_if_exists(path: Path, limit: int = 20000) -> str:
+def read_text_if_exists(path: Path, limit: Optional[int] = 20000) -> str:
     if not path.exists() or not path.is_file():
         return ""
     text = path.read_text(encoding="utf-8", errors="replace")
+    if limit is None or limit <= 0:
+        return text
     return text[-limit:]
 
 
-def extract_codex_agent_message_jsonl(path: Path, max_messages: int = 120) -> str:
+def extract_codex_agent_message_jsonl(path: Path, max_messages: Optional[int] = 120) -> str:
     if not path.exists() or not path.is_file():
         return ""
     messages: list[str] = []
@@ -598,7 +600,7 @@ def extract_codex_agent_message_jsonl(path: Path, max_messages: int = 120) -> st
             if not isinstance(item, dict) or item.get("type") != "agent_message":
                 continue
             messages.append(line)
-            if len(messages) > max_messages:
+            if max_messages is not None and max_messages > 0 and len(messages) > max_messages:
                 messages = messages[-max_messages:]
     return "\n".join(messages)
 
@@ -3175,6 +3177,10 @@ def render_task_agents_md(task_id: str) -> str:
 - 런타임 AI 호출이 필요한 앱은 `runtime_package_name`과 실제 요청 package name이 일치해야 한다.
 - 사용자가 저장을 원했다면 앱 재실행 후에도 유지되는 저장 방식을 사용한다.
 - 더미 데이터나 예시 문구는 UI 스켈레톤 확인용 보조로만 허용된다. 핵심 사용자 흐름을 더미 데이터만으로 완성 처리하면 안 된다.
+- Flutter UI는 모든 화면 크기와 키보드/시스템 inset에서 `RenderFlex overflowed by ... pixels` 및 top/bottom/right/left overflow가 나지 않게 만든다.
+- 세로로 내용이 늘어나는 화면은 `SafeArea`와 `SingleChildScrollView`, `ListView`, `CustomScrollView` 중 적절한 스크롤 컨테이너를 사용한다. 고정 높이 `Column`에 긴 콘텐츠를 그대로 넣지 않는다.
+- `Column`/`Row` 안의 긴 텍스트, 버튼, 입력창, 카드 목록은 `Flexible`/`Expanded`, `Wrap`, `ConstrainedBox`, `LayoutBuilder`, `maxLines`/`overflow` 등을 사용해 작은 화면에서도 넘치지 않게 한다.
+- 빌드 전에 작은 화면 기준으로 레이아웃을 점검하고, overflow 가능성이 있으면 성공으로 보고하지 않는다.
 - 구현이 어려워 일부 요구사항을 못 지켰다면 숨기지 말고 실패 처리하거나 `known_limitations`에 명시한다.
 - 빌드 성공 시 반드시 `.codex_result/task_result.json`을 valid JSON으로 작성한다.
 - 빌드 실패 시에도 반드시 `.codex_result/task_result.json`을 valid JSON으로 작성한다.
@@ -3342,6 +3348,7 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - 런타임 AI를 쓰는 앱이라면 `task_result.json` 성공 결과에 `app_llm_enabled`, `app_llm_model`, `app_llm_system_prompt`를 함께 넣는다.
 - `app_llm_system_prompt`는 이 앱 목적에 맞는 앱 전용 프롬프트여야 하며, 모든 앱에 공통으로 쓰는 고정 문구를 그대로 복사하지 않는다.
 - 예를 들어 방 정리 조언 앱이라면 사진 속 공간 상태를 관찰하고, 우선순위와 실행 순서를 조언하는 방향이 드러나야 한다.
+- 화면 레이아웃은 작은 Android 화면, 화면 회전, 키보드 표시 상태에서도 top/bottom/right/left overflow가 나지 않게 구현한다. 긴 콘텐츠는 `SafeArea`와 스크롤 가능한 컨테이너로 감싸고, `Row`/`Column`의 긴 자식은 `Flexible`/`Expanded`/`Wrap`/`overflow` 처리를 한다.
 - 현재 사용자 기기 정보가 제공되면, UI 크기·Android 버전·센서/웨어러블 가능성 같은 구현 판단에 실제로 반영한다.
 """
 
@@ -3384,7 +3391,7 @@ def default_app_llm_config(settings: Settings) -> dict[str, Any]:
         "model": settings.app_runtime_model,
         "api_key": settings.app_runtime_api_key,
         "base_url": settings.app_runtime_base_url,
-        "system_prompt": "",
+        "system_prompt": settings.app_runtime_system_prompt,
         "daily_request_limit": settings.app_runtime_daily_request_limit,
         "daily_token_limit": settings.app_runtime_daily_token_limit,
         "max_output_tokens": settings.app_runtime_max_output_tokens,
@@ -3404,7 +3411,15 @@ def resolve_default_app_llm_config(db: Database, settings: Settings) -> dict[str
 def ensure_default_app_llm_config(db: Database, settings: Settings, task_id: str) -> None:
     if db.get_app_llm_config(task_id):
         return
-    db.upsert_app_llm_config(task_id, resolve_default_app_llm_config(db, settings))
+    config = resolve_default_app_llm_config(db, settings)
+    db.upsert_app_llm_config(task_id, config)
+    db.log_event(
+        task_id,
+        actor="system",
+        event_type="app_llm_config_initialized",
+        message_text=app_llm_config_event_message(config),
+        payload=app_llm_config_event_payload(config, source="default"),
+    )
 
 
 def require_admin_token(settings: Settings, provided_token: Optional[str]) -> None:
@@ -3428,6 +3443,57 @@ def app_llm_config_response_payload(config: dict[str, Any]) -> dict[str, Any]:
         "temperature": float(config.get("temperature") or 0.0),
         "api_key_configured": bool(str(config.get("api_key") or "").strip()),
     }
+
+
+def app_llm_config_changed_fields(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    previous_payload = app_llm_config_response_payload(previous)
+    current_payload = app_llm_config_response_payload(current)
+    keys = (
+        "enabled",
+        "provider",
+        "model",
+        "base_url",
+        "system_prompt",
+        "daily_request_limit",
+        "daily_token_limit",
+        "max_output_tokens",
+        "temperature",
+        "api_key_configured",
+    )
+    changed = [key for key in keys if previous_payload.get(key) != current_payload.get(key)]
+    if str(previous.get("api_key") or "") != str(current.get("api_key") or "") and "api_key" not in changed:
+        changed.append("api_key")
+    return changed
+
+
+def app_llm_config_event_payload(
+    config: dict[str, Any],
+    *,
+    previous_config: Optional[dict[str, Any]] = None,
+    source: str = "",
+) -> dict[str, Any]:
+    payload = app_llm_config_response_payload(config)
+    if source:
+        payload["source"] = source
+    if previous_config is not None:
+        previous_system_prompt = str(previous_config.get("system_prompt") or "")
+        current_system_prompt = str(config.get("system_prompt") or "")
+        payload["previous_system_prompt"] = previous_system_prompt
+        payload["system_prompt_changed"] = previous_system_prompt != current_system_prompt
+        payload["previous_model"] = str(previous_config.get("model") or "")
+        payload["previous_enabled"] = bool(previous_config.get("enabled"))
+        payload["changed_fields"] = app_llm_config_changed_fields(previous_config, config)
+    return payload
+
+
+def app_llm_config_event_message(config: dict[str, Any]) -> str:
+    return (
+        f"enabled={bool(config.get('enabled'))} "
+        f"provider={str(config.get('provider') or 'openai')} "
+        f"model={str(config.get('model') or '')}\n"
+        "system_prompt:\n"
+        f"{str(config.get('system_prompt') or '')}"
+    )
 
 
 def merge_app_llm_config_values(
@@ -3488,12 +3554,8 @@ def apply_codex_generated_app_llm_settings(
         task_id,
         actor="system",
         event_type="app_llm_config_generated",
-        message_text=f"enabled={bool(merged.get('enabled'))} model={merged.get('model') or ''}",
-        payload={
-            "enabled": bool(merged.get("enabled")),
-            "model": merged.get("model") or "",
-            "system_prompt": merged.get("system_prompt") or "",
-        },
+        message_text=app_llm_config_event_message(merged),
+        payload=app_llm_config_event_payload(merged, previous_config=existing, source="codex_result"),
     )
 
 
@@ -3519,7 +3581,7 @@ def log_agent_output_event(
         task_id,
         actor="assistant",
         event_type="agent_raw_output",
-        message_text=raw_output_text[:200],
+        message_text=raw_output_text,
         payload={
             "agent_name": agent_name,
             "model": model,
@@ -3607,13 +3669,64 @@ def current_revision_label(project_root: Path) -> str:
     return parent_name if parent_name.startswith("rev_") else "rev_0000"
 
 
+def revision_number_from_label(revision_label: str) -> int:
+    match = re.fullmatch(r"rev_0*(\d+)", revision_label.strip())
+    if not match:
+        return 1
+    return max(1, int(match.group(1)))
+
+
+def ensure_project_revision_version(project_root: Path, revision_label: Optional[str] = None) -> bool:
+    label = revision_label or current_revision_label(project_root)
+    revision_number = revision_number_from_label(label)
+    pubspec_path = project_root / "pubspec.yaml"
+    pubspec_text = read_text_if_exists(pubspec_path, limit=100_000)
+    if not pubspec_text:
+        return False
+
+    version_match = re.search(r"^version:\s*([^\s#]+)(.*)$", pubspec_text, re.MULTILINE)
+    if version_match:
+        current_value = version_match.group(1).strip()
+        suffix = version_match.group(2)
+        version_name, _, build_number_text = current_value.partition("+")
+        version_name = version_name.strip() or "1.0.0"
+        existing_build_number = int(build_number_text) if build_number_text.isdigit() else 0
+        build_number = max(existing_build_number, revision_number)
+        next_line = f"version: {version_name}+{build_number}{suffix}"
+        next_text = (
+            pubspec_text[: version_match.start()]
+            + next_line
+            + pubspec_text[version_match.end() :]
+        )
+    else:
+        separator = "" if pubspec_text.endswith("\n") else "\n"
+        next_text = f"{pubspec_text}{separator}version: 1.0.0+{revision_number}\n"
+
+    if next_text == pubspec_text:
+        return False
+    pubspec_path.write_text(next_text, encoding="utf-8")
+    return True
+
+
 def create_initial_project_revision(task_root: Path, base_project_path: Path) -> tuple[Path, str]:
     revision_label = "rev_0001"
     revision_root = task_root / "revisions" / revision_label
     project_root = revision_root / "project"
     shutil.copytree(base_project_path, project_root)
+    ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(task_root, project_root)
     return project_root, revision_label
+
+
+def ignore_project_revision_cache_dirs(path: str, names: list[str]) -> set[str]:
+    _ = path
+    cache_names = {
+        "build",
+        ".dart_tool",
+        ".gradle",
+        ".tooling",
+    }
+    return {name for name in names if name in cache_names}
 
 
 def create_followup_project_revision(workspace_path: Path, source_project_path: Path) -> tuple[Path, str]:
@@ -3629,7 +3742,8 @@ def create_followup_project_revision(workspace_path: Path, source_project_path: 
     revision_label = f"rev_{highest_index + 1:04d}"
     revision_root = revisions_root / revision_label
     project_root = revision_root / "project"
-    shutil.copytree(source_project_path, project_root)
+    shutil.copytree(source_project_path, project_root, ignore=ignore_project_revision_cache_dirs)
+    ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(workspace_path, project_root)
     return project_root, revision_label
 
@@ -3693,10 +3807,19 @@ def status_display_text(status: str, message: Optional[str] = None) -> str:
 def build_attempts_for_task(task: dict[str, Any]) -> int:
     if task["status"] in {"Queued", "Running"}:
         return 0
+    for key in ("apk_path", "project_path"):
+        match = re.search(r"(?:^|[/\\])rev_0*(\d+)(?:[/\\]|$)", str(task.get(key) or ""))
+        if match:
+            return max(1, int(match.group(1)))
     return 1
 
 
-def collect_raw_log_sections(workspace_root: Path, build_log_hint: Optional[str] = None) -> list[dict[str, str]]:
+def collect_raw_log_sections(
+    workspace_root: Path,
+    build_log_hint: Optional[str] = None,
+    *,
+    full: bool = False,
+) -> list[dict[str, str]]:
     sections: list[dict[str, str]] = []
     if build_log_hint:
         try:
@@ -3705,7 +3828,9 @@ def collect_raw_log_sections(workspace_root: Path, build_log_hint: Optional[str]
                 sections.append(
                     {
                         "title": "빌드 로그",
-                        "content": sanitize_user_visible_text(read_text_if_exists(build_log_path)),
+                        "content": sanitize_user_visible_text(
+                            read_text_if_exists(build_log_path, limit=None if full else 20000)
+                        ),
                     }
                 )
         except ValueError:
@@ -3718,7 +3843,7 @@ def collect_raw_log_sections(workspace_root: Path, build_log_hint: Optional[str]
         path = workspace_root / relative_path
         if path.exists():
             if relative_path == "logs/codex_stdout.log":
-                agent_jsonl = extract_codex_agent_message_jsonl(path)
+                agent_jsonl = extract_codex_agent_message_jsonl(path, max_messages=None if full else 120)
                 if agent_jsonl:
                     sections.append(
                         {
@@ -3729,14 +3854,16 @@ def collect_raw_log_sections(workspace_root: Path, build_log_hint: Optional[str]
             sections.append(
                 {
                     "title": title,
-                    "content": sanitize_user_visible_text(read_text_if_exists(path, limit=120000)),
+                    "content": sanitize_user_visible_text(
+                        read_text_if_exists(path, limit=None if full else 120000)
+                    ),
                 }
             )
     return [section for section in sections if section.get("content")]
 
 
-def collect_task_logs(workspace_root: Path, build_log_hint: Optional[str] = None) -> str:
-    sections = collect_raw_log_sections(workspace_root, build_log_hint)
+def collect_task_logs(workspace_root: Path, build_log_hint: Optional[str] = None, *, full: bool = False) -> str:
+    sections = collect_raw_log_sections(workspace_root, build_log_hint, full=full)
     return "\n\n".join(
         f"[{section['title']}]\n{section['content']}".strip()
         for section in sections
@@ -4047,6 +4174,12 @@ def build_decision_response(task_id: str, decision: IntentDecision) -> dict[str,
 
 
 def build_task_status_payload(task: dict[str, Any]) -> dict[str, Any]:
+    apk_path_value = str(task.get("apk_path") or "")
+    apk_size_bytes = None
+    if apk_path_value:
+        apk_path = Path(apk_path_value)
+        if apk_path.exists() and apk_path.is_file():
+            apk_size_bytes = apk_path.stat().st_size
     return {
         "status": task.get("status") or "",
         "message": task.get("message") or "",
@@ -4054,6 +4187,7 @@ def build_task_status_payload(task: dict[str, Any]) -> dict[str, Any]:
         "package_name": task.get("package_name") or "",
         "apk_url": task.get("apk_url") or "",
         "apk_path": task.get("apk_path") or "",
+        "apk_size_bytes": apk_size_bytes,
         "input_tokens": task.get("input_tokens"),
         "cached_input_tokens": task.get("cached_input_tokens"),
         "output_tokens": task.get("output_tokens"),
@@ -4235,7 +4369,7 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
             )
         )
     else:
-        if event_type in {"agent_raw_output", "app_llm_config_generated", "app_llm_config_bulk_updated"}:
+        if event_type == "agent_raw_output" or event_type.startswith("app_llm_config_"):
             return None
         kind = "log" if actor == "system" else "assistant"
         title = "로그" if kind == "log" else "AI"
@@ -4245,7 +4379,7 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
     detail = sanitize_user_visible_text(detail).strip()
     if not body:
         return None
-    return {
+    event = {
         "event_id": event_id,
         "created_at": created_at,
         "kind": kind,
@@ -4254,6 +4388,13 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
         "detail": detail,
         "event_type": event_type,
     }
+    for key in ("apk_url", "apk_path", "app_name", "package_name"):
+        value = sanitize_user_visible_text(str(payload.get(key) or ""))
+        if value:
+            event[key] = value
+    if payload.get("apk_size_bytes") is not None:
+        event["apk_size_bytes"] = str(payload.get("apk_size_bytes"))
+    return event
 
 
 def build_task_timeline_events(db: Database, task_id: str) -> list[dict[str, str]]:
@@ -4705,7 +4846,8 @@ class CodexTaskRunner:
         project_path: Path,
         current_apk_path: Path,
     ) -> Path:
-        if current_apk_path.name == "app-debug.apk" and current_apk_path.exists():
+        version_changed = ensure_project_revision_version(project_path)
+        if current_apk_path.name == "app-debug.apk" and current_apk_path.exists() and not version_changed:
             return current_apk_path
 
         candidate_paths: list[Path] = []
@@ -4773,6 +4915,7 @@ class CodexTaskRunner:
     ) -> None:
         task = self.db.get_task(task_id) or {}
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
+        ensure_project_revision_version(project_path)
         build_log_path = workspace_path / "logs" / "build.log"
         env = self.build_task_env(workspace_path)
         flutter_args = shlex.split(self.settings.flutter_command)
@@ -4978,7 +5121,7 @@ class CodexTaskRunner:
         }
 
         if timed_out:
-            log_text = collect_task_logs(workspace_path, "logs/build.log")
+            log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
             self.db.update_task(
                 task_id,
                 status="Failed",
@@ -5005,7 +5148,7 @@ class CodexTaskRunner:
             return
 
         if not result_path.exists():
-            log_text = collect_task_logs(workspace_path, "logs/build.log")
+            log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
             message = "결과 파일이 생성되지 않았습니다."
             if exit_code not in (0, None):
                 message = f"{message} worker exit code: {exit_code}"
@@ -5033,7 +5176,7 @@ class CodexTaskRunner:
         try:
             result = json.loads(result_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            log_text = collect_task_logs(workspace_path, "logs/build.log")
+            log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
             self.db.update_task(
                 task_id,
                 status="Failed",
@@ -5058,7 +5201,7 @@ class CodexTaskRunner:
 
         codex_result_json = json.dumps(result, ensure_ascii=False)
         build_log_hint = result.get("build_log_path")
-        log_text = collect_task_logs(workspace_path, build_log_hint)
+        log_text = collect_task_logs(workspace_path, build_log_hint, full=True)
 
         if result.get("status") == "success":
             apk_value = result.get("apk_path")
@@ -5114,7 +5257,7 @@ class CodexTaskRunner:
                     return
                 result["apk_path"] = str(apk_path.relative_to(workspace_path).as_posix())
                 codex_result_json = json.dumps(result, ensure_ascii=False)
-                log_text = collect_task_logs(workspace_path, build_log_hint)
+                log_text = collect_task_logs(workspace_path, build_log_hint, full=True)
 
                 if project_looks_like_placeholder_app(current_project_path):
                     self.db.update_task(
@@ -5306,6 +5449,12 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
     )
     sanitized_log_text = sanitize_user_visible_text(log_text)
     sanitized_log_lines = [sanitize_user_visible_text(line) for line in log_lines]
+    apk_path_value = str(task.get("apk_path") or "")
+    apk_size_bytes = None
+    if apk_path_value:
+        apk_path = Path(apk_path_value)
+        if apk_path.exists() and apk_path.is_file():
+            apk_size_bytes = apk_path.stat().st_size
     return {
         "task_id": task["task_id"],
         "status": task["status"],
@@ -5313,6 +5462,8 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
         "message": sanitize_user_visible_text(str(task["message"] or "")),
         "status_message": sanitize_user_visible_text(str(task["message"] or "")),
         "apk_url": task.get("apk_url") or "",
+        "apk_path": apk_path_value,
+        "apk_size_bytes": apk_size_bytes,
         "app_name": task.get("app_name") or "",
         "generated_app_name": task.get("app_name") or "",
         "package_name": task.get("package_name") or "",
@@ -5589,15 +5740,12 @@ def create_app() -> FastAPI:
                     task_id,
                     actor="system",
                     event_type="app_llm_config_bulk_updated",
-                    message_text=f"global defaults applied model={merged_task_config['model']}",
-                    payload={
-                        "provider": merged_task_config["provider"],
-                        "model": merged_task_config["model"],
-                        "daily_request_limit": merged_task_config["daily_request_limit"],
-                        "daily_token_limit": merged_task_config["daily_token_limit"],
-                        "max_output_tokens": merged_task_config["max_output_tokens"],
-                        "system_prompt_overridden": request.system_prompt is not None,
-                    },
+                    message_text=app_llm_config_event_message(merged_task_config),
+                    payload=app_llm_config_event_payload(
+                        merged_task_config,
+                        previous_config=existing_task_config,
+                        source="global_defaults",
+                    ),
                 )
             updated_task_count = len(task_ids)
         return {
@@ -6131,14 +6279,12 @@ def create_app() -> FastAPI:
             task_id,
             actor="system",
             event_type="app_llm_config_updated",
-            message_text=f"enabled={request.enabled} model={request.model.strip()}",
-            payload={
-                "provider": request.provider.strip(),
-                "model": request.model.strip(),
-                "daily_request_limit": request.daily_request_limit,
-                "daily_token_limit": request.daily_token_limit,
-                "max_output_tokens": request.max_output_tokens,
-            },
+            message_text=app_llm_config_event_message(new_config),
+            payload=app_llm_config_event_payload(
+                new_config,
+                previous_config=existing,
+                source="task_config_endpoint",
+            ),
         )
         return get_app_llm_config(task_id, device_id=device_id, phone_number=phone_number)
 
@@ -6237,14 +6383,21 @@ def create_app() -> FastAPI:
             total_tokens=total_tokens,
             status="success",
         )
+        runtime_instructions = build_app_runtime_instructions(config, request)
         db.log_event(
             task_id,
             actor="system",
             event_type="app_llm_response",
-            message_text=str(model_response.get("message") or "")[:200],
+            message_text=str(model_response.get("message") or ""),
             payload={
                 "package_name": request.package_name.strip(),
                 "model": config.get("model") or "",
+                "system_prompt": str(config.get("system_prompt") or ""),
+                "runtime_instructions": runtime_instructions,
+                "user_message": request.user_message,
+                "context": request.context or "",
+                "image_attached": bool(request.image_base64 and request.image_base64.strip()),
+                "image_mime_type": request.image_mime_type or "",
                 "input_tokens": int(usage.get("input_tokens") or 0),
                 "output_tokens": int(usage.get("output_tokens") or 0),
                 "total_tokens": total_tokens,

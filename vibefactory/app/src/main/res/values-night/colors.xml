@@ -23,9 +23,9 @@
     <color name="accent_primary">#79D8A8</color>
     <color name="accent_primary_dark">#9BE3BD</color>
     <color name="assistant_bubble">#1B241D</color>
-    <color name="user_bubble">#1F6B4F</color>
-    <color name="user_bubble_text">#F4FBF6</color>
-    <color name="user_bubble_meta">#D7E9DE</color>
+    <color name="user_bubble">#2A303A</color>
+    <color name="user_bubble_text">#F2F5F7</color>
+    <color name="user_bubble_meta">#B8C0CC</color>
     <color name="status_bubble">#1E2B23</color>
     <color name="log_bubble">#3A321D</color>
     <color name="divider_soft">#334238</color>

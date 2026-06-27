@@ -308,9 +308,9 @@ class MainActivity : AppCompatActivity() {
         loadPersistedArtifactStates()
         loadPersistedRuntimeErrors()
         reconcilePersistedRuntimeErrors()
-        pendingTaskSelectionKey = savedInstanceState?.getString(STATE_SELECTED_TASK_ID)
-            ?: intent?.getStringExtra(STATE_SELECTED_TASK_ID)
-            ?: getLastSelectedTaskId()
+        pendingTaskSelectionKey = visibleTaskIdCandidate(savedInstanceState?.getString(STATE_SELECTED_TASK_ID))
+            ?: visibleTaskIdCandidate(intent?.getStringExtra(STATE_SELECTED_TASK_ID))
+            ?: visibleTaskIdCandidate(getLastSelectedTaskId())
         pendingTaskSelectionKey
             ?.takeIf { it.isNotBlank() && hasRequiredPhoneNumber() }
             ?.let { showPersistedTaskPreview(it) }
@@ -429,7 +429,7 @@ class MainActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         val requestedTaskId = intent?.getStringExtra(STATE_SELECTED_TASK_ID)?.trim().orEmpty()
-        if (requestedTaskId.isNotBlank()) {
+        if (requestedTaskId.isNotBlank() && requestedTaskId !in hiddenTaskIds) {
             pendingTaskSelectionKey = requestedTaskId
             if (hasRequiredPhoneNumber()) {
                 restoreCurrentTaskState(trigger = "onNewIntent")
@@ -445,10 +445,10 @@ class MainActivity : AppCompatActivity() {
     private fun restoreCurrentTaskState(trigger: String) {
         if (!hasRequiredPhoneNumber()) return
         val fallbackPersistedTaskId = taskConversationMessages.keys.firstOrNull { it.isNotBlank() && !hiddenTaskIds.contains(it) }
-        val taskId = currentTaskId?.takeIf { it.isNotBlank() }
-            ?: screenState.selectedTaskId?.takeIf { it.isNotBlank() }
-            ?: pendingTaskSelectionKey?.takeIf { it.isNotBlank() }
-            ?: getLastSelectedTaskId()?.takeIf { it.isNotBlank() }
+        val taskId = visibleTaskIdCandidate(currentTaskId)
+            ?: visibleTaskIdCandidate(screenState.selectedTaskId)
+            ?: visibleTaskIdCandidate(pendingTaskSelectionKey)
+            ?: visibleTaskIdCandidate(getLastSelectedTaskId())
             ?: fallbackPersistedTaskId
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
@@ -1159,7 +1159,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun selectTask(taskId: String, autoInstallOnSuccess: Boolean) {
         val resolvedTaskId = resolveApiTaskId(taskId, "/status/{task_id}") ?: return
-        if (resolvedTaskId.isBlank()) return
+        if (resolvedTaskId.isBlank() || resolvedTaskId in hiddenTaskIds) return
         stopPolling()
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
@@ -1470,6 +1470,12 @@ class MainActivity : AppCompatActivity() {
         autoInstallOnSuccess: Boolean,
         syncPolling: Boolean
     ) {
+        if (taskId in hiddenTaskIds) {
+            if (currentTaskId == taskId || screenState.selectedTaskId == taskId) {
+                resetForNewChat()
+            }
+            return
+        }
         currentTaskId = taskId
         val normalizedStatus = response.status.trim()
         val isSuccess = isSuccessStatus(normalizedStatus)
@@ -2013,6 +2019,11 @@ ${record.stackTrace}
         hiddenTaskIds += preferencesStore.loadHiddenTaskIds()
     }
 
+    private fun visibleTaskIdCandidate(taskId: String?): String? {
+        val normalizedTaskId = taskId?.trim().orEmpty()
+        return normalizedTaskId.takeIf { it.isNotBlank() && it !in hiddenTaskIds }
+    }
+
     private fun persistHiddenTaskIds() {
         preferencesStore.saveHiddenTaskIds(hiddenTaskIds)
     }
@@ -2021,6 +2032,7 @@ ${record.stackTrace}
         val restoredChats = preferencesStore.loadTaskChats()
         taskConversationMessages.clear()
         restoredChats.timelines.forEach { (taskId, messages) ->
+            if (taskId in hiddenTaskIds) return@forEach
             taskConversationMessages[taskId] = messages.toMutableList()
         }
         if (restoredChats.statusMessages.isNotEmpty()) {
@@ -2041,7 +2053,7 @@ ${record.stackTrace}
     private fun syncArtifactPointersForActiveTask() {
         val activeTaskId = currentTaskId?.trim().takeUnless { it.isNullOrBlank() }
             ?: screenState.selectedTaskId?.trim().takeUnless { it.isNullOrBlank() }
-        if (activeTaskId.isNullOrBlank()) {
+        if (activeTaskId.isNullOrBlank() || activeTaskId in hiddenTaskIds) {
             latestApkUrl = null
             latestDownloadedTaskId = null
             latestDownloadedApkFile = null
@@ -2118,7 +2130,7 @@ ${record.stackTrace}
 
     private fun showPersistedTaskPreview(taskId: String) {
         val normalizedTaskId = taskId.trim()
-        if (normalizedTaskId.isBlank()) return
+        if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return
         val hasPersistedMessages = taskConversationMessages[normalizedTaskId].orEmpty().isNotEmpty()
         if (!hasPersistedMessages) return
         pendingInitialChatScrollTaskId = normalizedTaskId
@@ -2547,7 +2559,7 @@ ${record.stackTrace}
             taskId = normalizedTaskId,
             response = response,
             appName = appName,
-            eventId = "latest-${response.build_attempts}-${response.apk_url.orEmpty().hashCode()}",
+            eventId = "latest-${response.build_attempts}-${response.apk_path.orEmpty().hashCode()}-${response.apk_url.orEmpty().hashCode()}",
             createdAt = currentTimestampString()
         )
 
@@ -2555,22 +2567,27 @@ ${record.stackTrace}
         if (timeline.any { it.id == artifactMessage.id }) return
         val artifactPath = artifactMessage.artifactApkPath?.trim().orEmpty()
         val artifactUrl = artifactMessage.artifactApkUrl?.trim().orEmpty()
-        val staleArtifactIndex = timeline.indexOfLast { message ->
+        val existingArtifactIndex = timeline.indexOfLast { message ->
             message.artifactTaskId == normalizedTaskId &&
-                (
-                    artifactPath.isNotBlank() && message.artifactApkPath?.trim() == artifactPath ||
-                        artifactPath.isNotBlank() && message.artifactApkPath.isNullOrBlank() ||
-                        artifactPath.isBlank() && artifactUrl.isNotBlank() && message.artifactApkUrl == artifactUrl
-                    )
+                isSameApkArtifact(message, artifactPath, artifactUrl)
         }
-        if (staleArtifactIndex >= 0) {
-            timeline.removeAt(staleArtifactIndex)
-            timeline += artifactMessage.withUniqueId(normalizedTaskId, timeline.size)
+        if (existingArtifactIndex >= 0) {
+            timeline[existingArtifactIndex] = artifactMessage.withUniqueId(normalizedTaskId, existingArtifactIndex)
             persistTaskChats()
             return
         }
         timeline += artifactMessage.withUniqueId(normalizedTaskId, timeline.size)
         persistTaskChats()
+    }
+
+    private fun isSameApkArtifact(message: ChatMessage, artifactPath: String, artifactUrl: String): Boolean {
+        val messagePath = message.artifactApkPath?.trim().orEmpty()
+        val messageUrl = message.artifactApkUrl?.trim().orEmpty()
+        return when {
+            artifactPath.isNotBlank() && messagePath.isNotBlank() -> messagePath == artifactPath
+            artifactPath.isBlank() && artifactUrl.isNotBlank() && messageUrl.isNotBlank() -> messageUrl == artifactUrl
+            else -> false
+        }
     }
 
     private fun apkArtifactMessage(
@@ -2587,7 +2604,17 @@ ${record.stackTrace}
             ?: "${HostAppConfig.BASE_URL}/download/$taskId"
         val artifactApkPath = response.apk_path?.trim()?.takeIf { it.isNotBlank() }
         val revisionLabel = apkArtifactRevisionLabel(response)
-        val downloadedFile = persistedDownloadedApkFileForTask(taskId)
+        val cachedArtifactFile = cachedDownloadedApkFileForArtifact(
+            taskId = taskId,
+            url = artifactApkUrl,
+            artifactPath = artifactApkPath
+        )
+        val fallbackDownloadedFile = if (artifactApkPath.isNullOrBlank()) {
+            persistedDownloadedApkFileForTask(taskId)
+        } else {
+            null
+        }
+        val installableFile = cachedArtifactFile ?: fallbackDownloadedFile
         return ChatMessage(
             id = "artifact-$taskId-$eventId",
             kind = MessageKind.STATUS,
@@ -2598,19 +2625,11 @@ ${record.stackTrace}
             artifactTaskId = taskId,
             artifactApkUrl = artifactApkUrl,
             artifactApkPath = artifactApkPath,
-            artifactDownloadedPath = cachedDownloadedApkFileForArtifact(
-                taskId = taskId,
-                url = artifactApkUrl,
-                artifactPath = artifactApkPath
-            )?.absolutePath ?: downloadedFile?.absolutePath,
+            artifactDownloadedPath = installableFile?.absolutePath,
             artifactRevisionLabel = revisionLabel,
             artifactBuildAttempt = response.build_attempts.takeIf { it > 0 },
             artifactCanDownload = artifactApkUrl.isNotBlank(),
-            artifactCanInstall = cachedDownloadedApkFileForArtifact(
-                taskId = taskId,
-                url = artifactApkUrl,
-                artifactPath = artifactApkPath
-            ) != null || downloadedFile != null,
+            artifactCanInstall = installableFile != null,
             artifactDownloading = isDownloadingApk
         )
     }
@@ -2698,20 +2717,27 @@ ${record.stackTrace}
         if (isDownloadingApk) return
         val taskId = message.artifactTaskId?.trim().orEmpty()
         if (taskId.isBlank()) return
-        val downloadedFile = message.artifactDownloadedPath
+        val artifactPath = message.artifactApkPath?.trim()?.takeIf { it.isNotBlank() }
+        val artifactUrl = message.artifactApkUrl?.trim()?.takeIf { it.isNotBlank() }
+        val messageDownloadedFile = message.artifactDownloadedPath
             ?.trim()
             ?.takeIf { it.isNotBlank() }
             ?.let(::File)
             ?.takeIf { it.exists() }
-            ?: cachedDownloadedApkFileForArtifact(taskId, message.artifactApkUrl, message.artifactApkPath)
-            ?: if (message.artifactApkPath.isNullOrBlank()) persistedDownloadedApkFileForTask(taskId) else null
+        val cachedArtifactFile = cachedDownloadedApkFileForArtifact(taskId, artifactUrl, artifactPath)
+        val downloadedFile = if (artifactPath != null) {
+            cachedArtifactFile
+        } else {
+            messageDownloadedFile
+                ?: cachedArtifactFile
+                ?: persistedDownloadedApkFileForTask(taskId)
+        }
         if (downloadedFile != null) {
             installApk(downloadedFile)
             return
         }
-        val apkUrl = message.artifactApkUrl?.trim()?.takeIf { it.isNotBlank() }
-            ?: persistedApkUrlForTask(taskId)
-        apkUrl?.let { downloadAndInstall(taskId, it, message.artifactApkPath) }
+        val apkUrl = artifactUrl ?: persistedApkUrlForTask(taskId)
+        apkUrl?.let { downloadAndInstall(taskId, it, artifactPath) }
     }
 
     private fun formatFileSize(bytes: Long): String {
@@ -3613,6 +3639,7 @@ ${record.stackTrace}
         statusText: String,
         hasApk: Boolean
     ) {
+        if (taskId in hiddenTaskIds) return
         val existing = taskSummaryById[taskId]
         val updatedTitle = buildTaskContentTitle(
             initialPrompt = response.conversation_state
@@ -4102,6 +4129,7 @@ ${record.stackTrace}
 
     private fun shouldReenterRuntimeErrorTask(taskId: String): Boolean {
         if (taskId.isBlank()) return false
+        if (taskId in hiddenTaskIds) return false
         if (screenState.selectedTaskId == taskId || currentTaskId == taskId) return true
         if (taskSummaryById.containsKey(taskId)) return true
         return taskConversationMessages[taskId].orEmpty().isNotEmpty()
@@ -4114,6 +4142,7 @@ ${record.stackTrace}
         errorMessage: String? = null,
         reportKind: String? = null
     ) {
+        if (taskId in hiddenTaskIds) return
         val existing = pendingRuntimeErrors[taskId]
         if (existing?.stackTrace == stackTrace && existing.awaitingUserConfirmation) {
             return
@@ -4239,6 +4268,7 @@ ${record.stackTrace}
     private fun loadPersistedRuntimeErrors() {
         preferencesStore.loadPendingRuntimeErrors().forEach { (taskId, record) ->
             val resolvedTaskId = resolveCrashTaskId(taskId, record.packageName) ?: taskId
+            if (resolvedTaskId in hiddenTaskIds) return@forEach
             if (record.awaitingUserConfirmation) {
                 handleRuntimeError(
                     taskId = resolvedTaskId,
@@ -4260,6 +4290,7 @@ ${record.stackTrace}
 
         lifecycleScope.launch {
             snapshot.forEach { (taskId, record) ->
+                if (taskId in hiddenTaskIds) return@forEach
                 try {
                     logTaskIdForApi("/status/{task_id}", taskId)
                     logApiRequest("/status/{task_id}", taskId = taskId, deviceId = deviceId, extra = "reconcile_runtime_error=true")
@@ -4795,6 +4826,8 @@ ${record.stackTrace}
             if (isWebResearchInProgress(response)) "web_research" else "",
             response.package_name,
             response.apk_url,
+            response.apk_path,
+            response.apk_size_bytes?.toString().orEmpty(),
             response.build_success.toString(),
             response.build_attempts.toString()
         ).joinToString("|")
@@ -5138,7 +5171,7 @@ ${record.stackTrace}
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putString(STATE_SELECTED_TASK_ID, screenState.selectedTaskId ?: currentTaskId)
+        outState.putString(STATE_SELECTED_TASK_ID, visibleTaskIdCandidate(screenState.selectedTaskId ?: currentTaskId))
         outState.putString(STATE_INPUT_PROMPT, inputPrompt.text?.toString().orEmpty())
     }
 

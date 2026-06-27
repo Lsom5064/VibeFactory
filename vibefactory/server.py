@@ -3832,6 +3832,10 @@ def render_task_agents_md(task_id: str) -> str:
 - 런타임 AI 호출이 필요한 앱은 `runtime_package_name`과 실제 요청 package name이 일치해야 한다.
 - 사용자가 저장을 원했다면 앱 재실행 후에도 유지되는 저장 방식을 사용한다.
 - 더미 데이터나 예시 문구는 UI 스켈레톤 확인용 보조로만 허용된다. 핵심 사용자 흐름을 더미 데이터만으로 완성 처리하면 안 된다.
+- Flutter UI는 모든 화면 크기와 키보드/시스템 inset에서 `RenderFlex overflowed by ... pixels` 및 top/bottom/right/left overflow가 나지 않게 만든다.
+- 세로로 내용이 늘어나는 화면은 `SafeArea`와 `SingleChildScrollView`, `ListView`, `CustomScrollView` 중 적절한 스크롤 컨테이너를 사용한다. 고정 높이 `Column`에 긴 콘텐츠를 그대로 넣지 않는다.
+- `Column`/`Row` 안의 긴 텍스트, 버튼, 입력창, 카드 목록은 `Flexible`/`Expanded`, `Wrap`, `ConstrainedBox`, `LayoutBuilder`, `maxLines`/`overflow` 등을 사용해 작은 화면에서도 넘치지 않게 한다.
+- 빌드 전에 작은 화면 기준으로 레이아웃을 점검하고, overflow 가능성이 있으면 성공으로 보고하지 않는다.
 - 구현이 어려워 일부 요구사항을 못 지켰다면 숨기지 말고 실패 처리하거나 `known_limitations`에 명시한다.
 - 빌드 성공 시 반드시 `.codex_result/task_result.json`을 valid JSON으로 작성한다.
 - 빌드 실패 시에도 반드시 `.codex_result/task_result.json`을 valid JSON으로 작성한다.
@@ -4016,6 +4020,7 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - 런타임 AI를 쓰는 앱이라면 `task_result.json` 성공 결과에 `app_llm_enabled`, `app_llm_model`, `app_llm_system_prompt`를 함께 넣는다.
 - `app_llm_system_prompt`는 이 앱 목적에 맞는 앱 전용 프롬프트여야 하며, 모든 앱에 공통으로 쓰는 고정 문구를 그대로 복사하지 않는다.
 - 예를 들어 방 정리 조언 앱이라면 사진 속 공간 상태를 관찰하고, 우선순위와 실행 순서를 조언하는 방향이 드러나야 한다.
+- 화면 레이아웃은 작은 Android 화면, 화면 회전, 키보드 표시 상태에서도 top/bottom/right/left overflow가 나지 않게 구현한다. 긴 콘텐츠는 `SafeArea`와 스크롤 가능한 컨테이너로 감싸고, `Row`/`Column`의 긴 자식은 `Flexible`/`Expanded`/`Wrap`/`overflow` 처리를 한다.
 - 현재 사용자 기기 정보가 제공되면, UI 크기·Android 버전·센서/웨어러블 가능성 같은 구현 판단에 실제로 반영한다.
 """
 
@@ -4294,11 +4299,51 @@ def current_revision_label(project_root: Path) -> str:
     return parent_name if parent_name.startswith("rev_") else "rev_0000"
 
 
+def revision_number_from_label(revision_label: str) -> int:
+    match = re.fullmatch(r"rev_0*(\d+)", revision_label.strip())
+    if not match:
+        return 1
+    return max(1, int(match.group(1)))
+
+
+def ensure_project_revision_version(project_root: Path, revision_label: Optional[str] = None) -> bool:
+    label = revision_label or current_revision_label(project_root)
+    revision_number = revision_number_from_label(label)
+    pubspec_path = project_root / "pubspec.yaml"
+    pubspec_text = read_text_if_exists(pubspec_path, limit=100_000)
+    if not pubspec_text:
+        return False
+
+    version_match = re.search(r"^version:\s*([^\s#]+)(.*)$", pubspec_text, re.MULTILINE)
+    if version_match:
+        current_value = version_match.group(1).strip()
+        suffix = version_match.group(2)
+        version_name, _, build_number_text = current_value.partition("+")
+        version_name = version_name.strip() or "1.0.0"
+        existing_build_number = int(build_number_text) if build_number_text.isdigit() else 0
+        build_number = max(existing_build_number, revision_number)
+        next_line = f"version: {version_name}+{build_number}{suffix}"
+        next_text = (
+            pubspec_text[: version_match.start()]
+            + next_line
+            + pubspec_text[version_match.end() :]
+        )
+    else:
+        separator = "" if pubspec_text.endswith("\n") else "\n"
+        next_text = f"{pubspec_text}{separator}version: 1.0.0+{revision_number}\n"
+
+    if next_text == pubspec_text:
+        return False
+    pubspec_path.write_text(next_text, encoding="utf-8")
+    return True
+
+
 def create_initial_project_revision(task_root: Path, base_project_path: Path) -> tuple[Path, str]:
     revision_label = "rev_0001"
     revision_root = task_root / "revisions" / revision_label
     project_root = revision_root / "project"
     shutil.copytree(base_project_path, project_root)
+    ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(task_root, project_root)
     return project_root, revision_label
 
@@ -4317,6 +4362,7 @@ def create_followup_project_revision(workspace_path: Path, source_project_path: 
     revision_root = revisions_root / revision_label
     project_root = revision_root / "project"
     shutil.copytree(source_project_path, project_root)
+    ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(workspace_path, project_root)
     return project_root, revision_label
 
@@ -4382,6 +4428,10 @@ def status_display_text(status: str, message: Optional[str] = None) -> str:
 def build_attempts_for_task(task: dict[str, Any]) -> int:
     if task["status"] in {"Queued", "Running"}:
         return 0
+    for key in ("apk_path", "project_path"):
+        match = re.search(r"(?:^|[/\\])rev_0*(\d+)(?:[/\\]|$)", str(task.get(key) or ""))
+        if match:
+            return max(1, int(match.group(1)))
     return 1
 
 
@@ -4637,6 +4687,12 @@ def build_decision_response(task_id: str, decision: IntentDecision) -> dict[str,
 
 
 def build_task_status_payload(task: dict[str, Any]) -> dict[str, Any]:
+    apk_path_value = str(task.get("apk_path") or "")
+    apk_size_bytes = None
+    if apk_path_value:
+        apk_path = Path(apk_path_value)
+        if apk_path.exists() and apk_path.is_file():
+            apk_size_bytes = apk_path.stat().st_size
     return {
         "status": task.get("status") or "",
         "message": task.get("message") or "",
@@ -4644,6 +4700,7 @@ def build_task_status_payload(task: dict[str, Any]) -> dict[str, Any]:
         "package_name": task.get("package_name") or "",
         "apk_url": task.get("apk_url") or "",
         "apk_path": task.get("apk_path") or "",
+        "apk_size_bytes": apk_size_bytes,
         "input_tokens": task.get("input_tokens"),
         "cached_input_tokens": task.get("cached_input_tokens"),
         "output_tokens": task.get("output_tokens"),
@@ -4853,7 +4910,7 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
     detail = sanitize_user_visible_text(detail).strip()
     if not body:
         return None
-    return {
+    event = {
         "event_id": event_id,
         "created_at": created_at,
         "kind": kind,
@@ -4862,6 +4919,13 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
         "detail": detail,
         "event_type": event_type,
     }
+    for key in ("apk_url", "apk_path", "app_name", "package_name"):
+        value = sanitize_user_visible_text(str(payload.get(key) or ""))
+        if value:
+            event[key] = value
+    if payload.get("apk_size_bytes") is not None:
+        event["apk_size_bytes"] = str(payload.get("apk_size_bytes"))
+    return event
 
 
 def build_task_timeline_events(db: Database, task_id: str) -> list[dict[str, str]]:
@@ -5375,7 +5439,8 @@ class CodexTaskRunner:
         project_path: Path,
         current_apk_path: Path,
     ) -> Path:
-        if current_apk_path.name == "app-debug.apk" and current_apk_path.exists():
+        version_changed = ensure_project_revision_version(project_path)
+        if current_apk_path.name == "app-debug.apk" and current_apk_path.exists() and not version_changed:
             return current_apk_path
 
         candidate_paths: list[Path] = []
@@ -5443,6 +5508,7 @@ class CodexTaskRunner:
     ) -> None:
         task = self.db.get_task(task_id) or {}
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
+        ensure_project_revision_version(project_path)
         build_log_path = workspace_path / "logs" / "build.log"
         env = self.build_task_env(workspace_path)
         flutter_args = shlex.split(self.settings.flutter_command)
