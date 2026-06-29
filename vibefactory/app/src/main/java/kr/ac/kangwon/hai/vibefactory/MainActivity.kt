@@ -174,6 +174,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var userIdentity: UserIdentity
     private val runtimeErrorTaskIds = mutableSetOf<String>()
     private val pendingRuntimeErrors = mutableMapOf<String, RuntimeErrorRecord>()
+    private var persistedRuntimeErrorsLoaded: Boolean = false
     private val taskConversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
     private val loadedTaskChatIds = mutableSetOf<String>()
     private val taskInputQueueManager by lazy {
@@ -4482,21 +4483,29 @@ ${record.stackTrace}
     }
 
     private fun loadPersistedRuntimeErrors() {
+        if (persistedRuntimeErrorsLoaded) return
+        persistedRuntimeErrorsLoaded = true
+        var shouldRewritePersistedRecords = false
         preferencesStore.loadPendingRuntimeErrors().forEach { (taskId, record) ->
-            val resolvedTaskId = resolveCrashTaskId(taskId, record.packageName) ?: taskId
-            if (resolvedTaskId in hiddenTaskIds) return@forEach
-            if (record.awaitingUserConfirmation) {
-                handleRuntimeError(
-                    taskId = resolvedTaskId,
-                    packageName = record.packageName,
-                    stackTrace = record.stackTrace,
-                    errorMessage = record.errorMessage,
-                    reportKind = record.reportKind
-                )
-            } else {
-                pendingRuntimeErrors[resolvedTaskId] = record
-                runtimeErrorTaskIds += resolvedTaskId
+            val resolvedTaskId = (resolveCrashTaskId(taskId, record.packageName) ?: taskId).trim()
+            if (resolvedTaskId.isBlank() || resolvedTaskId in hiddenTaskIds) {
+                shouldRewritePersistedRecords = true
+                return@forEach
             }
+            val restoredRecord = record.copy(
+                packageName = record.packageName.trim().ifBlank { "알 수 없는 앱" },
+                stackTrace = RuntimeErrorStoragePolicy.compactStackTrace(record.stackTrace),
+                errorMessage = record.errorMessage?.trim()?.ifBlank { null },
+                reportKind = record.reportKind?.trim()?.ifBlank { null }
+            )
+            pendingRuntimeErrors[resolvedTaskId] = restoredRecord
+            runtimeErrorTaskIds += resolvedTaskId
+            if (resolvedTaskId != taskId || restoredRecord != record) {
+                shouldRewritePersistedRecords = true
+            }
+        }
+        if (shouldRewritePersistedRecords) {
+            persistPendingRuntimeErrors()
         }
     }
 
