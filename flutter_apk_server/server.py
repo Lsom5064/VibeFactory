@@ -6691,6 +6691,7 @@ def create_app() -> FastAPI:
         device_id: Optional[str] = Query(default=None),
         phone_number: Optional[str] = Query(default=None),
         user_id: Optional[str] = Query(default=None),
+        artifact_path: Optional[str] = Query(default=None),
     ) -> FileResponse:
         db: Database = app.state.db
         task = db.get_task(task_id)
@@ -6698,11 +6699,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         if not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
             raise HTTPException(status_code=404, detail="task not found")
-        if task["status"] != "Success" or not task.get("apk_path") or not task.get("workspace_path"):
+        if not task.get("workspace_path"):
             raise HTTPException(status_code=404, detail="apk not available")
 
         workspace_path = Path(task["workspace_path"])
-        apk_path = Path(task["apk_path"]).resolve()
+        apk_path_value = normalize_whitespace(str(artifact_path or task.get("apk_path") or ""))
+        if not apk_path_value:
+            raise HTTPException(status_code=404, detail="apk not available")
+        apk_path = Path(apk_path_value)
+        if not apk_path.is_absolute():
+            apk_path = workspace_path / apk_path
+        apk_path = apk_path.resolve()
         if not ensure_within_root(apk_path, workspace_path):
             raise HTTPException(status_code=403, detail="invalid apk path")
         if not apk_path.exists() or apk_path.suffix.lower() != ".apk":
