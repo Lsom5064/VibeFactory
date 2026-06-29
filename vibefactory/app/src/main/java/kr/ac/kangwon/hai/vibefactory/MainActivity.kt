@@ -98,6 +98,9 @@ class MainActivity : AppCompatActivity() {
         private const val MAX_ATTACHMENT_IMAGE_PAYLOAD_BYTES = 4 * 1024 * 1024
         private const val MAX_ATTACHMENT_PDF_BYTES = 10 * 1024 * 1024
         private const val MAX_ATTACHMENT_TEXT_BYTES = 2 * 1024 * 1024
+        private const val MAX_CHAT_TIMELINE_EVENTS_FOR_RENDER = 120
+        private const val MAX_RECENT_ASSISTANT_MESSAGES_FOR_RENDER = 24
+        private const val MAX_IN_MEMORY_TASK_MESSAGES = 180
     }
 
     private val gson: Gson = GsonBuilder().create()
@@ -1200,6 +1203,7 @@ class MainActivity : AppCompatActivity() {
         currentTaskId = resolvedTaskId
         pendingTaskSelectionKey = null
         persistLastSelectedTaskId(resolvedTaskId)
+        requestScrollLatestAfterResponse()
         val summary = taskSummaryById[resolvedTaskId]
         screenState = screenState.copy(
             selectedTaskId = resolvedTaskId,
@@ -1919,7 +1923,7 @@ class MainActivity : AppCompatActivity() {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
         if (screenState.selectedTaskId != apiTaskId) {
-            pendingInitialChatScrollTaskId = apiTaskId
+            requestScrollLatestAfterResponse()
             screenState = screenState.copy(
                 selectedTaskId = apiTaskId,
                 displayedAppName = taskSummaryById[apiTaskId]?.appName ?: screenState.displayedAppName,
@@ -1982,7 +1986,7 @@ class MainActivity : AppCompatActivity() {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
         if (screenState.selectedTaskId != apiTaskId) {
-            pendingInitialChatScrollTaskId = apiTaskId
+            requestScrollLatestAfterResponse()
             screenState = screenState.copy(
                 selectedTaskId = apiTaskId,
                 displayedAppName = taskSummaryById[apiTaskId]?.appName ?: screenState.displayedAppName,
@@ -2327,6 +2331,7 @@ ${record.stackTrace}
     private fun persistTaskChat(taskId: String): Boolean {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return true
+        trimTaskTimelineInMemory(normalizedTaskId)
         val committed = preferencesStore.saveTaskChat(
             normalizedTaskId,
             taskConversationMessages[normalizedTaskId].orEmpty()
@@ -2343,7 +2348,10 @@ ${record.stackTrace}
         ensureTaskChatLoaded(normalizedTaskId)
         val hasPersistedMessages = taskConversationMessages[normalizedTaskId].orEmpty().isNotEmpty()
         if (!hasPersistedMessages) return
-        pendingInitialChatScrollTaskId = normalizedTaskId
+        val wasAlreadySelected = screenState.selectedTaskId == normalizedTaskId
+        if (!wasAlreadySelected) {
+            requestScrollLatestAfterResponse()
+        }
 
         val summary = taskSummaryById[normalizedTaskId]
         val hasArtifact = summary?.hasApk == true || persistedApkUrlForTask(normalizedTaskId) != null
@@ -2659,9 +2667,6 @@ ${record.stackTrace}
         } else if (!anchorMessageId.isNullOrBlank()) {
             // submitList commit callback scrolls after DiffUtil applies the latest item heights.
         } else if (visibleMessages.isNotEmpty() && !selectedTaskId.isNullOrBlank() && pendingInitialChatScrollTaskId == selectedTaskId) {
-            recyclerMessages.post {
-                recyclerMessages.scrollToPosition(0)
-            }
             pendingInitialChatScrollTaskId = null
         } else if (shouldAutoScrollNewMessage && !shouldPreserveManualScroll) {
             recyclerMessages.post {
@@ -3416,7 +3421,9 @@ ${record.stackTrace}
 
     private fun extractTimelineEvents(response: StatusResponse): List<TimelineEventSnapshot> {
         val array = response.timeline_events?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
-        return array.mapNotNull { item ->
+        val startIndex = (array.size() - MAX_CHAT_TIMELINE_EVENTS_FOR_RENDER).coerceAtLeast(0)
+        return (startIndex until array.size()).mapNotNull { index ->
+            val item = array[index]
             val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
             val payload = timelineEventPayloadObject(obj)
             TimelineEventSnapshot(
@@ -3685,14 +3692,16 @@ ${record.stackTrace}
         }
         val recent = response.recent_messages?.takeIf { it.isJsonArray }?.asJsonArray
         val messages = mutableListOf<ChatMessage>()
-        recent?.forEachIndexed { index, item ->
-            val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: return@forEachIndexed
+        val recentStartIndex = ((recent?.size() ?: 0) - MAX_RECENT_ASSISTANT_MESSAGES_FOR_RENDER).coerceAtLeast(0)
+        for (index in recentStartIndex until (recent?.size() ?: 0)) {
+            val item = recent?.get(index) ?: continue
+            val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: continue
             val role = firstString(obj, "role")?.trim().orEmpty().lowercase()
             val messageType = firstString(obj, "message_type")?.trim().orEmpty().lowercase()
             val content = firstString(obj, "content")?.trim().orEmpty()
-            if (content.isBlank()) return@forEachIndexed
-            if (!role.contains("assistant") && !role.contains("clarification")) return@forEachIndexed
-            if (messageType == "task_log") return@forEachIndexed
+            if (content.isBlank()) continue
+            if (!role.contains("assistant") && !role.contains("clarification")) continue
+            if (messageType == "task_log") continue
 
             val message = ChatMessage(
                 id = "recent-$taskId-$messageType-$index-${content.hashCode()}",
@@ -3702,10 +3711,10 @@ ${record.stackTrace}
                 createdAt = firstString(obj, "created_at")?.trim().orEmpty().ifBlank { currentTimestampString() },
                 eventType = messageType.ifBlank { null }
             )
-            if (existingTimeline.any { it.sameContentAs(message) }) return@forEachIndexed
-            if (messages.any { it.sameContentAs(message) }) return@forEachIndexed
-            if (isRedundantAggregatedAssistantMessage(taskId, message)) return@forEachIndexed
-            if (isRedundantOperationalAssistantMessage(taskId, message)) return@forEachIndexed
+            if (existingTimeline.any { it.sameContentAs(message) }) continue
+            if (messages.any { it.sameContentAs(message) }) continue
+            if (isRedundantAggregatedAssistantMessage(taskId, message)) continue
+            if (isRedundantOperationalAssistantMessage(taskId, message)) continue
             messages += message
         }
 
@@ -4893,6 +4902,15 @@ ${record.stackTrace}
         persistTaskChat(normalizedTaskId)
     }
 
+    private fun trimTaskTimelineInMemory(taskId: String) {
+        val normalizedTaskId = taskId.trim()
+        val timeline = taskConversationMessages[normalizedTaskId] ?: return
+        if (timeline.size <= MAX_IN_MEMORY_TASK_MESSAGES) return
+        taskConversationMessages[normalizedTaskId] = timeline
+            .takeLast(MAX_IN_MEMORY_TASK_MESSAGES)
+            .toMutableList()
+    }
+
     private fun timelineContainsEquivalentClarificationMessage(timeline: List<ChatMessage>, message: ChatMessage): Boolean {
         if (!isAssistantLikeMessage(message)) return false
         val incomingQuestionKeys = clarificationQuestionKeys(message.body, requireQuestionMark = true)
@@ -5363,6 +5381,7 @@ ${record.stackTrace}
     }
 
     private fun requestChatScrollAnchor(messageId: String) {
+        clearInitialScrollForActiveTask()
         pendingChatAnchorMessageId = messageId
         clearPendingChatAnchorAfterScroll = false
     }
@@ -5373,7 +5392,16 @@ ${record.stackTrace}
     }
 
     private fun requestScrollLatestAfterResponse() {
+        clearInitialScrollForActiveTask()
         pendingScrollLatestAfterResponse = true
+    }
+
+    private fun clearInitialScrollForActiveTask() {
+        val activeTaskId = screenState.selectedTaskId?.trim()?.takeIf { it.isNotBlank() }
+            ?: currentTaskId?.trim()?.takeIf { it.isNotBlank() }
+        if (!activeTaskId.isNullOrBlank() && pendingInitialChatScrollTaskId == activeTaskId) {
+            pendingInitialChatScrollTaskId = null
+        }
     }
 
     private fun logApiRequest(endpoint: String, taskId: String? = null, deviceId: String, extra: String? = null) {

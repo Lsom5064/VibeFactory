@@ -171,6 +171,7 @@
     <string name="task_log_detail_title">작업 로그</string>
     <string name="task_log_empty">아직 표시할 로그가 없어요.</string>
     <string name="task_log_copied">항목을 복사했어요.</string>
+    <string name="message_copied">메시지를 복사했어요.</string>
     <string name="task_log_apk_missing">APK 파일을 찾을 수 없어요.</string>
     <string name="task_log_section_empty">표시할 항목이 없어요.</string>
     <string name="task_log_time_missing">시간 정보 없음</string>

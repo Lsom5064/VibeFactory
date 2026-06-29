@@ -1,5 +1,7 @@
 package kr.ac.kangwon.hai.vibefactory
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.text.TextUtils
 import android.view.ActionMode
@@ -12,6 +14,7 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
@@ -99,6 +102,8 @@ class ChatMessageAdapter(
     companion object {
         private const val CHAT_MESSAGE_COLLAPSE_CHAR_THRESHOLD = 420
         private const val CHAT_MESSAGE_COLLAPSED_MAX_LINES = 14
+        private const val CHAT_MESSAGE_INLINE_RENDER_CHAR_LIMIT = 1_200
+        private const val CHAT_MESSAGE_INLINE_DETAIL_CHAR_LIMIT = 1_500
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChatViewHolder {
@@ -136,10 +141,13 @@ class ChatMessageAdapter(
             title.customSelectionActionModeCallback = messageSelectionActionModeCallback
             body.customSelectionActionModeCallback = messageSelectionActionModeCallback
             detail.customSelectionActionModeCallback = messageSelectionActionModeCallback
+            bindCopyOnLongClick(title) { item.title.orEmpty() }
+            bindCopyOnLongClick(body) { item.body }
+            bindCopyOnLongClick(detail) { item.detail.orEmpty() }
             title.text = ""
             title.visibility = View.GONE
             bindLoadingState(item, context)
-            detail.text = item.detail
+            detail.text = item.detail?.let(::inlineDetailText)
             detail.visibility = if (item.detail.isNullOrBlank()) View.GONE else View.VISIBLE
             val formattedTimestamp = formatMessageTimestamp(item.createdAt)
             timestamp.text = formattedTimestamp
@@ -249,11 +257,23 @@ class ChatMessageAdapter(
         }
 
         private fun chatMessageBodyText(item: ChatMessage, context: android.content.Context): CharSequence {
+            val inlineBody = inlineBodyText(item)
             return if (item.kind == MessageKind.ASSISTANT || item.kind == MessageKind.CONFIRMATION) {
-                ChatMarkdownRenderer.render(context, item.body)
+                ChatMarkdownRenderer.render(context, inlineBody)
             } else {
-                item.body
+                inlineBody
             }
+        }
+
+        private fun inlineBodyText(item: ChatMessage): String {
+            if (!isExpandableChatMessage(item)) return item.body
+            if (item.body.length <= CHAT_MESSAGE_INLINE_RENDER_CHAR_LIMIT) return item.body
+            return item.body.take(CHAT_MESSAGE_INLINE_RENDER_CHAR_LIMIT).trimEnd() + "\n\n..."
+        }
+
+        private fun inlineDetailText(rawDetail: String): String {
+            if (rawDetail.length <= CHAT_MESSAGE_INLINE_DETAIL_CHAR_LIMIT) return rawDetail
+            return rawDetail.take(CHAT_MESSAGE_INLINE_DETAIL_CHAR_LIMIT).trimEnd() + "\n\n..."
         }
 
         private fun bindArtifactCard(item: ChatMessage, context: android.content.Context) {
@@ -339,10 +359,7 @@ class ChatMessageAdapter(
         }
 
         private fun bindExpandableChatMessage(item: ChatMessage) {
-            val supportsExpansion = item.kind == MessageKind.USER ||
-                item.kind == MessageKind.ASSISTANT ||
-                item.kind == MessageKind.CONFIRMATION
-            val isLongChatMessage = supportsExpansion && item.body.length > CHAT_MESSAGE_COLLAPSE_CHAR_THRESHOLD
+            val isLongChatMessage = isExpandableChatMessage(item)
             if (!isLongChatMessage) {
                 body.maxLines = Int.MAX_VALUE
                 body.ellipsize = null
@@ -362,6 +379,25 @@ class ChatMessageAdapter(
                     Intent(context, FullMessageActivity::class.java)
                         .putExtra(FullMessageActivity.EXTRA_BODY, item.body)
                 )
+            }
+        }
+
+        private fun isExpandableChatMessage(item: ChatMessage): Boolean {
+            val supportsExpansion = item.kind == MessageKind.USER ||
+                item.kind == MessageKind.ASSISTANT ||
+                item.kind == MessageKind.CONFIRMATION
+            return supportsExpansion && item.body.length > CHAT_MESSAGE_COLLAPSE_CHAR_THRESHOLD
+        }
+
+        private fun bindCopyOnLongClick(view: TextView, textProvider: () -> String) {
+            view.setTextIsSelectable(false)
+            view.setOnLongClickListener {
+                val text = textProvider().trim()
+                if (text.isBlank()) return@setOnLongClickListener false
+                val clipboard = itemView.context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("message", text))
+                Toast.makeText(itemView.context, R.string.message_copied, Toast.LENGTH_SHORT).show()
+                true
             }
         }
 
