@@ -3731,6 +3731,67 @@ def codex_usage_payload(usage: Optional[CodexUsage]) -> dict[str, Optional[int]]
     }
 
 
+def looks_like_technical_reference(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return False
+    if "/" in normalized or "\\" in normalized:
+        return True
+    if re.search(r"\.(dart|kt|java|xml|gradle|json|ya?ml|py|md|txt)$", normalized, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:\(\))?", normalized):
+        return True
+    return bool(re.search(r"[a-z][A-Z]|_", normalized) and re.search(r"[A-Za-z]", normalized))
+
+
+def sanitize_codex_followup_user_text(text: str) -> str:
+    if not text:
+        return ""
+
+    sanitized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def replace_inline_code(match: re.Match[str]) -> str:
+        content = match.group(1)
+        return "앱 내부 구현" if looks_like_technical_reference(content) else content
+
+    sanitized = re.sub(r"`([^`\n]{1,160})`", replace_inline_code, sanitized)
+    sanitized = re.sub(
+        r"(?<![\w가-힣])(?:/[\w./~@:+-]+|(?:project|lib|android|ios|web|test|build|src|app|res|values|logs|revisions|workspace|workspaces)[\w./-]+)",
+        "앱 내부 구현",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(
+        r"(?<![\w가-힣])[\w.-]+(?:/[\w.-]+)+\.(?:dart|kt|java|xml|gradle|json|ya?ml|py|md|txt)(?![\w가-힣])",
+        "앱 내부 구현",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(
+        r"(?<![\w가-힣])[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b(?:\(\))?",
+        "앱 내부 구현",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?<![\w가-힣])[A-Za-z_][A-Za-z0-9_]*\(\)",
+        "앱 내부 동작",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?<![\w가-힣])_?[A-Za-z]+(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)[A-Za-z0-9_]*(?![\w가-힣])",
+        "앱 내부 구현",
+        sanitized,
+    )
+    sanitized = re.sub(r"\bline\s*\d+\b", "해당 부분", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"\d+\s*번째\s*줄|\d+\s*번\s*줄|\d+\s*줄", "해당 부분", sanitized)
+    sanitized = sanitized.replace("앱 내부 구현의 앱 내부 구현", "앱 내부 구현")
+    sanitized = sanitized.replace("앱 내부 구현의 앱 내부 동작", "앱 내부 구현")
+    sanitized = sanitized.replace("앱 내부 구현가", "앱 내부 구현이")
+    sanitized = sanitized.replace("앱 내부 구현는", "앱 내부 구현은")
+    sanitized = sanitized.replace("앱 내부 구현를", "앱 내부 구현을")
+    return sanitized
+
+
 def run_codex_existing_task_followup_decision(
     settings: Settings,
     db: Database,
@@ -3785,6 +3846,7 @@ The existing app source code is already available in the `project` directory ins
 Read the actual code and project files as needed before deciding.
 
 User-facing language must be Korean.
+The user is a non-technical end user. User-visible text must explain behavior in plain words.
 
 Hard rules:
 - Do not modify source files.
@@ -3798,7 +3860,10 @@ Decide the latest user message into exactly one mode:
 - `build`: the user is asking to change, fix, add, remove, redesign, rebuild, or otherwise modify the existing app. Do not perform the change in this preflight step.
 - `ask_confirmation`: the request cannot be safely answered or built without one or more blocking details.
 
-For `answer_question`, include a concise but concrete Korean `assistant_reply`. Cite relevant file paths when useful.
+For `answer_question`, include a concise but concrete Korean `assistant_reply` for a normal app user.
+Do not include file paths, folder names, line numbers, package names, class names, function names, variable names, stack trace symbols, or code identifiers in `assistant_reply` or `questions`.
+If implementation details matter, translate them into user-facing concepts such as "화면 전환 처리", "저장 처리", "AI 응답 처리", or "대화 기록 처리".
+Put developer-facing references only in `referenced_files`, never in `assistant_reply`.
 For `build`, leave `assistant_reply` empty and put the code-aware build instruction in `effective_user_prompt`.
 If `previous_conversation_state.awaiting_confirmation` is true and the latest user message answers that pending question, merge the pending request and latest answer into `effective_user_prompt`.
 For `ask_confirmation`, include 1-3 short Korean `questions`.
@@ -3881,6 +3946,14 @@ Context:
     mode = normalize_whitespace(str(parsed.get("mode") or ""))
     if mode not in {"answer_question", "build", "ask_confirmation"}:
         return None
+    if mode == "answer_question":
+        parsed["assistant_reply"] = sanitize_codex_followup_user_text(str(parsed.get("assistant_reply") or ""))
+    if mode == "ask_confirmation":
+        parsed["questions"] = [
+            sanitize_codex_followup_user_text(str(item))
+            for item in parsed.get("questions", [])
+            if normalize_whitespace(str(item))
+        ]
 
     usage = parse_codex_usage_from_jsonl(stdout_path)
     raw_output_text = json.dumps(parsed, ensure_ascii=False)
