@@ -733,6 +733,8 @@ class Settings:
     intent_agent_enabled: bool
     intent_agent_model: str
     intent_agent_timeout_seconds: int
+    codex_existing_task_followup_enabled: bool
+    codex_followup_decision_timeout_seconds: int
     app_runtime_enabled_by_default: bool
     app_runtime_provider: str
     app_runtime_model: str
@@ -779,6 +781,8 @@ def load_settings() -> Settings:
         intent_agent_enabled=env_flag("INTENT_AGENT_ENABLED", not mock_codex),
         intent_agent_model=os.getenv("INTENT_AGENT_MODEL", "gpt-5.4").strip() or "gpt-5.4",
         intent_agent_timeout_seconds=max(5, int(os.getenv("INTENT_AGENT_TIMEOUT_SECONDS", "20"))),
+        codex_existing_task_followup_enabled=env_flag("CODEX_EXISTING_TASK_FOLLOWUP_ENABLED", True),
+        codex_followup_decision_timeout_seconds=max(10, int(os.getenv("CODEX_FOLLOWUP_DECISION_TIMEOUT_SECONDS", "90"))),
         app_runtime_enabled_by_default=runtime_enabled_default,
         app_runtime_provider=os.getenv("APP_RUNTIME_PROVIDER", "openai").strip() or "openai",
         app_runtime_model=os.getenv("APP_RUNTIME_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini",
@@ -3716,6 +3720,189 @@ def log_agent_output_event(
     )
 
 
+def codex_usage_payload(usage: Optional[CodexUsage]) -> dict[str, Optional[int]]:
+    return {
+        "input_tokens": usage.input_tokens if usage else None,
+        "cached_input_tokens": usage.cached_input_tokens if usage else None,
+        "output_tokens": usage.output_tokens if usage else None,
+        "cached_output_tokens": None,
+        "reasoning_output_tokens": usage.reasoning_output_tokens if usage else None,
+        "total_tokens": usage.total_tokens if usage else None,
+    }
+
+
+def run_codex_existing_task_followup_decision(
+    settings: Settings,
+    db: Database,
+    task: dict[str, Any],
+    *,
+    prompt: str,
+    previous_conversation_state: dict[str, Any],
+    device_info: Optional[dict[str, Any]] = None,
+    reference_image_name: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    workspace_value = normalize_whitespace(str(task.get("workspace_path") or ""))
+    project_value = normalize_whitespace(str(task.get("project_path") or ""))
+    if not workspace_value or not project_value:
+        return None
+
+    workspace_path = Path(workspace_value).resolve()
+    project_path = Path(project_value).resolve()
+    if not workspace_path.exists() or not workspace_path.is_dir():
+        return None
+    if not project_path.exists() or not project_path.is_dir():
+        return None
+    if not ensure_within_root(project_path, workspace_path):
+        return None
+
+    request_id = uuid.uuid4().hex[:12]
+    result_relative_path = f".codex_result/followup_decision_{request_id}.json"
+    result_path = workspace_path / result_relative_path
+    stdout_path = workspace_path / "logs" / f"followup_decision_{request_id}_stdout.log"
+    stderr_path = workspace_path / "logs" / f"followup_decision_{request_id}_stderr.log"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+
+    current_app_context = build_current_app_context(previous_conversation_state)
+    safe_previous_conversation_state = dict(previous_conversation_state)
+    if safe_previous_conversation_state.get("reference_image_base64"):
+        safe_previous_conversation_state["reference_image_base64"] = "[omitted]"
+    context_payload = {
+        "task_id": task.get("task_id") or "",
+        "app_name": current_task_app_name(task, previous_conversation_state),
+        "package_name": current_task_package_name(task, previous_conversation_state),
+        "latest_user_prompt": prompt,
+        "current_app_context": current_app_context,
+        "previous_conversation_state": safe_previous_conversation_state,
+        "device_info": device_info or {},
+        "reference_image_name": normalize_reference_image_name(reference_image_name),
+        "project_path": str(project_path),
+    }
+    context_json = json.dumps(context_payload, ensure_ascii=False, indent=2)
+    codex_prompt = f"""You are the VibeFactory Codex follow-up decision agent for an existing Flutter Android app.
+
+The existing app source code is already available in the `project` directory inside this workspace.
+Read the actual code and project files as needed before deciding.
+
+User-facing language must be Korean.
+
+Hard rules:
+- Do not modify source files.
+- Do not build the app.
+- Do not run destructive commands.
+- Only write the final machine-readable result JSON to `{result_relative_path}`.
+- Do not wrap the JSON in Markdown.
+
+Decide the latest user message into exactly one mode:
+- `answer_question`: the user is asking about the existing app, its implementation, files, behavior, cause of an issue, or what happened. Answer from the actual code/workspace.
+- `build`: the user is asking to change, fix, add, remove, redesign, rebuild, or otherwise modify the existing app. Do not perform the change in this preflight step.
+- `ask_confirmation`: the request cannot be safely answered or built without one or more blocking details.
+
+For `answer_question`, include a concise but concrete Korean `assistant_reply`. Cite relevant file paths when useful.
+For `build`, leave `assistant_reply` empty and put the code-aware build instruction in `effective_user_prompt`.
+If `previous_conversation_state.awaiting_confirmation` is true and the latest user message answers that pending question, merge the pending request and latest answer into `effective_user_prompt`.
+For `ask_confirmation`, include 1-3 short Korean `questions`.
+
+Result JSON schema:
+{{
+  "mode": "answer_question | build | ask_confirmation",
+  "effective_user_prompt": "string",
+  "assistant_reply": "string",
+  "questions": ["string"],
+  "reason": "string",
+  "referenced_files": ["string"]
+}}
+
+Context:
+```json
+{context_json}
+```
+"""
+
+    placeholder = "__CODEX_PROMPT_PLACEHOLDER_6F4A1F45__"
+    try:
+        command_text = settings.codex_command.format(
+            prompt=placeholder,
+            task_id=str(task.get("task_id") or ""),
+            workspace=str(workspace_path),
+            project=str(project_path),
+        )
+    except KeyError:
+        return None
+
+    args = shlex.split(command_text)
+    args = [part.replace(placeholder, codex_prompt) for part in args]
+    env = os.environ.copy()
+    env["CI"] = "1"
+
+    exit_code: Optional[int] = None
+    timed_out = False
+    try:
+        with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+            completed = subprocess.run(
+                args,
+                cwd=workspace_path,
+                env=env,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                timeout=settings.codex_followup_decision_timeout_seconds,
+                check=False,
+            )
+            exit_code = completed.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    except OSError:
+        return None
+
+    if not result_path.exists():
+        stdout_text = read_text_if_exists(stdout_path, limit=12000)
+        stderr_text = read_text_if_exists(stderr_path, limit=12000)
+        db.log_event(
+            str(task.get("task_id") or ""),
+            actor="system",
+            event_type="codex_followup_decision_failed",
+            message_text="기존 앱 follow-up 판단 결과 파일이 생성되지 않았습니다.",
+            payload={
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "stdout_tail": "\n".join(tail_lines(stdout_text, 40)),
+                "stderr_tail": "\n".join(tail_lines(stderr_text, 40)),
+            },
+        )
+        return None
+
+    try:
+        parsed = json.loads(result_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    mode = normalize_whitespace(str(parsed.get("mode") or ""))
+    if mode not in {"answer_question", "build", "ask_confirmation"}:
+        return None
+
+    usage = parse_codex_usage_from_jsonl(stdout_path)
+    raw_output_text = json.dumps(parsed, ensure_ascii=False)
+    log_agent_output_event(
+        db,
+        str(task.get("task_id") or ""),
+        agent_name="codex_existing_task_followup",
+        model=infer_model_name_from_codex_command(settings.codex_command),
+        raw_output_text=raw_output_text,
+        parsed_result=parsed,
+        usage=codex_usage_payload(usage),
+        raw_response={
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "result_path": result_relative_path,
+            "stdout_log": str(stdout_path.relative_to(workspace_path).as_posix()),
+            "stderr_log": str(stderr_path.relative_to(workspace_path).as_posix()),
+        },
+    )
+    return parsed
+
+
 def apply_project_defaults(project_root: Path, task_id: str, app_name: str, package_name: str) -> None:
     manifest_path = project_root / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
     manifest_text = read_text_if_exists(manifest_path, limit=100_000)
@@ -6009,18 +6196,117 @@ def create_app() -> FastAPI:
                 previous_conversation_state.get("reference_image_base64")
             )
             existing_workspace_ready = bool(task.get("workspace_path") and task.get("project_path"))
-            decision = decide_intent(
-                request.prompt,
-                followup_task_id,
-                existing_task=True,
-                existing_workspace_ready=existing_workspace_ready,
-                previous_conversation_state=previous_conversation_state,
-                device_info=request_device_info or previous_conversation_state.get("device_info"),
-                reference_image_name=effective_reference_image_name,
-                reference_image_base64=effective_reference_image_base64,
-                settings=settings,
-                db=db,
+            codex_followup_enabled = (
+                settings.codex_existing_task_followup_enabled
+                and not settings.mock_codex
+                and existing_workspace_ready
             )
+            if codex_followup_enabled:
+                codex_followup_payload = run_codex_existing_task_followup_decision(
+                    settings,
+                    db,
+                    task,
+                    prompt=request.prompt,
+                    previous_conversation_state=previous_conversation_state,
+                    device_info=request_device_info or previous_conversation_state.get("device_info"),
+                    reference_image_name=effective_reference_image_name,
+                )
+
+                codex_followup_mode = normalize_whitespace(str((codex_followup_payload or {}).get("mode") or ""))
+                if not codex_followup_payload:
+                    decision = build_intent_decision(
+                        mode="answer_question",
+                        task_id=followup_task_id,
+                        existing_task=True,
+                        existing_workspace_ready=True,
+                        user_prompt=request.prompt,
+                        effective_user_prompt=request.prompt,
+                        reason="기존 앱 workspace를 확인하는 Codex follow-up 단계가 완료되지 않았습니다.",
+                        assistant_message="기존 앱을 확인하는 작업을 완료하지 못했어요. 잠시 후 다시 시도하거나 연구원에게 문의해 주세요.",
+                        request_scope="existing_app_modification",
+                    )
+                elif codex_followup_mode == "answer_question":
+                    assistant_reply = korean_text_or_fallback(
+                        str((codex_followup_payload or {}).get("assistant_reply") or ""),
+                        "기존 앱 코드를 확인했지만 답변을 정리하지 못했어요. 조금 더 구체적으로 물어봐 주세요.",
+                    )
+                    decision = build_intent_decision(
+                        mode="answer_question",
+                        task_id=followup_task_id,
+                        existing_task=True,
+                        existing_workspace_ready=True,
+                        user_prompt=request.prompt,
+                        effective_user_prompt=request.prompt,
+                        reason=korean_text_or_fallback(
+                            str((codex_followup_payload or {}).get("reason") or ""),
+                            "기존 앱 workspace를 Codex가 직접 확인해 답변합니다.",
+                        ),
+                        assistant_message=assistant_reply,
+                        request_scope="existing_app_modification",
+                    )
+                elif codex_followup_mode == "ask_confirmation":
+                    codex_questions = [
+                        normalize_whitespace(str(item))
+                        for item in (codex_followup_payload or {}).get("questions", [])
+                        if normalize_whitespace(str(item))
+                    ]
+                    decision = build_intent_decision(
+                        mode="ask_confirmation",
+                        task_id=followup_task_id,
+                        existing_task=True,
+                        existing_workspace_ready=True,
+                        user_prompt=request.prompt,
+                        effective_user_prompt=normalize_whitespace(
+                            str((codex_followup_payload or {}).get("effective_user_prompt") or request.prompt)
+                        ),
+                        questions=codex_questions or build_clarification_questions(request.prompt),
+                        reason=korean_text_or_fallback(
+                            str((codex_followup_payload or {}).get("reason") or ""),
+                            "기존 앱 코드를 확인했지만 수정 전에 막히는 세부사항이 있어요.",
+                        ),
+                        request_scope="existing_app_modification",
+                        suggested_app_name=current_task_app_name(task, previous_conversation_state),
+                    )
+                else:
+                    decision = build_intent_decision(
+                        mode="build",
+                        task_id=followup_task_id,
+                        existing_task=True,
+                        existing_workspace_ready=True,
+                        user_prompt=request.prompt,
+                        effective_user_prompt=normalize_whitespace(
+                            str((codex_followup_payload or {}).get("effective_user_prompt") or request.prompt)
+                        ),
+                        reason=korean_text_or_fallback(
+                            str((codex_followup_payload or {}).get("reason") or ""),
+                            "기존 앱 workspace가 있으므로 명세 구체화 Agent를 거치지 않고 Codex가 직접 수정합니다.",
+                        ),
+                        request_scope="existing_app_modification",
+                        suggested_app_name=current_task_app_name(task, previous_conversation_state),
+                        primary_user_flow=normalize_whitespace(
+                            str(previous_conversation_state.get("latest_primary_user_flow") or request.prompt)
+                        ),
+                        secondary_requirements=normalize_secondary_requirements(
+                            previous_conversation_state.get("latest_secondary_requirements")
+                        ),
+                        secondary_scope_confirmed=True,
+                        acceptance_criteria=normalize_acceptance_criteria(
+                            previous_conversation_state.get("latest_acceptance_criteria")
+                        ),
+                    )
+            else:
+                decision = decide_intent(
+                    request.prompt,
+                    followup_task_id,
+                    existing_task=True,
+                    existing_workspace_ready=existing_workspace_ready,
+                    previous_conversation_state=previous_conversation_state,
+                    device_info=request_device_info or previous_conversation_state.get("device_info"),
+                    reference_image_name=effective_reference_image_name,
+                    reference_image_base64=effective_reference_image_base64,
+                    settings=settings,
+                    db=db,
+                )
             if effective_reference_image_name and not decision.image_reference_summary:
                 decision = replace(
                     decision,
