@@ -53,7 +53,7 @@ internal object TaskLogDetailFormatter {
         val status = summary?.status?.trim()?.takeIf { it.isNotBlank() }
             ?: currentStatus.trim().takeIf { it.isNotBlank() }
             ?: "상태 없음"
-        val taskIdShort = taskId.trim().take(8)
+        val normalizedTaskId = taskId.trim()
         val visibleMessages = messages
             .filterNot { it.kind == MessageKind.BUILD_LOG }
             .mapNotNull { messageToItem(it, formatTimestamp) }
@@ -79,7 +79,7 @@ internal object TaskLogDetailFormatter {
         return TaskLogDetailPayload(
             title = "$appName · 작업 로그",
             appName = appName,
-            taskId = taskIdShort,
+            taskId = normalizedTaskId,
             status = status,
             statusTone = statusTone(status),
             lastUpdated = lastUpdated,

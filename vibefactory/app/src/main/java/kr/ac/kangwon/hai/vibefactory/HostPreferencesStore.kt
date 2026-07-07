@@ -344,7 +344,12 @@ class HostPreferencesStore(
         return message.copy(
             body = truncateForPrefs(message.body, MAX_PERSISTED_BODY_CHARS),
             detail = message.detail?.let { truncateForPrefs(it, MAX_PERSISTED_DETAIL_CHARS) },
-            imagePreviewBase64 = message.imagePreviewBase64?.take(MAX_PERSISTED_IMAGE_PREVIEW_CHARS)
+            imagePreviewBase64 = message.imagePreviewBase64?.take(MAX_PERSISTED_IMAGE_PREVIEW_CHARS),
+            imagePreviews = message.imagePreviews.orEmpty()
+                .take(8)
+                .map { preview ->
+                    preview.copy(base64 = preview.base64.take(MAX_PERSISTED_IMAGE_PREVIEW_CHARS))
+                }
         )
     }
 

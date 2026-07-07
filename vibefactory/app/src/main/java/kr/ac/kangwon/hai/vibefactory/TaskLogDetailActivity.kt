@@ -10,6 +10,7 @@ import android.view.View
 import android.widget.Button
 import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -31,6 +32,8 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private var apkAction: TaskLogApkAction? = null
     private var downloadedApkFile: File? = null
     private var isDownloadingApk = false
+    private var boundPayload: TaskLogDetailPayload? = null
+    private var revisionOptions: List<TaskRevisionDto> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,6 +50,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
     }
 
     private fun bindPayload(payload: TaskLogDetailPayload) {
+        boundPayload = payload
         findViewById<TextView>(R.id.taskLogTitle).text = payload.title
         findViewById<TextView>(R.id.taskLogAppName).text = payload.appName
         findViewById<TextView>(R.id.taskLogStatusBadge).apply {
@@ -62,15 +66,112 @@ class TaskLogDetailActivity : AppCompatActivity() {
             )
         }
         findViewById<TextView>(R.id.taskLogMeta).text = buildString {
-            if (payload.taskId.isNotBlank()) append("작업 ID ${payload.taskId}\n")
+            if (payload.taskId.isNotBlank()) append("작업 ID ${payload.taskId.take(8)}\n")
             append("마지막 업데이트 ${payload.lastUpdated}")
         }
+        bindRevisionSelector(payload, emptyList())
+        loadRevisions(payload)
         bindApkAction(payload.apkAction)
 
         val sections = findViewById<LinearLayout>(R.id.taskLogSectionsContainer)
         sections.removeAllViews()
         sections.addView(sectionCard("진행 단계", payload.progressItems))
         sections.addView(sectionCard("작업 메모", payload.agentItems))
+    }
+
+    private fun loadRevisions(payload: TaskLogDetailPayload) {
+        val taskId = payload.taskId.trim()
+        if (taskId.isBlank()) return
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    apiService.getTaskRevisions(
+                        taskId = taskId,
+                        deviceId = preferencesStore.getOrCreateDeviceId(),
+                        userId = null,
+                        phoneNumber = preferencesStore.loadPhoneNumber()
+                    )
+                }
+            }
+            result.onSuccess { response ->
+                revisionOptions = response.revisions
+                bindRevisionSelector(payload, revisionOptions)
+            }.onFailure { error ->
+                Toast.makeText(
+                    this@TaskLogDetailActivity,
+                    getString(R.string.task_log_revision_load_failed, userVisibleErrorMessage(error)),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    private fun bindRevisionSelector(payload: TaskLogDetailPayload, revisions: List<TaskRevisionDto>) {
+        val selector = findViewById<LinearLayout>(R.id.taskLogRevisionSelector)
+        val value = findViewById<TextView>(R.id.taskLogRevisionValue)
+        val visibleRevisions = revisions.filter { it.revision_label.isNotBlank() || it.version_name.isNotBlank() }
+        if (visibleRevisions.isEmpty()) {
+            selector.visibility = View.GONE
+            selector.setOnClickListener(null)
+            return
+        }
+        val selected = visibleRevisions.firstOrNull { it.is_current } ?: visibleRevisions.last()
+        selector.visibility = View.VISIBLE
+        value.text = revisionDisplayLabel(selected)
+        selector.setOnClickListener {
+            showRevisionMenu(selector, payload, visibleRevisions)
+        }
+    }
+
+    private fun showRevisionMenu(anchor: View, payload: TaskLogDetailPayload, revisions: List<TaskRevisionDto>) {
+        val menu = PopupMenu(this, anchor)
+        revisions.forEachIndexed { index, revision ->
+            menu.menu.add(0, index, index, revisionMenuLabel(revision))
+        }
+        menu.setOnMenuItemClickListener { item ->
+            val revision = revisions.getOrNull(item.itemId) ?: return@setOnMenuItemClickListener false
+            findViewById<TextView>(R.id.taskLogRevisionValue).text = revisionDisplayLabel(revision)
+            bindApkAction(apkActionForRevision(payload, revision))
+            true
+        }
+        menu.show()
+    }
+
+    private fun apkActionForRevision(payload: TaskLogDetailPayload, revision: TaskRevisionDto): TaskLogApkAction? {
+        if (!revision.has_apk || revision.apk_path.isNullOrBlank()) return null
+        val taskId = revision.task_id.ifBlank { payload.taskId }
+        val version = revision.version_name.ifBlank { revision.revision_label }
+        return TaskLogApkAction(
+            taskId = taskId,
+            title = "${payload.appName} $version APK",
+            meta = listOf(version, revision.revision_label, formatBytes(revision.apk_size_bytes))
+                .filter { it.isNotBlank() }
+                .distinct()
+                .joinToString(" · "),
+            apkUrl = revision.apk_url?.takeIf { it.isNotBlank() } ?: "${HostAppConfig.BASE_URL}/download/$taskId",
+            artifactPath = revision.apk_path,
+            downloadedPath = null
+        )
+    }
+
+    private fun revisionDisplayLabel(revision: TaskRevisionDto): String {
+        val version = revision.version_name.ifBlank { revision.revision_label.ifBlank { "버전" } }
+        return if (revision.is_current) "$version · 현재" else version
+    }
+
+    private fun revisionMenuLabel(revision: TaskRevisionDto): String {
+        val source = revision.source.takeIf { it.isNotBlank() }
+        val apk = if (revision.has_apk) "APK" else "APK 없음"
+        return listOf(revisionDisplayLabel(revision), source, apk)
+            .filterNotNull()
+            .joinToString(" · ")
+    }
+
+    private fun formatBytes(value: Long?): String {
+        val bytes = value ?: return ""
+        if (bytes <= 0L) return ""
+        val mb = bytes / (1024.0 * 1024.0)
+        return String.format(java.util.Locale.US, "%.1f MB", mb)
     }
 
     private fun bindApkAction(action: TaskLogApkAction?) {

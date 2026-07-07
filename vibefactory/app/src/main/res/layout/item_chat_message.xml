@@ -123,6 +123,14 @@
             android:scaleType="centerCrop"
             android:visibility="gone" />
 
+        <LinearLayout
+            android:id="@+id/messageImagePreviewList"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="vertical"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/messageBody"
             android:layout_width="wrap_content"
@@ -159,6 +167,22 @@
                 app:indicatorColor="@color/accent_primary"
                 app:indicatorSize="24dp"
                 app:trackThickness="3dp" />
+
+            <TextView
+                android:id="@+id/btnCancelBuild"
+                android:layout_width="wrap_content"
+                android:layout_height="30dp"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bg_button_secondary"
+                android:gravity="center"
+                android:minWidth="48dp"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:text="@string/build_cancel"
+                android:textColor="@color/text_primary"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
         </LinearLayout>
 
         <TextView

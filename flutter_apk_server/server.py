@@ -1,5 +1,6 @@
 import base64
 import binascii
+import hashlib
 import json
 import os
 import queue
@@ -7,6 +8,7 @@ import re
 import selectors
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -130,9 +132,17 @@ def default_codex_command(root: Path) -> str:
         "--skip-git-repo-check",
         "--json",
     ]
+    codex_model = os.getenv("CODEX_MODEL", "").strip()
+    if codex_model:
+        args.extend(["--model", shlex.quote(codex_model)])
     reasoning_effort = (os.getenv("CODEX_REASONING_EFFORT", "default").strip().lower() or "default")
-    if reasoning_effort not in {"default", "medium"}:
-        args.extend(["--reasoning-effort", shlex.quote(reasoning_effort)])
+    if reasoning_effort == "default":
+        reasoning_effort = "medium"
+    args.extend(["-c", shlex.quote(f'model_reasoning_effort="{reasoning_effort}"')])
+    service_tier = (os.getenv("CODEX_SERVICE_TIER", "default").strip().lower() or "default")
+    args.extend(["-c", shlex.quote(f'service_tier="{service_tier}"')])
+    if env_flag("CODEX_FAST_MODE", service_tier in {"priority", "fast"}):
+        args.extend(["--enable", "fast_mode"])
     if env_flag("CODEX_DANGEROUS_BYPASS", True):
         args.append("--dangerously-bypass-approvals-and-sandbox")
     else:
@@ -647,16 +657,58 @@ def save_reference_image_attachment(
     reference_image_name: str,
     reference_image_base64: str,
 ) -> Optional[str]:
+    result = save_reference_image_attachment_result(
+        workspace_root,
+        reference_image_name=reference_image_name,
+        reference_image_base64=reference_image_base64,
+    )
+    return str(result.get("workspace_path") or "") or None
+
+
+def reference_attachment_file_metadata(workspace_root: Path, workspace_path: str) -> Optional[dict[str, Any]]:
+    normalized_path = normalize_whitespace(str(workspace_path or ""))
+    if not normalized_path:
+        return None
+    candidate = (workspace_root / normalized_path).resolve()
+    if not ensure_within_root(candidate, workspace_root.resolve()) or not candidate.is_file():
+        return None
+    try:
+        data = candidate.read_bytes()
+    except OSError:
+        return None
+    return {
+        "workspace_path": str(candidate.relative_to(workspace_root.resolve())),
+        "absolute_path": str(candidate),
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def save_reference_image_attachment_result(
+    workspace_root: Path,
+    *,
+    reference_image_name: str,
+    reference_image_base64: str,
+) -> dict[str, Any]:
     normalized_name = normalize_reference_image_name(reference_image_name)
     normalized_base64 = normalize_reference_image_base64(reference_image_base64)
     if not normalized_name or not normalized_base64:
-        return None
+        return {
+            "status": "failed",
+            "error_message": "missing image name or base64 payload",
+        }
     try:
         image_bytes = base64.b64decode(normalized_base64, validate=False)
     except (ValueError, binascii.Error):
-        return None
+        return {
+            "status": "failed",
+            "error_message": "invalid base64 image payload",
+        }
     if not image_bytes:
-        return None
+        return {
+            "status": "failed",
+            "error_message": "empty decoded image payload",
+        }
 
     image_dir = workspace_root / "reference_images"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -665,7 +717,134 @@ def save_reference_image_attachment(
     filename = f"{utc_now_compact()}_{safe_stem}{suffix}"
     image_path = image_dir / filename
     image_path.write_bytes(image_bytes)
-    return str(image_path.relative_to(workspace_root))
+    return {
+        "status": "saved",
+        "workspace_path": str(image_path.relative_to(workspace_root)),
+        "absolute_path": str(image_path),
+        "size_bytes": len(image_bytes),
+        "sha256": hashlib.sha256(image_bytes).hexdigest(),
+    }
+
+
+def normalize_reference_attachments(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in value[:8]:
+        if isinstance(item, BaseModel):
+            raw = item.model_dump()
+        elif isinstance(item, dict):
+            raw = item
+        else:
+            continue
+        attachment_type = normalize_whitespace(str(raw.get("type") or raw.get("payload_type") or "")).lower()
+        mime_type = normalize_whitespace(str(raw.get("mime_type") or raw.get("mimeType") or ""))
+        name = normalize_reference_image_name(raw.get("name") or raw.get("displayName") or raw.get("reference_image_name"))
+        base64_value = normalize_reference_image_base64(raw.get("base64") or raw.get("reference_image_base64"))
+        workspace_path = normalize_whitespace(str(raw.get("workspace_path") or raw.get("reference_image_workspace_path") or ""))
+        if not name:
+            name = "reference_image"
+        is_image = attachment_type == "image" or mime_type.lower().startswith("image/")
+        if not is_image:
+            continue
+        if not base64_value and not workspace_path:
+            continue
+        normalized.append(
+            {
+                "type": "image",
+                "mime_type": mime_type or f"image/{infer_reference_image_suffix(name).lstrip('.')}",
+                "name": name,
+                "base64": base64_value,
+                "workspace_path": workspace_path,
+            }
+        )
+    return normalized
+
+
+def request_reference_attachments(request: "GenerateRequest") -> list[dict[str, str]]:
+    attachments = normalize_reference_attachments(request.attachments)
+    legacy_name = normalize_reference_image_name(request.reference_image_name)
+    legacy_base64 = normalize_reference_image_base64(request.reference_image_base64)
+    if legacy_name and legacy_base64:
+        legacy = {
+            "type": "image",
+            "mime_type": f"image/{infer_reference_image_suffix(legacy_name).lstrip('.')}",
+            "name": legacy_name,
+            "base64": legacy_base64,
+            "workspace_path": "",
+        }
+        if not any(item.get("base64") == legacy_base64 for item in attachments):
+            attachments.insert(0, legacy)
+    return attachments[:8]
+
+
+def first_reference_attachment(attachments: list[dict[str, str]]) -> dict[str, str]:
+    return next((item for item in attachments if item.get("base64") or item.get("workspace_path")), {})
+
+
+def save_reference_attachments(workspace_root: Path, attachments: list[dict[str, str]]) -> list[dict[str, str]]:
+    saved: list[dict[str, str]] = []
+    for attachment in normalize_reference_attachments(attachments):
+        workspace_path = attachment.get("workspace_path") or ""
+        save_result: dict[str, Any] = {}
+        existing_metadata = reference_attachment_file_metadata(workspace_root, workspace_path)
+        if existing_metadata:
+            save_result = {
+                "status": "existing",
+                **existing_metadata,
+            }
+        if attachment.get("base64"):
+            if not existing_metadata:
+                save_result = save_reference_image_attachment_result(
+                    workspace_root,
+                    reference_image_name=attachment.get("name") or "reference_image",
+                    reference_image_base64=attachment.get("base64") or "",
+                )
+            workspace_path = str(save_result.get("workspace_path") or workspace_path)
+        elif not save_result:
+            save_result = {
+                "status": "pending",
+                "error_message": "image payload is referenced by path only or has not been saved yet",
+            }
+        saved.append(
+            {
+                **attachment,
+                "workspace_path": workspace_path,
+                "base64": "" if workspace_path else attachment.get("base64", ""),
+                "save_status": str(save_result.get("status") or ""),
+                "absolute_path": str(save_result.get("absolute_path") or ""),
+                "size_bytes": str(save_result.get("size_bytes") or ""),
+                "sha256": str(save_result.get("sha256") or ""),
+                "error_message": str(save_result.get("error_message") or ""),
+            }
+        )
+    return saved
+
+
+def reference_attachment_event_payload(attachment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": attachment.get("type") or "image",
+        "mime_type": attachment.get("mime_type") or "",
+        "name": attachment.get("name") or "reference_image",
+        "workspace_path": attachment.get("workspace_path") or "",
+        "absolute_path": attachment.get("absolute_path") or "",
+        "size_bytes": int(attachment.get("size_bytes") or 0),
+        "sha256": attachment.get("sha256") or "",
+        "status": attachment.get("save_status") or "",
+        "error_message": attachment.get("error_message") or "",
+    }
+
+
+def reference_attachments_summary(attachments: list[dict[str, str]]) -> str:
+    normalized = normalize_reference_attachments(attachments)
+    if not normalized:
+        return ""
+    names = [item.get("name") or "reference_image" for item in normalized]
+    if len(names) == 1:
+        return build_reference_image_summary(names[0])
+    preview = ", ".join(names[:3])
+    suffix = f" 외 {len(names) - 3}개" if len(names) > 3 else ""
+    return f"참고 이미지 {len(names)}개({preview}{suffix})를 함께 전달받았어요. 각 이미지의 UI, 레이아웃, 콘텐츠 맥락을 함께 참고합니다."
 
 
 def read_text_if_exists(path: Path, limit: Optional[int] = 20000) -> str:
@@ -794,7 +973,7 @@ def load_settings() -> Settings:
         ).strip(),
         app_runtime_daily_request_limit=max(1, int(os.getenv("APP_RUNTIME_DAILY_REQUEST_LIMIT", "100"))),
         app_runtime_daily_token_limit=max(1, int(os.getenv("APP_RUNTIME_DAILY_TOKEN_LIMIT", "50000"))),
-        app_runtime_max_output_tokens=max(64, int(os.getenv("APP_RUNTIME_MAX_OUTPUT_TOKENS", "700"))),
+        app_runtime_max_output_tokens=max(0, int(os.getenv("APP_RUNTIME_MAX_OUTPUT_TOKENS", "0"))),
         app_runtime_temperature=float(os.getenv("APP_RUNTIME_TEMPERATURE", "0.4")),
         admin_api_token=os.getenv("ADMIN_API_TOKEN", "").strip(),
     )
@@ -2703,6 +2882,13 @@ def decide_intent(
     )
 
 
+class GenerateAttachmentPayload(BaseModel):
+    type: str = ""
+    mime_type: str = ""
+    name: str = ""
+    base64: str = ""
+
+
 class GenerateRequest(BaseModel):
     task_id: Optional[str] = None
     device_id: str = Field(..., min_length=1)
@@ -2712,6 +2898,7 @@ class GenerateRequest(BaseModel):
     reference_image_path: Optional[str] = None
     reference_image_name: Optional[str] = None
     reference_image_base64: Optional[str] = None
+    attachments: list[GenerateAttachmentPayload] = Field(default_factory=list)
 
 
 class TaskUpdateRequest(BaseModel):
@@ -2727,7 +2914,7 @@ class AppLlmConfigRequest(BaseModel):
     system_prompt: Optional[str] = None
     daily_request_limit: int = Field(default=100, ge=1)
     daily_token_limit: int = Field(default=50000, ge=1)
-    max_output_tokens: int = Field(default=700, ge=64)
+    max_output_tokens: int = Field(default=0, ge=0)
     temperature: float = Field(default=0.4, ge=0.0, le=2.0)
 
 
@@ -2818,6 +3005,32 @@ class Database:
                 """
             )
             connection.execute("CREATE INDEX IF NOT EXISTS idx_task_events_task_id_created_at ON task_events(task_id, created_at)")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_attachments (
+                    attachment_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    event_id TEXT,
+                    source TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    original_name TEXT,
+                    mime_type TEXT,
+                    workspace_path TEXT,
+                    absolute_path TEXT,
+                    size_bytes INTEGER,
+                    sha256 TEXT,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_attachments_task_id_created_at ON task_attachments(task_id, created_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_attachments_sha256 ON task_attachments(sha256)"
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS app_llm_configs (
@@ -2946,6 +3159,22 @@ class Database:
             connection.execute(f"UPDATE tasks SET {assignments} WHERE task_id = ?", values)
             connection.commit()
 
+    def update_task_if_status(self, task_id: str, allowed_statuses: set[str], **fields: Any) -> bool:
+        if not fields or not allowed_statuses:
+            return False
+        fields["updated_at"] = utc_now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        status_values = [status.strip().lower() for status in allowed_statuses if status.strip()]
+        placeholders = ", ".join("?" for _ in status_values)
+        values = list(fields.values()) + [task_id] + status_values
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE tasks SET {assignments} WHERE task_id = ? AND lower(status) IN ({placeholders})",
+                values,
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
     def log_event(
         self,
         task_id: str,
@@ -2954,8 +3183,9 @@ class Database:
         event_type: str,
         message_text: str = "",
         payload: Optional[dict[str, Any]] = None,
-    ) -> None:
+    ) -> str:
         created_at = utc_now_iso()
+        event_id = uuid.uuid4().hex
         payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
         with self.connect() as connection:
             connection.execute(
@@ -2965,7 +3195,7 @@ class Database:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    uuid.uuid4().hex,
+                    event_id,
                     task_id,
                     actor,
                     event_type,
@@ -2975,6 +3205,66 @@ class Database:
                 ),
             )
             connection.commit()
+        return event_id
+
+    def record_task_attachment(
+        self,
+        *,
+        task_id: str,
+        event_id: Optional[str],
+        source: str,
+        kind: str,
+        original_name: str,
+        mime_type: str,
+        workspace_path: str,
+        absolute_path: str,
+        size_bytes: Optional[int],
+        sha256: str,
+        status: str,
+        error_message: str = "",
+    ) -> str:
+        attachment_id = uuid.uuid4().hex
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_attachments (
+                    attachment_id, task_id, event_id, source, kind, original_name, mime_type,
+                    workspace_path, absolute_path, size_bytes, sha256, status, error_message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attachment_id,
+                    task_id,
+                    event_id,
+                    source,
+                    kind,
+                    original_name,
+                    mime_type,
+                    workspace_path,
+                    absolute_path,
+                    size_bytes,
+                    sha256,
+                    status,
+                    error_message,
+                    utc_now_iso(),
+                ),
+            )
+            connection.commit()
+        return attachment_id
+
+    def list_task_attachments(self, task_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT attachment_id, task_id, event_id, source, kind, original_name, mime_type,
+                       workspace_path, absolute_path, size_bytes, sha256, status, error_message, created_at
+                FROM task_attachments
+                WHERE task_id = ?
+                ORDER BY rowid ASC
+                """,
+                (task_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def list_events(self, task_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -3027,7 +3317,7 @@ class Database:
                     config.get("system_prompt"),
                     int(config.get("daily_request_limit") or 100),
                     int(config.get("daily_token_limit") or 50000),
-                    int(config.get("max_output_tokens") or 700),
+                    int(config.get("max_output_tokens") if config.get("max_output_tokens") is not None else 0),
                     float(config.get("temperature") or 0.4),
                     created_at,
                     now,
@@ -3266,6 +3556,91 @@ class Database:
             return [dict(row) for row in rows]
 
 
+def task_workspace_root_for(settings: Settings, task: dict[str, Any]) -> Path:
+    safe_user_id = sanitize_component(str(task["user_id"]))
+    safe_task_id = sanitize_component(str(task["task_id"]))
+    return settings.workspaces_root / f"user_{safe_user_id}" / f"task_{safe_task_id}"
+
+
+def persist_reference_attachments_for_task(
+    db: Database,
+    settings: Settings,
+    task: dict[str, Any],
+    attachments: list[dict[str, str]],
+    *,
+    source: str,
+    event_id: Optional[str] = None,
+    fail_on_error: bool = True,
+) -> list[dict[str, str]]:
+    normalized = normalize_reference_attachments(attachments)
+    if not normalized:
+        return []
+
+    task_root = task_workspace_root_for(settings, task)
+    saved_attachments = save_reference_attachments(task_root, normalized)
+    first_attachment = first_reference_attachment(saved_attachments)
+    first_workspace_path = normalize_whitespace(str(first_attachment.get("workspace_path") or ""))
+    if saved_attachments:
+        task["reference_attachments"] = saved_attachments
+    if first_workspace_path:
+        task["reference_image_workspace_path"] = first_workspace_path
+
+    failed_messages: list[str] = []
+    for attachment in saved_attachments:
+        payload = reference_attachment_event_payload(attachment)
+        status = str(payload.get("status") or "unknown")
+        error_message = str(payload.get("error_message") or "")
+        attachment_id = db.record_task_attachment(
+            task_id=str(task["task_id"]),
+            event_id=event_id,
+            source=source,
+            kind="image",
+            original_name=str(payload.get("name") or "reference_image"),
+            mime_type=str(payload.get("mime_type") or ""),
+            workspace_path=str(payload.get("workspace_path") or ""),
+            absolute_path=str(payload.get("absolute_path") or ""),
+            size_bytes=int(payload.get("size_bytes") or 0) or None,
+            sha256=str(payload.get("sha256") or ""),
+            status=status,
+            error_message=error_message,
+        )
+        payload = {
+            **payload,
+            "attachment_id": attachment_id,
+            "source": source,
+            "linked_event_id": event_id or "",
+        }
+        if status in {"saved", "existing"}:
+            db.log_event(
+                str(task["task_id"]),
+                actor="system",
+                event_type="attachment_saved",
+                message_text=f"이미지 첨부 저장됨: {payload.get('name') or 'reference_image'}",
+                payload=payload,
+            )
+        elif status == "pending":
+            db.log_event(
+                str(task["task_id"]),
+                actor="system",
+                event_type="attachment_received",
+                message_text=f"이미지 첨부 정보 수신됨: {payload.get('name') or 'reference_image'}",
+                payload=payload,
+            )
+        else:
+            failed_messages.append(error_message or f"failed to save {payload.get('name') or 'reference_image'}")
+            db.log_event(
+                str(task["task_id"]),
+                actor="system",
+                event_type="attachment_save_failed",
+                message_text=f"이미지 첨부 저장 실패: {payload.get('name') or 'reference_image'}",
+                payload=payload,
+            )
+
+    if fail_on_error and failed_messages:
+        raise ValueError("; ".join(failed_messages))
+    return saved_attachments
+
+
 def render_task_agents_md(task_id: str) -> str:
     return f"""# Task Workspace Instructions
 
@@ -3372,16 +3747,36 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
     reference_image_workspace_path = normalize_whitespace(
         str(conversation_state.get("reference_image_workspace_path") or task.get("reference_image_workspace_path") or "")
     )
+    reference_attachments = normalize_reference_attachments(
+        conversation_state.get("reference_attachments") or task.get("reference_attachments") or []
+    )
+    if not reference_attachments and reference_image_name:
+        reference_attachments = [
+            {
+                "type": "image",
+                "mime_type": f"image/{infer_reference_image_suffix(reference_image_name).lstrip('.')}",
+                "name": reference_image_name,
+                "base64": normalize_reference_image_base64(
+                    conversation_state.get("reference_image_base64") or task.get("reference_image_base64")
+                ),
+                "workspace_path": reference_image_workspace_path,
+            }
+        ]
     secondary_section = "\n".join(f"- {item}" for item in secondary_requirements) if secondary_requirements else "- 없음 또는 미정"
     acceptance_section = "\n".join(f"- {criterion}" for criterion in acceptance_criteria) if acceptance_criteria else "- (없음)"
-    reference_image_section = (
-        f"- 첨부된 참고 이미지 이름: {reference_image_name}\n"
-        f"- workspace 저장 경로: {reference_image_workspace_path or '(미저장)'}\n"
-        "- 이 이미지는 UI 스타일, 화면 구성, 참고 레이아웃, 대상 사물/장면, 텍스트 맥락을 해석하는 데 사용한다.\n"
-        "- 사용자가 텍스트로 설명한 요구와 이미지가 함께 있으면 둘을 함께 반영하되, 충돌 시에는 사용자 텍스트 요청을 우선하고 차이를 명시한다."
-        if reference_image_name
-        else "- 첨부된 참고 이미지 없음"
-    )
+    if reference_attachments:
+        reference_lines = []
+        for index, attachment in enumerate(reference_attachments, start=1):
+            reference_lines.append(
+                f"- 이미지 {index}: {attachment.get('name') or 'reference_image'} "
+                f"(workspace 경로: {attachment.get('workspace_path') or '(미저장)'})"
+            )
+        reference_image_section = "\n".join(reference_lines) + (
+            "\n- 이 이미지들은 UI 스타일, 화면 구성, 참고 레이아웃, 대상 사물/장면, 텍스트 맥락을 해석하는 데 사용한다.\n"
+            "- 사용자가 텍스트로 설명한 요구와 이미지가 함께 있으면 둘을 함께 반영하되, 충돌 시에는 사용자 텍스트 요청을 우선하고 차이를 명시한다."
+        )
+    else:
+        reference_image_section = "- 첨부된 참고 이미지 없음"
     return f"""# Task Request
 
 - task_id: {task['task_id']}
@@ -4159,6 +4554,8 @@ def status_display_text(status: str, message: Optional[str] = None) -> str:
         return "요청을 대기열에 넣었어요."
     if normalized == "running":
         return "앱을 생성하고 있어요."
+    if normalized in {"cancelled", "canceled"}:
+        return (message or "앱 생성을 중단했어요.").strip()
     if normalized == "success":
         return "앱 생성이 완료되었어요."
     if normalized == "failed":
@@ -4168,6 +4565,10 @@ def status_display_text(status: str, message: Optional[str] = None) -> str:
     if normalized == "ratelimited":
         return (message or "앱 생성 한도를 모두 사용했어요.").strip()
     return (message or status).strip() or "상태를 확인하고 있어요."
+
+
+def is_cancellable_task_status(status: str) -> bool:
+    return status.strip().lower() in {"queued", "running"}
 
 
 def build_attempts_for_task(task: dict[str, Any]) -> int:
@@ -4494,6 +4895,19 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
     reference_image_name = normalize_reference_image_name(task.get("reference_image_name"))
     reference_image_base64 = normalize_reference_image_base64(task.get("reference_image_base64"))
     reference_image_workspace_path = normalize_whitespace(str(task.get("reference_image_workspace_path") or ""))
+    reference_attachments = normalize_reference_attachments(task.get("reference_attachments") or [])
+    if not reference_attachments and reference_image_name:
+        reference_attachments = [
+            {
+                "type": "image",
+                "mime_type": f"image/{infer_reference_image_suffix(reference_image_name).lstrip('.')}",
+                "name": reference_image_name,
+                "base64": reference_image_base64,
+                "workspace_path": reference_image_workspace_path,
+            }
+        ]
+    if reference_attachments and any(item.get("workspace_path") for item in reference_attachments):
+        reference_image_base64 = ""
     ui_flags = decision_ui_flags(decision)
     state_request_scope = decision.request_scope
     previous_request_scope = normalize_whitespace(str(previous_conversation_state.get("request_scope") or ""))
@@ -4560,6 +4974,7 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "reference_image_name": reference_image_name,
             "reference_image_base64": reference_image_base64,
             "reference_image_workspace_path": reference_image_workspace_path,
+            "reference_attachments": reference_attachments,
             "image_reference_summary": decision.image_reference_summary,
             "image_conflict_note": decision.image_conflict_note,
         },
@@ -4621,6 +5036,7 @@ def build_task_status_payload(task: dict[str, Any]) -> dict[str, Any]:
         apk_path = Path(apk_path_value)
         if apk_path.exists() and apk_path.is_file():
             apk_size_bytes = apk_path.stat().st_size
+    cancel_allowed = is_cancellable_task_status(str(task.get("status") or ""))
     return {
         "status": task.get("status") or "",
         "message": task.get("message") or "",
@@ -4634,6 +5050,8 @@ def build_task_status_payload(task: dict[str, Any]) -> dict[str, Any]:
         "output_tokens": task.get("output_tokens"),
         "reasoning_output_tokens": task.get("reasoning_output_tokens"),
         "total_tokens": task.get("total_tokens"),
+        "cancel_allowed": cancel_allowed,
+        "allowed_next_actions": ["cancel"] if cancel_allowed else [],
     }
 
 
@@ -5035,9 +5453,11 @@ def invoke_app_runtime_model(config: dict[str, Any], request: AppLlmRuntimeReque
                 "content": content_items,
             }
         ],
-        "max_output_tokens": int(config.get("max_output_tokens") or 700),
         "temperature": float(config.get("temperature") or 0.4),
     }
+    max_output_tokens = int(config.get("max_output_tokens") if config.get("max_output_tokens") is not None else 0)
+    if max_output_tokens > 0:
+        payload["max_output_tokens"] = max_output_tokens
 
     with httpx.Client(timeout=httpx.Timeout(timeout=60.0, connect=10.0)) as client:
         response = client.post(
@@ -5072,6 +5492,7 @@ class CodexTaskRunner:
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
         self.active_processes: dict[int, subprocess.Popen] = {}
+        self.active_task_processes: dict[str, subprocess.Popen] = {}
         self.process_lock = threading.Lock()
 
     def start(self) -> None:
@@ -5095,36 +5516,92 @@ class CodexTaskRunner:
             thread.join(timeout=5)
         self.threads.clear()
 
-    def register_process(self, process: subprocess.Popen) -> None:
+    def register_process(self, process: subprocess.Popen, task_id: Optional[str] = None) -> None:
         with self.process_lock:
             self.active_processes[id(process)] = process
+            if task_id:
+                self.active_task_processes[task_id] = process
 
     def unregister_process(self, process: subprocess.Popen) -> None:
         with self.process_lock:
             self.active_processes.pop(id(process), None)
+            for task_id, active_process in list(self.active_task_processes.items()):
+                if active_process is process:
+                    self.active_task_processes.pop(task_id, None)
+
+    def terminate_process(self, process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            self.unregister_process(process)
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            self.unregister_process(process)
+            return
+        except Exception:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                self.unregister_process(process)
+                return
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            process.wait()
+        finally:
+            self.unregister_process(process)
 
     def terminate_active_processes(self) -> None:
         with self.process_lock:
             processes = list(self.active_processes.values())
         for process in processes:
-            if process.poll() is not None:
-                self.unregister_process(process)
-                continue
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                self.unregister_process(process)
-        for process in processes:
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                process.wait()
-            finally:
-                self.unregister_process(process)
+            self.terminate_process(process)
+
+    def terminate_task_process(self, task_id: str) -> None:
+        with self.process_lock:
+            process = self.active_task_processes.get(task_id)
+        if process is not None:
+            self.terminate_process(process)
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        task = self.db.get_task(task_id)
+        return str(task.get("status") or "").strip().lower() in {"cancelled", "canceled"} if task else False
+
+    def cancel_task(self, task_id: str) -> dict[str, Any]:
+        task = self.db.get_task(task_id)
+        if not task:
+            raise KeyError("task not found")
+        status = str(task.get("status") or "")
+        if not is_cancellable_task_status(status):
+            return task
+        did_cancel = self.db.update_task_if_status(
+            task_id,
+            {"queued", "running"},
+            status="Cancelled",
+            message="앱 생성을 중단했어요.",
+        )
+        if not did_cancel:
+            return self.db.get_task(task_id) or task
+        updated_task = self.db.get_task(task_id) or task
+        log_task_status_event(self.db, updated_task, event_type="task_cancelled")
+        log_build_stage_event(
+            self.db,
+            task_id,
+            stage="앱 생성 작업",
+            phase="cancelled",
+            body="사용자가 앱 생성을 중단했어요.",
+        )
+        self.terminate_task_process(task_id)
+        return updated_task
 
     def enqueue(self, task_id: str) -> None:
         self.queue.put(task_id)
@@ -5138,6 +5615,8 @@ class CodexTaskRunner:
             try:
                 self.process_task(task_id)
             except Exception as exc:
+                if self.is_task_cancelled(task_id):
+                    continue
                 self.db.update_task(
                     task_id,
                     status="Error",
@@ -5153,14 +5632,23 @@ class CodexTaskRunner:
         task = self.db.get_task(task_id)
         if not task:
             return
+        if self.is_task_cancelled(task_id):
+            return
 
         workspace_path = Path(task["workspace_path"])
         result_path = workspace_path / ".codex_result" / "task_result.json"
         stdout_path = workspace_path / "logs" / "codex_stdout.log"
         stderr_path = workspace_path / "logs" / "codex_stderr.log"
 
+        did_start = self.db.update_task_if_status(
+            task_id,
+            {"queued"},
+            status="Running",
+            message="앱 생성 작업을 진행하고 있습니다.",
+        )
+        if not did_start:
+            return
         clear_previous_run_artifacts(workspace_path)
-        self.db.update_task(task_id, status="Running", message="앱 생성 작업을 진행하고 있습니다.")
         updated_task = self.db.get_task(task_id)
         if updated_task:
             log_task_status_event(self.db, updated_task)
@@ -5179,7 +5667,7 @@ class CodexTaskRunner:
             exit_code, timed_out = self.run_mock(task, workspace_path, stdout_path, stderr_path, result_path)
         else:
             exit_code, timed_out = self.run_codex(task, workspace_path, stdout_path, stderr_path)
-            if not timed_out and not result_path.exists():
+            if not timed_out and not result_path.exists() and not self.is_task_cancelled(task_id):
                 codex_log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
                 if codex_engine_issue_from_logs(codex_log_text, exit_code) is None:
                     self.attempt_server_side_build(task_id, workspace_path, result_path, exit_code)
@@ -5193,6 +5681,9 @@ class CodexTaskRunner:
         stdout_path: Path,
         stderr_path: Path,
     ) -> tuple[Optional[int], bool]:
+        task_id = str(task["task_id"])
+        if self.is_task_cancelled(task_id):
+            return None, False
         prompt = (workspace_path / "prompt.md").read_text(encoding="utf-8")
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
         prompt_placeholder = "__CODEX_PROMPT_PLACEHOLDER_6F4A1F45__"
@@ -5216,8 +5707,12 @@ class CodexTaskRunner:
                 env=env,
                 stdout=stdout_file,
                 stderr=stderr_file,
+                start_new_session=True,
             )
-            self.register_process(process)
+            self.register_process(process, task_id=task_id)
+            if self.is_task_cancelled(task_id):
+                self.terminate_task_process(task_id)
+                return process.returncode, False
             try:
                 return self.wait_for_process(process), False
             except subprocess.TimeoutExpired:
@@ -5256,7 +5751,10 @@ class CodexTaskRunner:
         cwd: Path,
         env: dict[str, str],
         log_path: Path,
+        task_id: Optional[str] = None,
     ) -> tuple[int, bool]:
+        if task_id and self.is_task_cancelled(task_id):
+            return 1, False
         log_path.parent.mkdir(parents=True, exist_ok=True)
         command_text = " ".join(shlex.quote(part) for part in args)
         with log_path.open("a", encoding="utf-8") as log_file:
@@ -5269,8 +5767,12 @@ class CodexTaskRunner:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 text=True,
+                start_new_session=True,
             )
-            self.register_process(process)
+            self.register_process(process, task_id=task_id)
+            if task_id and self.is_task_cancelled(task_id):
+                self.terminate_task_process(task_id)
+                return process.returncode or 1, False
             try:
                 return self.wait_for_process(process), False
             except subprocess.TimeoutExpired:
@@ -5313,7 +5815,14 @@ class CodexTaskRunner:
         env = self.build_task_env(workspace_path)
         flutter_args = shlex.split(self.settings.flutter_command)
         status_message = "설치 가능한 디버그 APK를 준비하고 있어요."
-        self.db.update_task(task_id, status="Running", message=status_message)
+        did_update = self.db.update_task_if_status(
+            task_id,
+            {"running"},
+            status="Running",
+            message=status_message,
+        )
+        if not did_update:
+            raise RuntimeError("앱 생성이 중단되었습니다.")
         running_task = self.db.get_task(task_id)
         if running_task:
             log_task_status_event(self.db, running_task, event_type="build_stage_debug_prepare")
@@ -5330,7 +5839,10 @@ class CodexTaskRunner:
             cwd=project_path,
             env=env,
             log_path=build_log_path,
+            task_id=task_id,
         )
+        if self.is_task_cancelled(task_id):
+            raise RuntimeError("앱 생성이 중단되었습니다.")
         if timed_out:
             raise RuntimeError("debug APK 빌드가 시간 제한을 초과했습니다.")
         if exit_code != 0:
@@ -5387,7 +5899,16 @@ class CodexTaskRunner:
         }
 
         for stage_key, status_message, args in stages:
-            self.db.update_task(task_id, status="Running", message=status_message)
+            if self.is_task_cancelled(task_id):
+                return
+            did_update = self.db.update_task_if_status(
+                task_id,
+                {"running"},
+                status="Running",
+                message=status_message,
+            )
+            if not did_update:
+                return
             running_task = self.db.get_task(task_id)
             if running_task:
                 log_task_status_event(self.db, running_task, event_type=f"build_stage_{stage_key}")
@@ -5399,7 +5920,15 @@ class CodexTaskRunner:
                 body=status_message,
                 detail="명령을 실행하고 있어요.",
             )
-            exit_code, timed_out = self.run_logged_command(args, cwd=project_path, env=env, log_path=build_log_path)
+            exit_code, timed_out = self.run_logged_command(
+                args,
+                cwd=project_path,
+                env=env,
+                log_path=build_log_path,
+                task_id=task_id,
+            )
+            if self.is_task_cancelled(task_id):
+                return
             if timed_out:
                 log_build_stage_event(
                     self.db,
@@ -5553,6 +6082,8 @@ class CodexTaskRunner:
         timed_out: bool,
     ) -> None:
         task = self.db.get_task(task_id) or {}
+        if self.is_task_cancelled(task_id):
+            return
         usage = parse_codex_usage_from_jsonl(workspace_path / "logs" / "codex_stdout.log")
         codex_model = infer_model_name_from_codex_command(self.settings.codex_command)
         usage_update_fields = {
@@ -5710,6 +6241,8 @@ class CodexTaskRunner:
                 try:
                     apk_path = self.ensure_debug_apk(task_id, workspace_path, current_project_path, apk_path)
                 except Exception as exc:
+                    if self.is_task_cancelled(task_id):
+                        return
                     self.db.update_task(
                         task_id,
                         status="Failed",
@@ -5734,6 +6267,8 @@ class CodexTaskRunner:
                 result["apk_path"] = str(apk_path.relative_to(workspace_path).as_posix())
                 codex_result_json = json.dumps(result, ensure_ascii=False)
                 log_text = collect_task_logs(workspace_path, build_log_hint, full=True)
+                if self.is_task_cancelled(task_id):
+                    return
 
                 if project_looks_like_placeholder_app(current_project_path):
                     self.db.update_task(
@@ -5875,7 +6410,7 @@ def build_task_workspace(settings: Settings, task: dict[str, Any]) -> tuple[Path
     logs_root = task_root / "logs"
     result_root = task_root / ".codex_result"
 
-    if task_root.exists():
+    if task_root.exists() and ((task_root / "project").exists() or (task_root / "revisions").exists()):
         raise RuntimeError(f"task workspace already exists: {task_root}")
 
     settings.workspaces_root.mkdir(parents=True, exist_ok=True)
@@ -5889,11 +6424,22 @@ def build_task_workspace(settings: Settings, task: dict[str, Any]) -> tuple[Path
         )
 
     project_root, _ = create_initial_project_revision(task_root, settings.base_project_path)
-    reference_image_workspace_path = save_reference_image_attachment(
-        task_root,
-        reference_image_name=normalize_reference_image_name(task.get("reference_image_name")),
-        reference_image_base64=normalize_reference_image_base64(task.get("reference_image_base64")),
-    )
+    reference_attachments = normalize_reference_attachments(task.get("reference_attachments") or [])
+    if not reference_attachments:
+        reference_attachments = [
+            {
+                "type": "image",
+                "mime_type": "",
+                "name": normalize_reference_image_name(task.get("reference_image_name")),
+                "base64": normalize_reference_image_base64(task.get("reference_image_base64")),
+                "workspace_path": "",
+            }
+        ]
+    saved_reference_attachments = save_reference_attachments(task_root, reference_attachments)
+    first_attachment = first_reference_attachment(saved_reference_attachments)
+    reference_image_workspace_path = first_attachment.get("workspace_path") or ""
+    if saved_reference_attachments:
+        task["reference_attachments"] = saved_reference_attachments
     if reference_image_workspace_path:
         task["reference_image_workspace_path"] = reference_image_workspace_path
     if task.get("app_name") and task.get("package_name"):
@@ -5923,6 +6469,13 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
     latest_failure_message = (
         latest_assistant_message if task["status"] in {"Failed", "Error"} else sanitize_user_visible_text(str(state_payload.get("latest_failure_message") or ""))
     )
+    retry_allowed = task["status"] in {"Failed", "Error"}
+    cancel_allowed = is_cancellable_task_status(str(task.get("status") or ""))
+    allowed_next_actions = []
+    if retry_allowed:
+        allowed_next_actions.append("retry")
+    if cancel_allowed:
+        allowed_next_actions.append("cancel")
     sanitized_log_text = sanitize_user_visible_text(log_text)
     sanitized_log_lines = [sanitize_user_visible_text(line) for line in log_lines]
     apk_path_value = str(task.get("apk_path") or "")
@@ -5969,11 +6522,65 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
         "requires_confirmation": bool(state_payload.get("requires_confirmation")),
         "pending_decision_reason": str(state_payload.get("pending_decision_reason") or ""),
         "suppress_assistant_bubble": bool(state_payload.get("suppress_assistant_bubble")),
-        "retry_allowed": task["status"] in {"Failed", "Error"},
-        "allowed_next_actions": ["retry"] if task["status"] in {"Failed", "Error"} else [],
+        "retry_allowed": retry_allowed,
+        "cancel_allowed": cancel_allowed,
+        "allowed_next_actions": allowed_next_actions,
         "conversation_state": conversation_state,
         "created_at": task["created_at"],
         "updated_at": task["updated_at"],
+    }
+
+
+def revision_version_name(revision_label: str) -> str:
+    revision_number = revision_number_from_label(revision_label)
+    return f"v{revision_number}" if revision_number > 0 else revision_label
+
+
+def find_revision_apk(workspace_path: Path, project_path: Path, task: dict[str, Any]) -> Optional[Path]:
+    candidates: list[Path] = []
+    task_apk_path = normalize_whitespace(str(task.get("apk_path") or ""))
+    task_project_path = normalize_whitespace(str(task.get("project_path") or ""))
+    if task_apk_path and task_project_path and Path(task_project_path).resolve() == project_path.resolve():
+        candidates.append(Path(task_apk_path))
+    candidates.extend(
+        [
+            project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk",
+            project_path / "build" / "app" / "outputs" / "apk" / "debug" / "app-debug.apk",
+        ]
+    )
+    candidates.extend(sorted((project_path / "build" / "app" / "outputs" / "flutter-apk").glob("*.apk")) if (project_path / "build" / "app" / "outputs" / "flutter-apk").exists() else [])
+    for candidate in candidates:
+        apk_path = candidate if candidate.is_absolute() else workspace_path / candidate
+        apk_path = apk_path.resolve()
+        if ensure_within_root(apk_path, workspace_path) and apk_path.exists() and apk_path.is_file() and apk_path.suffix.lower() == ".apk":
+            return apk_path
+    return None
+
+
+def serialize_project_revision(task: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    workspace_path = Path(str(snapshot.get("workspace_path") or task.get("workspace_path") or "")).resolve()
+    project_path = Path(str(snapshot.get("project_path") or "")).resolve()
+    revision_label = str(snapshot.get("revision_label") or current_revision_label(project_path))
+    apk_path = find_revision_apk(workspace_path, project_path, task) if workspace_path.exists() and project_path.exists() else None
+    artifact_path = ""
+    if apk_path is not None:
+        try:
+            artifact_path = str(apk_path.relative_to(workspace_path).as_posix())
+        except ValueError:
+            artifact_path = str(apk_path)
+    return {
+        "snapshot_id": str(snapshot.get("snapshot_id") or ""),
+        "task_id": str(task.get("task_id") or snapshot.get("task_id") or ""),
+        "revision_label": revision_label,
+        "version_name": revision_version_name(revision_label),
+        "source": str(snapshot.get("source") or ""),
+        "created_at": str(snapshot.get("created_at") or ""),
+        "project_path": str(project_path),
+        "apk_path": artifact_path,
+        "apk_url": f"/download/{task.get('task_id')}" if artifact_path else "",
+        "apk_size_bytes": apk_path.stat().st_size if apk_path is not None else None,
+        "has_apk": apk_path is not None,
+        "is_current": str(task.get("project_path") or "").strip() == str(project_path),
     }
 
 
@@ -6237,8 +6844,14 @@ def create_app() -> FastAPI:
         db: Database = app.state.db
         runner: CodexTaskRunner = app.state.runner
         request_device_info = serialize_device_info(request.device_info)
-        requested_reference_image_name = normalize_reference_image_name(request.reference_image_name)
-        requested_reference_image_base64 = normalize_reference_image_base64(request.reference_image_base64)
+        requested_reference_attachments = request_reference_attachments(request)
+        requested_first_reference = first_reference_attachment(requested_reference_attachments)
+        requested_reference_image_name = normalize_reference_image_name(
+            requested_first_reference.get("name") or request.reference_image_name
+        )
+        requested_reference_image_base64 = normalize_reference_image_base64(
+            requested_first_reference.get("base64") or request.reference_image_base64
+        )
         followup_task_id = (request.task_id or "").strip()
 
         if followup_task_id:
@@ -6249,7 +6862,7 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="task not found")
             if task["status"] in {"Queued", "Running"}:
                 raise HTTPException(status_code=409, detail="task already in progress")
-            db.log_event(
+            user_event_id = db.log_event(
                 followup_task_id,
                 actor="user",
                 event_type="user_message",
@@ -6259,14 +6872,39 @@ def create_app() -> FastAPI:
                     "device_id": request.device_id,
                     "phone_number": request.phone_number,
                     "raw_prompt": request.prompt,
+                    "attachment_count": len(requested_reference_attachments),
+                    "attachments": [
+                        reference_attachment_event_payload(attachment)
+                        for attachment in requested_reference_attachments
+                    ],
                 },
             )
+            if requested_reference_attachments:
+                try:
+                    saved_requested_attachments = persist_reference_attachments_for_task(
+                        db,
+                        settings,
+                        task,
+                        requested_reference_attachments,
+                        source="followup_request",
+                        event_id=user_event_id,
+                        fail_on_error=True,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"attachment save failed: {exc}") from exc
+                if saved_requested_attachments:
+                    requested_reference_attachments = saved_requested_attachments
             previous_conversation_state = build_task_conversation_state(task)
+            previous_reference_attachments = normalize_reference_attachments(
+                previous_conversation_state.get("reference_attachments") or []
+            )
+            effective_reference_attachments = requested_reference_attachments or previous_reference_attachments
+            effective_first_reference = first_reference_attachment(effective_reference_attachments)
             effective_reference_image_name = requested_reference_image_name or normalize_reference_image_name(
-                previous_conversation_state.get("reference_image_name")
+                effective_first_reference.get("name") or previous_conversation_state.get("reference_image_name")
             )
             effective_reference_image_base64 = requested_reference_image_base64 or normalize_reference_image_base64(
-                previous_conversation_state.get("reference_image_base64")
+                effective_first_reference.get("base64") or previous_conversation_state.get("reference_image_base64")
             )
             existing_workspace_ready = bool(task.get("workspace_path") and task.get("project_path"))
             codex_followup_enabled = (
@@ -6383,7 +7021,8 @@ def create_app() -> FastAPI:
             if effective_reference_image_name and not decision.image_reference_summary:
                 decision = replace(
                     decision,
-                    image_reference_summary=build_reference_image_summary(effective_reference_image_name),
+                    image_reference_summary=reference_attachments_summary(effective_reference_attachments)
+                    or build_reference_image_summary(effective_reference_image_name),
                 )
             decision = preserve_followup_task_identity(decision, task, previous_conversation_state)
             if decision.used_previous_pending_prompt:
@@ -6413,6 +7052,7 @@ def create_app() -> FastAPI:
                                 "reference_image_name": effective_reference_image_name,
                                 "reference_image_base64": effective_reference_image_base64,
                                 "reference_image_workspace_path": previous_conversation_state.get("reference_image_workspace_path") or "",
+                                "reference_attachments": effective_reference_attachments,
                             },
                             decision,
                             request.prompt,
@@ -6442,6 +7082,7 @@ def create_app() -> FastAPI:
             reference_image_workspace_path = normalize_whitespace(
                 str(previous_conversation_state.get("reference_image_workspace_path") or "")
             )
+            saved_reference_attachments: list[dict[str, str]] = []
             if not workspace_path_value or not project_path_value:
                 build_task = {
                     **task,
@@ -6453,6 +7094,7 @@ def create_app() -> FastAPI:
                     "reference_image_name": effective_reference_image_name,
                     "reference_image_base64": effective_reference_image_base64,
                     "reference_image_workspace_path": previous_conversation_state.get("reference_image_workspace_path") or "",
+                    "reference_attachments": effective_reference_attachments,
                 }
                 try:
                     workspace_path, project_path = build_task_workspace(settings, build_task)
@@ -6470,6 +7112,9 @@ def create_app() -> FastAPI:
                 project_path_value = str(project_path)
                 reference_image_workspace_path = normalize_whitespace(
                     str(build_task.get("reference_image_workspace_path") or reference_image_workspace_path)
+                )
+                saved_reference_attachments = normalize_reference_attachments(
+                    build_task.get("reference_attachments") or []
                 )
                 db.update_task(
                     followup_task_id,
@@ -6490,11 +7135,12 @@ def create_app() -> FastAPI:
                     Path(project_path_value),
                 )
                 project_path_value = str(project_path_obj)
-                reference_image_workspace_path = save_reference_image_attachment(
+                saved_reference_attachments = save_reference_attachments(
                     workspace_path_obj,
-                    reference_image_name=effective_reference_image_name,
-                    reference_image_base64=effective_reference_image_base64,
+                    effective_reference_attachments,
                 )
+                saved_first_reference = first_reference_attachment(saved_reference_attachments)
+                reference_image_workspace_path = saved_first_reference.get("workspace_path") or ""
                 apply_project_defaults(project_path_obj, followup_task_id, resolved_app_name, resolved_package_name)
                 append_followup_prompt(
                     workspace_path_obj,
@@ -6531,6 +7177,7 @@ def create_app() -> FastAPI:
                             "reference_image_name": effective_reference_image_name,
                             "reference_image_base64": effective_reference_image_base64,
                             "reference_image_workspace_path": reference_image_workspace_path or previous_conversation_state.get("reference_image_workspace_path") or "",
+                            "reference_attachments": saved_reference_attachments or effective_reference_attachments,
                         },
                         decision,
                         request.prompt,
@@ -6582,7 +7229,8 @@ def create_app() -> FastAPI:
         if requested_reference_image_name and not decision.image_reference_summary:
             decision = replace(
                 decision,
-                image_reference_summary=build_reference_image_summary(requested_reference_image_name),
+                image_reference_summary=reference_attachments_summary(requested_reference_attachments)
+                or build_reference_image_summary(requested_reference_image_name),
             )
         if decision.mode == "build":
             decision = build_pre_build_confirmation_decision(decision, existing_task=False)
@@ -6595,6 +7243,7 @@ def create_app() -> FastAPI:
             "device_info": request_device_info,
             "reference_image_name": requested_reference_image_name,
             "reference_image_base64": requested_reference_image_base64,
+            "reference_attachments": requested_reference_attachments,
             "reference_image_workspace_path": "",
             "status": decision.status,
             "message": decision.message,
@@ -6616,6 +7265,7 @@ def create_app() -> FastAPI:
                         "device_info": request_device_info,
                         "reference_image_name": requested_reference_image_name,
                         "reference_image_base64": requested_reference_image_base64,
+                        "reference_attachments": requested_reference_attachments,
                         "reference_image_workspace_path": "",
                     },
                     decision,
@@ -6642,9 +7292,10 @@ def create_app() -> FastAPI:
                 "device_id": request.device_id,
                 "phone_number": request.phone_number,
                 "raw_prompt": request.prompt,
+                "attachment_count": len(requested_reference_attachments),
             },
         )
-        db.log_event(
+        user_event_id = db.log_event(
             task_id,
             actor="user",
             event_type="user_message",
@@ -6653,8 +7304,45 @@ def create_app() -> FastAPI:
                 "task_id": task_id,
                 "device_id": request.device_id,
                 "phone_number": request.phone_number,
+                "attachment_count": len(requested_reference_attachments),
+                "attachments": [
+                    reference_attachment_event_payload(attachment)
+                    for attachment in requested_reference_attachments
+                ],
             },
         )
+        if requested_reference_attachments:
+            try:
+                saved_requested_attachments = persist_reference_attachments_for_task(
+                    db,
+                    settings,
+                    task,
+                    requested_reference_attachments,
+                    source="initial_request",
+                    event_id=user_event_id,
+                    fail_on_error=True,
+                )
+            except ValueError as exc:
+                db.update_task(
+                    task_id,
+                    status="Error",
+                    message=f"첨부 이미지 저장 실패: {exc}",
+                )
+                failed_task = db.get_task(task_id)
+                if failed_task:
+                    log_task_status_event(db, failed_task, event_type="task_error")
+                raise HTTPException(status_code=400, detail=f"attachment save failed: {exc}") from exc
+            if saved_requested_attachments:
+                requested_reference_attachments = saved_requested_attachments
+                task["reference_attachments"] = saved_requested_attachments
+                first_saved_reference = first_reference_attachment(saved_requested_attachments)
+                task["reference_image_workspace_path"] = first_saved_reference.get("workspace_path") or ""
+                task["reference_image_base64"] = ""
+                task["codex_result_json"] = json.dumps(
+                    make_decision_state(task, decision, request.prompt),
+                    ensure_ascii=False,
+                )
+                db.update_task(codex_result_json=task["codex_result_json"])
         log_task_status_event(db, task)
         log_package_name_event(
             db,
@@ -6716,6 +7404,29 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         log_codex_rate_limits_to_server_log(task_id, settings.codex_command)
         return serialize_task_for_status(db, task, settings.status_log_line_limit)
+
+    @app.post("/tasks/{task_id}/cancel")
+    def cancel_task(
+        task_id: str,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        _ = user_id
+        db: Database = app.state.db
+        settings: Settings = app.state.settings
+        runner: CodexTaskRunner = app.state.runner
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="task not found")
+        if not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
+            raise HTTPException(status_code=404, detail="task not found")
+        if str(task.get("status") or "").strip().lower() in {"cancelled", "canceled"}:
+            return serialize_task_for_status(db, task, settings.status_log_line_limit)
+        if not is_cancellable_task_status(str(task.get("status") or "")):
+            raise HTTPException(status_code=409, detail="task is not cancellable")
+        updated_task = runner.cancel_task(task_id)
+        return serialize_task_for_status(db, updated_task, settings.status_log_line_limit)
 
     @app.patch("/tasks/{task_id}")
     def update_task_metadata(
@@ -7031,6 +7742,35 @@ def create_app() -> FastAPI:
                 "daily_token_limit": daily_token_limit,
             },
         }
+
+    @app.get("/tasks/{task_id}/revisions")
+    def list_task_revisions(
+        task_id: str,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        db: Database = app.state.db
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="task not found")
+        if not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
+            raise HTTPException(status_code=404, detail="task not found")
+        snapshots = db.list_project_snapshots(task_id)
+        if not snapshots and task.get("workspace_path") and task.get("project_path"):
+            snapshots = [
+                {
+                    "snapshot_id": "",
+                    "task_id": task_id,
+                    "revision_label": current_revision_label(Path(str(task.get("project_path")))),
+                    "source": "current",
+                    "workspace_path": task.get("workspace_path"),
+                    "project_path": task.get("project_path"),
+                    "created_at": task.get("created_at"),
+                }
+            ]
+        revisions = [serialize_project_revision(task, snapshot) for snapshot in snapshots]
+        return {"task_id": task_id, "revisions": revisions}
 
     @app.get("/tasks")
     def list_tasks(

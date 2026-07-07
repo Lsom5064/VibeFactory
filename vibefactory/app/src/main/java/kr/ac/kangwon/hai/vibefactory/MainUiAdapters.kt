@@ -13,8 +13,10 @@ import android.widget.Button
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
@@ -97,7 +99,8 @@ class ChatMessageAdapter(
     private val onConfirmationAccept: (ChatMessage) -> Unit,
     private val onConfirmationDismiss: (ChatMessage) -> Unit,
     private val onArtifactDownload: (ChatMessage) -> Unit,
-    private val onArtifactInstall: (ChatMessage) -> Unit
+    private val onArtifactInstall: (ChatMessage) -> Unit,
+    private val onBuildCancel: (ChatMessage) -> Unit
 ) : ListAdapter<ChatMessage, ChatMessageAdapter.ChatViewHolder>(ChatMessageDiffCallback) {
     companion object {
         private const val CHAT_MESSAGE_COLLAPSE_CHAR_THRESHOLD = 420
@@ -126,8 +129,10 @@ class ChatMessageAdapter(
         private val body: TextView = view.findViewById(R.id.messageBody)
         private val loadingRow: LinearLayout = view.findViewById(R.id.messageLoadingRow)
         private val loadingText: TextView = view.findViewById(R.id.messageLoadingText)
+        private val btnCancelBuild: TextView = view.findViewById(R.id.btnCancelBuild)
         private val imageLabel: TextView = view.findViewById(R.id.messageImageLabel)
         private val imagePreview: ImageView = view.findViewById(R.id.messageImagePreview)
+        private val imagePreviewList: LinearLayout = view.findViewById(R.id.messageImagePreviewList)
         private val expandToggle: TextView = view.findViewById(R.id.messageExpandToggle)
         private val detail: TextView = view.findViewById(R.id.messageDetail)
         private val confirmationActions: LinearLayout = view.findViewById(R.id.messageConfirmationActions)
@@ -249,8 +254,18 @@ class ChatMessageAdapter(
                 body.visibility = View.GONE
                 loadingRow.visibility = View.VISIBLE
                 loadingText.text = item.body
+                if (item.cancelTaskId.isNullOrBlank()) {
+                    btnCancelBuild.visibility = View.GONE
+                    btnCancelBuild.setOnClickListener(null)
+                } else {
+                    btnCancelBuild.visibility = View.VISIBLE
+                    btnCancelBuild.text = context.getString(R.string.build_cancel)
+                    btnCancelBuild.setOnClickListener { onBuildCancel(item) }
+                }
             } else {
                 loadingRow.visibility = View.GONE
+                btnCancelBuild.visibility = View.GONE
+                btnCancelBuild.setOnClickListener(null)
                 body.visibility = View.VISIBLE
                 body.text = chatMessageBodyText(item, context)
             }
@@ -303,6 +318,8 @@ class ChatMessageAdapter(
             imageLabel.visibility = View.GONE
             imagePreview.visibility = View.GONE
             imagePreview.setImageDrawable(null)
+            imagePreviewList.visibility = View.GONE
+            imagePreviewList.removeAllViews()
             title.visibility = View.GONE
             title.text = ""
             body.visibility = View.GONE
@@ -402,24 +419,141 @@ class ChatMessageAdapter(
         }
 
         private fun bindImagePreview(item: ChatMessage, context: android.content.Context) {
-            val hasImagePreview = !item.imagePreviewBase64.isNullOrBlank()
-            if (!hasImagePreview) {
+            val previews = item.allImagePreviews()
+            if (previews.isEmpty()) {
                 imageLabel.visibility = View.GONE
                 imagePreview.visibility = View.GONE
                 imagePreview.setImageDrawable(null)
+                imagePreview.isClickable = false
+                imagePreview.setOnClickListener(null)
+                imagePreviewList.visibility = View.GONE
+                imagePreviewList.removeAllViews()
                 return
             }
 
-            imageLabel.text = item.imagePreviewName
-                ?.takeIf { it.isNotBlank() }
-                ?.let { context.getString(R.string.reference_image_selected, it) }
-                ?: context.getString(R.string.reference_image_attached_message)
+            imageLabel.text = if (previews.size == 1) {
+                previews.first().displayName
+                    .takeIf { it.isNotBlank() }
+                    ?.let { context.getString(R.string.reference_image_selected, it) }
+                    ?: context.getString(R.string.reference_image_attached_message)
+            } else {
+                context.getString(R.string.reference_images_selected, previews.size)
+            }
             imageLabel.visibility = View.VISIBLE
+            if (previews.size == 1) {
+                bindSingleImagePreview(previews.first(), context)
+            } else {
+                imagePreview.visibility = View.GONE
+                imagePreview.setImageDrawable(null)
+                imagePreview.isClickable = false
+                imagePreview.setOnClickListener(null)
+                bindImagePreviewGrid(previews, context)
+            }
+        }
+
+        private fun bindSingleImagePreview(preview: ChatImagePreview, context: android.content.Context) {
+            imagePreviewList.visibility = View.GONE
+            imagePreviewList.removeAllViews()
             bindInlineImagePreview(
                 imageView = imagePreview,
-                imageBase64 = item.imagePreviewBase64,
+                imageBase64 = preview.base64,
                 fallbackVisibility = View.GONE
             )
+            imagePreview.isClickable = true
+            imagePreview.setOnClickListener {
+                showAttachedImageDialog(
+                    context = context,
+                    imageBase64 = preview.base64,
+                    imageName = preview.displayName
+                )
+            }
+        }
+
+        private fun bindImagePreviewGrid(
+            previews: List<ChatImagePreview>,
+            context: android.content.Context
+        ) {
+            imagePreviewList.removeAllViews()
+            imagePreviewList.visibility = View.VISIBLE
+            previews.chunked(2).forEachIndexed { rowIndex, rowPreviews ->
+                val row = LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        if (rowIndex > 0) topMargin = dp(context, 6)
+                    }
+                }
+                rowPreviews.forEachIndexed { columnIndex, preview ->
+                    row.addView(createImagePreviewThumbnail(preview, context, columnIndex))
+                }
+                imagePreviewList.addView(row)
+            }
+        }
+
+        private fun createImagePreviewThumbnail(
+            preview: ChatImagePreview,
+            context: android.content.Context,
+            columnIndex: Int
+        ): ImageView {
+            return ImageView(context).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(context, 104), dp(context, 104)).apply {
+                    if (columnIndex > 0) marginStart = dp(context, 6)
+                }
+                adjustViewBounds = false
+                setBackgroundResource(R.drawable.bg_surface_card)
+                contentDescription = context.getString(R.string.reference_image_preview_content_description)
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                isClickable = true
+                bindInlineImagePreview(
+                    imageView = this,
+                    imageBase64 = preview.base64,
+                    fallbackVisibility = View.GONE
+                )
+                setOnClickListener {
+                    showAttachedImageDialog(
+                        context = context,
+                        imageBase64 = preview.base64,
+                        imageName = preview.displayName
+                    )
+                }
+            }
+        }
+
+        private fun showAttachedImageDialog(
+            context: android.content.Context,
+            imageBase64: String?,
+            imageName: String?
+        ) {
+            val imageView = ImageView(context).apply {
+                adjustViewBounds = true
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setBackgroundColor(ContextCompat.getColor(context, R.color.bg_app))
+                contentDescription = context.getString(R.string.reference_image_preview_content_description)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            }
+            bindInlineImagePreview(
+                imageView = imageView,
+                imageBase64 = imageBase64,
+                fallbackVisibility = View.GONE
+            )
+            val content = ScrollView(context).apply {
+                setPadding(dp(context, 16), dp(context, 12), dp(context, 16), dp(context, 12))
+                addView(imageView)
+            }
+            AlertDialog.Builder(context)
+                .setTitle(
+                    imageName
+                        ?.takeIf { it.isNotBlank() }
+                        ?: context.getString(R.string.attached_image_dialog_title)
+                )
+                .setView(content)
+                .setPositiveButton(android.R.string.ok, null)
+                .show()
         }
 
         private fun bindConfirmationActions(item: ChatMessage) {

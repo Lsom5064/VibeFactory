@@ -40,6 +40,7 @@ data class ChatMessage(
     val eventType: String? = null,
     val imagePreviewBase64: String? = null,
     val imagePreviewName: String? = null,
+    val imagePreviews: List<ChatImagePreview> = emptyList(),
     val confirmAction: String? = null,
     val confirmTaskId: String? = null,
     val confirmPayload: String? = null,
@@ -52,8 +53,16 @@ data class ChatMessage(
     val artifactCanDownload: Boolean = false,
     val artifactCanInstall: Boolean = false,
     val artifactDownloading: Boolean = false,
+    val cancelTaskId: String? = null,
     val isLoading: Boolean = false
 )
+
+fun ChatMessage.allImagePreviews(): List<ChatImagePreview> {
+    val explicitPreviews = imagePreviews.orEmpty().filter { it.base64.isNotBlank() }
+    if (explicitPreviews.isNotEmpty()) return explicitPreviews
+    val legacyBase64 = imagePreviewBase64?.takeIf { it.isNotBlank() } ?: return emptyList()
+    return listOf(ChatImagePreview(displayName = imagePreviewName.orEmpty(), base64 = legacyBase64))
+}
 
 data class RuntimeErrorRecord(
     val packageName: String,

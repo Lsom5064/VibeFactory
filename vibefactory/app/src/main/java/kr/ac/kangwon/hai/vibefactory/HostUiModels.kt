@@ -51,6 +51,38 @@ fun buildAttachmentChipLabel(kind: SelectedAttachmentKind, displayName: String):
     return "[${kind.chipPrefix} #1] $safeName x"
 }
 
+fun List<SelectedAttachment>.toPayloads(): List<AttachmentPayload> {
+    return map { it.toPayload() }
+}
+
+fun List<SelectedAttachment>.toChatImagePreview(): ChatImagePreview? {
+    val imageAttachments = filter { it.kind == SelectedAttachmentKind.IMAGE }
+    val first = imageAttachments.firstOrNull() ?: return null
+    val displayName = if (imageAttachments.size == 1) {
+        first.displayName
+    } else {
+        "${first.displayName} 외 ${imageAttachments.size - 1}장"
+    }
+    return ChatImagePreview(displayName = displayName, base64 = first.base64)
+}
+
+fun List<SelectedAttachment>.toChatImagePreviews(): List<ChatImagePreview> {
+    return filter { it.kind == SelectedAttachmentKind.IMAGE }
+        .map { ChatImagePreview(displayName = it.displayName, base64 = it.base64) }
+}
+
+fun buildAttachmentChipLabel(attachments: List<SelectedAttachment>): String {
+    if (attachments.isEmpty()) return ""
+    if (attachments.size == 1) return attachments.first().chipLabel()
+    val imageCount = attachments.count { it.kind == SelectedAttachmentKind.IMAGE }
+    val fileCount = attachments.size - imageCount
+    val parts = buildList {
+        if (imageCount > 0) add("이미지 ${imageCount}장")
+        if (fileCount > 0) add("파일 ${fileCount}개")
+    }
+    return "${parts.joinToString(", ")} x"
+}
+
 data class PersistedArtifactState(
     val apkUrl: String? = null,
     val downloadedApkPath: String? = null

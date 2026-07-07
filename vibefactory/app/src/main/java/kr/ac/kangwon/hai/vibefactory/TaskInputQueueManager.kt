@@ -3,7 +3,7 @@ package kr.ac.kangwon.hai.vibefactory
 data class QueuedTaskInput(
     val prompt: String,
     val imagePreview: ChatImagePreview?,
-    val attachment: SelectedAttachment?
+    val attachments: List<SelectedAttachment>
 )
 
 data class TaskInputQueueState(

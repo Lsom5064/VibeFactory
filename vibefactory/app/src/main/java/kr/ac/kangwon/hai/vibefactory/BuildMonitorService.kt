@@ -82,6 +82,7 @@ class BuildMonitorService : Service() {
         super.onCreate()
         apiService = createApiService()
         createNotificationChannels()
+        restoreMonitoredTasks()
         pruneHiddenTasks()
     }
 
@@ -102,7 +103,7 @@ class BuildMonitorService : Service() {
             return START_NOT_STICKY
         }
         ensureMonitorLoop()
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -571,6 +572,16 @@ class BuildMonitorService : Service() {
             hiddenMonitoredTaskIds
         }
         removedTaskIds.forEach(::clearTerminalNotificationMarkers)
+    }
+
+    private fun restoreMonitoredTasks() {
+        val hiddenTaskIds = loadHiddenTaskIds()
+        val storedTaskIds = loadStringSet(HostAppConfig.PREF_MONITORED_TASK_IDS)
+            .filter { it !in hiddenTaskIds }
+        if (storedTaskIds.isEmpty()) return
+        synchronized(taskLock) {
+            monitoredTaskIds += storedTaskIds
+        }
     }
 
     private fun monitoredTaskNameKey(taskId: String): String {

@@ -51,7 +51,7 @@ pip install -r requirements.txt
 - `APP_RUNTIME_SYSTEM_PROMPT`: 생성 앱 런타임 LLM의 기본 시스템 프롬프트
 - `APP_RUNTIME_DAILY_REQUEST_LIMIT`: 앱별 일일 호출 횟수 제한
 - `APP_RUNTIME_DAILY_TOKEN_LIMIT`: 앱별 일일 총 토큰 제한
-- `APP_RUNTIME_MAX_OUTPUT_TOKENS`: 앱별 런타임 응답 최대 출력 토큰
+- `APP_RUNTIME_MAX_OUTPUT_TOKENS`: 앱별 런타임 응답 최대 출력 토큰. `0`이면 서버가 1회 호출 출력 토큰 제한을 명시하지 않음
 - `APP_RUNTIME_TEMPERATURE`: 앱별 런타임 temperature
 - `ADMIN_API_TOKEN`: 설정 시 `/admin/*` 관리 endpoint 호출에 필요한 관리자 토큰
 
@@ -83,6 +83,7 @@ export APP_RUNTIME_OPENAI_API_KEY=sk-...
 export APP_RUNTIME_MODEL=gpt-5.4-mini
 export APP_RUNTIME_DAILY_REQUEST_LIMIT=100
 export APP_RUNTIME_DAILY_TOKEN_LIMIT=50000
+export APP_RUNTIME_MAX_OUTPUT_TOKENS=0
 export MOCK_CODEX=1
 ```
 

@@ -107,6 +107,7 @@ data class StatusResponse(
     val pending_decision_reason: String? = "",
     val suppress_assistant_bubble: Boolean? = null,
     val retry_allowed: Boolean? = null,
+    val cancel_allowed: Boolean? = null,
     val allowed_next_actions: List<String>? = null,
     val retry_block_reason: String? = null
 )
@@ -157,6 +158,26 @@ data class TokenUsageResponse(
     val status_message: String? = null
 )
 
+data class TaskRevisionDto(
+    val snapshot_id: String = "",
+    val task_id: String = "",
+    val revision_label: String = "",
+    val version_name: String = "",
+    val source: String = "",
+    val created_at: String = "",
+    val project_path: String = "",
+    val apk_path: String? = "",
+    val apk_url: String? = "",
+    val apk_size_bytes: Long? = null,
+    val has_apk: Boolean = false,
+    val is_current: Boolean = false
+)
+
+data class TaskRevisionsResponse(
+    val task_id: String = "",
+    val revisions: List<TaskRevisionDto> = emptyList()
+)
+
 data class TaskRenameRequest(
     val app_name: String
 )
@@ -181,6 +202,14 @@ interface VibeApiService {
         @Query("phone_number") phoneNumber: String? = null
     ): StatusResponse
 
+    @POST("/tasks/{task_id}/cancel")
+    suspend fun cancelTask(
+        @Path("task_id") taskId: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): StatusResponse
+
     @GET("/tasks/{task_id}/usage")
     suspend fun getTaskUsage(
         @Path("task_id") taskId: String,
@@ -188,6 +217,14 @@ interface VibeApiService {
         @Query("user_id") userId: String? = null,
         @Query("phone_number") phoneNumber: String? = null
     ): TokenUsageResponse
+
+    @GET("/tasks/{task_id}/revisions")
+    suspend fun getTaskRevisions(
+        @Path("task_id") taskId: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): TaskRevisionsResponse
 
     @PATCH("/tasks/{task_id}")
     suspend fun renameTask(

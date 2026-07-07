@@ -4,7 +4,7 @@ internal object TaskProgressTimelinePolicy {
     const val INSTALLABLE_APK_READY_MESSAGE = "설치 가능한 앱 파일을 준비했어요"
 
     private val activeBuildStatuses = setOf("queued", "running", "processing", "building", "in progress", "working")
-    private val terminalBuildStatuses = setOf("success", "failed", "error", "rejected", "timeout", "timed out", "ratelimited")
+    private val terminalBuildStatuses = setOf("success", "failed", "error", "rejected", "timeout", "timed out", "ratelimited", "cancelled", "canceled")
 
     fun isActiveBuildStatus(status: String?): Boolean {
         return normalizeStatus(status) in activeBuildStatuses
