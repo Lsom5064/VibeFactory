@@ -119,23 +119,59 @@ internal object TaskProgressTimelinePolicy {
 
     fun keepLatestDuplicateArtifacts(messages: List<ChatMessage>): List<ChatMessage> {
         val latestIndexByKey = messages
-            .mapIndexedNotNull { index, message -> artifactKey(message)?.let { key -> key to index } }
+            .mapIndexedNotNull { index, message -> artifactDedupeKey(message)?.let { key -> key to index } }
             .toMap()
         if (latestIndexByKey.isEmpty()) return messages
 
         return messages.filterIndexed { index, message ->
-            val key = artifactKey(message) ?: return@filterIndexed true
+            val key = artifactDedupeKey(message) ?: return@filterIndexed true
             latestIndexByKey[key] == index
         }
     }
 
-    private fun artifactKey(message: ChatMessage): String? {
+    fun artifactDedupeKey(message: ChatMessage): String? {
         val taskId = message.artifactTaskId?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val revision = artifactRevisionKey(message)
+        if (revision != null) return "$taskId\u0001revision\u0001$revision"
+
         val identity = message.artifactApkPath?.trim()?.takeIf { it.isNotBlank() }
             ?: message.artifactApkUrl?.trim()?.takeIf { it.isNotBlank() }
             ?: message.body.trim().takeIf { it.isNotBlank() }
             ?: return null
         return "$taskId\u0001$identity"
+    }
+
+    private fun artifactRevisionKey(message: ChatMessage): String? {
+        Regex("""(?:^|[/\\])rev_0*(\d+)(?:[/\\]|$)""")
+            .find(message.artifactApkPath.orEmpty())
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
+            ?.let { return "v$it" }
+        normalizedRevisionLabel(message.artifactRevisionLabel)?.let { return it }
+        message.artifactBuildAttempt?.takeIf { it > 0 }?.let { return "v$it" }
+        return null
+    }
+
+    private fun normalizedRevisionLabel(label: String?): String? {
+        val raw = label?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        raw.removePrefix("build-").toIntOrNull()?.takeIf { it > 0 }?.let { return "v$it" }
+        Regex("""(?:^|[^0-9])v0*(\d+)(?:$|[^0-9])""", RegexOption.IGNORE_CASE)
+            .find(raw)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
+            ?.let { return "v$it" }
+        Regex("""(?:^|[/\\])rev_0*(\d+)(?:[/\\]|$)""", RegexOption.IGNORE_CASE)
+            .find(raw)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
+            ?.let { return "v$it" }
+        return raw.lowercase()
     }
 
     private fun stripTechnicalLabel(value: String): String {

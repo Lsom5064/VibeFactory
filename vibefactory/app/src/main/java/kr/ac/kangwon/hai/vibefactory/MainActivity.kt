@@ -2817,12 +2817,19 @@ ${record.stackTrace}
         if (timeline.any { it.id == artifactMessage.id }) return
         val artifactPath = artifactMessage.artifactApkPath?.trim().orEmpty()
         val artifactUrl = artifactMessage.artifactApkUrl?.trim().orEmpty()
+        val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(artifactMessage)
         val existingArtifactIndex = timeline.indexOfLast { message ->
             message.artifactTaskId == normalizedTaskId &&
-                isSameApkArtifact(message, artifactPath, artifactUrl)
+                (
+                    artifactKey != null && TaskProgressTimelinePolicy.artifactDedupeKey(message) == artifactKey ||
+                        isSameApkArtifact(message, artifactPath, artifactUrl)
+                    )
         }
         if (existingArtifactIndex >= 0) {
-            timeline[existingArtifactIndex] = artifactMessage.withUniqueId(normalizedTaskId, existingArtifactIndex)
+            timeline[existingArtifactIndex] = mergeApkArtifactMessages(
+                existing = timeline[existingArtifactIndex],
+                incoming = artifactMessage
+            ).withUniqueId(normalizedTaskId, existingArtifactIndex)
             persistTaskChat(normalizedTaskId)
             return
         }
@@ -2838,6 +2845,26 @@ ${record.stackTrace}
             artifactPath.isBlank() && artifactUrl.isNotBlank() && messageUrl.isNotBlank() -> messageUrl == artifactUrl
             else -> false
         }
+    }
+
+    private fun mergeApkArtifactMessages(existing: ChatMessage, incoming: ChatMessage): ChatMessage {
+        if (existing.artifactTaskId.isNullOrBlank() || incoming.artifactTaskId.isNullOrBlank()) {
+            return incoming
+        }
+        return incoming.copy(
+            id = existing.id,
+            artifactApkUrl = incoming.artifactApkUrl?.trim()?.takeIf { it.isNotBlank() } ?: existing.artifactApkUrl,
+            artifactApkPath = incoming.artifactApkPath?.trim()?.takeIf { it.isNotBlank() } ?: existing.artifactApkPath,
+            artifactDownloadedPath = incoming.artifactDownloadedPath?.trim()?.takeIf { it.isNotBlank() }
+                ?: existing.artifactDownloadedPath,
+            artifactRevisionLabel = incoming.artifactRevisionLabel?.trim()?.takeIf { it.isNotBlank() }
+                ?: existing.artifactRevisionLabel,
+            artifactBuildAttempt = incoming.artifactBuildAttempt ?: existing.artifactBuildAttempt,
+            artifactCanDownload = incoming.artifactCanDownload || existing.artifactCanDownload,
+            artifactCanInstall = incoming.artifactCanInstall || existing.artifactCanInstall,
+            artifactDownloading = incoming.artifactDownloading || existing.artifactDownloading,
+            createdAt = incoming.createdAt ?: existing.createdAt
+        )
     }
 
     private fun apkArtifactMessage(
@@ -4965,12 +4992,7 @@ ${record.stackTrace}
                 return@filter true
             }
             val key = if (!message.artifactTaskId.isNullOrBlank()) {
-                listOf(
-                    "artifact",
-                    message.artifactTaskId.orEmpty().trim(),
-                    message.artifactApkPath.orEmpty().trim(),
-                    message.artifactApkUrl.orEmpty().trim().ifBlank { message.body.trim() }
-                ).joinToString(":")
+                TaskProgressTimelinePolicy.artifactDedupeKey(message).orEmpty()
             } else {
                 clarificationQuestionDedupeKey(message)
                     ?: compactMessageTextForDedupe(normalizeMessageTextForDedupe(message.body))
@@ -4987,9 +5009,20 @@ ${record.stackTrace}
         if (normalizedTaskId.isBlank()) return
         val timeline = editableTaskTimeline(normalizedTaskId) ?: return
         if (!message.artifactTaskId.isNullOrBlank()) {
+            val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(message)
             val existingArtifactIndex = timeline.indexOfFirst { it.id == message.id }
+                .takeIf { it >= 0 }
+                ?: artifactKey?.let { key ->
+                    timeline.indexOfLast { existing ->
+                        TaskProgressTimelinePolicy.artifactDedupeKey(existing) == key
+                    }.takeIf { it >= 0 }
+                }
+                ?: -1
             if (existingArtifactIndex >= 0) {
-                timeline[existingArtifactIndex] = message.withUniqueId(normalizedTaskId, existingArtifactIndex)
+                timeline[existingArtifactIndex] = mergeApkArtifactMessages(
+                    existing = timeline[existingArtifactIndex],
+                    incoming = message
+                ).withUniqueId(normalizedTaskId, existingArtifactIndex)
                 persistTaskChat(normalizedTaskId)
                 return
             }
@@ -5235,6 +5268,11 @@ ${record.stackTrace}
 
     private fun ChatMessage.sameContentAs(other: ChatMessage): Boolean {
         if (kind != other.kind) return false
+        val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(this)
+        val otherArtifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(other)
+        if (artifactKey != null || otherArtifactKey != null) {
+            return artifactKey != null && artifactKey == otherArtifactKey
+        }
         val sameBody = hasSameMessageText(body, other.body)
         val sameDetail = hasSameMessageText(detail, other.detail)
         return when (kind) {
