@@ -75,13 +75,16 @@ import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.text.ParsePosition
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.OffsetDateTime
 import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 class MainActivity : AppCompatActivity() {
 
@@ -104,9 +107,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val gson: Gson = GsonBuilder().create()
-    private val serverTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-    private val displayTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
-    private val bubbleTimestampFormat = SimpleDateFormat("a h:mm", Locale.KOREA)
+    private val koreaZoneId: ZoneId = ZoneId.of("Asia/Seoul")
+    private val koreaTimeZone: TimeZone = TimeZone.getTimeZone(koreaZoneId)
+    private val serverTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.KOREA).apply {
+        timeZone = koreaTimeZone
+        isLenient = false
+    }
+    private val displayTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.KOREA).apply {
+        timeZone = koreaTimeZone
+        isLenient = false
+    }
+    private val bubbleTimestampFormat = SimpleDateFormat("a h:mm", Locale.KOREA).apply {
+        timeZone = koreaTimeZone
+        isLenient = false
+    }
+    private val dateSeparatorTimestampFormat = SimpleDateFormat("yyyy년 M월 d일 EEEE", Locale.KOREA).apply {
+        timeZone = koreaTimeZone
+        isLenient = false
+    }
+    private val localTimestampParsers = listOf(
+        DateTimeFormatter.ISO_LOCAL_DATE_TIME,
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.KOREA),
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.KOREA)
+    )
 
     private lateinit var apiService: VibeApiService
     private lateinit var drawerLayout: DrawerLayout
@@ -1807,7 +1830,9 @@ class MainActivity : AppCompatActivity() {
             packageName = existing?.packageName,
             subtitle = normalizedAppName,
             status = existing?.status ?: screenState.currentStatus,
-            updatedAt = updatedAt ?: currentTimestampString(),
+            updatedAt = taskSummaryLastBubbleTimestamp(normalizedTaskId)
+                ?: formatTaskSummaryTimestamp(updatedAt)
+                ?: currentTaskSummaryTimestampString(),
             hasApk = existing?.hasApk == true || persistedApkUrlForTask(normalizedTaskId) != null,
             hasRuntimeError = existing?.hasRuntimeError ?: (normalizedTaskId in runtimeErrorTaskIds)
         )
@@ -3315,14 +3340,19 @@ ${record.stackTrace}
                 appName = appName,
                 conversationState = dto.conversation_state
             ) ?: getString(R.string.untitled_task)
+            val createdAt = formatTaskSummaryTimestamp(dto.created_at)
+            val lastBubbleAt = taskSummaryLastBubbleTimestamp(taskId)
+            val displayUpdatedAt = lastBubbleAt
+                ?: formatTaskSummaryTimestamp(dto.updated_at)
+                ?: createdAt
             TaskSummary(
                 taskId = taskId,
                 title = title,
                 appName = appName,
                 packageName = dto.package_name.ifBlank { null },
-                subtitle = appName ?: dto.created_at.ifBlank { taskId },
+                subtitle = appName ?: createdAt.orEmpty().ifBlank { taskId },
                 status = dto.status_display_text.ifBlank { displayStatusText(dto.status) },
-                updatedAt = dto.updated_at.ifBlank { dto.created_at.ifBlank { null } },
+                updatedAt = displayUpdatedAt,
                 hasApk = dto.apk_url.isNotBlank(),
                 hasRuntimeError = taskId in runtimeErrorTaskIds
             )
@@ -3591,6 +3621,7 @@ ${record.stackTrace}
                     MessageKind.ASSISTANT, MessageKind.CONFIRMATION -> getString(R.string.message_title_assistant)
                     MessageKind.STATUS -> getString(R.string.message_title_status)
                     MessageKind.LOG, MessageKind.BUILD_LOG -> getString(R.string.message_title_log)
+                    MessageKind.DATE_SEPARATOR -> ""
                 }
             },
             body = event.body,
@@ -4004,9 +4035,9 @@ ${record.stackTrace}
             title = updatedTitle,
             appName = resolvedAppName ?: existing?.appName,
             packageName = response.package_name?.ifBlank { null } ?: existing?.packageName,
-            subtitle = (resolvedAppName ?: existing?.appName) ?: existing?.subtitle ?: currentTimestampString(),
+            subtitle = (resolvedAppName ?: existing?.appName) ?: existing?.subtitle ?: currentTaskSummaryTimestampString(),
             status = statusText,
-            updatedAt = currentTimestampString(),
+            updatedAt = taskSummaryLastBubbleTimestamp(taskId) ?: currentTaskSummaryTimestampString(),
             hasApk = hasApk || existing?.hasApk == true,
             hasRuntimeError = existing?.hasRuntimeError ?: (taskId in runtimeErrorTaskIds)
         )
@@ -4033,9 +4064,9 @@ ${record.stackTrace}
                 ?: getString(R.string.untitled_task),
             appName = appName ?: existing?.appName,
             packageName = packageName ?: existing?.packageName,
-            subtitle = appName ?: existing?.subtitle ?: currentTimestampString(),
+            subtitle = appName ?: existing?.subtitle ?: currentTaskSummaryTimestampString(),
             status = status,
-            updatedAt = currentTimestampString(),
+            updatedAt = taskSummaryLastBubbleTimestamp(taskId) ?: currentTaskSummaryTimestampString(),
             hasApk = hasApk || existing?.hasApk == true,
             hasRuntimeError = existing?.hasRuntimeError ?: (taskId in runtimeErrorTaskIds)
         )
@@ -4933,6 +4964,33 @@ ${record.stackTrace}
             }
             .let(TaskProgressTimelinePolicy::moveArtifactsToEndOfUserTurns)
             .let(TaskProgressTimelinePolicy::moveLoadingMessagesToEnd)
+            .let(::withDateSeparators)
+    }
+
+    private fun withDateSeparators(messages: List<ChatMessage>): List<ChatMessage> {
+        if (messages.isEmpty()) return messages
+        val result = mutableListOf<ChatMessage>()
+        var lastDateKey: String? = null
+        messages.forEach { message ->
+            if (message.kind == MessageKind.DATE_SEPARATOR) return@forEach
+            val messageDate = parseMessageTimestamp(message.createdAt)
+                ?.toInstant()
+                ?.atZone(koreaZoneId)
+                ?.toLocalDate()
+            val dateKey = messageDate?.toString()
+            if (dateKey != null && dateKey != lastDateKey) {
+                result += ChatMessage(
+                    id = "date-separator-$dateKey-${result.size}",
+                    kind = MessageKind.DATE_SEPARATOR,
+                    title = null,
+                    body = dateSeparatorTimestampFormat.format(Date.from(messageDate.atStartOfDay(koreaZoneId).toInstant())),
+                    createdAt = dateKey
+                )
+                lastDateKey = dateKey
+            }
+            result += message
+        }
+        return result
     }
 
     private fun shouldShowChatMessage(message: ChatMessage): Boolean {
@@ -5290,6 +5348,7 @@ ${record.stackTrace}
             MessageKind.ASSISTANT,
             MessageKind.CONFIRMATION,
             MessageKind.LOG -> sameBody && sameDetail
+            MessageKind.DATE_SEPARATOR -> sameBody
             MessageKind.STATUS,
             MessageKind.BUILD_LOG -> sameBody && sameDetail && normalizeMessageTextForDedupe(title) == normalizeMessageTextForDedupe(other.title)
         }
@@ -5351,6 +5410,10 @@ ${record.stackTrace}
         return serverTimestampFormat.format(Date())
     }
 
+    private fun currentTaskSummaryTimestampString(): String {
+        return displayTimestampFormat.format(Date())
+    }
+
     private fun advanceTaskSelectionGeneration(): Long {
         taskSelectionGeneration += 1L
         return taskSelectionGeneration
@@ -5363,9 +5426,24 @@ ${record.stackTrace}
     private fun formatMessageTimestamp(value: String?): String? {
         val raw = value?.trim().orEmpty()
         if (raw.isBlank()) return null
-        return runCatching {
-            displayTimestampFormat.format(serverTimestampFormat.parse(raw) ?: return raw)
-        }.getOrElse { raw }
+        return parseMessageTimestamp(raw)?.let(displayTimestampFormat::format) ?: raw
+    }
+
+    private fun formatTaskSummaryTimestamp(value: String?): String? {
+        val raw = value?.trim().orEmpty()
+        if (raw.isBlank()) return null
+        return parseMessageTimestamp(raw)?.let(displayTimestampFormat::format) ?: raw
+    }
+
+    private fun taskSummaryLastBubbleTimestamp(taskId: String): String? {
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return null
+        return buildTaskTimeline(normalizedTaskId)
+            .asReversed()
+            .firstNotNullOfOrNull { message ->
+                if (message.kind == MessageKind.DATE_SEPARATOR) return@firstNotNullOfOrNull null
+                parseMessageTimestamp(message.createdAt)?.let(displayTimestampFormat::format)
+            }
     }
 
     private fun formatMessageTimestampForBubble(value: String?): String? {
@@ -5377,12 +5455,24 @@ ${record.stackTrace}
         val raw = value?.trim().orEmpty()
         if (raw.isBlank()) return null
 
-        return runCatching { serverTimestampFormat.parse(raw) }.getOrNull()
-            ?: runCatching { Date.from(Instant.parse(raw)) }.getOrNull()
+        return runCatching { Date.from(Instant.parse(raw)) }.getOrNull()
             ?: runCatching { Date.from(OffsetDateTime.parse(raw).toInstant()) }.getOrNull()
-            ?: runCatching {
-                Date.from(LocalDateTime.parse(raw).atZone(ZoneId.systemDefault()).toInstant())
-            }.getOrNull()
+            ?: parseLocalTimestamp(raw)
+            ?: parseStrictTimestamp(serverTimestampFormat, raw)
+    }
+
+    private fun parseLocalTimestamp(value: String): Date? {
+        for (formatter in localTimestampParsers) {
+            val parsed = runCatching { LocalDateTime.parse(value, formatter) }.getOrNull() ?: continue
+            return Date.from(parsed.atZone(koreaZoneId).toInstant())
+        }
+        return null
+    }
+
+    private fun parseStrictTimestamp(format: SimpleDateFormat, value: String): Date? {
+        val position = ParsePosition(0)
+        val parsed = format.parse(value, position) ?: return null
+        return if (position.index == value.length) parsed else null
     }
 
     private fun ChatMessage.withUniqueId(taskId: String, position: Int): ChatMessage {

@@ -15,7 +15,8 @@ enum class MessageKind {
     CONFIRMATION,
     BUILD_LOG,
     STATUS,
-    LOG
+    LOG,
+    DATE_SEPARATOR
 }
 
 data class TaskSummary(

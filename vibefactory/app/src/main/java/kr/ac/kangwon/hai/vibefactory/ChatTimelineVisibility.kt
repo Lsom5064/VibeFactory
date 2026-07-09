@@ -25,6 +25,7 @@ internal object ChatTimelineVisibility {
             )
             MessageKind.LOG,
             MessageKind.BUILD_LOG -> false
+            MessageKind.DATE_SEPARATOR -> true
         }
     }
 

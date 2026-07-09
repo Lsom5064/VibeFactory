@@ -119,6 +119,7 @@ class ChatMessageAdapter(
     }
 
     inner class ChatViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        private val dateSeparator: TextView = view.findViewById(R.id.messageDateSeparator)
         private val block: LinearLayout = view.findViewById(R.id.messageBlock)
         private val container: LinearLayout = view.findViewById(R.id.messageBubble)
         private val artifactCard: LinearLayout = view.findViewById(R.id.messageArtifactCard)
@@ -142,6 +143,12 @@ class ChatMessageAdapter(
 
         fun bind(item: ChatMessage) {
             val context = itemView.context
+            if (item.kind == MessageKind.DATE_SEPARATOR) {
+                bindDateSeparator(item)
+                return
+            }
+            dateSeparator.visibility = View.GONE
+            block.visibility = View.VISIBLE
             val isArtifactCard = item.kind == MessageKind.STATUS && !item.artifactTaskId.isNullOrBlank()
             title.customSelectionActionModeCallback = messageSelectionActionModeCallback
             body.customSelectionActionModeCallback = messageSelectionActionModeCallback
@@ -244,9 +251,18 @@ class ChatMessageAdapter(
                     detail.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                     timestamp.setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
                 }
+                MessageKind.DATE_SEPARATOR -> Unit
             }
             block.layoutParams = blockParams
             container.layoutParams = bubbleParams
+        }
+
+        private fun bindDateSeparator(item: ChatMessage) {
+            dateSeparator.visibility = View.VISIBLE
+            dateSeparator.text = item.body
+            dateSeparator.setTextIsSelectable(false)
+            dateSeparator.setOnLongClickListener(null)
+            block.visibility = View.GONE
         }
 
         private fun bindLoadingState(item: ChatMessage, context: android.content.Context) {
