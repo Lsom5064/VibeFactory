@@ -1,6 +1,7 @@
 package kr.ac.kangwon.hai.vibefactory
 
 import android.app.Activity
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -96,22 +97,54 @@ internal object ApkArtifactActionHandler {
 
     fun installApk(activity: Activity, file: File): Boolean {
         if (!file.exists()) return false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) {
+        if (needsInstallPermission(activity)) {
+            return requestInstallPermission(activity)
+        }
+        return launchApkInstaller(activity, file)
+    }
+
+    fun needsInstallPermission(activity: Activity): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !activity.packageManager.canRequestPackageInstalls()
+    }
+
+    fun requestInstallPermission(activity: Activity): Boolean {
+        return runCatching {
             activity.startActivity(
                 Intent(
                     Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                     Uri.parse("package:${activity.packageName}")
                 )
             )
+        }.isSuccess
+    }
+
+    @Suppress("DEPRECATION")
+    fun launchApkInstaller(activity: Activity, file: File): Boolean {
+        if (!file.exists()) return false
+        val uri = runCatching {
+            FileProvider.getUriForFile(activity, "${activity.packageName}.provider", file)
+        }.getOrNull() ?: return false
+        val readFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
+        val clipData = ClipData.newUri(activity.contentResolver, file.name, uri)
+        val installIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+            data = uri
+            addFlags(readFlags)
+            this.clipData = clipData
+            putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+            putExtra(Intent.EXTRA_RETURN_RESULT, true)
+        }
+        if (runCatching { activity.startActivity(installIntent) }.isSuccess) {
             return true
         }
 
-        val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.provider", file)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        activity.startActivity(intent)
-        return true
+        return runCatching {
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(readFlags)
+                this.clipData = clipData
+            }
+            activity.startActivity(intent)
+        }.isSuccess
     }
 }

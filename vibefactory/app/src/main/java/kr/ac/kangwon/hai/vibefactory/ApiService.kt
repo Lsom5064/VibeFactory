@@ -9,6 +9,7 @@ import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
+import retrofit2.http.Streaming
 
 data class DeviceInfo(
     val model: String,
@@ -250,6 +251,7 @@ interface VibeApiService {
         @Body request: RuntimeErrorReportRequest
     ): JsonElement
 
+    @Streaming
     @GET("/download/{task_id}")
     suspend fun downloadApk(
         @Path("task_id") taskId: String,

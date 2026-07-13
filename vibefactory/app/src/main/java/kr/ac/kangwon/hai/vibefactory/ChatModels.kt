@@ -54,6 +54,8 @@ data class ChatMessage(
     val artifactCanDownload: Boolean = false,
     val artifactCanInstall: Boolean = false,
     val artifactDownloading: Boolean = false,
+    val artifactDownloadProgressPercent: Int? = null,
+    val artifactDownloadProgressText: String? = null,
     val cancelTaskId: String? = null,
     val isLoading: Boolean = false
 )

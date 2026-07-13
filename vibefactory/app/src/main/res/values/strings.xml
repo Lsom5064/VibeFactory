@@ -92,7 +92,11 @@
     <string name="download_apk">APK 다운로드</string>
     <string name="artifact_download_action">다운로드</string>
     <string name="download_apk_in_progress">다운로드 중...</string>
+    <string name="download_apk_progress">다운로드 중... %1$d%%</string>
+    <string name="download_apk_progress_bytes">다운로드 중... %1$s</string>
     <string name="install_apk">설치</string>
+    <string name="install_permission_required">설치 권한을 허용한 뒤 돌아오면 바로 설치를 이어갈게요.</string>
+    <string name="install_failed">설치 화면을 열지 못했어요. 다운로드된 APK에서 다시 설치를 눌러주세요.</string>
     <string name="message_title_apk">APK</string>
     <string name="artifact_file_label">APK 파일</string>
     <string name="artifact_size_pending">크기 확인 전</string>

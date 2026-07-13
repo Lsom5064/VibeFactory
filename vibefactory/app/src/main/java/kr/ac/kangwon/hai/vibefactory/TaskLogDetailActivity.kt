@@ -34,6 +34,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private var isDownloadingApk = false
     private var boundPayload: TaskLogDetailPayload? = null
     private var revisionOptions: List<TaskRevisionDto> = emptyList()
+    private var pendingInstallApkFile: File? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,6 +48,11 @@ class TaskLogDetailActivity : AppCompatActivity() {
         findViewById<ImageButton>(R.id.btnBackTaskLog).setOnClickListener { finish() }
 
         bindPayload(payload)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        retryPendingApkInstallIfReady()
     }
 
     private fun bindPayload(payload: TaskLogDetailPayload) {
@@ -242,8 +248,33 @@ class TaskLogDetailActivity : AppCompatActivity() {
     }
 
     private fun installApk(file: File) {
-        if (!ApkArtifactActionHandler.installApk(this, file)) {
+        if (!file.exists()) {
             Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (ApkArtifactActionHandler.needsInstallPermission(this)) {
+            pendingInstallApkFile = file
+            Toast.makeText(this, R.string.install_permission_required, Toast.LENGTH_LONG).show()
+            if (!ApkArtifactActionHandler.requestInstallPermission(this)) {
+                Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        pendingInstallApkFile = null
+        if (!ApkArtifactActionHandler.launchApkInstaller(this, file)) {
+            Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun retryPendingApkInstallIfReady() {
+        val file = pendingInstallApkFile ?: return
+        if (!file.exists()) {
+            pendingInstallApkFile = null
+            Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!ApkArtifactActionHandler.needsInstallPermission(this)) {
+            installApk(file)
         }
     }
 

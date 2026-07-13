@@ -220,6 +220,8 @@ class MainActivity : AppCompatActivity() {
     private var downloadingApkTaskId: String? = null
     private var downloadingApkUrl: String? = null
     private var downloadingArtifactPath: String? = null
+    private var downloadProgressPercent: Int? = null
+    private var downloadProgressBytes: Long = 0L
     private var skipNextResumeRestore: Boolean = false
     private var hasAttemptedPhonePermissionRequest: Boolean = false
     private var restoreTaskJob: Job? = null
@@ -236,6 +238,7 @@ class MainActivity : AppCompatActivity() {
     private var isMessageTextSelectionActive = false
     private val selectedAttachments = mutableListOf<SelectedAttachment>()
     private var pendingCameraImageUri: Uri? = null
+    private var pendingInstallApkFile: File? = null
     private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
 
     private data class TimelineEventSnapshot(
@@ -261,6 +264,10 @@ class MainActivity : AppCompatActivity() {
     private data class ChatScrollSnapshot(
         val messageId: String,
         val topOffset: Int
+    )
+
+    private data class ChatBottomScrollSnapshot(
+        val bottomOffset: Int
     )
 
     private val pickReferenceImageLauncher =
@@ -464,6 +471,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         restoreCurrentTaskState(trigger = "onResume")
+        retryPendingApkInstallIfReady()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -878,6 +886,21 @@ class MainActivity : AppCompatActivity() {
         val attachedImagePreview = attachments.toChatImagePreview()
         inputPrompt.setText("")
 
+        if (isComposerOnNewChatSurface()) {
+            currentTaskId = null
+            pendingTaskSelectionKey = null
+            persistLastSelectedTaskId(null)
+            screenState = screenState.copy(
+                selectedTaskId = null,
+                displayedAppName = null,
+                inputMode = InputMode.NEW_GENERATE,
+                canDownload = false,
+                canInstall = false
+            )
+            startAppSynthesis(prompt, attachedImagePreview, attachments = attachments)
+            return
+        }
+
         when (screenState.inputMode) {
             InputMode.NEW_GENERATE -> startAppSynthesis(prompt, attachedImagePreview, attachments = attachments)
             InputMode.CHAT -> {
@@ -915,6 +938,14 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun isComposerOnNewChatSurface(): Boolean {
+        if (screenState.inputMode == InputMode.NEW_GENERATE) return true
+        if (screenState.inputMode == InputMode.READ_ONLY) return false
+        val hasSelectedTask = !screenState.selectedTaskId.isNullOrBlank()
+        val hasVisibleMessages = screenState.messages.any { it.kind != MessageKind.DATE_SEPARATOR }
+        return !hasSelectedTask && !hasVisibleMessages
     }
 
     private fun currentReferenceImageName(): String? = selectedAttachments.firstOrNull { it.kind == SelectedAttachmentKind.IMAGE }?.displayName
@@ -1377,6 +1408,29 @@ class MainActivity : AppCompatActivity() {
         val responseAppName = taskDisplayName(response.generated_app_name)
             ?: taskDisplayName(response.app_name)
         val responsePackageName = response.package_name?.trim()?.takeIf { it.isNotBlank() }
+
+        if (isCancelledStatus(response.status.orEmpty())) {
+            addTaskEvent(
+                taskId,
+                ChatMessage(
+                    id = "generate-cancelled-$taskId-${System.currentTimeMillis()}",
+                    kind = MessageKind.STATUS,
+                    title = getString(R.string.message_title_status),
+                    body = getString(R.string.status_cancelled),
+                    createdAt = currentTimestampString()
+                )
+            )
+            screenState = screenState.copy(
+                selectedTaskId = taskId,
+                inputMode = InputMode.CHAT,
+                currentStatus = getString(R.string.status_cancelled),
+                statusDetail = response.message?.trim()?.takeIf { it.isNotBlank() }
+                    ?: getString(R.string.status_cancelled)
+            )
+            renderState()
+            setComposerEnabled(true)
+            return
+        }
 
         if (responseAppName != null || responsePackageName != null) {
             ensureTaskSummaryVisible(
@@ -2489,12 +2543,13 @@ ${record.stackTrace}
         downloadingApkTaskId = normalizedTaskId
         downloadingApkUrl = normalizedUrl
         downloadingArtifactPath = normalizedArtifactPath
+        downloadProgressPercent = 0
+        downloadProgressBytes = 0L
         screenState = screenState.copy(
             currentStatus = getString(R.string.download_apk_in_progress),
-            statusDetail = null,
+            statusDetail = currentDownloadProgressText(),
             canDownload = false
         )
-        requestScrollLatestAfterResponse()
         renderState()
         lifecycleScope.launch(Dispatchers.IO) {
             val downloadTaskId = resolveApiTaskId(normalizedTaskId, "/download/{task_id}")?.trim().takeUnless { it.isNullOrBlank() }
@@ -2522,10 +2577,72 @@ ${record.stackTrace}
                 }
 
                 val apkFile = artifactDownloadCacheFile(downloadTaskId ?: "latest", normalizedUrl, normalizedArtifactPath)
-                response.body()?.byteStream()?.use { input ->
-                    FileOutputStream(apkFile).use { output ->
-                        input.copyTo(output)
+                val tempFile = File(apkFile.parentFile ?: externalCacheDir ?: cacheDir, "${apkFile.name}.tmp")
+                val responseBody = response.body() ?: throw IllegalStateException("empty response")
+                val contentLength = responseBody.contentLength()
+                    .takeIf { it > 0L }
+                    ?: response.headers()["Content-Length"]?.toLongOrNull()
+                    ?: -1L
+                var downloadedBytes = 0L
+                var lastProgressPercent = if (contentLength > 0L) 0 else -1
+                var lastRenderedBytes = 0L
+                withContext(Dispatchers.Main) {
+                    downloadProgressPercent = if (contentLength > 0L) 0 else null
+                    downloadProgressBytes = 0L
+                    screenState = screenState.copy(
+                        currentStatus = getString(R.string.download_apk_in_progress),
+                        statusDetail = currentDownloadProgressText(),
+                        canDownload = false
+                    )
+                    renderState()
+                }
+                responseBody.byteStream().use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            downloadedBytes += read
+                            downloadProgressBytes = downloadedBytes
+                            if (contentLength > 0L) {
+                                val progress = ((downloadedBytes * 100L) / contentLength)
+                                    .toInt()
+                                    .coerceIn(0, 100)
+                                if (progress != lastProgressPercent) {
+                                    lastProgressPercent = progress
+                                    withContext(Dispatchers.Main) {
+                                        downloadProgressPercent = progress
+                                        screenState = screenState.copy(
+                                            currentStatus = getString(R.string.download_apk_in_progress),
+                                            statusDetail = currentDownloadProgressText(),
+                                            canDownload = false
+                                        )
+                                        renderState()
+                                    }
+                                }
+                            } else if (downloadedBytes - lastRenderedBytes >= 1024L * 1024L) {
+                                lastRenderedBytes = downloadedBytes
+                                withContext(Dispatchers.Main) {
+                                    downloadProgressPercent = null
+                                    downloadProgressBytes = downloadedBytes
+                                    screenState = screenState.copy(
+                                        currentStatus = getString(R.string.download_apk_in_progress),
+                                        statusDetail = currentDownloadProgressText(),
+                                        canDownload = false
+                                    )
+                                    renderState()
+                                }
+                            }
+                        }
                     }
+                }
+                if (apkFile.exists() && !apkFile.delete()) {
+                    throw IllegalStateException("failed to replace cached APK")
+                }
+                if (!tempFile.renameTo(apkFile)) {
+                    tempFile.copyTo(apkFile, overwrite = true)
+                    tempFile.delete()
                 }
 
                 latestDownloadedApkFile = apkFile
@@ -2536,6 +2653,8 @@ ${record.stackTrace}
                     downloadingApkTaskId = null
                     downloadingApkUrl = null
                     downloadingArtifactPath = null
+                    downloadProgressPercent = null
+                    downloadProgressBytes = 0L
                     downloadTaskId?.let { markArtifactDownloaded(it, normalizedUrl, normalizedArtifactPath, apkFile) }
                     downloadTaskId?.let { taskId ->
                         addTaskEvent(
@@ -2564,6 +2683,8 @@ ${record.stackTrace}
                     downloadingApkTaskId = null
                     downloadingApkUrl = null
                     downloadingArtifactPath = null
+                    downloadProgressPercent = null
+                    downloadProgressBytes = 0L
                     logApiFailure("/download/{task_id}", taskId = downloadTaskId, deviceId = deviceId, throwable = e)
                     downloadTaskId?.let { taskId ->
                         addTaskEvent(
@@ -2588,17 +2709,36 @@ ${record.stackTrace}
     }
 
     private fun installApk(file: File) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
-            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+        if (!file.exists()) {
+            Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
             return
         }
 
-        val uri = FileProvider.getUriForFile(this, "$packageName.provider", file)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (ApkArtifactActionHandler.needsInstallPermission(this)) {
+            pendingInstallApkFile = file
+            Toast.makeText(this, R.string.install_permission_required, Toast.LENGTH_LONG).show()
+            if (!ApkArtifactActionHandler.requestInstallPermission(this)) {
+                Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
+            }
+            return
         }
-        startActivity(intent)
+
+        pendingInstallApkFile = null
+        if (!ApkArtifactActionHandler.launchApkInstaller(this, file)) {
+            Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun retryPendingApkInstallIfReady() {
+        val file = pendingInstallApkFile ?: return
+        if (!file.exists()) {
+            pendingInstallApkFile = null
+            Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!ApkArtifactActionHandler.needsInstallPermission(this)) {
+            installApk(file)
+        }
     }
 
     private fun renderState() {
@@ -2638,11 +2778,17 @@ ${record.stackTrace}
             baseVisibleMessages
         }
         val visibleMessages = withColdStartMessage(withDownloadProgressMessage(timelineVisibleMessages))
-        val shouldAutoScrollNewMessage = shouldAutoScrollMessages(visibleMessages)
+        val hasTransientProgressUpdate = visibleMessages.any { it.isLoading || it.artifactDownloading }
+        val shouldPinBottomForTransientUpdate = hasTransientProgressUpdate && isChatNearBottomByPixels()
+        val shouldAutoScrollNewMessage = shouldAutoScrollMessages(visibleMessages) && !hasTransientProgressUpdate
         val anchorMessageId = pendingChatAnchorMessageId
         val clearAnchorAfterScroll = clearPendingChatAnchorAfterScroll
-        val shouldPreserveManualScroll = visibleMessages.isNotEmpty() && !isChatNearBottom()
-        val scrollLatestAfterResponse = pendingScrollLatestAfterResponse && !shouldPreserveManualScroll
+        val shouldPreserveManualScroll = visibleMessages.isNotEmpty() &&
+            !shouldPinBottomForTransientUpdate &&
+            (hasTransientProgressUpdate || !isChatNearBottom())
+        val scrollLatestAfterResponse = pendingScrollLatestAfterResponse &&
+            !shouldPreserveManualScroll &&
+            !shouldPinBottomForTransientUpdate
         if (pendingScrollLatestAfterResponse && !scrollLatestAfterResponse) {
             pendingScrollLatestAfterResponse = false
         }
@@ -2657,6 +2803,9 @@ ${record.stackTrace}
             clearAnchorAfterScroll = clearAnchorAfterScroll,
             scrollLatestAfterResponse = scrollLatestAfterResponse,
             preserveVisiblePosition = shouldPreserveManualScroll &&
+                !scrollLatestAfterResponse &&
+                anchorMessageId.isNullOrBlank(),
+            preserveBottomPosition = shouldPinBottomForTransientUpdate &&
                 !scrollLatestAfterResponse &&
                 anchorMessageId.isNullOrBlank()
         )
@@ -2769,6 +2918,18 @@ ${record.stackTrace}
         return lastVisible >= currentCount - 1 - thresholdItems
     }
 
+    private fun isChatNearBottomByPixels(thresholdPx: Int = dp(48)): Boolean {
+        return chatBottomOffsetPx() <= thresholdPx
+    }
+
+    private fun chatBottomOffsetPx(): Int {
+        val range = recyclerMessages.computeVerticalScrollRange()
+        val extent = recyclerMessages.computeVerticalScrollExtent()
+        val offset = recyclerMessages.computeVerticalScrollOffset()
+        if (range <= 0 || extent <= 0) return 0
+        return (range - extent - offset).coerceAtLeast(0)
+    }
+
     private fun withColdStartMessage(messages: List<ChatMessage>): List<ChatMessage> {
         if (messages.isNotEmpty()) return messages
         if (screenState.inputMode != InputMode.NEW_GENERATE) return messages
@@ -2789,25 +2950,53 @@ ${record.stackTrace}
         return message.kind == MessageKind.STATUS && message.body == getString(R.string.status_downloaded)
     }
 
+    private fun currentDownloadProgressText(): String {
+        downloadProgressPercent?.let { return getString(R.string.download_apk_progress, it) }
+        if (downloadProgressBytes > 0L) {
+            return getString(R.string.download_apk_progress_bytes, formatDownloadBytes(downloadProgressBytes))
+        }
+        return getString(R.string.download_apk_in_progress)
+    }
+
+    private fun formatDownloadBytes(bytes: Long): String {
+        val mib = bytes.toDouble() / (1024.0 * 1024.0)
+        return String.format(Locale.US, "%.1fMB", mib)
+    }
+
     private fun withDownloadProgressMessage(messages: List<ChatMessage>): List<ChatMessage> {
         val taskId = downloadingApkTaskId?.trim()?.takeIf { it.isNotBlank() } ?: return messages
         val activeTaskId = screenState.selectedTaskId?.trim()?.takeIf { it.isNotBlank() }
             ?: currentTaskId?.trim()?.takeIf { it.isNotBlank() }
         if (!isDownloadingApk || activeTaskId != taskId) return messages
+        if (messages.any(::isCurrentDownloadArtifact)) return messages
         val progressId = "download-progress-$taskId"
         if (messages.any { it.id == progressId }) return messages
         return messages + ChatMessage(
             id = progressId,
             kind = MessageKind.STATUS,
             title = getString(R.string.message_title_status),
-            body = getString(R.string.download_apk_in_progress),
+            body = currentDownloadProgressText(),
             isLoading = true
         )
     }
 
     private fun withTransientArtifactDownloadState(message: ChatMessage): ChatMessage {
         val downloading = isCurrentDownloadArtifact(message)
-        return if (message.artifactDownloading == downloading) message else message.copy(artifactDownloading = downloading)
+        val progressPercent = if (downloading) downloadProgressPercent else null
+        val progressText = if (downloading) currentDownloadProgressText() else null
+        return if (
+            message.artifactDownloading == downloading &&
+            message.artifactDownloadProgressPercent == progressPercent &&
+            message.artifactDownloadProgressText == progressText
+        ) {
+            message
+        } else {
+            message.copy(
+                artifactDownloading = downloading,
+                artifactDownloadProgressPercent = progressPercent,
+                artifactDownloadProgressText = progressText
+            )
+        }
     }
 
     private fun isCurrentDownloadArtifact(message: ChatMessage): Boolean {
@@ -2815,10 +3004,21 @@ ${record.stackTrace}
         val taskId = downloadingApkTaskId?.trim()?.takeIf { it.isNotBlank() } ?: return false
         if (message.artifactTaskId?.trim() != taskId) return false
 
+        return isCurrentDownloadArtifactFor(
+            taskId = taskId,
+            artifactPath = message.artifactApkPath,
+            artifactUrl = message.artifactApkUrl
+        )
+    }
+
+    private fun isCurrentDownloadArtifactFor(taskId: String, artifactPath: String?, artifactUrl: String?): Boolean {
+        if (!isDownloadingApk) return false
+        val activeDownloadTaskId = downloadingApkTaskId?.trim()?.takeIf { it.isNotBlank() } ?: return false
+        if (taskId.trim() != activeDownloadTaskId) return false
         val targetPath = downloadingArtifactPath?.trim().orEmpty()
         val targetUrl = downloadingApkUrl?.trim().orEmpty()
-        val messagePath = message.artifactApkPath?.trim().orEmpty()
-        val messageUrl = message.artifactApkUrl?.trim().orEmpty()
+        val messagePath = artifactPath?.trim().orEmpty()
+        val messageUrl = artifactUrl?.trim().orEmpty()
         return when {
             targetPath.isNotBlank() && messagePath == targetPath -> true
             targetUrl.isNotBlank() && messageUrl == targetUrl -> true
@@ -2888,6 +3088,10 @@ ${record.stackTrace}
             artifactCanDownload = incoming.artifactCanDownload || existing.artifactCanDownload,
             artifactCanInstall = incoming.artifactCanInstall || existing.artifactCanInstall,
             artifactDownloading = incoming.artifactDownloading || existing.artifactDownloading,
+            artifactDownloadProgressPercent = incoming.artifactDownloadProgressPercent
+                ?: existing.artifactDownloadProgressPercent,
+            artifactDownloadProgressText = incoming.artifactDownloadProgressText
+                ?: existing.artifactDownloadProgressText,
             createdAt = incoming.createdAt ?: existing.createdAt
         )
     }
@@ -2932,7 +3136,17 @@ ${record.stackTrace}
             artifactBuildAttempt = response.build_attempts.takeIf { it > 0 },
             artifactCanDownload = artifactApkUrl.isNotBlank(),
             artifactCanInstall = installableFile != null,
-            artifactDownloading = isDownloadingApk
+            artifactDownloading = isCurrentDownloadArtifactFor(taskId, artifactApkPath, artifactApkUrl),
+            artifactDownloadProgressPercent = if (isCurrentDownloadArtifactFor(taskId, artifactApkPath, artifactApkUrl)) {
+                downloadProgressPercent
+            } else {
+                null
+            },
+            artifactDownloadProgressText = if (isCurrentDownloadArtifactFor(taskId, artifactApkPath, artifactApkUrl)) {
+                currentDownloadProgressText()
+            } else {
+                null
+            }
         )
     }
 
@@ -2953,7 +3167,9 @@ ${record.stackTrace}
             message.copy(
                 artifactDownloadedPath = file.absolutePath,
                 artifactCanInstall = true,
-                artifactDownloading = false
+                artifactDownloading = false,
+                artifactDownloadProgressPercent = null,
+                artifactDownloadProgressText = null
             )
         }
         if (!changed) return
@@ -3417,7 +3633,7 @@ ${record.stackTrace}
         val obj = response.conversation_state?.takeIf { it.isJsonObject }?.asJsonObject
         if (obj != null) {
             val initialPrompt = firstString(obj, "initial_user_prompt")?.trim().orEmpty()
-            if (initialPrompt.isNotBlank()) {
+            if (initialPrompt.isNotBlank() && !taskHasUserMessageText(taskId, initialPrompt)) {
                 appendTaskTimelineMessage(
                     taskId,
                     ChatMessage(
@@ -3438,7 +3654,12 @@ ${record.stackTrace}
             val confirmationPayload = firstString(obj, "confirmation_payload")?.trim().orEmpty()
             val renderMode = firstString(obj, "render_mode")?.trim().orEmpty()
             val awaitingConfirmation = obj.get("awaiting_confirmation")?.takeIf { it.isJsonPrimitive }?.asBoolean == true
-            if (latestSummary.isNotBlank() && renderMode != "confirmation_bubble" && !timelineContainsBody(taskId, latestSummary)) {
+            if (
+                latestSummary.isNotBlank() &&
+                renderMode != "confirmation_bubble" &&
+                !isUserPromptEcho(taskId, latestSummary, initialPrompt) &&
+                !timelineContainsBody(taskId, latestSummary)
+            ) {
                 appendTaskTimelineMessage(
                     taskId,
                     ChatMessage(
@@ -3544,6 +3765,25 @@ ${record.stackTrace}
 
     private fun timelineContainsBody(taskId: String, body: String): Boolean {
         return buildTaskTimeline(taskId).any { hasSameMessageText(it.body, body) }
+    }
+
+    private fun taskHasUserMessageText(taskId: String, body: String): Boolean {
+        val normalizedTaskId = taskId.trim()
+        val taskMessages = taskConversationMessages[normalizedTaskId].orEmpty()
+        val activeScreenMessages = if (screenState.selectedTaskId == normalizedTaskId || currentTaskId == normalizedTaskId) {
+            screenState.messages
+        } else {
+            emptyList()
+        }
+        return (taskMessages.asSequence() + activeScreenMessages.asSequence())
+            .any { it.kind == MessageKind.USER && hasSameMessageText(it.body, body) }
+    }
+
+    private fun isUserPromptEcho(taskId: String, body: String, initialPrompt: String? = null): Boolean {
+        val normalizedBody = body.trim()
+        if (normalizedBody.isBlank()) return false
+        if (!initialPrompt.isNullOrBlank() && hasSameMessageText(normalizedBody, initialPrompt)) return true
+        return taskHasUserMessageText(taskId, normalizedBody)
     }
 
     private fun timelineContainsClarificationQuestions(taskId: String, questions: List<String>): Boolean {
@@ -4341,6 +4581,8 @@ ${record.stackTrace}
             "reviewing",
             "repairing",
             "running",
+            "cancelled",
+            "canceled",
             "in progress",
             "working"
         )
@@ -4962,7 +5204,6 @@ ${record.stackTrace}
                     isProcessingBody = { processingAnimationBaseText(it) != null }
                 )
             }
-            .let(TaskProgressTimelinePolicy::moveArtifactsToEndOfUserTurns)
             .let(TaskProgressTimelinePolicy::moveLoadingMessagesToEnd)
             .let(::withDateSeparators)
     }
@@ -5031,6 +5272,7 @@ ${record.stackTrace}
             getString(R.string.status_thinking),
             getString(R.string.status_generating),
             getString(R.string.status_downloaded),
+            getString(R.string.status_cancelled),
             getString(R.string.status_queued_input_added),
             getString(R.string.status_queued_input_start),
             getString(R.string.runtime_error_analysis_pending),
@@ -5653,6 +5895,32 @@ ${record.stackTrace}
         layoutManager.scrollToPositionWithOffset(index, snapshot.topOffset)
     }
 
+    private fun captureChatBottomScrollSnapshot(): ChatBottomScrollSnapshot? {
+        if (chatAdapter.itemCount <= 0) return null
+        return ChatBottomScrollSnapshot(bottomOffset = chatBottomOffsetPx())
+    }
+
+    private fun restoreChatBottomScrollSnapshotAfterLayout(snapshot: ChatBottomScrollSnapshot) {
+        recyclerMessages.post {
+            restoreChatBottomScrollSnapshot(snapshot)
+            recyclerMessages.post {
+                restoreChatBottomScrollSnapshot(snapshot)
+            }
+        }
+    }
+
+    private fun restoreChatBottomScrollSnapshot(snapshot: ChatBottomScrollSnapshot) {
+        val range = recyclerMessages.computeVerticalScrollRange()
+        val extent = recyclerMessages.computeVerticalScrollExtent()
+        val currentOffset = recyclerMessages.computeVerticalScrollOffset()
+        if (range <= 0 || extent <= 0) return
+        val targetOffset = (range - extent - snapshot.bottomOffset).coerceAtLeast(0)
+        val delta = targetOffset - currentOffset
+        if (delta != 0) {
+            recyclerMessages.scrollBy(0, delta)
+        }
+    }
+
     private fun requestChatScrollAnchor(messageId: String) {
         clearInitialScrollForActiveTask()
         pendingChatAnchorMessageId = messageId
@@ -5740,7 +6008,8 @@ ${record.stackTrace}
         anchorMessageId: String? = null,
         clearAnchorAfterScroll: Boolean = false,
         scrollLatestAfterResponse: Boolean = false,
-        preserveVisiblePosition: Boolean = false
+        preserveVisiblePosition: Boolean = false,
+        preserveBottomPosition: Boolean = false
     ) {
         when (chooseChatMessageRefreshAction(isMessageTextSelectionActive, recyclerMessages.isComputingLayout)) {
             ChatMessageRefreshAction.SKIP_FOR_TEXT_SELECTION -> return
@@ -5751,14 +6020,25 @@ ${record.stackTrace}
                         anchorMessageId,
                         clearAnchorAfterScroll,
                         scrollLatestAfterResponse,
-                        preserveVisiblePosition
+                        preserveVisiblePosition,
+                        preserveBottomPosition
                     )
                 }
                 return
             }
             ChatMessageRefreshAction.SUBMIT -> {
+                val bottomSnapshot = if (
+                    preserveBottomPosition &&
+                    !scrollLatestAfterResponse &&
+                    anchorMessageId.isNullOrBlank()
+                ) {
+                    captureChatBottomScrollSnapshot()
+                } else {
+                    null
+                }
                 val scrollSnapshot = if (
                     preserveVisiblePosition &&
+                    bottomSnapshot == null &&
                     !scrollLatestAfterResponse &&
                     anchorMessageId.isNullOrBlank()
                 ) {
@@ -5771,6 +6051,8 @@ ${record.stackTrace}
                         scrollLatestMessageAfterLayout()
                     } else if (!anchorMessageId.isNullOrBlank()) {
                         scrollChatToAnchorAfterLayout(anchorMessageId, clearAnchorAfterScroll)
+                    } else if (bottomSnapshot != null) {
+                        restoreChatBottomScrollSnapshotAfterLayout(bottomSnapshot)
                     } else if (scrollSnapshot != null) {
                         restoreChatScrollSnapshotAfterLayout(scrollSnapshot)
                     }

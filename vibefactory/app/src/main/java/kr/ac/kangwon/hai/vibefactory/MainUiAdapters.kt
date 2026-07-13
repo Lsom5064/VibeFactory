@@ -327,7 +327,10 @@ class ChatMessageAdapter(
             artifactMeta.text = artifactDisplayMeta(item, context)
             artifactAction.visibility = View.VISIBLE
             artifactAction.text = when {
-                item.artifactDownloading -> context.getString(R.string.download_apk_in_progress)
+                item.artifactDownloading -> item.artifactDownloadProgressText
+                    ?: item.artifactDownloadProgressPercent
+                        ?.let { context.getString(R.string.download_apk_progress, it) }
+                    ?: context.getString(R.string.download_apk_in_progress)
                 item.artifactCanInstall -> context.getString(R.string.install_apk)
                 else -> context.getString(R.string.artifact_download_action)
             }

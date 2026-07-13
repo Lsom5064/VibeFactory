@@ -132,9 +132,8 @@ def default_codex_command(root: Path) -> str:
         "--skip-git-repo-check",
         "--json",
     ]
-    codex_model = os.getenv("CODEX_MODEL", "").strip()
-    if codex_model:
-        args.extend(["--model", shlex.quote(codex_model)])
+    codex_model = os.getenv("CODEX_MODEL", "gpt-5.4").strip() or "gpt-5.4"
+    args.extend(["--model", shlex.quote(codex_model)])
     reasoning_effort = (os.getenv("CODEX_REASONING_EFFORT", "default").strip().lower() or "default")
     if reasoning_effort == "default":
         reasoning_effort = "medium"
@@ -1534,12 +1533,16 @@ def build_clarification_questions(prompt: str) -> list[str]:
         "앱 이름을 어떻게 할까요?",
         "첫 화면은 입력 중심으로 할까요, 목록이나 대시보드 중심으로 할까요?",
         "등록한 항목은 작성만 있으면 될까요, 수정과 삭제도 같이 필요할까요?",
+        "검색, 필터, 알림 중 이번 버전에 꼭 필요한 기능이 있을까요?",
+        "앱을 다시 열었을 때 어떤 정보가 저장되어 있어야 할까요?",
     ]
     if "sns" in lowered or "대화" in lowered:
         questions = [
             "묶고 싶은 SNS나 메신저 종류는 무엇인가요?",
             "한 화면 통합 피드로 볼까요, 서비스별 탭으로 나눌까요?",
             "이번 버전은 보기 중심이면 될까요, 답장이나 작성 흐름도 필요할까요?",
+            "대화나 게시글을 검색하거나 즐겨찾기하는 기능도 필요할까요?",
+            "알림이나 새 메시지 표시가 이번 버전에 꼭 필요할까요?",
         ]
     return questions
 
@@ -1653,12 +1656,16 @@ def build_scope_clarification_questions(
             "메모 작성만 있으면 될까요, 수정과 삭제도 같이 필요할까요?",
             "검색이나 폴더·태그 같은 정리 기능도 이번에 필요할까요?",
             "첫 화면은 메모 목록으로 할까요, 빠른 작성 화면으로 할까요?",
+            "앱을 다시 열었을 때 메모가 유지되어야 할까요?",
+            "중요 메모 고정이나 즐겨찾기도 이번 버전에 필요할까요?",
         ]
 
     return [
         "기본 등록 기능만 있으면 될까요, 수정과 삭제도 같이 필요할까요?",
         "첫 화면은 입력 중심으로 할까요, 목록이나 대시보드 중심으로 할까요?",
         "검색, 필터, 알림 중 이번에 꼭 필요한 보조 기능이 있을까요?",
+        "앱을 다시 열었을 때 어떤 정보가 저장되어 있어야 할까요?",
+        "목록 정렬이나 즐겨찾기 같은 관리 기능도 필요할까요?",
     ]
 
 
@@ -2419,7 +2426,7 @@ def run_spec_clarification_agent(
             "questions": {
                 "type": "array",
                 "items": {"type": "string"},
-                "maxItems": 3,
+                "maxItems": 5,
             },
         },
     }
@@ -2465,7 +2472,7 @@ Rules:
 - For a new app request, do not use mode=build until both of these are decided:
   1. primary_user_flow is concrete enough,
   2. secondary_scope_confirmed is true and secondary_requirements are either explicitly listed or explicitly confirmed as none for now.
-- If the user's message does not clearly separate first-release core flow from second-phase enhancements, use mode=ask_confirmation and propose 2-3 short feature questions yourself.
+- If the user's message does not clearly separate first-release core flow from second-phase enhancements, use mode=ask_confirmation and propose 2-5 short feature questions yourself.
 - Do not ask the user to write or organize 1차 핵심 흐름 and 2차 고도화 요구 from scratch.
 - This build system does not provide a backend database, account system, cloud storage, or multi-device sync for each generated app by default.
 - Do not ask whether login, account creation, server storage, cloud sync, or multi-device sync is needed unless the user explicitly requested login, accounts, sharing across users, teams, cloud sync, or multi-device use.
@@ -2513,7 +2520,7 @@ Rules:
 - effective_user_prompt is internal machine input, so preserve the user's requested app details faithfully there, but keep all explanatory text fields in Korean.
 - For build or ask_confirmation, assistant_reply should be an empty string.
 - For answer_question, assistant_reply must answer the user's real question or explain feasibility. It must never describe your own formatting behavior, schema behavior, or output-policy compliance.
-- If you ask clarification questions for a new app, prefer 1-3 short Korean feature questions with concrete options.
+- If you ask clarification questions for a new app, prefer 1-5 short Korean feature questions with concrete options.
 - Avoid wording like "적어주세요", "알려주세요", "나눠서 답해 주세요", or other open-ended authoring requests when short option questions would work.
 - For build or ask_confirmation, do not leave acceptance_criteria empty.
 - For answer_question, acceptance_criteria must be an empty array.
@@ -4261,7 +4268,7 @@ If implementation details matter, translate them into user-facing concepts such 
 Put developer-facing references only in `referenced_files`, never in `assistant_reply`.
 For `build`, leave `assistant_reply` empty and put the code-aware build instruction in `effective_user_prompt`.
 If `previous_conversation_state.awaiting_confirmation` is true and the latest user message answers that pending question, merge the pending request and latest answer into `effective_user_prompt`.
-For `ask_confirmation`, include 1-3 short Korean `questions`.
+For `ask_confirmation`, include 1-5 short Korean `questions`.
 
 Result JSON schema:
 {{
@@ -4568,7 +4575,15 @@ def status_display_text(status: str, message: Optional[str] = None) -> str:
 
 
 def is_cancellable_task_status(status: str) -> bool:
+    return status.strip().lower() in {"pending decision", "queued", "running"}
+
+
+def is_generate_blocked_task_status(status: str) -> bool:
     return status.strip().lower() in {"queued", "running"}
+
+
+def is_cancelled_task_status(status: str) -> bool:
+    return status.strip().lower() in {"cancelled", "canceled"}
 
 
 def build_attempts_for_task(task: dict[str, Any]) -> int:
@@ -5176,7 +5191,7 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
         kind = "assistant"
         title = "AI"
         body = message_text
-    elif event_type in {"task_status", "task_succeeded", "task_failed", "task_error", "task_timeout"}:
+    elif event_type in {"task_status", "task_succeeded", "task_failed", "task_error", "task_timeout", "task_cancelled"}:
         kind = "status"
         title = "상태"
         body = sanitize_user_visible_text(
@@ -5585,7 +5600,7 @@ class CodexTaskRunner:
             return task
         did_cancel = self.db.update_task_if_status(
             task_id,
-            {"queued", "running"},
+            {"pending decision", "queued", "running"},
             status="Cancelled",
             message="앱 생성을 중단했어요.",
         )
@@ -6860,8 +6875,20 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="task not found")
             if not is_task_access_allowed(task, device_id=request.device_id, phone_number=request.phone_number):
                 raise HTTPException(status_code=404, detail="task not found")
-            if task["status"] in {"Queued", "Running"}:
+            if is_generate_blocked_task_status(str(task.get("status") or "")):
                 raise HTTPException(status_code=409, detail="task already in progress")
+            previous_task_for_context = dict(task)
+            db.update_task(
+                followup_task_id,
+                status="Pending Decision",
+                message="요청을 검토하고 있어요.",
+                device_id=request.device_id,
+                phone_number=request.phone_number,
+            )
+            pending_decision_task = db.get_task(followup_task_id)
+            if pending_decision_task:
+                task = pending_decision_task
+                log_task_status_event(db, pending_decision_task)
             user_event_id = db.log_event(
                 followup_task_id,
                 actor="user",
@@ -6894,7 +6921,7 @@ def create_app() -> FastAPI:
                     raise HTTPException(status_code=400, detail=f"attachment save failed: {exc}") from exc
                 if saved_requested_attachments:
                     requested_reference_attachments = saved_requested_attachments
-            previous_conversation_state = build_task_conversation_state(task)
+            previous_conversation_state = build_task_conversation_state(previous_task_for_context)
             previous_reference_attachments = normalize_reference_attachments(
                 previous_conversation_state.get("reference_attachments") or []
             )
@@ -7018,6 +7045,9 @@ def create_app() -> FastAPI:
                     settings=settings,
                     db=db,
                 )
+            cancelled_task = db.get_task(followup_task_id)
+            if cancelled_task and is_cancelled_task_status(str(cancelled_task.get("status") or "")):
+                return serialize_task_for_status(db, cancelled_task, settings.status_log_line_limit)
             if effective_reference_image_name and not decision.image_reference_summary:
                 decision = replace(
                     decision,
@@ -7038,6 +7068,9 @@ def create_app() -> FastAPI:
                     },
                 )
             if decision.mode != "build":
+                cancelled_task = db.get_task(followup_task_id)
+                if cancelled_task and is_cancelled_task_status(str(cancelled_task.get("status") or "")):
+                    return serialize_task_for_status(db, cancelled_task, settings.status_log_line_limit)
                 db.update_task(
                     followup_task_id,
                     status=decision.status,
@@ -7158,6 +7191,9 @@ def create_app() -> FastAPI:
                     project_path=project_path_value,
                 )
 
+            cancelled_task = db.get_task(followup_task_id)
+            if cancelled_task and is_cancelled_task_status(str(cancelled_task.get("status") or "")):
+                return serialize_task_for_status(db, cancelled_task, settings.status_log_line_limit)
             db.update_task(
                 followup_task_id,
                 status="Queued",
@@ -7342,7 +7378,7 @@ def create_app() -> FastAPI:
                     make_decision_state(task, decision, request.prompt),
                     ensure_ascii=False,
                 )
-                db.update_task(codex_result_json=task["codex_result_json"])
+                db.update_task(task_id, codex_result_json=task["codex_result_json"])
         log_task_status_event(db, task)
         log_package_name_event(
             db,
@@ -7421,7 +7457,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         if not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
             raise HTTPException(status_code=404, detail="task not found")
-        if str(task.get("status") or "").strip().lower() in {"cancelled", "canceled"}:
+        if is_cancelled_task_status(str(task.get("status") or "")):
             return serialize_task_for_status(db, task, settings.status_log_line_limit)
         if not is_cancellable_task_status(str(task.get("status") or "")):
             raise HTTPException(status_code=409, detail="task is not cancellable")

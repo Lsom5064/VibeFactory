@@ -30,6 +30,7 @@ pip install -r requirements.txt
 - `BASE_PROJECT_PATH`: task workspace에 복사할 Base Flutter 프로젝트 경로
 - `WORKSPACES_ROOT`: 생성된 task workspace 루트 경로
 - `CODEX_COMMAND`: Codex CLI 실행 명령 템플릿
+- `CODEX_MODEL`: 앱 생성/수정 작업을 수행하는 Codex CLI 모델. 기본값 `gpt-5.4`
 - `CODEX_DANGEROUS_BYPASS`: 기본값 `1`. `1`이면 Codex를 `--dangerously-bypass-approvals-and-sandbox`로 실행
 - `CODEX_SANDBOX_MODE`: `CODEX_DANGEROUS_BYPASS=0`일 때 사용할 Codex sandbox mode. 기본값 `danger-full-access`
 - `INTENT_AGENT_ENABLED`: 기본값은 실제 서버에서 `1`, `MOCK_CODEX=1`일 때는 `0`. `1`이면 후속 요청/확인 메시지 해석에 Codex 기반 intent agent 사용
@@ -72,6 +73,7 @@ DB 기록:
 ```bash
 export BASE_PROJECT_PATH=/absolute/path/to/base_flutter_project
 export WORKSPACES_ROOT=/absolute/path/to/flutter_apk_server/workspaces
+export CODEX_MODEL=gpt-5.4
 export CODEX_DANGEROUS_BYPASS=1
 export INTENT_AGENT_ENABLED=1
 export INTENT_AGENT_MODEL=gpt-5.4
@@ -150,7 +152,7 @@ codex exec --skip-git-repo-check --json --dangerously-bypass-approvals-and-sandb
 - 서버가 이미 VM, 컨테이너, 별도 계정 같은 외부 격리 환경 안에서 돌고 있을 때만 이 기본값을 유지하는 것이 안전하다.
 - 더 제한적으로 운용하려면 `CODEX_DANGEROUS_BYPASS=0`과 함께 `CODEX_SANDBOX_MODE=workspace-write` 또는 `danger-full-access`를 지정하거나, `CODEX_COMMAND`를 직접 오버라이드하면 된다.
 - 후속 수정 요청에서 사용자가 `네, 진행해줘`처럼 확인만 보냈을 때는 intent agent가 직전의 확인 대기 명세를 복원해서 빌드 입력으로 사용한다. 따라서 호스트 앱이 확인 문구만 재전송해도 서버는 가능한 한 원래 수정 명세를 유지한다.
-- intent agent는 명세가 충분히 구체적일 때만 build를 시작한다. 핵심 요구사항이 모호하면 먼저 1-3개의 질문으로 멈추고, 사용자의 답변이 들어온 뒤에만 build로 넘어간다.
+- intent agent는 명세가 충분히 구체적일 때만 build를 시작한다. 핵심 요구사항이 모호하면 먼저 1-5개의 질문으로 멈추고, 사용자의 답변이 들어온 뒤에만 build로 넘어간다.
 - 명세 보강용 spec clarification agent는 새 앱 생성과 기존 앱 수정을 구분한다. 기존 앱 수정처럼 보이지만 현재 task에 기존 workspace가 없으면 새 앱으로 오인해 빌드하지 않는다.
 
 실행 흐름:
