@@ -52,3 +52,13 @@ fun createVibeApiService(
         .build()
         .create(VibeApiService::class.java)
 }
+
+fun createDownloadVibeApiService(gson: Gson? = null): VibeApiService {
+    return createVibeApiService(
+        gson = gson,
+        connectTimeoutSeconds = 20,
+        readTimeoutSeconds = 600,
+        writeTimeoutSeconds = 120,
+        callTimeoutSeconds = null
+    )
+}

@@ -900,6 +900,7 @@ def sanitize_user_visible_text(text: str) -> str:
 class Settings:
     base_project_path: Path
     workspaces_root: Path
+    build_cache_root: Path
     codex_command: str
     flutter_command: str
     codex_timeout_seconds: Optional[int]
@@ -923,6 +924,9 @@ class Settings:
     app_runtime_daily_token_limit: int
     app_runtime_max_output_tokens: int
     app_runtime_temperature: float
+    shared_build_cache_enabled: bool
+    optimized_download_apk_enabled: bool
+    android_only_workspace_enabled: bool
     admin_api_token: str
 
 
@@ -942,6 +946,11 @@ def load_settings() -> Settings:
         workspaces_root=resolve_path(
             os.getenv("WORKSPACES_ROOT", ""),
             root / "workspaces",
+            root,
+        ),
+        build_cache_root=resolve_path(
+            os.getenv("BUILD_CACHE_ROOT", ""),
+            root / ".tooling",
             root,
         ),
         codex_command=os.getenv("CODEX_COMMAND", default_codex_command(root)),
@@ -974,6 +983,9 @@ def load_settings() -> Settings:
         app_runtime_daily_token_limit=max(1, int(os.getenv("APP_RUNTIME_DAILY_TOKEN_LIMIT", "50000"))),
         app_runtime_max_output_tokens=max(0, int(os.getenv("APP_RUNTIME_MAX_OUTPUT_TOKENS", "0"))),
         app_runtime_temperature=float(os.getenv("APP_RUNTIME_TEMPERATURE", "0.4")),
+        shared_build_cache_enabled=env_flag("SHARED_BUILD_CACHE_ENABLED", True),
+        optimized_download_apk_enabled=env_flag("OPTIMIZED_DOWNLOAD_APK_ENABLED", True),
+        android_only_workspace_enabled=env_flag("ANDROID_ONLY_WORKSPACE_ENABLED", True),
         admin_api_token=os.getenv("ADMIN_API_TOKEN", "").strip(),
     )
 
@@ -3655,9 +3667,9 @@ def render_task_agents_md(task_id: str) -> str:
 - iOS/Xcode는 사용하지 않는다.
 - 사용자의 명세를 반영해 `project` 폴더의 Flutter 앱을 수정한다.
 - 가급적 `project/lib/main.dart`, `project/pubspec.yaml`, `project/android/app/` 아래만 집중해서 수정한다.
-- `flutter pub get`, `flutter analyze`, `flutter build apk --debug` 중 필요한 명령을 실행한다.
-- APK가 필요하면 release 대신 debug APK만 만든다.
-- `assembleRelease`나 `flutter build apk --release`는 실행하지 않는다.
+- `flutter pub get`, `flutter analyze`, `flutter build apk --release --target-platform android-arm64` 중 필요한 명령을 실행한다.
+- APK가 필요하면 다운로드가 빠른 arm64 release APK를 우선 만든다.
+- release APK 빌드가 실패할 때만 debug APK를 fallback으로 만든다.
 - 사용자가 요청한 핵심 기능을 더 쉬운 대체 구현으로 바꾸지 않는다.
 - `prompt.md`에 적힌 `1차 핵심 흐름`을 이번 빌드의 최우선 범위로 본다.
 - `2차 고도화 요구`는 1차가 안정적으로 성립한 뒤에 반영한다. 시간이 부족하거나 충돌하면 1차를 우선하고, 못 넣은 2차 요구는 `known_limitations`에 남긴다.
@@ -4391,6 +4403,36 @@ def apply_project_defaults(project_root: Path, task_id: str, app_name: str, pack
         gradle_text = re.sub(r'namespace\s*=\s*"[^"]+"', f'namespace = "{package_name}"', gradle_text, count=1)
         gradle_text = re.sub(r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{package_name}"', gradle_text, count=1)
         gradle_path.write_text(gradle_text, encoding="utf-8")
+    ensure_release_uses_debug_signing(project_root)
+
+
+def ensure_release_uses_debug_signing(project_root: Path) -> bool:
+    gradle_path = project_root / "android" / "app" / "build.gradle.kts"
+    gradle_text = read_text_if_exists(gradle_path, limit=100_000)
+    if not gradle_text:
+        return False
+    if "signingConfigs.getByName(\"debug\")" in gradle_text or "signingConfigs.debug" in gradle_text:
+        return False
+
+    flutter_block_match = re.search(r"(?m)^flutter\s*\{", gradle_text)
+    search_end = flutter_block_match.start() if flutter_block_match else len(gradle_text)
+    android_end_index = gradle_text.rfind("}", 0, search_end)
+    if android_end_index < 0:
+        return False
+
+    build_types_block = """
+
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+"""
+    next_text = gradle_text[:android_end_index] + build_types_block + gradle_text[android_end_index:]
+    if next_text == gradle_text:
+        return False
+    gradle_path.write_text(next_text, encoding="utf-8")
+    return True
 
     kotlin_root = project_root / "android" / "app" / "src" / "main" / "kotlin"
     for kotlin_file in kotlin_root.rglob("MainActivity.kt"):
@@ -4474,11 +4516,34 @@ def ensure_project_revision_version(project_root: Path, revision_label: Optional
     return True
 
 
-def create_initial_project_revision(task_root: Path, base_project_path: Path) -> tuple[Path, str]:
+ANDROID_ONLY_WORKSPACE_ROOT_IGNORES = {
+    "ios",
+    "macos",
+    "windows",
+    "linux",
+    "web",
+    "test",
+}
+
+
+def create_initial_project_revision(
+    task_root: Path,
+    base_project_path: Path,
+    *,
+    android_only: bool = True,
+) -> tuple[Path, str]:
     revision_label = "rev_0001"
     revision_root = task_root / "revisions" / revision_label
     project_root = revision_root / "project"
-    shutil.copytree(base_project_path, project_root)
+    source_root = base_project_path.resolve()
+
+    def ignore_initial_project_dirs(path: str, names: list[str]) -> set[str]:
+        ignored = ignore_project_revision_cache_dirs(path, names)
+        if android_only and Path(path).resolve() == source_root:
+            ignored.update(name for name in names if name in ANDROID_ONLY_WORKSPACE_ROOT_IGNORES)
+        return ignored
+
+    shutil.copytree(base_project_path, project_root, ignore=ignore_initial_project_dirs)
     ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(task_root, project_root)
     return project_root, revision_label
@@ -4495,7 +4560,12 @@ def ignore_project_revision_cache_dirs(path: str, names: list[str]) -> set[str]:
     return {name for name in names if name in cache_names}
 
 
-def create_followup_project_revision(workspace_path: Path, source_project_path: Path) -> tuple[Path, str]:
+def create_followup_project_revision(
+    workspace_path: Path,
+    source_project_path: Path,
+    *,
+    android_only: bool = True,
+) -> tuple[Path, str]:
     revisions_root = workspace_path / "revisions"
     revisions_root.mkdir(parents=True, exist_ok=True)
     highest_index = 0
@@ -4508,7 +4578,15 @@ def create_followup_project_revision(workspace_path: Path, source_project_path: 
     revision_label = f"rev_{highest_index + 1:04d}"
     revision_root = revisions_root / revision_label
     project_root = revision_root / "project"
-    shutil.copytree(source_project_path, project_root, ignore=ignore_project_revision_cache_dirs)
+    source_root = source_project_path.resolve()
+
+    def ignore_followup_project_dirs(path: str, names: list[str]) -> set[str]:
+        ignored = ignore_project_revision_cache_dirs(path, names)
+        if android_only and Path(path).resolve() == source_root:
+            ignored.update(name for name in names if name in ANDROID_ONLY_WORKSPACE_ROOT_IGNORES)
+        return ignored
+
+    shutil.copytree(source_project_path, project_root, ignore=ignore_followup_project_dirs)
     ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(workspace_path, project_root)
     return project_root, revision_label
@@ -4520,6 +4598,8 @@ def clear_previous_run_artifacts(workspace_path: Path) -> None:
         workspace_path / "logs" / "codex_stdout.log",
         workspace_path / "logs" / "codex_stderr.log",
         workspace_path / "logs" / "build.log",
+        workspace_path / "project" / "build" / "app" / "outputs" / "flutter-apk" / "app-release.apk",
+        workspace_path / "project" / "build" / "app" / "outputs" / "flutter-apk" / "app-arm64-v8a-release.apk",
         workspace_path / "project" / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk",
     )
     for artifact_path in artifact_paths:
@@ -5677,11 +5757,30 @@ class CodexTaskRunner:
 
         exit_code: Optional[int] = None
         timed_out = False
+        codex_started_at = time.monotonic()
 
         if self.settings.mock_codex:
             exit_code, timed_out = self.run_mock(task, workspace_path, stdout_path, stderr_path, result_path)
         else:
             exit_code, timed_out = self.run_codex(task, workspace_path, stdout_path, stderr_path)
+            if not self.is_task_cancelled(task_id):
+                codex_elapsed_seconds = time.monotonic() - codex_started_at
+                codex_phase = "failed" if timed_out or (exit_code not in (0, None) and not result_path.exists()) else "succeeded"
+                codex_body = (
+                    "앱 설계와 코드 생성 시간이 제한을 초과했어요."
+                    if timed_out
+                    else "앱 설계와 코드 생성 단계가 완료되었어요."
+                    if codex_phase == "succeeded"
+                    else "앱 설계와 코드 생성 단계에 실패했어요."
+                )
+                log_build_stage_event(
+                    self.db,
+                    task_id,
+                    stage="앱 설계와 코드 생성",
+                    phase=codex_phase,
+                    body=codex_body,
+                    detail=f"종료 코드: {exit_code if exit_code is not None else '-'}, 소요 시간: {codex_elapsed_seconds:.1f}초",
+                )
             if not timed_out and not result_path.exists() and not self.is_task_cancelled(task_id):
                 codex_log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
                 if codex_engine_issue_from_logs(codex_log_text, exit_code) is None:
@@ -5744,10 +5843,10 @@ class CodexTaskRunner:
         return process.wait(timeout=timeout_seconds)
 
     def build_task_env(self, workspace_path: Path) -> dict[str, str]:
-        tool_cache_root = workspace_path / ".tooling"
+        tool_cache_root = self.settings.build_cache_root if self.settings.shared_build_cache_enabled else workspace_path / ".tooling"
         pub_cache_path = tool_cache_root / "pub-cache"
         gradle_home_path = tool_cache_root / "gradle"
-        temp_path = tool_cache_root / "tmp"
+        temp_path = workspace_path / ".tooling" / "tmp"
         pub_cache_path.mkdir(parents=True, exist_ok=True)
         gradle_home_path.mkdir(parents=True, exist_ok=True)
         temp_path.mkdir(parents=True, exist_ok=True)
@@ -5767,11 +5866,12 @@ class CodexTaskRunner:
         env: dict[str, str],
         log_path: Path,
         task_id: Optional[str] = None,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, bool, float]:
         if task_id and self.is_task_cancelled(task_id):
-            return 1, False
+            return 1, False, 0.0
         log_path.parent.mkdir(parents=True, exist_ok=True)
         command_text = " ".join(shlex.quote(part) for part in args)
+        started_at = time.monotonic()
         with log_path.open("a", encoding="utf-8") as log_file:
             log_file.write(f"\n\n$ {command_text}\n")
             log_file.flush()
@@ -5787,15 +5887,23 @@ class CodexTaskRunner:
             self.register_process(process, task_id=task_id)
             if task_id and self.is_task_cancelled(task_id):
                 self.terminate_task_process(task_id)
-                return process.returncode or 1, False
+                elapsed = time.monotonic() - started_at
+                log_file.write(f"\n[server] command cancelled after {elapsed:.1f}s\n")
+                log_file.flush()
+                return process.returncode or 1, False, elapsed
             try:
-                return self.wait_for_process(process), False
+                exit_code = self.wait_for_process(process)
+                elapsed = time.monotonic() - started_at
+                log_file.write(f"\n[server] command finished exit_code={exit_code} duration={elapsed:.1f}s\n")
+                log_file.flush()
+                return exit_code, False, elapsed
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-                log_file.write("\n[server] command timed out\n")
+                elapsed = time.monotonic() - started_at
+                log_file.write(f"\n[server] command timed out after {elapsed:.1f}s\n")
                 log_file.flush()
-                return process.returncode or 1, True
+                return process.returncode or 1, True, elapsed
             finally:
                 self.unregister_process(process)
 
@@ -5847,9 +5955,9 @@ class CodexTaskRunner:
             stage="debug apk",
             phase="started",
             body=status_message,
-            detail="release 결과 대신 debug APK를 우선 준비합니다.",
+            detail="최적화 APK 준비에 실패했거나 비활성화되어 debug APK를 준비합니다.",
         )
-        exit_code, timed_out = self.run_logged_command(
+        exit_code, timed_out, elapsed_seconds = self.run_logged_command(
             flutter_args + ["build", "apk", "--debug"],
             cwd=project_path,
             env=env,
@@ -5863,7 +5971,7 @@ class CodexTaskRunner:
         if exit_code != 0:
             raise RuntimeError(f"debug APK 빌드에 실패했습니다. exit code: {exit_code}")
 
-        debug_apk = (workspace_path / "project" / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk").resolve()
+        debug_apk = (project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk").resolve()
         if not ensure_within_root(debug_apk, workspace_path) or not debug_apk.exists() or debug_apk.stat().st_size <= 0:
             raise RuntimeError("debug APK 산출물을 찾을 수 없습니다.")
 
@@ -5873,8 +5981,124 @@ class CodexTaskRunner:
             stage="debug apk",
             phase="succeeded",
             body="설치 가능한 디버그 APK를 준비했어요.",
+            detail=f"소요 시간: {elapsed_seconds:.1f}초",
         )
         return debug_apk
+
+    def optimized_download_apk_candidates(self, project_path: Path, current_apk_path: Path) -> list[Path]:
+        flutter_apk_root = project_path / "build" / "app" / "outputs" / "flutter-apk"
+        candidates = [
+            current_apk_path,
+            flutter_apk_root / "app-release.apk",
+            flutter_apk_root / "app-arm64-v8a-release.apk",
+        ]
+        if flutter_apk_root.exists():
+            candidates.extend(sorted(flutter_apk_root.glob("*arm64*v8a*release*.apk")))
+            candidates.extend(sorted(flutter_apk_root.glob("*release*.apk")))
+
+        seen: set[Path] = set()
+        ordered: list[Path] = []
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            ordered.append(resolved)
+        return ordered
+
+    def find_existing_optimized_download_apk(
+        self,
+        workspace_path: Path,
+        project_path: Path,
+        current_apk_path: Path,
+    ) -> Optional[Path]:
+        for candidate in self.optimized_download_apk_candidates(project_path, current_apk_path):
+            if "release" not in candidate.name.lower():
+                continue
+            if ensure_within_root(candidate, workspace_path) and candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        return None
+
+    def ensure_download_apk(
+        self,
+        task_id: str,
+        workspace_path: Path,
+        project_path: Path,
+        current_apk_path: Path,
+    ) -> Path:
+        version_changed = ensure_project_revision_version(project_path)
+        if not self.settings.optimized_download_apk_enabled or self.settings.mock_codex:
+            return self.ensure_debug_apk(task_id, workspace_path, project_path, current_apk_path)
+
+        existing_optimized_apk = self.find_existing_optimized_download_apk(
+            workspace_path,
+            project_path,
+            current_apk_path,
+        )
+        if existing_optimized_apk is not None and not version_changed:
+            return existing_optimized_apk
+
+        build_log_path = workspace_path / "logs" / "build.log"
+        env = self.build_task_env(workspace_path)
+        flutter_args = shlex.split(self.settings.flutter_command)
+        ensure_release_uses_debug_signing(project_path)
+        status_message = "다운로드용 APK를 최적화하고 있어요."
+        did_update = self.db.update_task_if_status(
+            task_id,
+            {"running"},
+            status="Running",
+            message=status_message,
+        )
+        if not did_update:
+            raise RuntimeError("앱 생성이 중단되었습니다.")
+        running_task = self.db.get_task(task_id)
+        if running_task:
+            log_task_status_event(self.db, running_task, event_type="build_stage_release_prepare")
+        log_build_stage_event(
+            self.db,
+            task_id,
+            stage="다운로드용 APK 최적화",
+            phase="started",
+            body=status_message,
+            detail="arm64 release APK를 생성합니다.",
+        )
+        exit_code, timed_out, elapsed_seconds = self.run_logged_command(
+            flutter_args + ["build", "apk", "--release", "--target-platform", "android-arm64"],
+            cwd=project_path,
+            env=env,
+            log_path=build_log_path,
+            task_id=task_id,
+        )
+        if self.is_task_cancelled(task_id):
+            raise RuntimeError("앱 생성이 중단되었습니다.")
+
+        optimized_apk = self.find_existing_optimized_download_apk(
+            workspace_path,
+            project_path,
+            current_apk_path,
+        )
+        if not timed_out and exit_code == 0 and optimized_apk is not None:
+            size_mb = optimized_apk.stat().st_size / (1024 * 1024)
+            log_build_stage_event(
+                self.db,
+                task_id,
+                stage="다운로드용 APK 최적화",
+                phase="succeeded",
+                body="다운로드용 APK를 작게 준비했어요.",
+                detail=f"{optimized_apk.name}, {size_mb:.1f}MB, 소요 시간: {elapsed_seconds:.1f}초",
+            )
+            return optimized_apk
+
+        reason = "시간 제한 초과" if timed_out else f"종료 코드: {exit_code}"
+        log_build_stage_event(
+            self.db,
+            task_id,
+            stage="다운로드용 APK 최적화",
+            phase="failed",
+            body="다운로드용 APK 최적화에 실패해 debug APK로 대체합니다.",
+            detail=f"{reason}, 소요 시간: {elapsed_seconds:.1f}초",
+        )
+        return self.ensure_debug_apk(task_id, workspace_path, project_path, current_apk_path)
 
     def attempt_server_side_build(
         self,
@@ -5886,13 +6110,18 @@ class CodexTaskRunner:
         task = self.db.get_task(task_id) or {}
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
         ensure_project_revision_version(project_path)
+        ensure_release_uses_debug_signing(project_path)
         build_log_path = workspace_path / "logs" / "build.log"
         env = self.build_task_env(workspace_path)
         flutter_args = shlex.split(self.settings.flutter_command)
         stages = [
             ("pub_get", "Flutter 의존성을 설치하고 있어요.", flutter_args + ["pub", "get"]),
             ("analyze", "Flutter 코드를 분석하고 있어요.", flutter_args + ["analyze"]),
-            ("build", "Android APK를 빌드하고 있어요.", flutter_args + ["build", "apk", "--debug"]),
+            (
+                "build",
+                "Android APK를 빌드하고 있어요.",
+                flutter_args + ["build", "apk", "--release", "--target-platform", "android-arm64"],
+            ),
         ]
 
         build_log_path.write_text(
@@ -5935,7 +6164,7 @@ class CodexTaskRunner:
                 body=status_message,
                 detail="명령을 실행하고 있어요.",
             )
-            exit_code, timed_out = self.run_logged_command(
+            exit_code, timed_out, elapsed_seconds = self.run_logged_command(
                 args,
                 cwd=project_path,
                 env=env,
@@ -5951,6 +6180,7 @@ class CodexTaskRunner:
                     stage=stage_labels[stage_key],
                     phase="failed",
                     body=f"Flutter {stage_labels[stage_key]} 단계가 시간 제한을 초과했어요.",
+                    detail=f"소요 시간: {elapsed_seconds:.1f}초",
                 )
                 write_result_json(
                     result_path,
@@ -5970,7 +6200,7 @@ class CodexTaskRunner:
                     stage=stage_labels[stage_key],
                     phase="failed",
                     body=f"Flutter {stage_labels[stage_key]} 단계에 실패했어요.",
-                    detail=f"종료 코드: {exit_code}",
+                    detail=f"종료 코드: {exit_code}, 소요 시간: {elapsed_seconds:.1f}초",
                 )
                 write_result_json(
                     result_path,
@@ -5989,6 +6219,7 @@ class CodexTaskRunner:
                 stage=stage_labels[stage_key],
                 phase="succeeded",
                 body=f"Flutter {stage_labels[stage_key]} 단계가 완료되었어요.",
+                detail=f"소요 시간: {elapsed_seconds:.1f}초",
             )
 
         if project_looks_like_placeholder_app(project_path):
@@ -6004,7 +6235,7 @@ class CodexTaskRunner:
             )
             return
 
-        apk_relative = Path("project/build/app/outputs/flutter-apk/app-debug.apk")
+        apk_relative = Path("project/build/app/outputs/flutter-apk/app-release.apk")
         write_result_json(
             result_path,
             {
@@ -6254,14 +6485,14 @@ class CodexTaskRunner:
 
             if current_project_path is not None:
                 try:
-                    apk_path = self.ensure_debug_apk(task_id, workspace_path, current_project_path, apk_path)
+                    apk_path = self.ensure_download_apk(task_id, workspace_path, current_project_path, apk_path)
                 except Exception as exc:
                     if self.is_task_cancelled(task_id):
                         return
                     self.db.update_task(
                         task_id,
                         status="Failed",
-                        message=f"설치 가능한 debug APK 준비 실패: {exc}",
+                        message=f"설치 가능한 APK 준비 실패: {exc}",
                         log=log_text,
                         codex_result_json=codex_result_json,
                         **usage_update_fields,
@@ -6274,9 +6505,9 @@ class CodexTaskRunner:
                     log_build_stage_event(
                         self.db,
                         task_id,
-                        stage="debug apk",
+                        stage="APK 준비",
                         phase="failed",
-                        body=f"설치 가능한 debug APK를 준비하지 못했어요: {exc}",
+                        body=f"설치 가능한 APK를 준비하지 못했어요: {exc}",
                     )
                     return
                 result["apk_path"] = str(apk_path.relative_to(workspace_path).as_posix())
@@ -6438,7 +6669,11 @@ def build_task_workspace(settings: Settings, task: dict[str, Any]) -> tuple[Path
             f"BASE_PROJECT_PATH does not exist or is not a directory: {settings.base_project_path}"
         )
 
-    project_root, _ = create_initial_project_revision(task_root, settings.base_project_path)
+    project_root, _ = create_initial_project_revision(
+        task_root,
+        settings.base_project_path,
+        android_only=settings.android_only_workspace_enabled,
+    )
     reference_attachments = normalize_reference_attachments(task.get("reference_attachments") or [])
     if not reference_attachments:
         reference_attachments = [
@@ -6559,11 +6794,16 @@ def find_revision_apk(workspace_path: Path, project_path: Path, task: dict[str, 
         candidates.append(Path(task_apk_path))
     candidates.extend(
         [
+            project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-release.apk",
+            project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-arm64-v8a-release.apk",
             project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk",
             project_path / "build" / "app" / "outputs" / "apk" / "debug" / "app-debug.apk",
         ]
     )
-    candidates.extend(sorted((project_path / "build" / "app" / "outputs" / "flutter-apk").glob("*.apk")) if (project_path / "build" / "app" / "outputs" / "flutter-apk").exists() else [])
+    flutter_apk_root = project_path / "build" / "app" / "outputs" / "flutter-apk"
+    if flutter_apk_root.exists():
+        candidates.extend(sorted(flutter_apk_root.glob("*release*.apk")))
+        candidates.extend(sorted(flutter_apk_root.glob("*.apk")))
     for candidate in candidates:
         apk_path = candidate if candidate.is_absolute() else workspace_path / candidate
         apk_path = apk_path.resolve()
@@ -7166,6 +7406,7 @@ def create_app() -> FastAPI:
                 project_path_obj, revision_label = create_followup_project_revision(
                     workspace_path_obj,
                     Path(project_path_value),
+                    android_only=settings.android_only_workspace_enabled,
                 )
                 project_path_value = str(project_path_obj)
                 saved_reference_attachments = save_reference_attachments(
@@ -7850,6 +8091,19 @@ def create_app() -> FastAPI:
         if not apk_path.exists() or apk_path.suffix.lower() != ".apk":
             raise HTTPException(status_code=404, detail="apk not found")
 
+        db.log_event(
+            task_id,
+            actor="system",
+            event_type="apk_download_requested",
+            message_text=f"APK 다운로드 요청: {apk_path.name}",
+            payload={
+                "apk_path": str(apk_path),
+                "artifact_path": artifact_path or "",
+                "size_bytes": apk_path.stat().st_size,
+                "device_id": device_id or "",
+                "phone_number": phone_number or "",
+            },
+        )
         return FileResponse(
             apk_path,
             media_type="application/vnd.android.package-archive",

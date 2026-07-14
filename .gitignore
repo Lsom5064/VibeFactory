@@ -32,6 +32,7 @@ flutter_apk_server/workspaces/
 flutter_apk_server/profiles/
 flutter_apk_server/logs/
 flutter_apk_server/uploads/
+flutter_apk_server/.tooling/
 flutter_apk_server/.venv/
 flutter_apk_server/venv/
 

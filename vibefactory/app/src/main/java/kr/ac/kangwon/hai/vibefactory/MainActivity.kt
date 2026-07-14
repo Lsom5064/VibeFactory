@@ -132,6 +132,7 @@ class MainActivity : AppCompatActivity() {
     )
 
     private lateinit var apiService: VibeApiService
+    private lateinit var downloadApiService: VibeApiService
     private lateinit var drawerLayout: DrawerLayout
     private lateinit var mainContent: FrameLayout
     private lateinit var topBar: LinearLayout
@@ -232,6 +233,10 @@ class MainActivity : AppCompatActivity() {
     private var pendingChatAnchorMessageId: String? = null
     private var clearPendingChatAnchorAfterScroll: Boolean = false
     private var pendingScrollLatestAfterResponse: Boolean = false
+    private var chatScrollStartedByUser: Boolean = false
+    private var chatAutoScrollLockedByUser: Boolean = false
+    private var chatShouldStickToBottom: Boolean = true
+    private var manualChatScrollSnapshot: ChatScrollSnapshot? = null
     private val pendingResponseScrollTaskIds = mutableSetOf<String>()
     private val notifiedBuildSuccessTaskIds = mutableSetOf<String>()
     private val buildMonitorStartedTaskIds = mutableSetOf<String>()
@@ -554,10 +559,33 @@ class MainActivity : AppCompatActivity() {
         recyclerMessages.layoutManager = LinearLayoutManager(this)
         recyclerMessages.itemAnimator = null
         recyclerMessages.adapter = chatAdapter
+        recyclerMessages.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                when (newState) {
+                    RecyclerView.SCROLL_STATE_DRAGGING -> {
+                        chatScrollStartedByUser = true
+                        lockChatAutoScrollFromUser()
+                    }
+                    RecyclerView.SCROLL_STATE_IDLE -> {
+                        if (chatScrollStartedByUser) {
+                            updateManualChatScrollState()
+                        }
+                        chatScrollStartedByUser = false
+                    }
+                }
+            }
+
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                if (chatScrollStartedByUser) {
+                    updateManualChatScrollState()
+                }
+            }
+        })
     }
 
     private fun setupNetwork() {
         apiService = createVibeApiService(gson = gson)
+        downloadApiService = createDownloadVibeApiService(gson = gson)
     }
 
     private fun createNotificationChannel() {
@@ -789,6 +817,10 @@ class MainActivity : AppCompatActivity() {
         advanceTaskSelectionGeneration()
         currentTaskId = null
         pendingTaskSelectionKey = null
+        chatAutoScrollLockedByUser = false
+        chatShouldStickToBottom = true
+        chatScrollStartedByUser = false
+        manualChatScrollSnapshot = null
         persistLastSelectedTaskId(null)
         latestApkUrl = null
         latestDownloadedApkFile = null
@@ -1282,7 +1314,7 @@ class MainActivity : AppCompatActivity() {
         currentTaskId = resolvedTaskId
         pendingTaskSelectionKey = null
         persistLastSelectedTaskId(resolvedTaskId)
-        requestScrollLatestAfterResponse()
+        requestScrollLatestAfterResponse(force = true)
         val summary = taskSummaryById[resolvedTaskId]
         screenState = screenState.copy(
             selectedTaskId = resolvedTaskId,
@@ -1346,7 +1378,7 @@ class MainActivity : AppCompatActivity() {
         if (pendingInitialChatScrollTaskId == resolvedTaskId) {
             pendingInitialChatScrollTaskId = null
         }
-        requestScrollLatestAfterResponse()
+        requestScrollLatestAfterResponse(force = true)
         ensureTaskSummaryVisible(
             taskId = resolvedTaskId,
             title = taskSummaryById[resolvedTaskId]?.title ?: screenState.messages.firstOrNull { it.kind == MessageKind.USER }?.body,
@@ -2030,7 +2062,7 @@ class MainActivity : AppCompatActivity() {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
         if (screenState.selectedTaskId != apiTaskId) {
-            requestScrollLatestAfterResponse()
+            requestScrollLatestAfterResponse(force = true)
             screenState = screenState.copy(
                 selectedTaskId = apiTaskId,
                 displayedAppName = taskSummaryById[apiTaskId]?.appName ?: screenState.displayedAppName,
@@ -2095,7 +2127,7 @@ class MainActivity : AppCompatActivity() {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
         if (screenState.selectedTaskId != apiTaskId) {
-            requestScrollLatestAfterResponse()
+            requestScrollLatestAfterResponse(force = true)
             screenState = screenState.copy(
                 selectedTaskId = apiTaskId,
                 displayedAppName = taskSummaryById[apiTaskId]?.appName ?: screenState.displayedAppName,
@@ -2461,7 +2493,7 @@ ${record.stackTrace}
         if (!hasPersistedMessages) return
         val wasAlreadySelected = screenState.selectedTaskId == normalizedTaskId
         if (!wasAlreadySelected) {
-            requestScrollLatestAfterResponse()
+            requestScrollLatestAfterResponse(force = true)
         }
 
         val summary = taskSummaryById[normalizedTaskId]
@@ -2557,7 +2589,7 @@ ${record.stackTrace}
                 downloadTaskId?.let { logTaskSelection(it, it) }
                 logApiRequest("/download/{task_id}", taskId = downloadTaskId, deviceId = deviceId, extra = "url=$normalizedUrl")
                 val response = if (!downloadTaskId.isNullOrBlank()) {
-                    apiService.downloadApk(
+                    downloadApiService.downloadApk(
                         downloadTaskId,
                         deviceId,
                         null,
@@ -2772,21 +2804,41 @@ ${record.stackTrace}
             .map(::withTransientArtifactDownloadState)
             .filter { it.kind != MessageKind.LOG }
             .filterNot(::isRedundantDownloadedStatusMessage)
-        val timelineVisibleMessages = if (shouldAnimateProcessingStatus(screenState.messages)) {
+        val suppressTransientChatUpdates = chatAutoScrollLockedByUser || isChatScrollInteractionActive()
+        val timelineVisibleMessages = if (
+            !suppressTransientChatUpdates &&
+            shouldAnimateProcessingStatus(screenState.messages)
+        ) {
             animateProcessingStatusBubble(baseVisibleMessages)
         } else {
             baseVisibleMessages
         }
         val visibleMessages = withColdStartMessage(withDownloadProgressMessage(timelineVisibleMessages))
-        val hasTransientProgressUpdate = visibleMessages.any { it.isLoading || it.artifactDownloading }
-        val shouldPinBottomForTransientUpdate = hasTransientProgressUpdate && isChatNearBottomByPixels()
-        val shouldAutoScrollNewMessage = shouldAutoScrollMessages(visibleMessages) && !hasTransientProgressUpdate
+        val hasTransientProgressUpdate = visibleMessages.any {
+            it.isLoading ||
+                it.artifactDownloading ||
+                processingAnimationBaseText(it.body) != null
+        } || isProcessingAnimationActiveState()
+        val shouldPinBottomForTransientUpdate = visibleMessages.isNotEmpty() &&
+            hasTransientProgressUpdate &&
+            chatShouldStickToBottom &&
+            !chatAutoScrollLockedByUser &&
+            !isMessageTextSelectionActive
+        val hasPendingInitialScroll = !screenState.selectedTaskId.isNullOrBlank() &&
+            pendingInitialChatScrollTaskId == screenState.selectedTaskId
+        val shouldAutoScrollNewMessage = !hasTransientProgressUpdate &&
+            !chatAutoScrollLockedByUser &&
+            !hasPendingInitialScroll &&
+            (shouldAutoScrollMessages(visibleMessages) || chatShouldStickToBottom)
         val anchorMessageId = pendingChatAnchorMessageId
         val clearAnchorAfterScroll = clearPendingChatAnchorAfterScroll
         val shouldPreserveManualScroll = visibleMessages.isNotEmpty() &&
+            !chatAutoScrollLockedByUser &&
+            !isChatScrollInteractionActive() &&
             !shouldPinBottomForTransientUpdate &&
             (hasTransientProgressUpdate || !isChatNearBottom())
         val scrollLatestAfterResponse = pendingScrollLatestAfterResponse &&
+            !chatAutoScrollLockedByUser &&
             !shouldPreserveManualScroll &&
             !shouldPinBottomForTransientUpdate
         if (pendingScrollLatestAfterResponse && !scrollLatestAfterResponse) {
@@ -2805,6 +2857,7 @@ ${record.stackTrace}
             preserveVisiblePosition = shouldPreserveManualScroll &&
                 !scrollLatestAfterResponse &&
                 anchorMessageId.isNullOrBlank(),
+            preserveScrollSnapshot = manualChatScrollSnapshot,
             preserveBottomPosition = shouldPinBottomForTransientUpdate &&
                 !scrollLatestAfterResponse &&
                 anchorMessageId.isNullOrBlank()
@@ -3092,7 +3145,7 @@ ${record.stackTrace}
                 ?: existing.artifactDownloadProgressPercent,
             artifactDownloadProgressText = incoming.artifactDownloadProgressText
                 ?: existing.artifactDownloadProgressText,
-            createdAt = incoming.createdAt ?: existing.createdAt
+            createdAt = existing.createdAt ?: incoming.createdAt
         )
     }
 
@@ -3349,7 +3402,7 @@ ${record.stackTrace}
         )
         val localMessages = screenState.messages + localUserMessage
         screenState = screenState.copy(messages = localMessages)
-        requestChatScrollAnchor(localUserMessage.id)
+        requestScrollLatestAfterResponse(force = true)
         renderState()
     }
 
@@ -3365,7 +3418,7 @@ ${record.stackTrace}
         screenState = screenState.copy(
             messages = screenState.messages + assistantMessage
         )
-        requestChatScrollAnchor(assistantMessage.id)
+        requestScrollLatestAfterResponse(force = true)
         renderState()
     }
 
@@ -3527,7 +3580,7 @@ ${record.stackTrace}
         if (pendingInitialChatScrollTaskId == normalizedTaskId) {
             pendingInitialChatScrollTaskId = null
         }
-        requestScrollLatestAfterResponse()
+        requestScrollLatestAfterResponse(force = true)
         screenState = screenState.copy(
             selectedTaskId = normalizedTaskId,
             messages = buildTaskTimeline(normalizedTaskId)
@@ -5071,16 +5124,7 @@ ${record.stackTrace}
             while (isActive && shouldAnimateProcessingStatus(screenState.messages)) {
                 delay(PROCESSING_STATUS_ANIMATION_MS)
                 processingStatusAnimationFrame = (processingStatusAnimationFrame + 1) % 4
-                if (isMessageTextSelectionActive) {
-                    continue
-                }
-                val visibleMessages = animateProcessingStatusBubble(
-                    screenState.messages.filter { it.kind != MessageKind.LOG }
-                )
-                submitChatMessagesWhenSafe(
-                    visibleMessages,
-                    preserveVisiblePosition = !isChatNearBottom()
-                )
+                renderState()
             }
         }
     }
@@ -5142,7 +5186,7 @@ ${record.stackTrace}
         if (screenState.selectedTaskId == taskId) {
             screenState = screenState.copy(messages = buildTaskTimeline(taskId))
             if (message.kind == MessageKind.USER) {
-                requestChatScrollAnchor(message.id)
+                requestScrollLatestAfterResponse(force = true)
             } else if (message.isLoading) {
                 if (message.isLoading) {
                     pendingResponseScrollTaskIds += taskId
@@ -5507,11 +5551,13 @@ ${record.stackTrace}
         if (normalizedTaskId.isBlank()) return
         if (scrollToTop) {
             pendingInitialChatScrollTaskId = normalizedTaskId
+            chatAutoScrollLockedByUser = true
+            chatShouldStickToBottom = false
         } else if (pendingInitialChatScrollTaskId == normalizedTaskId) {
             pendingInitialChatScrollTaskId = null
         }
         if (scrollToLatest) {
-            requestScrollLatestAfterResponse()
+            requestScrollLatestAfterResponse(force = true)
         }
         screenState = screenState.copy(
             selectedTaskId = normalizedTaskId,
@@ -5791,7 +5837,7 @@ ${record.stackTrace}
         }
         screenState = screenState.copy(messages = screenState.messages + message)
         if (isLoading) {
-            requestChatAnchorScrollAgain(clearAfterScroll = false)
+            requestScrollLatestAfterResponse(force = true)
         }
         renderState()
     }
@@ -5845,6 +5891,7 @@ ${record.stackTrace}
     }
 
     private fun scrollLatestMessageAfterLayout() {
+        unlockChatAutoScroll()
         recyclerMessages.post {
             scrollLatestMessage()
             recyclerMessages.post {
@@ -5856,6 +5903,7 @@ ${record.stackTrace}
     private fun scrollLatestMessage() {
         val lastIndex = chatAdapter.itemCount - 1
         if (lastIndex < 0) return
+        unlockChatAutoScroll()
         val layoutManager = recyclerMessages.layoutManager as? LinearLayoutManager
         val lastChild = layoutManager?.findViewByPosition(lastIndex)
         if (lastChild == null) {
@@ -5868,27 +5916,82 @@ ${record.stackTrace}
 
     private fun captureChatScrollSnapshot(): ChatScrollSnapshot? {
         val layoutManager = recyclerMessages.layoutManager as? LinearLayoutManager ?: return null
-        val firstVisiblePosition = layoutManager.findFirstVisibleItemPosition()
-            .takeIf { it != RecyclerView.NO_POSITION }
-            ?: return null
-        val message = chatAdapter.currentList.getOrNull(firstVisiblePosition) ?: return null
-        val view = layoutManager.findViewByPosition(firstVisiblePosition) ?: return null
+        val viewportTop = recyclerMessages.paddingTop
+        val viewportBottom = recyclerMessages.height - recyclerMessages.paddingBottom
+        val viewportCenter = viewportTop + ((viewportBottom - viewportTop) / 2)
+        var fallback: Pair<View, ChatMessage>? = null
+        var best: Pair<View, ChatMessage>? = null
+        var bestDistance = Int.MAX_VALUE
+        for (index in 0 until recyclerMessages.childCount) {
+            val child = recyclerMessages.getChildAt(index) ?: continue
+            val adapterPosition = recyclerMessages.getChildAdapterPosition(child)
+                .takeIf { it != RecyclerView.NO_POSITION }
+                ?: continue
+            val message = chatAdapter.currentList.getOrNull(adapterPosition) ?: continue
+            if (fallback == null) {
+                fallback = child to message
+            }
+            if (!isStableChatScrollAnchor(message)) continue
+            val childCenter = child.top + (child.height / 2)
+            val distance = kotlin.math.abs(childCenter - viewportCenter)
+            if (distance < bestDistance) {
+                best = child to message
+                bestDistance = distance
+            }
+        }
+        val (view, message) = best ?: fallback ?: return null
         return ChatScrollSnapshot(
             messageId = message.id,
             topOffset = view.top
         )
     }
 
+    private fun isStableChatScrollAnchor(message: ChatMessage): Boolean {
+        return message.kind != MessageKind.DATE_SEPARATOR &&
+            !message.isLoading &&
+            !message.artifactDownloading &&
+            message.artifactTaskId.isNullOrBlank()
+    }
+
+    private fun updateManualChatScrollState() {
+        if (isChatNearBottomByPixels(dp(2))) {
+            unlockChatAutoScroll()
+        } else {
+            lockChatAutoScrollFromUser()
+        }
+    }
+
+    private fun lockChatAutoScrollFromUser() {
+        chatAutoScrollLockedByUser = true
+        chatShouldStickToBottom = false
+        pendingScrollLatestAfterResponse = false
+        manualChatScrollSnapshot = captureChatScrollSnapshot() ?: manualChatScrollSnapshot
+    }
+
+    private fun unlockChatAutoScroll() {
+        chatAutoScrollLockedByUser = false
+        chatShouldStickToBottom = true
+        manualChatScrollSnapshot = null
+    }
+
+    private fun isChatScrollInteractionActive(): Boolean {
+        return chatScrollStartedByUser || recyclerMessages.scrollState != RecyclerView.SCROLL_STATE_IDLE
+    }
+
     private fun restoreChatScrollSnapshotAfterLayout(snapshot: ChatScrollSnapshot) {
+        if (isChatScrollInteractionActive()) return
         recyclerMessages.post {
+            if (isChatScrollInteractionActive()) return@post
             restoreChatScrollSnapshot(snapshot)
             recyclerMessages.post {
+                if (isChatScrollInteractionActive()) return@post
                 restoreChatScrollSnapshot(snapshot)
             }
         }
     }
 
     private fun restoreChatScrollSnapshot(snapshot: ChatScrollSnapshot) {
+        if (isChatScrollInteractionActive()) return
         val index = chatAdapter.currentList.indexOfFirst { it.id == snapshot.messageId }
         if (index < 0) return
         val layoutManager = recyclerMessages.layoutManager as? LinearLayoutManager ?: return
@@ -5901,15 +6004,20 @@ ${record.stackTrace}
     }
 
     private fun restoreChatBottomScrollSnapshotAfterLayout(snapshot: ChatBottomScrollSnapshot) {
+        if (isChatScrollInteractionActive()) return
+        unlockChatAutoScroll()
         recyclerMessages.post {
+            if (isChatScrollInteractionActive()) return@post
             restoreChatBottomScrollSnapshot(snapshot)
             recyclerMessages.post {
+                if (isChatScrollInteractionActive()) return@post
                 restoreChatBottomScrollSnapshot(snapshot)
             }
         }
     }
 
     private fun restoreChatBottomScrollSnapshot(snapshot: ChatBottomScrollSnapshot) {
+        if (isChatScrollInteractionActive()) return
         val range = recyclerMessages.computeVerticalScrollRange()
         val extent = recyclerMessages.computeVerticalScrollExtent()
         val currentOffset = recyclerMessages.computeVerticalScrollOffset()
@@ -5932,8 +6040,13 @@ ${record.stackTrace}
         clearPendingChatAnchorAfterScroll = clearPendingChatAnchorAfterScroll || clearAfterScroll
     }
 
-    private fun requestScrollLatestAfterResponse() {
+    private fun requestScrollLatestAfterResponse(force: Boolean = false) {
         clearInitialScrollForActiveTask()
+        if (!force && (chatAutoScrollLockedByUser || !chatShouldStickToBottom)) {
+            pendingScrollLatestAfterResponse = false
+            return
+        }
+        unlockChatAutoScroll()
         pendingScrollLatestAfterResponse = true
     }
 
@@ -6009,6 +6122,7 @@ ${record.stackTrace}
         clearAnchorAfterScroll: Boolean = false,
         scrollLatestAfterResponse: Boolean = false,
         preserveVisiblePosition: Boolean = false,
+        preserveScrollSnapshot: ChatScrollSnapshot? = null,
         preserveBottomPosition: Boolean = false
     ) {
         when (chooseChatMessageRefreshAction(isMessageTextSelectionActive, recyclerMessages.isComputingLayout)) {
@@ -6021,6 +6135,7 @@ ${record.stackTrace}
                         clearAnchorAfterScroll,
                         scrollLatestAfterResponse,
                         preserveVisiblePosition,
+                        preserveScrollSnapshot,
                         preserveBottomPosition
                     )
                 }
@@ -6042,11 +6157,16 @@ ${record.stackTrace}
                     !scrollLatestAfterResponse &&
                     anchorMessageId.isNullOrBlank()
                 ) {
-                    captureChatScrollSnapshot()
+                    preserveScrollSnapshot
+                        ?.takeIf { snapshot -> visibleMessages.any { it.id == snapshot.messageId } }
+                        ?: captureChatScrollSnapshot()
                 } else {
                     null
                 }
                 chatAdapter.submitList(visibleMessages) {
+                    if (isChatScrollInteractionActive()) {
+                        return@submitList
+                    }
                     if (scrollLatestAfterResponse) {
                         scrollLatestMessageAfterLayout()
                     } else if (!anchorMessageId.isNullOrBlank()) {

@@ -29,6 +29,9 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private val apiService by lazy {
         createVibeApiService(gson = gson)
     }
+    private val downloadApiService by lazy {
+        createDownloadVibeApiService(gson = gson)
+    }
     private var apkAction: TaskLogApkAction? = null
     private var downloadedApkFile: File? = null
     private var isDownloadingApk = false
@@ -222,7 +225,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
                 runCatching {
                     ApkArtifactActionHandler.downloadToCache(
                         context = this@TaskLogDetailActivity,
-                        apiService = apiService,
+                        apiService = downloadApiService,
                         taskId = action.taskId,
                         url = action.apkUrl,
                         artifactPath = action.artifactPath,
