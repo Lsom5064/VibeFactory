@@ -44,6 +44,7 @@ pip install -r requirements.txt
 추가 환경변수:
 
 - `DB_PATH`: SQLite 파일 경로, 기본값 `./tasks.db`
+- `APP_DATA_DB_PATH`: 생성앱 서버 데이터 저장용 SQLite 파일 경로, 기본값 `./app_data.db`
 - `MOCK_CODEX=1`: 실제 Codex 대신 가짜 APK와 결과 JSON을 생성
 - `APP_RUNTIME_OPENAI_API_KEY`: 생성된 앱이 서버를 통해 호출할 런타임 LLM 전용 OpenAI API key
 - `APP_RUNTIME_ENABLED`: 기본값은 `APP_RUNTIME_OPENAI_API_KEY`가 있으면 `1`
@@ -52,7 +53,7 @@ pip install -r requirements.txt
 - `APP_RUNTIME_SYSTEM_PROMPT`: 생성 앱 런타임 LLM의 기본 시스템 프롬프트
 - `APP_RUNTIME_DAILY_REQUEST_LIMIT`: 앱별 일일 호출 횟수 제한
 - `APP_RUNTIME_DAILY_TOKEN_LIMIT`: 앱별 일일 총 토큰 제한
-- `APP_RUNTIME_MAX_OUTPUT_TOKENS`: 앱별 런타임 응답 최대 출력 토큰. `0`이면 서버가 1회 호출 출력 토큰 제한을 명시하지 않음
+- `APP_RUNTIME_MAX_OUTPUT_TOKENS`: 과거 호환용 설정. 현재 서버는 JSON 응답 절단을 막기 위해 1회 호출 출력 토큰 제한을 명시하지 않음
 - `APP_RUNTIME_TEMPERATURE`: 앱별 런타임 temperature
 - `ADMIN_API_TOKEN`: 설정 시 `/admin/*` 관리 endpoint 호출에 필요한 관리자 토큰
 
@@ -64,6 +65,8 @@ DB 기록:
 - `task_events`에는 `token_usage_recorded` 이벤트도 남겨서 토큰 사용량 이력을 추적할 수 있다.
 - `app_llm_configs` 테이블은 생성 앱별 LLM provider/model/api_key/한도 설정을 저장한다.
 - `app_llm_usage` 테이블은 생성 앱이 런타임 LLM endpoint를 호출할 때의 일별 사용량 집계를 위한 사용 기록을 저장한다.
+- 생성앱 서버 데이터는 `tasks.db`가 아니라 `APP_DATA_DB_PATH`의 별도 SQLite DB에 저장한다.
+- `app_data_records` 테이블은 `task_id + package_name + collection` 기준으로 생성앱 레코드를 저장한다. 인증/권한은 없고, package name 일치만 검증한다.
 - 따라서 같은 task에 대한 후속 수정 요청과 확인 절차도 DB에서 시간순으로 추적할 수 있다.
 - 서버는 OpenAI Responses API 기반 spec clarification agent를 사용해, 추가 명세가 필요하면 먼저 질문하고 충분히 구체화된 뒤에만 build를 시작한다.
 - 기존 앱 수정 요청은 원래 앱 task의 workspace가 있을 때만 그 workspace에서 진행한다. 기존 앱을 수정하겠다는 요청이지만 현재 thread에 원래 workspace가 없으면 build를 막고, 기존 앱 대화에서 이어서 요청하도록 안내한다.
@@ -73,6 +76,7 @@ DB 기록:
 ```bash
 export BASE_PROJECT_PATH=/absolute/path/to/base_flutter_project
 export WORKSPACES_ROOT=/absolute/path/to/flutter_apk_server/workspaces
+export APP_DATA_DB_PATH=/absolute/path/to/flutter_apk_server/app_data.db
 export CODEX_MODEL=gpt-5.4
 export CODEX_DANGEROUS_BYPASS=1
 export INTENT_AGENT_ENABLED=1
@@ -98,6 +102,29 @@ export MOCK_CODEX=1
 - `POST /apps/{task_id}/llm/respond`
   - 생성된 앱이 실제 LLM 기능을 호출하는 공통 runtime endpoint
   - 요청 본문에 `package_name`, `user_message`, 선택적으로 `context`, `image_base64`, `image_mime_type`를 넣는다
+
+생성 앱용 서버 데이터 endpoint:
+
+- `GET /apps/{task_id}/data/{collection}?package_name=...`
+  - 컬렉션 레코드 목록 조회
+  - 선택 쿼리: `owner_id`, `include_deleted`, `limit`
+- `POST /apps/{task_id}/data/{collection}`
+  - 레코드 생성
+  - 요청 본문: `{"package_name":"...","owner_id":"...","data":{...}}`
+- `GET /apps/{task_id}/data/{collection}/{record_id}?package_name=...`
+  - 단일 레코드 조회
+- `PATCH /apps/{task_id}/data/{collection}/{record_id}`
+  - 레코드 수정
+  - 요청 본문: `{"package_name":"...","owner_id":"...","data":{...},"replace":false}`
+- `DELETE /apps/{task_id}/data/{collection}/{record_id}?package_name=...`
+  - 레코드 soft delete
+
+주의:
+
+- 이 데이터 API는 인증/권한이 없는 연구용 최소 구현이다.
+- 원장/학부모/수강생처럼 여러 기기가 같은 데이터를 공유해야 하는 프로토타입에는 사용할 수 있다.
+- 민감정보, 의료정보, 결제정보, 주민번호 같은 고위험 개인정보 저장에는 사용하지 않는다.
+- 운영 공개 전에는 인증, 초대 코드, TLS, rate limit, 백업 정책이 필요하다.
 
 관리 endpoint:
 

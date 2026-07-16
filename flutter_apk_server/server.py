@@ -907,6 +907,7 @@ class Settings:
     server_base_url: str
     max_concurrent_codex_runs: int
     db_path: Path
+    app_data_db_path: Path
     mock_codex: bool
     status_log_line_limit: int
     intent_agent_enabled: bool
@@ -961,6 +962,11 @@ def load_settings() -> Settings:
         db_path=resolve_path(
             os.getenv("DB_PATH", ""),
             root / "tasks.db",
+            root,
+        ),
+        app_data_db_path=resolve_path(
+            os.getenv("APP_DATA_DB_PATH", ""),
+            root / "app_data.db",
             root,
         ),
         mock_codex=mock_codex,
@@ -2949,12 +2955,277 @@ class AppLlmRuntimeRequest(BaseModel):
     image_mime_type: Optional[str] = None
 
 
+class AppDataCreateRequest(BaseModel):
+    package_name: str = Field(..., min_length=1)
+    owner_id: Optional[str] = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class AppDataUpdateRequest(BaseModel):
+    package_name: str = Field(..., min_length=1)
+    owner_id: Optional[str] = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    replace: bool = False
+
+
 class RuntimeErrorReportRequest(BaseModel):
     package_name: str = Field(..., min_length=1)
     summary: str = Field(..., min_length=1)
     stack_trace: str = Field(..., min_length=1)
     error_message: Optional[str] = None
     report_kind: Optional[str] = None
+
+
+APP_DATA_COLLECTION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def normalize_app_data_collection(collection: str) -> str:
+    value = collection.strip()
+    if not APP_DATA_COLLECTION_RE.fullmatch(value):
+        raise HTTPException(status_code=400, detail="invalid collection")
+    return value
+
+
+def normalize_app_data_owner_id(owner_id: Optional[str]) -> str:
+    return normalize_whitespace(owner_id or "")[:120]
+
+
+def decode_app_data_json(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+class AppDataDatabase:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def init_db(self) -> None:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_data_records (
+                    record_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    package_name TEXT NOT NULL,
+                    collection TEXT NOT NULL,
+                    owner_id TEXT,
+                    data_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    deleted_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_app_data_records_task_collection_updated
+                ON app_data_records(task_id, collection, deleted_at, updated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_app_data_records_owner
+                ON app_data_records(task_id, collection, owner_id, deleted_at)
+                """
+            )
+            connection.commit()
+
+    def serialize_record(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "record_id": row["record_id"],
+            "task_id": row["task_id"],
+            "package_name": row["package_name"],
+            "collection": row["collection"],
+            "owner_id": row["owner_id"] or "",
+            "data": decode_app_data_json(str(row["data_json"] or "{}")),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "deleted_at": row["deleted_at"],
+        }
+
+    def create_record(
+        self,
+        *,
+        task_id: str,
+        package_name: str,
+        collection: str,
+        owner_id: str,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        record_id = uuid.uuid4().hex
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_data_records (
+                    record_id, task_id, package_name, collection, owner_id,
+                    data_json, created_at, updated_at, deleted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    record_id,
+                    task_id,
+                    package_name,
+                    collection,
+                    owner_id or None,
+                    json.dumps(data, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+            row = connection.execute(
+                """
+                SELECT record_id, task_id, package_name, collection, owner_id,
+                       data_json, created_at, updated_at, deleted_at
+                FROM app_data_records
+                WHERE record_id = ?
+                """,
+                (record_id,),
+            ).fetchone()
+        return self.serialize_record(row)
+
+    def list_records(
+        self,
+        *,
+        task_id: str,
+        package_name: str,
+        collection: str,
+        owner_id: str,
+        include_deleted: bool,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clauses = ["task_id = ?", "package_name = ?", "collection = ?"]
+        params: list[Any] = [task_id, package_name, collection]
+        if owner_id:
+            clauses.append("owner_id = ?")
+            params.append(owner_id)
+        if not include_deleted:
+            clauses.append("deleted_at IS NULL")
+        params.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT record_id, task_id, package_name, collection, owner_id,
+                       data_json, created_at, updated_at, deleted_at
+                FROM app_data_records
+                WHERE {" AND ".join(clauses)}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self.serialize_record(row) for row in rows]
+
+    def get_record(
+        self,
+        *,
+        task_id: str,
+        package_name: str,
+        collection: str,
+        record_id: str,
+        include_deleted: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        clauses = [
+            "record_id = ?",
+            "task_id = ?",
+            "package_name = ?",
+            "collection = ?",
+        ]
+        params: list[Any] = [record_id, task_id, package_name, collection]
+        if not include_deleted:
+            clauses.append("deleted_at IS NULL")
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT record_id, task_id, package_name, collection, owner_id,
+                       data_json, created_at, updated_at, deleted_at
+                FROM app_data_records
+                WHERE {" AND ".join(clauses)}
+                """,
+                params,
+            ).fetchone()
+        return self.serialize_record(row) if row else None
+
+    def update_record(
+        self,
+        *,
+        task_id: str,
+        package_name: str,
+        collection: str,
+        record_id: str,
+        owner_id: str,
+        data: dict[str, Any],
+        replace: bool,
+    ) -> Optional[dict[str, Any]]:
+        existing = self.get_record(
+            task_id=task_id,
+            package_name=package_name,
+            collection=collection,
+            record_id=record_id,
+        )
+        if not existing:
+            return None
+        merged_data = data if replace else {**existing["data"], **data}
+        resolved_owner_id = owner_id or str(existing.get("owner_id") or "")
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE app_data_records
+                SET owner_id = ?, data_json = ?, updated_at = ?
+                WHERE record_id = ? AND task_id = ? AND package_name = ? AND collection = ?
+                  AND deleted_at IS NULL
+                """,
+                (
+                    resolved_owner_id or None,
+                    json.dumps(merged_data, ensure_ascii=False),
+                    now,
+                    record_id,
+                    task_id,
+                    package_name,
+                    collection,
+                ),
+            )
+            connection.commit()
+        return self.get_record(
+            task_id=task_id,
+            package_name=package_name,
+            collection=collection,
+            record_id=record_id,
+        )
+
+    def delete_record(
+        self,
+        *,
+        task_id: str,
+        package_name: str,
+        collection: str,
+        record_id: str,
+    ) -> bool:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE app_data_records
+                SET deleted_at = ?, updated_at = ?
+                WHERE record_id = ? AND task_id = ? AND package_name = ? AND collection = ?
+                  AND deleted_at IS NULL
+                """,
+                (now, now, record_id, task_id, package_name, collection),
+            )
+            connection.commit()
+        return cursor.rowcount > 0
 
 
 class Database:
@@ -3347,7 +3618,11 @@ class Database:
     def get_app_llm_config(self, task_id: str) -> Optional[dict[str, Any]]:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM app_llm_configs WHERE task_id = ?", (task_id,)).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            config = dict(row)
+            config["max_output_tokens"] = 0
+            return config
 
     def list_all_task_ids(self) -> list[str]:
         with self.connect() as connection:
@@ -3678,6 +3953,8 @@ def render_task_agents_md(task_id: str) -> str:
 - 실제 런타임 호출이 필요한 기능은 localhost나 `127.0.0.1` 같은 단말 내부 주소를 쓰지 말고 `prompt.md`에 적힌 서버 endpoint를 사용한다.
 - 런타임 AI 호출이 필요한 앱은 `runtime_package_name`과 실제 요청 package name이 일치해야 한다.
 - 사용자가 저장을 원했다면 앱 재실행 후에도 유지되는 저장 방식을 사용한다.
+- 여러 사용자나 여러 기기가 같은 데이터를 봐야 하는 공유형 앱은 `prompt.md`의 서버 데이터 API를 사용한다.
+- 단일 사용자 로컬 저장만 필요한 앱은 서버 데이터 API를 쓰지 말고 기기 내부 저장을 우선한다.
 - 더미 데이터나 예시 문구는 UI 스켈레톤 확인용 보조로만 허용된다. 핵심 사용자 흐름을 더미 데이터만으로 완성 처리하면 안 된다.
 - Flutter UI는 모든 화면 크기와 키보드/시스템 inset에서 `RenderFlex overflowed by ... pixels` 및 top/bottom/right/left overflow가 나지 않게 만든다.
 - 세로로 내용이 늘어나는 화면은 `SafeArea`와 `SingleChildScrollView`, `ListView`, `CustomScrollView` 중 적절한 스크롤 컨테이너를 사용한다. 고정 높이 `Column`에 긴 콘텐츠를 그대로 넣지 않는다.
@@ -3732,11 +4009,21 @@ def build_app_runtime_metadata(task: dict[str, Any], settings: Settings) -> dict
     }
 
 
+def build_app_data_runtime_metadata(task: dict[str, Any], settings: Settings) -> dict[str, str]:
+    package_name = str(task.get("package_name") or "").strip() or "(미정)"
+    return {
+        "data_available": "yes",
+        "data_endpoint_base": f"{settings.server_base_url}/apps/{task['task_id']}/data",
+        "package_name": package_name,
+    }
+
+
 def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
     phone_line = task.get("phone_number") or "(없음)"
     normalized_prompt = task.get("normalized_prompt") or task["prompt"]
     build_request_prompt = task.get("build_request_prompt") or task["prompt"]
     runtime_meta = build_app_runtime_metadata(task, settings)
+    data_meta = build_app_data_runtime_metadata(task, settings)
     state_payload = load_task_state_payload(task)
     conversation_state = state_payload.get("conversation_state") if isinstance(state_payload.get("conversation_state"), dict) else {}
     primary_user_flow = normalize_whitespace(
@@ -3852,6 +4139,22 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - runtime_package_name: {runtime_meta['package_name']}
 - runtime_model: {runtime_meta['model']}
 
+## 서버 제공 생성앱 데이터 API
+
+- data_available: {data_meta['data_available']}
+- data_endpoint_base: {data_meta['data_endpoint_base']}
+- data_package_name: {data_meta['package_name']}
+- 공유형 앱, 여러 기기에서 같은 데이터를 봐야 하는 앱, 원장/학부모/수강생처럼 역할별 화면이 같은 데이터를 공유하는 앱은 이 서버 데이터 API를 사용한다.
+- 단일 사용자 로컬 저장만 필요한 앱이면 서버 데이터 API를 쓰지 말고 기기 내부 영구 저장을 우선한다.
+- 서버 데이터 API에는 인증/권한 기능이 없으므로 민감정보, 의료정보, 결제정보, 주민번호 같은 고위험 개인정보는 저장하지 않는다.
+- 컬렉션별 endpoint는 `data_endpoint_base + "/{{collection}}"` 형식이다.
+- 생성앱에서 요청할 때 반드시 `package_name`에 data_package_name 값을 넣는다.
+- `POST /apps/{{task_id}}/data/{{collection}}`: body `{{"package_name": "...", "owner_id": "...", "data": {{...}}}}`
+- `GET /apps/{{task_id}}/data/{{collection}}?package_name=...&owner_id=...`: 컬렉션 목록 조회
+- `PATCH /apps/{{task_id}}/data/{{collection}}/{{record_id}}`: body `{{"package_name": "...", "owner_id": "...", "data": {{...}}, "replace": false}}`
+- `DELETE /apps/{{task_id}}/data/{{collection}}/{{record_id}}?package_name=...`: 레코드 삭제
+- BaseProject에 `lib/vibe_data_client.dart`가 있으면 이를 우선 사용한다.
+
 ## 작업 규칙
 
 - `AGENTS.md` 지침을 반드시 따른다.
@@ -3961,7 +4264,7 @@ def app_llm_config_response_payload(config: dict[str, Any]) -> dict[str, Any]:
         "system_prompt": str(config.get("system_prompt") or ""),
         "daily_request_limit": int(config.get("daily_request_limit") or 0),
         "daily_token_limit": int(config.get("daily_token_limit") or 0),
-        "max_output_tokens": int(config.get("max_output_tokens") or 0),
+        "max_output_tokens": 0,
         "temperature": float(config.get("temperature") or 0.0),
         "api_key_configured": bool(str(config.get("api_key") or "").strip()),
     }
@@ -4043,7 +4346,7 @@ def merge_app_llm_config_values(
         "system_prompt": (system_prompt if system_prompt is not None else existing_config.get("system_prompt")) or "",
         "daily_request_limit": daily_request_limit,
         "daily_token_limit": daily_token_limit,
-        "max_output_tokens": max_output_tokens,
+        "max_output_tokens": 0,
         "temperature": temperature,
     }
 
@@ -5550,9 +5853,8 @@ def invoke_app_runtime_model(config: dict[str, Any], request: AppLlmRuntimeReque
         ],
         "temperature": float(config.get("temperature") or 0.4),
     }
-    max_output_tokens = int(config.get("max_output_tokens") if config.get("max_output_tokens") is not None else 0)
-    if max_output_tokens > 0:
-        payload["max_output_tokens"] = max_output_tokens
+    # Keep per-call output uncapped. The daily token quota remains enforced after
+    # the response, but adding max_output_tokens can truncate structured JSON.
 
     with httpx.Client(timeout=httpx.Timeout(timeout=60.0, connect=10.0)) as client:
         response = client.post(
@@ -6987,16 +7289,32 @@ def build_token_usage_response(
     }
 
 
+def require_app_data_package(db: Database, task_id: str, package_name: str) -> tuple[dict[str, Any], str]:
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    normalized_package_name = package_name.strip()
+    if not normalized_package_name:
+        raise HTTPException(status_code=400, detail="package_name is required")
+    expected_package_name = str(task.get("package_name") or "").strip()
+    if expected_package_name and normalized_package_name != expected_package_name:
+        raise HTTPException(status_code=403, detail="package name mismatch")
+    return task, normalized_package_name
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = load_settings()
     db = Database(settings.db_path)
     db.init_db()
+    app_data_db = AppDataDatabase(settings.app_data_db_path)
+    app_data_db.init_db()
     runner = CodexTaskRunner(settings, db)
     runner.start()
 
     app.state.settings = settings
     app.state.db = db
+    app.state.app_data_db = app_data_db
     app.state.runner = runner
     try:
         yield
@@ -8018,6 +8336,127 @@ def create_app() -> FastAPI:
                 "daily_request_limit": daily_request_limit,
                 "daily_token_limit": daily_token_limit,
             },
+        }
+
+    @app.get("/apps/{task_id}/data/{collection}")
+    def list_app_data_records(
+        task_id: str,
+        collection: str,
+        package_name: str = Query(..., min_length=1),
+        owner_id: Optional[str] = Query(default=None),
+        include_deleted: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        db: Database = app.state.db
+        app_data_db: AppDataDatabase = app.state.app_data_db
+        _, normalized_package_name = require_app_data_package(db, task_id, package_name)
+        normalized_collection = normalize_app_data_collection(collection)
+        records = app_data_db.list_records(
+            task_id=task_id,
+            package_name=normalized_package_name,
+            collection=normalized_collection,
+            owner_id=normalize_app_data_owner_id(owner_id),
+            include_deleted=include_deleted,
+            limit=limit,
+        )
+        return {
+            "task_id": task_id,
+            "package_name": normalized_package_name,
+            "collection": normalized_collection,
+            "records": records,
+        }
+
+    @app.post("/apps/{task_id}/data/{collection}")
+    def create_app_data_record(
+        task_id: str,
+        collection: str,
+        request: AppDataCreateRequest,
+    ) -> dict[str, Any]:
+        db: Database = app.state.db
+        app_data_db: AppDataDatabase = app.state.app_data_db
+        _, normalized_package_name = require_app_data_package(db, task_id, request.package_name)
+        normalized_collection = normalize_app_data_collection(collection)
+        record = app_data_db.create_record(
+            task_id=task_id,
+            package_name=normalized_package_name,
+            collection=normalized_collection,
+            owner_id=normalize_app_data_owner_id(request.owner_id),
+            data=request.data,
+        )
+        return {"record": record}
+
+    @app.get("/apps/{task_id}/data/{collection}/{record_id}")
+    def get_app_data_record(
+        task_id: str,
+        collection: str,
+        record_id: str,
+        package_name: str = Query(..., min_length=1),
+        include_deleted: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        db: Database = app.state.db
+        app_data_db: AppDataDatabase = app.state.app_data_db
+        _, normalized_package_name = require_app_data_package(db, task_id, package_name)
+        normalized_collection = normalize_app_data_collection(collection)
+        record = app_data_db.get_record(
+            task_id=task_id,
+            package_name=normalized_package_name,
+            collection=normalized_collection,
+            record_id=record_id,
+            include_deleted=include_deleted,
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="record not found")
+        return {"record": record}
+
+    @app.patch("/apps/{task_id}/data/{collection}/{record_id}")
+    def update_app_data_record(
+        task_id: str,
+        collection: str,
+        record_id: str,
+        request: AppDataUpdateRequest,
+    ) -> dict[str, Any]:
+        db: Database = app.state.db
+        app_data_db: AppDataDatabase = app.state.app_data_db
+        _, normalized_package_name = require_app_data_package(db, task_id, request.package_name)
+        normalized_collection = normalize_app_data_collection(collection)
+        record = app_data_db.update_record(
+            task_id=task_id,
+            package_name=normalized_package_name,
+            collection=normalized_collection,
+            record_id=record_id,
+            owner_id=normalize_app_data_owner_id(request.owner_id),
+            data=request.data,
+            replace=request.replace,
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="record not found")
+        return {"record": record}
+
+    @app.delete("/apps/{task_id}/data/{collection}/{record_id}")
+    def delete_app_data_record(
+        task_id: str,
+        collection: str,
+        record_id: str,
+        package_name: str = Query(..., min_length=1),
+    ) -> dict[str, Any]:
+        db: Database = app.state.db
+        app_data_db: AppDataDatabase = app.state.app_data_db
+        _, normalized_package_name = require_app_data_package(db, task_id, package_name)
+        normalized_collection = normalize_app_data_collection(collection)
+        deleted = app_data_db.delete_record(
+            task_id=task_id,
+            package_name=normalized_package_name,
+            collection=normalized_collection,
+            record_id=record_id,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="record not found")
+        return {
+            "task_id": task_id,
+            "package_name": normalized_package_name,
+            "collection": normalized_collection,
+            "record_id": record_id,
+            "deleted": True,
         }
 
     @app.get("/tasks/{task_id}/revisions")
