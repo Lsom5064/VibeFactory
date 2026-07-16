@@ -3686,17 +3686,34 @@ ${record.stackTrace}
         val obj = response.conversation_state?.takeIf { it.isJsonObject }?.asJsonObject
         if (obj != null) {
             val initialPrompt = firstString(obj, "initial_user_prompt")?.trim().orEmpty()
-            if (initialPrompt.isNotBlank() && !taskHasUserMessageText(taskId, initialPrompt)) {
-                appendTaskTimelineMessage(
-                    taskId,
-                    ChatMessage(
-                        id = "seed-user-$taskId",
-                        kind = MessageKind.USER,
-                        title = getString(R.string.message_title_user),
-                        body = initialPrompt,
-                        createdAt = currentTimestampString()
+            if (initialPrompt.isNotBlank()) {
+                val initialCreatedAt = response.created_at.trim().takeIf { it.isNotBlank() }
+                    ?: currentTimestampString()
+                val normalizedTaskId = taskId.trim()
+                val timeline = taskConversationMessages[normalizedTaskId]
+                val existingSeedIndex = timeline?.indexOfFirst { message ->
+                    message.kind == MessageKind.USER &&
+                        message.id.startsWith("seed-user-") &&
+                        hasSameMessageText(message.body, initialPrompt)
+                } ?: -1
+                if (timeline != null && existingSeedIndex >= 0) {
+                    val existingSeed = timeline[existingSeedIndex]
+                    if (existingSeed.createdAt != initialCreatedAt) {
+                        timeline[existingSeedIndex] = existingSeed.copy(createdAt = initialCreatedAt)
+                        persistTaskChat(normalizedTaskId)
+                    }
+                } else if (!taskHasUserMessageText(taskId, initialPrompt)) {
+                    appendTaskTimelineMessage(
+                        taskId,
+                        ChatMessage(
+                            id = "seed-user-$taskId",
+                            kind = MessageKind.USER,
+                            title = getString(R.string.message_title_user),
+                            body = initialPrompt,
+                            createdAt = initialCreatedAt
+                        )
                     )
-                )
+                }
             }
 
             val latestSummary = firstString(obj, "latest_summary")
@@ -4111,15 +4128,16 @@ ${record.stackTrace}
         )
         if (!terminalProgressMessage.isNullOrBlank()) {
             val finalizedId = "finished-progress-log-$taskId-${terminalProgressMessage.hashCode()}"
-            if (timeline.none { it.id == finalizedId }) {
-                timeline += ChatMessage(
-                    id = finalizedId,
-                    kind = MessageKind.STATUS,
-                    title = "빌드",
-                    body = terminalProgressMessage,
-                    detail = null,
-                    createdAt = currentTimestampString()
-                )
+            val terminalMessage = ChatMessage(
+                id = finalizedId,
+                kind = MessageKind.STATUS,
+                title = "빌드",
+                body = terminalProgressMessage,
+                detail = null,
+                createdAt = currentTimestampString()
+            )
+            if (timeline.none { it.id == finalizedId } && timeline.none { shouldDropIncomingDuplicateMessage(it, terminalMessage) }) {
+                timeline += terminalMessage
                 changed = true
             }
         }
@@ -5330,20 +5348,77 @@ ${record.stackTrace}
     }
 
     private fun List<ChatMessage>.filterVisibleDuplicateMessages(): List<ChatMessage> {
-        val seen = mutableSetOf<String>()
+        val seen = mutableMapOf<String, ChatMessage>()
         return filter { message ->
-            if (message.kind == MessageKind.USER || message.isLoading) {
+            if (message.isLoading) {
                 return@filter true
             }
-            val key = if (!message.artifactTaskId.isNullOrBlank()) {
-                TaskProgressTimelinePolicy.artifactDedupeKey(message).orEmpty()
-            } else {
-                clarificationQuestionDedupeKey(message)
-                    ?: compactMessageTextForDedupe(normalizeMessageTextForDedupe(message.body))
-            }
+            val key = visibleMessageDedupeKey(message) ?: return@filter true
             if (key.isBlank()) return@filter true
-            seen.add(key)
+            val previous = seen[key]
+            if (previous == null) {
+                seen[key] = message
+                return@filter true
+            }
+            if (message.kind == MessageKind.USER && !isLikelyUserPromptEcho(previous, message)) {
+                seen[key] = message
+                return@filter true
+            }
+            false
         }
+    }
+
+    private fun visibleMessageDedupeKey(message: ChatMessage): String? {
+        if (message.isLoading) return null
+        val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(message)
+        if (artifactKey != null) return artifactKey
+        if (isCancelledCompletionStatusMessage(message)) return "status:cancelled-complete"
+        val bodyKey = clarificationQuestionDedupeKey(message)
+            ?: compactMessageTextForDedupe(normalizeMessageTextForDedupe(message.body))
+        if (bodyKey.isBlank()) return null
+        if (message.kind != MessageKind.USER) return bodyKey
+        val imageKey = message.allImagePreviews()
+            .joinToString("|") { preview -> "${preview.displayName}:${preview.base64.hashCode()}" }
+        return "user:$bodyKey:$imageKey"
+    }
+
+    private fun shouldDropIncomingDuplicateMessage(existing: ChatMessage, incoming: ChatMessage): Boolean {
+        if (incoming.isLoading) return false
+        if (incoming.kind == MessageKind.USER) {
+            return isLikelyUserPromptEcho(existing, incoming)
+        }
+        return isCancelledCompletionStatusMessage(existing) &&
+            isCancelledCompletionStatusMessage(incoming)
+    }
+
+    private fun isLikelyUserPromptEcho(first: ChatMessage, second: ChatMessage): Boolean {
+        if (first.kind != MessageKind.USER || second.kind != MessageKind.USER) return false
+        if (!first.sameContentAs(second)) return false
+        if (isLocalUserMessage(first) != isLocalUserMessage(second) && (isServerUserMessage(first) || isServerUserMessage(second))) {
+            return true
+        }
+        val firstTime = parseMessageTimestamp(first.createdAt)?.time
+        val secondTime = parseMessageTimestamp(second.createdAt)?.time
+        if (firstTime == null || secondTime == null) return false
+        return kotlin.math.abs(firstTime - secondTime) <= 120_000L
+    }
+
+    private fun isLocalUserMessage(message: ChatMessage): Boolean {
+        return message.id.startsWith("local-") ||
+            message.id.startsWith("followup-origin-") ||
+            message.id.startsWith("chat-origin-") ||
+            message.id.startsWith("queued-input-")
+    }
+
+    private fun isServerUserMessage(message: ChatMessage): Boolean {
+        return message.id.startsWith("timeline-") || message.id.startsWith("seed-user-")
+    }
+
+    private fun isCancelledCompletionStatusMessage(message: ChatMessage): Boolean {
+        if (message.kind != MessageKind.STATUS) return false
+        val body = compactMessageTextForDedupe(normalizeMessageTextForDedupe(message.body))
+        if (!body.contains("중단") || body.contains("요청")) return false
+        return body.contains("앱 생성") || body.contains("생성 작업")
     }
 
     private fun appendTaskTimelineMessage(taskId: String, message: ChatMessage, allowDuplicateContent: Boolean = false) {
@@ -5352,6 +5427,7 @@ ${record.stackTrace}
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank()) return
         val timeline = editableTaskTimeline(normalizedTaskId) ?: return
+        if (timeline.any { shouldDropIncomingDuplicateMessage(it, message) }) return
         if (!message.artifactTaskId.isNullOrBlank()) {
             val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(message)
             val existingArtifactIndex = timeline.indexOfFirst { it.id == message.id }

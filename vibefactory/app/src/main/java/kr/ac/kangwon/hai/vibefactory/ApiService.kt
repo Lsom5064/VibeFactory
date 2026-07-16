@@ -110,7 +110,9 @@ data class StatusResponse(
     val retry_allowed: Boolean? = null,
     val cancel_allowed: Boolean? = null,
     val allowed_next_actions: List<String>? = null,
-    val retry_block_reason: String? = null
+    val retry_block_reason: String? = null,
+    val created_at: String = "",
+    val updated_at: String = ""
 )
 
 data class TaskSummaryDto(
