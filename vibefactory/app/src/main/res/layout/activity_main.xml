@@ -104,6 +104,26 @@
                         android:textSize="12sp"
                         android:visibility="gone" />
 
+                    <HorizontalScrollView
+                        android:id="@+id/selectedAttachmentPreviewScroller"
+                        android:layout_width="match_parent"
+                        android:layout_height="82dp"
+                        android:layout_marginStart="8dp"
+                        android:layout_marginBottom="4dp"
+                        android:clipToPadding="false"
+                        android:fillViewport="false"
+                        android:overScrollMode="never"
+                        android:scrollbars="none"
+                        android:visibility="gone">
+
+                        <LinearLayout
+                            android:id="@+id/selectedAttachmentPreviewList"
+                            android:layout_width="wrap_content"
+                            android:layout_height="match_parent"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal" />
+                    </HorizontalScrollView>
+
                     <EditText
                         android:id="@+id/inputPrompt"
                         android:layout_width="match_parent"

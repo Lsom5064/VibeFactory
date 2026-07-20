@@ -282,8 +282,13 @@ class ChatMessageAdapter(
                 loadingRow.visibility = View.GONE
                 btnCancelBuild.visibility = View.GONE
                 btnCancelBuild.setOnClickListener(null)
-                body.visibility = View.VISIBLE
-                body.text = chatMessageBodyText(item, context)
+                val bodyText = chatMessageBodyText(item, context)
+                body.text = bodyText
+                body.visibility = if (bodyText.isBlank() && item.allImagePreviews().isNotEmpty()) {
+                    View.GONE
+                } else {
+                    View.VISIBLE
+                }
             }
         }
 

@@ -36,7 +36,9 @@ import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -143,6 +145,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var inputPhoneGate: EditText
     private lateinit var btnAttachReferenceImage: TextView
     private lateinit var selectedAttachmentChip: TextView
+    private lateinit var selectedAttachmentPreviewScroller: HorizontalScrollView
+    private lateinit var selectedAttachmentPreviewList: LinearLayout
     private lateinit var btnSend: Button
     private lateinit var btnNewChat: Button
     private lateinit var btnOpenLibrary: Button
@@ -242,6 +246,9 @@ class MainActivity : AppCompatActivity() {
     private val buildMonitorStartedTaskIds = mutableSetOf<String>()
     private var isMessageTextSelectionActive = false
     private val selectedAttachments = mutableListOf<SelectedAttachment>()
+    private var lastRenderedTaskListFingerprint: String? = null
+    private var lastRenderedMessageListFingerprint: String? = null
+    private var lastRenderedAttachmentFingerprint: String? = null
     private var pendingCameraImageUri: Uri? = null
     private var pendingInstallApkFile: File? = null
     private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
@@ -386,6 +393,8 @@ class MainActivity : AppCompatActivity() {
         inputPhoneGate = findViewById(R.id.inputPhoneGate)
         btnAttachReferenceImage = findViewById(R.id.btnAttachReferenceImage)
         selectedAttachmentChip = findViewById(R.id.selectedAttachmentChip)
+        selectedAttachmentPreviewScroller = findViewById(R.id.selectedAttachmentPreviewScroller)
+        selectedAttachmentPreviewList = findViewById(R.id.selectedAttachmentPreviewList)
         btnSend = findViewById(R.id.btnSend)
         btnNewChat = findViewById(R.id.btnNewChat)
         btnOpenLibrary = findViewById(R.id.btnOpenLibrary)
@@ -912,13 +921,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun submitMessage() {
-        val prompt = inputPrompt.text.toString().trim()
-        if (prompt.isBlank()) return
+        val displayPrompt = inputPrompt.text.toString().trim()
         val attachments = selectedAttachments.toList()
+        if (displayPrompt.isBlank() && attachments.isEmpty()) return
+        val prompt = displayPrompt.ifBlank { attachmentOnlyPromptForMode(screenState.inputMode) }
         val attachedImagePreview = attachments.toChatImagePreview()
-        inputPrompt.setText("")
 
         if (isComposerOnNewChatSurface()) {
+            clearComposerDraftAfterSubmit()
             currentTaskId = null
             pendingTaskSelectionKey = null
             persistLastSelectedTaskId(null)
@@ -929,46 +939,71 @@ class MainActivity : AppCompatActivity() {
                 canDownload = false,
                 canInstall = false
             )
-            startAppSynthesis(prompt, attachedImagePreview, attachments = attachments)
+            startAppSynthesis(prompt, attachedImagePreview, attachments = attachments, displayPrompt = displayPrompt)
             return
         }
 
         when (screenState.inputMode) {
-            InputMode.NEW_GENERATE -> startAppSynthesis(prompt, attachedImagePreview, attachments = attachments)
+            InputMode.NEW_GENERATE -> {
+                clearComposerDraftAfterSubmit()
+                startAppSynthesis(prompt, attachedImagePreview, attachments = attachments, displayPrompt = displayPrompt)
+            }
             InputMode.CHAT -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    startTaskChatMessage(taskId, prompt, attachedImagePreview, attachments)
+                    clearComposerDraftAfterSubmit()
+                    startTaskChatMessage(taskId, prompt, attachedImagePreview, attachments, displayPrompt = displayPrompt)
                 } else {
-                    startAppSynthesis(prompt, attachedImagePreview, attachments = attachments)
+                    clearComposerDraftAfterSubmit()
+                    startAppSynthesis(prompt, attachedImagePreview, attachments = attachments, displayPrompt = displayPrompt)
                 }
             }
             InputMode.CONTINUE_CLARIFICATION -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    continueClarification(taskId, prompt, attachments = attachments)
+                    clearComposerDraftAfterSubmit()
+                    continueClarification(taskId, prompt, attachments = attachments, displayPrompt = displayPrompt)
                 }
             }
             InputMode.REFINE_EXISTING -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachments)
+                    clearComposerDraftAfterSubmit()
+                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachments, displayPrompt = displayPrompt)
                 }
             }
             InputMode.RETRY_FAILED -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
-                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachments)
+                    clearComposerDraftAfterSubmit()
+                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachments, displayPrompt = displayPrompt)
                 }
             }
             InputMode.READ_ONLY -> {
                 val taskId = currentTaskId ?: screenState.selectedTaskId
                 if (!taskId.isNullOrBlank() && isTaskInputQueueActive(taskId)) {
-                    enqueueInputForActiveTask(taskId, prompt, attachedImagePreview, attachments)
+                    clearComposerDraftAfterSubmit()
+                    enqueueInputForActiveTask(taskId, prompt, displayPrompt, attachedImagePreview, attachments)
                 } else {
                     Toast.makeText(this, R.string.read_only_hint, Toast.LENGTH_SHORT).show()
                 }
             }
+        }
+    }
+
+    private fun clearComposerDraftAfterSubmit() {
+        inputPrompt.setText("")
+        clearSelectedAttachment(render = false)
+    }
+
+    private fun attachmentOnlyPromptForMode(mode: InputMode): String {
+        return when (mode) {
+            InputMode.NEW_GENERATE -> getString(R.string.attachment_only_generate_prompt)
+            InputMode.REFINE_EXISTING,
+            InputMode.RETRY_FAILED,
+            InputMode.READ_ONLY -> getString(R.string.attachment_only_refine_prompt)
+            InputMode.CHAT,
+            InputMode.CONTINUE_CLARIFICATION -> getString(R.string.attachment_only_chat_prompt)
         }
     }
 
@@ -984,14 +1019,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun currentReferenceImageBase64(): String? = selectedAttachments.firstOrNull { it.kind == SelectedAttachmentKind.IMAGE }?.base64
 
-    private fun clearSelectedAttachment() {
+    private fun clearSelectedAttachment(render: Boolean = true) {
         selectedAttachments.clear()
-        renderState()
+        lastRenderedAttachmentFingerprint = null
+        if (render) {
+            renderState()
+        }
     }
 
     private fun enqueueInputForActiveTask(
         taskId: String,
         prompt: String,
+        displayPrompt: String,
         imagePreview: ChatImagePreview?,
         attachments: List<SelectedAttachment>
     ) {
@@ -1000,6 +1039,7 @@ class MainActivity : AppCompatActivity() {
             apiTaskId,
             QueuedTaskInput(
                 prompt = prompt,
+                displayPrompt = displayPrompt,
                 imagePreview = imagePreview,
                 attachments = attachments
             )
@@ -1010,7 +1050,7 @@ class MainActivity : AppCompatActivity() {
                 id = "queued-input-$apiTaskId-${System.currentTimeMillis()}",
                 kind = MessageKind.USER,
                 title = getString(R.string.message_title_user),
-                body = prompt,
+                body = displayPrompt,
                 createdAt = currentTimestampString(),
                 imagePreviewBase64 = imagePreview?.base64,
                 imagePreviewName = imagePreview?.displayName,
@@ -1064,7 +1104,8 @@ class MainActivity : AppCompatActivity() {
             imagePreview = nextInput.imagePreview,
             attachments = nextInput.attachments,
             mode = InputMode.REFINE_EXISTING,
-            appendUserMessage = false
+            appendUserMessage = false,
+            displayPrompt = nextInput.displayPrompt
         )
         return true
     }
@@ -1073,7 +1114,8 @@ class MainActivity : AppCompatActivity() {
         taskId: String,
         feedback: String,
         imagePreview: ChatImagePreview? = null,
-        attachments: List<SelectedAttachment> = selectedAttachments.toList()
+        attachments: List<SelectedAttachment> = selectedAttachments.toList(),
+        displayPrompt: String = feedback
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/status/{task_id}") ?: return
         val referenceImagePreview = if (screenState.inputMode == InputMode.REFINE_EXISTING) {
@@ -1086,7 +1128,8 @@ class MainActivity : AppCompatActivity() {
             prompt = feedback,
             imagePreview = referenceImagePreview,
             attachments = attachments,
-            mode = screenState.inputMode
+            mode = screenState.inputMode,
+            displayPrompt = displayPrompt
         )
     }
 
@@ -1231,7 +1274,6 @@ class MainActivity : AppCompatActivity() {
                         attachments = attachmentPayloads
                     )
                 )
-                clearSelectedAttachment()
                 if (sourceTaskId == null && isNonAppAnswerResponse(response)) {
                     removeLoadingMessages(null)
                     currentTaskId = null
@@ -1292,7 +1334,8 @@ class MainActivity : AppCompatActivity() {
         taskId: String,
         prompt: String,
         appendUserMessage: Boolean = true,
-        attachments: List<SelectedAttachment> = selectedAttachments.toList()
+        attachments: List<SelectedAttachment> = selectedAttachments.toList(),
+        displayPrompt: String = prompt
     ) {
         startFollowupSynthesis(
             taskId,
@@ -1300,7 +1343,8 @@ class MainActivity : AppCompatActivity() {
             imagePreview = attachments.toChatImagePreview(),
             attachments = attachments,
             mode = InputMode.CONTINUE_CLARIFICATION,
-            appendUserMessage = appendUserMessage
+            appendUserMessage = appendUserMessage,
+            displayPrompt = displayPrompt
         )
     }
 
@@ -1499,7 +1543,12 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        if (response.tool == "answer_question" && message.isNotBlank() && isAssistantRenderMode(response)) {
+        if (
+            response.tool == "answer_question" &&
+            message.isNotBlank() &&
+            isAssistantRenderMode(response) &&
+            !shouldSuppressDecisionAssistantMessage(response)
+        ) {
             appendOptimisticTaskMessage(
                 taskId,
                 ChatMessage(
@@ -2057,7 +2106,8 @@ class MainActivity : AppCompatActivity() {
         imagePreview: ChatImagePreview? = null,
         attachments: List<SelectedAttachment> = selectedAttachments.toList(),
         mode: InputMode,
-        appendUserMessage: Boolean = true
+        appendUserMessage: Boolean = true,
+        displayPrompt: String = prompt
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
@@ -2078,7 +2128,7 @@ class MainActivity : AppCompatActivity() {
                     id = "followup-origin-$apiTaskId-${System.currentTimeMillis()}",
                     kind = MessageKind.USER,
                     title = getString(R.string.message_title_user),
-                    body = prompt,
+                    body = displayPrompt,
                     createdAt = currentTimestampString(),
                     imagePreviewBase64 = imagePreview?.base64,
                     imagePreviewName = imagePreview?.displayName,
@@ -2114,7 +2164,7 @@ class MainActivity : AppCompatActivity() {
             imagePreview = imagePreview,
             attachments = attachments,
             sourceTaskId = apiTaskId,
-            displayPrompt = prompt
+            displayPrompt = displayPrompt
         )
     }
 
@@ -2122,7 +2172,8 @@ class MainActivity : AppCompatActivity() {
         taskId: String,
         prompt: String,
         imagePreview: ChatImagePreview? = null,
-        attachments: List<SelectedAttachment> = selectedAttachments.toList()
+        attachments: List<SelectedAttachment> = selectedAttachments.toList(),
+        displayPrompt: String = prompt
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
@@ -2142,7 +2193,7 @@ class MainActivity : AppCompatActivity() {
                 id = "chat-origin-$apiTaskId-${System.currentTimeMillis()}",
                 kind = MessageKind.USER,
                 title = getString(R.string.message_title_user),
-                body = prompt,
+                body = displayPrompt,
                 createdAt = currentTimestampString(),
                 imagePreviewBase64 = imagePreview?.base64,
                 imagePreviewName = imagePreview?.displayName,
@@ -2167,7 +2218,7 @@ class MainActivity : AppCompatActivity() {
             imagePreview = imagePreview,
             attachments = attachments,
             sourceTaskId = apiTaskId,
-            displayPrompt = prompt
+            displayPrompt = displayPrompt
         )
     }
 
@@ -2796,14 +2847,17 @@ ${record.stackTrace}
         inputPhoneGate.visibility = if (phoneGateVisible) View.GONE else View.VISIBLE
         btnSavePhoneGate.isEnabled = true
 
-        taskAdapter.submitList(
-            screenState.taskList.map { it.copy(hasRuntimeError = it.taskId in runtimeErrorTaskIds) },
-            screenState.selectedTaskId
-        )
+        val taskListForRender = screenState.taskList.map { it.copy(hasRuntimeError = it.taskId in runtimeErrorTaskIds) }
+        val taskListFingerprint = taskListRenderFingerprint(taskListForRender, screenState.selectedTaskId)
+        if (taskListFingerprint != lastRenderedTaskListFingerprint) {
+            lastRenderedTaskListFingerprint = taskListFingerprint
+            taskAdapter.submitList(taskListForRender, screenState.selectedTaskId)
+        }
         val baseVisibleMessages = screenState.messages
             .map(::withTransientArtifactDownloadState)
             .filter { it.kind != MessageKind.LOG }
             .filterNot(::isRedundantDownloadedStatusMessage)
+            .filterNot(::isRedundantModificationEchoMessage)
         val suppressTransientChatUpdates = chatAutoScrollLockedByUser || isChatScrollInteractionActive()
         val timelineVisibleMessages = if (
             !suppressTransientChatUpdates &&
@@ -2849,19 +2903,26 @@ ${record.stackTrace}
             pendingChatAnchorMessageId = null
             clearPendingChatAnchorAfterScroll = false
         }
-        submitChatMessagesWhenSafe(
-            visibleMessages = visibleMessages,
-            anchorMessageId = if (scrollLatestAfterResponse) null else anchorMessageId,
-            clearAnchorAfterScroll = clearAnchorAfterScroll,
-            scrollLatestAfterResponse = scrollLatestAfterResponse,
-            preserveVisiblePosition = shouldPreserveManualScroll &&
-                !scrollLatestAfterResponse &&
-                anchorMessageId.isNullOrBlank(),
-            preserveScrollSnapshot = manualChatScrollSnapshot,
-            preserveBottomPosition = shouldPinBottomForTransientUpdate &&
-                !scrollLatestAfterResponse &&
-                anchorMessageId.isNullOrBlank()
-        )
+        val messageListFingerprint = "${screenState.selectedTaskId.orEmpty()}|${messageListRenderFingerprint(visibleMessages)}"
+        val shouldSubmitMessages = messageListFingerprint != lastRenderedMessageListFingerprint ||
+            scrollLatestAfterResponse ||
+            !anchorMessageId.isNullOrBlank()
+        if (shouldSubmitMessages) {
+            lastRenderedMessageListFingerprint = messageListFingerprint
+            submitChatMessagesWhenSafe(
+                visibleMessages = visibleMessages,
+                anchorMessageId = if (scrollLatestAfterResponse) null else anchorMessageId,
+                clearAnchorAfterScroll = clearAnchorAfterScroll,
+                scrollLatestAfterResponse = scrollLatestAfterResponse,
+                preserveVisiblePosition = shouldPreserveManualScroll &&
+                    !scrollLatestAfterResponse &&
+                    anchorMessageId.isNullOrBlank(),
+                preserveScrollSnapshot = manualChatScrollSnapshot,
+                preserveBottomPosition = shouldPinBottomForTransientUpdate &&
+                    !scrollLatestAfterResponse &&
+                    anchorMessageId.isNullOrBlank()
+            )
+        }
         emptyChatText.visibility = if (visibleMessages.isEmpty()) View.VISIBLE else View.GONE
         syncProcessingStatusAnimation(screenState.messages)
 
@@ -2916,11 +2977,7 @@ ${record.stackTrace}
                 setComposerEnabled(canQueueInput)
             }
         }
-        selectedAttachmentChip.text = buildAttachmentChipLabel(selectedAttachments)
-        selectedAttachmentChip.visibility = if (selectedAttachments.isEmpty()) View.GONE else View.VISIBLE
-        selectedAttachmentChip.setOnClickListener {
-            clearSelectedAttachment()
-        }
+        renderSelectedAttachmentsIfChanged()
         inputModeLabel.visibility = if (isDownloadingApk) View.VISIBLE else View.GONE
 
         val selectedTaskId = screenState.selectedTaskId
@@ -2935,6 +2992,163 @@ ${record.stackTrace}
                 recyclerMessages.scrollToPosition(visibleMessages.lastIndex)
             }
         }
+    }
+
+    private fun taskListRenderFingerprint(tasks: List<TaskSummary>, selectedTaskId: String?): String {
+        return buildString {
+            append(selectedTaskId.orEmpty())
+            tasks.forEach { task ->
+                append('|')
+                append(task.taskId)
+                append(':')
+                append(task.title)
+                append(':')
+                append(task.appName.orEmpty())
+                append(':')
+                append(task.status)
+                append(':')
+                append(task.updatedAt.orEmpty())
+                append(':')
+                append(task.hasApk)
+                append(':')
+                append(task.hasRuntimeError)
+            }
+        }
+    }
+
+    private fun messageListRenderFingerprint(messages: List<ChatMessage>): String {
+        return buildString {
+            messages.forEach { message ->
+                append(message.id)
+                append(':')
+                append(message.kind.name)
+                append(':')
+                append(message.title.orEmpty().hashCode())
+                append(':')
+                append(message.body.hashCode())
+                append(':')
+                append(message.detail.orEmpty().hashCode())
+                append(':')
+                append(message.createdAt.orEmpty())
+                append(':')
+                append(message.isLoading)
+                append(':')
+                append(message.artifactDownloading)
+                append(':')
+                append(message.artifactDownloadProgressPercent ?: -1)
+                append(':')
+                append(message.artifactDownloadProgressText.orEmpty())
+                append(':')
+                append(message.artifactCanDownload)
+                append(':')
+                append(message.artifactCanInstall)
+                append(':')
+                append(message.artifactTaskId.orEmpty())
+                append(':')
+                append(message.artifactRevisionLabel.orEmpty())
+                append(':')
+                append(message.cancelTaskId.orEmpty())
+                append(':')
+                append(message.allImagePreviews().joinToString(",") { preview ->
+                    "${preview.displayName}:${preview.base64.hashCode()}"
+                })
+                append('|')
+            }
+        }
+    }
+
+    private fun selectedAttachmentsFingerprint(attachments: List<SelectedAttachment>): String {
+        return attachments.joinToString("|") { attachment ->
+            "${attachment.kind.name}:${attachment.displayName}:${attachment.mimeType}:${attachment.base64.hashCode()}"
+        }
+    }
+
+    private fun renderSelectedAttachmentsIfChanged(force: Boolean = false) {
+        val fingerprint = selectedAttachmentsFingerprint(selectedAttachments)
+        if (!force && fingerprint == lastRenderedAttachmentFingerprint) return
+        lastRenderedAttachmentFingerprint = fingerprint
+
+        selectedAttachmentChip.text = buildAttachmentChipLabel(selectedAttachments)
+        selectedAttachmentChip.visibility = if (selectedAttachments.isEmpty()) View.GONE else View.VISIBLE
+        selectedAttachmentChip.setOnClickListener {
+            clearSelectedAttachment()
+        }
+
+        val imageAttachments = selectedAttachments.filter { it.kind == SelectedAttachmentKind.IMAGE }
+        selectedAttachmentPreviewList.removeAllViews()
+        if (imageAttachments.isEmpty()) {
+            selectedAttachmentPreviewScroller.visibility = View.GONE
+            return
+        }
+
+        selectedAttachmentPreviewScroller.visibility = View.VISIBLE
+        imageAttachments.forEachIndexed { index, attachment ->
+            selectedAttachmentPreviewList.addView(createComposerImagePreview(attachment, index))
+        }
+    }
+
+    private fun createComposerImagePreview(attachment: SelectedAttachment, index: Int): View {
+        return FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(74), dp(74)).apply {
+                if (index > 0) marginStart = dp(8)
+                marginEnd = dp(2)
+            }
+            val imageView = ImageView(this@MainActivity).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+                setBackgroundResource(R.drawable.bg_surface_card)
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                contentDescription = getString(R.string.attachment_preview_open)
+                isClickable = true
+                bindInlineImagePreview(this, attachment.base64, View.INVISIBLE)
+                setOnClickListener {
+                    showSelectedAttachmentImageDialog(attachment)
+                }
+            }
+            addView(imageView)
+
+            val removeButton = TextView(this@MainActivity).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(26), dp(26), Gravity.TOP or Gravity.END)
+                background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_composer_action)
+                contentDescription = getString(R.string.attachment_preview_remove)
+                gravity = Gravity.CENTER
+                text = "x"
+                textSize = 16f
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    selectedAttachments.remove(attachment)
+                    renderSelectedAttachmentsIfChanged(force = true)
+                }
+            }
+            addView(removeButton)
+        }
+    }
+
+    private fun showSelectedAttachmentImageDialog(attachment: SelectedAttachment) {
+        val imageView = ImageView(this).apply {
+            adjustViewBounds = true
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.bg_app))
+            contentDescription = getString(R.string.attachment_preview_open)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        bindInlineImagePreview(imageView, attachment.base64, View.GONE)
+        val content = ScrollView(this).apply {
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            addView(imageView)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(attachment.displayName.ifBlank { getString(R.string.attached_image_dialog_title) })
+            .setView(content)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
     }
 
     private fun updateTopTitle(phoneGateVisible: Boolean) {
@@ -3001,6 +3215,15 @@ ${record.stackTrace}
 
     private fun isRedundantDownloadedStatusMessage(message: ChatMessage): Boolean {
         return message.kind == MessageKind.STATUS && message.body == getString(R.string.status_downloaded)
+    }
+
+    private fun isRedundantModificationEchoMessage(message: ChatMessage): Boolean {
+        if (message.kind != MessageKind.ASSISTANT) return false
+        val normalized = normalizeMessageTextForDedupe(message.body)
+        if (!normalized.contains("이번 수정") || !normalized.contains("반영")) return false
+        return normalized.contains("수정할게요") ||
+            normalized.contains("수정합니다") ||
+            normalized.startsWith("기존")
     }
 
     private fun currentDownloadProgressText(): String {
@@ -4546,7 +4769,19 @@ ${record.stackTrace}
 
     private fun shouldRenderDecisionSummary(response: BuildResponse): Boolean {
         if (isConfirmationRenderMode(response)) return false
+        if (shouldSuppressDecisionAssistantMessage(response)) return false
         return response.tool == "answer_question" && isAssistantRenderMode(response)
+    }
+
+    private fun shouldSuppressDecisionAssistantMessage(response: BuildResponse): Boolean {
+        if (response.suppress_assistant_bubble == true) return true
+        val renderMode = response.render_mode?.trim()?.lowercase().orEmpty()
+        if (renderMode == "status_only") return true
+        val requestScope = response.request_scope?.trim()?.lowercase().orEmpty()
+        val interactionType = response.interaction_type?.trim()?.lowercase().orEmpty()
+        val looksLikeRevision = requestScope in setOf("existing_app", "existing_task", "revision", "modification") ||
+            interactionType in setOf("build_started", "revision_started", "modification_started")
+        return looksLikeRevision && isModificationBuildResponse(response)
     }
 
     private fun isNonAppAnswerResponse(response: BuildResponse): Boolean {
@@ -4613,7 +4848,9 @@ ${record.stackTrace}
         val summary = response.summary?.trim().orEmpty()
         val message = response.message?.trim().orEmpty()
         return summary.contains("수정 방향은") ||
+            summary.contains("이번 수정") ||
             summary.contains("이렇게 수정할게요") ||
+            message.contains("이번 수정") ||
             message.contains("기존 앱 수정")
     }
 
