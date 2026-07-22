@@ -1,6 +1,7 @@
 package kr.ac.kangwon.hai.vibefactory
 
 import android.Manifest
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -185,6 +186,7 @@ class MainActivity : AppCompatActivity() {
             isConfirmationHandled = handledConfirmationMessageIds::contains,
             onConfirmationAccept = ::handleConfirmationAccepted,
             onConfirmationDismiss = ::handleConfirmationDismissed,
+            onPromptReviewOpen = ::openPromptReview,
             onArtifactDownload = ::handleArtifactDownloadRequested,
             onArtifactInstall = ::handleArtifactInstallRequested,
             onBuildCancel = ::handleBuildCancelRequested
@@ -251,6 +253,9 @@ class MainActivity : AppCompatActivity() {
     private var lastRenderedAttachmentFingerprint: String? = null
     private var pendingCameraImageUri: Uri? = null
     private var pendingInstallApkFile: File? = null
+    private var pendingInstallLaunchTaskId: String? = null
+    private var pendingInstallLaunchPackageName: String? = null
+    private var pendingInstallPackageWasInstalled: Boolean = false
     private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
 
     private data class TimelineEventSnapshot(
@@ -261,6 +266,10 @@ class MainActivity : AppCompatActivity() {
         val body: String,
         val detail: String,
         val eventType: String,
+        val confirmationAction: String?,
+        val confirmationPayload: String?,
+        val preparedPrompt: String?,
+        val renderMode: String?,
         val apkUrl: String?,
         val apkPath: String?,
         val apkSizeBytes: Long?,
@@ -311,6 +320,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    private val promptReviewLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+            val data = result.data ?: return@registerForActivityResult
+            val taskId = data.getStringExtra(PromptReviewActivity.EXTRA_TASK_ID).orEmpty()
+            val finalPrompt = data.getStringExtra(PromptReviewActivity.EXTRA_PROMPT).orEmpty()
+            val messageId = data.getStringExtra(PromptReviewActivity.EXTRA_MESSAGE_ID).orEmpty()
+            submitReviewedInitialPrompt(taskId, finalPrompt, messageId)
+        }
+
     private val crashReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != "kr.ac.kangwon.hai.action.CRASH_REPORT") return
@@ -338,6 +357,21 @@ class MainActivity : AppCompatActivity() {
                     TAG,
                     "Crash report dropped because task_id could not be resolved raw_task_id=${rawTaskId ?: "-"} package_name=${pkg.ifBlank { "-" }}"
                 )
+            }
+        }
+    }
+
+    private val packageInstallReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            if (action != Intent.ACTION_PACKAGE_ADDED && action != Intent.ACTION_PACKAGE_REPLACED) return
+            val installedPackage = intent.data?.schemeSpecificPart?.trim().orEmpty()
+            if (installedPackage.isBlank()) return
+            val pendingPackage = pendingInstallLaunchPackageName
+                ?: loadPendingInstallLaunchPackageName()
+                ?: return
+            if (installedPackage == pendingPackage) {
+                launchPendingInstalledAppIfReady("package-broadcast")
             }
         }
     }
@@ -376,6 +410,15 @@ class MainActivity : AppCompatActivity() {
         renderState()
 
         registerReceiver(crashReceiver, IntentFilter("kr.ac.kangwon.hai.action.CRASH_REPORT"), RECEIVER_EXPORTED)
+        registerReceiver(
+            packageInstallReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_PACKAGE_ADDED)
+                addAction(Intent.ACTION_PACKAGE_REPLACED)
+                addDataScheme("package")
+            },
+            RECEIVER_EXPORTED
+        )
         if (hasRequiredPhoneNumber()) {
             skipNextResumeRestore = true
             restoreCurrentTaskState(trigger = "onCreate")
@@ -480,12 +523,13 @@ class MainActivity : AppCompatActivity() {
         if (!hasRequiredPhoneNumber() && hasPhoneNumberPermissionGranted()) {
             tryFillPhoneNumberFromSim()
         }
+        retryPendingApkInstallIfReady()
+        launchPendingInstalledAppIfReady("onResume")
         if (skipNextResumeRestore) {
             skipNextResumeRestore = false
             return
         }
         restoreCurrentTaskState(trigger = "onResume")
-        retryPendingApkInstallIfReady()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -1133,7 +1177,63 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun openPromptReview(message: ChatMessage) {
+        val taskId = message.promptReviewTaskId
+            ?: message.confirmTaskId
+            ?: screenState.selectedTaskId
+            ?: currentTaskId
+            ?: return
+        val prompt = message.promptReviewText
+            ?: message.confirmPayload
+            ?: message.body
+        if (prompt.isBlank()) return
+        promptReviewLauncher.launch(
+            Intent(this, PromptReviewActivity::class.java)
+                .putExtra(PromptReviewActivity.EXTRA_TASK_ID, taskId)
+                .putExtra(PromptReviewActivity.EXTRA_PROMPT, prompt)
+                .putExtra(PromptReviewActivity.EXTRA_MESSAGE_ID, message.id)
+        )
+    }
+
+    private fun submitReviewedInitialPrompt(taskId: String, finalPrompt: String, promptReviewMessageId: String = "") {
+        val trimmedPrompt = finalPrompt.trim()
+        if (trimmedPrompt.isBlank()) {
+            Toast.makeText(this, R.string.prompt_review_empty, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
+        if (promptReviewMessageId.isNotBlank()) {
+            handledConfirmationMessageIds += promptReviewMessageId
+        }
+        val displayPrompt = getString(R.string.prompt_review_sent_bubble)
+        ensureTaskChatLoaded(apiTaskId)
+        appendOptimisticTaskMessage(
+            apiTaskId,
+            ChatMessage(
+                id = "prompt-review-submit-$apiTaskId-${System.currentTimeMillis()}",
+                kind = MessageKind.USER,
+                title = getString(R.string.message_title_user),
+                body = displayPrompt,
+                createdAt = currentTimestampString()
+            ),
+            allowDuplicateContent = true
+        )
+        startFollowupSynthesis(
+            taskId = apiTaskId,
+            prompt = trimmedPrompt,
+            attachments = emptyList(),
+            mode = InputMode.CONTINUE_CLARIFICATION,
+            appendUserMessage = false,
+            displayPrompt = displayPrompt,
+            requestAction = "submit_initial_prompt"
+        )
+    }
+
     private fun handleConfirmationAccepted(message: ChatMessage) {
+        if (message.confirmAction == "submit_initial_prompt") {
+            openPromptReview(message)
+            return
+        }
         if (!handledConfirmationMessageIds.add(message.id)) return
         val taskId = message.confirmTaskId ?: screenState.selectedTaskId ?: currentTaskId ?: return
         val payload = message.confirmPayload.orEmpty()
@@ -1237,7 +1337,8 @@ class MainActivity : AppCompatActivity() {
         imagePreview: ChatImagePreview? = null,
         attachments: List<SelectedAttachment> = selectedAttachments.toList(),
         sourceTaskId: String? = null,
-        displayPrompt: String? = null
+        displayPrompt: String? = null,
+        requestAction: String? = null
     ) {
         val deviceInfo = collectDeviceInfo()
         val referenceImagePreview = imagePreview ?: attachments.toChatImagePreview()
@@ -1271,6 +1372,7 @@ class MainActivity : AppCompatActivity() {
                         phone_number = userIdentity.phoneNumber,
                         reference_image_name = referenceImageName,
                         reference_image_base64 = referenceImageBase64,
+                        request_action = requestAction,
                         attachments = attachmentPayloads
                     )
                 )
@@ -1335,7 +1437,8 @@ class MainActivity : AppCompatActivity() {
         prompt: String,
         appendUserMessage: Boolean = true,
         attachments: List<SelectedAttachment> = selectedAttachments.toList(),
-        displayPrompt: String = prompt
+        displayPrompt: String = prompt,
+        requestAction: String? = null
     ) {
         startFollowupSynthesis(
             taskId,
@@ -1344,7 +1447,8 @@ class MainActivity : AppCompatActivity() {
             attachments = attachments,
             mode = InputMode.CONTINUE_CLARIFICATION,
             appendUserMessage = appendUserMessage,
-            displayPrompt = displayPrompt
+            displayPrompt = displayPrompt,
+            requestAction = requestAction
         )
     }
 
@@ -1481,6 +1585,8 @@ class MainActivity : AppCompatActivity() {
         val questions = response.questions.orEmpty().filter { it.isNotBlank() }
         val confirmationAction = response.confirmation_action?.trim().orEmpty()
         val confirmationPayload = response.confirmation_payload?.trim().orEmpty()
+        val preparedPrompt = response.prepared_prompt?.trim().orEmpty()
+            .ifBlank { confirmationPayload }
         val responseAppName = taskDisplayName(response.generated_app_name)
             ?: taskDisplayName(response.app_name)
         val responsePackageName = response.package_name?.trim()?.takeIf { it.isNotBlank() }
@@ -1570,6 +1676,36 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (response.tool == "ask_confirmation") {
+            if (isPromptReviewRenderMode(response) && preparedPrompt.isNotBlank()) {
+                val promptReviewMessage = message.ifBlank {
+                    summary.ifBlank { getString(R.string.prompt_review_open) }
+                }
+                appendOptimisticTaskMessage(
+                    taskId,
+                    ChatMessage(
+                        id = "decision-prompt-review-$taskId-${preparedPrompt.hashCode()}",
+                        kind = MessageKind.CONFIRMATION,
+                        title = getString(R.string.confirmation_title),
+                        body = preparedPrompt,
+                        detail = promptReviewMessage.takeIf { it.isNotBlank() },
+                        createdAt = currentTimestampString(),
+                        confirmAction = "submit_initial_prompt",
+                        confirmTaskId = taskId,
+                        confirmPayload = preparedPrompt,
+                        promptReviewTaskId = taskId,
+                        promptReviewText = preparedPrompt
+                    )
+                )
+                screenState = screenState.copy(
+                    selectedTaskId = taskId,
+                    inputMode = InputMode.CONTINUE_CLARIFICATION,
+                    currentStatus = resolveStatusDisplayText(response.status, null, null),
+                    statusDetail = promptReviewMessage
+                )
+                renderState()
+                setComposerEnabled(false)
+                return
+            }
             if (isConfirmationRenderMode(response) && confirmationAction.isNotBlank()) {
                 val confirmationBody = questions.firstOrNull()?.takeIf { it.isNotBlank() }
                     ?: getString(R.string.confirmation_generate_preview)
@@ -2107,7 +2243,8 @@ class MainActivity : AppCompatActivity() {
         attachments: List<SelectedAttachment> = selectedAttachments.toList(),
         mode: InputMode,
         appendUserMessage: Boolean = true,
-        displayPrompt: String = prompt
+        displayPrompt: String = prompt,
+        requestAction: String? = null
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
@@ -2164,7 +2301,8 @@ class MainActivity : AppCompatActivity() {
             imagePreview = imagePreview,
             attachments = attachments,
             sourceTaskId = apiTaskId,
-            displayPrompt = displayPrompt
+            displayPrompt = displayPrompt,
+            requestAction = requestAction
         )
     }
 
@@ -2758,7 +2896,7 @@ ${record.stackTrace}
                         canDownload = false
                     )
                     renderState()
-                    installApk(apkFile)
+                    installApk(apkFile, taskId = downloadTaskId)
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -2791,37 +2929,206 @@ ${record.stackTrace}
         }
     }
 
-    private fun installApk(file: File) {
+    private fun installApk(
+        file: File,
+        taskId: String? = latestDownloadedTaskId,
+        packageName: String? = null
+    ) {
         if (!file.exists()) {
             Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
             return
         }
 
+        val normalizedTaskId = taskId?.trim()?.takeIf { it.isNotBlank() }
+        val resolvedPackageName = resolveInstallLaunchPackageName(file, normalizedTaskId, packageName)
         if (ApkArtifactActionHandler.needsInstallPermission(this)) {
-            pendingInstallApkFile = file
+            rememberPendingInstallState(
+                file = file,
+                taskId = normalizedTaskId,
+                packageName = resolvedPackageName,
+                keepApkPath = true
+            )
             Toast.makeText(this, R.string.install_permission_required, Toast.LENGTH_LONG).show()
             if (!ApkArtifactActionHandler.requestInstallPermission(this)) {
+                clearPendingInstallState()
                 Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
             }
             return
         }
 
-        pendingInstallApkFile = null
+        rememberPendingInstallState(
+            file = file,
+            taskId = normalizedTaskId,
+            packageName = resolvedPackageName,
+            keepApkPath = false
+        )
         if (!ApkArtifactActionHandler.launchApkInstaller(this, file)) {
+            clearPendingInstallState()
             Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun retryPendingApkInstallIfReady() {
+        loadPendingInstallState()
         val file = pendingInstallApkFile ?: return
         if (!file.exists()) {
-            pendingInstallApkFile = null
+            clearPendingInstallState()
             Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
             return
         }
         if (!ApkArtifactActionHandler.needsInstallPermission(this)) {
-            installApk(file)
+            installApk(
+                file,
+                taskId = pendingInstallLaunchTaskId,
+                packageName = pendingInstallLaunchPackageName
+            )
         }
+    }
+
+    private fun resolveInstallLaunchPackageName(
+        file: File,
+        taskId: String?,
+        packageName: String?
+    ): String? {
+        return packageName?.trim()?.takeIf { it.isNotBlank() }
+            ?: taskId?.let { taskSummaryById[it]?.packageName?.trim()?.takeIf { packageName -> packageName.isNotBlank() } }
+            ?: packageNameFromApk(file)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun packageNameFromApk(file: File): String? {
+        if (!file.exists()) return null
+        return runCatching {
+            packageManager.getPackageArchiveInfo(file.absolutePath, 0)
+                ?.packageName
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    private fun rememberPendingInstallState(
+        file: File,
+        taskId: String?,
+        packageName: String?,
+        keepApkPath: Boolean
+    ) {
+        val normalizedTaskId = taskId?.trim()?.takeIf { it.isNotBlank() }
+        val normalizedPackageName = packageName?.trim()?.takeIf { it.isNotBlank() }
+        pendingInstallApkFile = if (keepApkPath) file else null
+        pendingInstallLaunchTaskId = normalizedTaskId
+        pendingInstallLaunchPackageName = normalizedPackageName
+        pendingInstallPackageWasInstalled = normalizedPackageName?.let(::isPackageInstalled) == true
+        getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .apply {
+                if (keepApkPath) {
+                    putString(HostAppConfig.PREF_PENDING_INSTALL_APK_PATH, file.absolutePath)
+                } else {
+                    remove(HostAppConfig.PREF_PENDING_INSTALL_APK_PATH)
+                }
+                if (normalizedTaskId != null) {
+                    putString(HostAppConfig.PREF_PENDING_INSTALL_TASK_ID, normalizedTaskId)
+                } else {
+                    remove(HostAppConfig.PREF_PENDING_INSTALL_TASK_ID)
+                }
+                if (normalizedPackageName != null) {
+                    putString(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_NAME, normalizedPackageName)
+                    putBoolean(
+                        HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_WAS_INSTALLED,
+                        pendingInstallPackageWasInstalled
+                    )
+                } else {
+                    remove(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_NAME)
+                    remove(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_WAS_INSTALLED)
+                }
+            }
+            .apply()
+    }
+
+    private fun loadPendingInstallState() {
+        val prefs = getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
+        if (pendingInstallApkFile == null) {
+            pendingInstallApkFile = prefs
+                .getString(HostAppConfig.PREF_PENDING_INSTALL_APK_PATH, null)
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let(::File)
+                ?.takeIf { it.exists() }
+        }
+        if (pendingInstallLaunchTaskId.isNullOrBlank()) {
+            pendingInstallLaunchTaskId = prefs
+                .getString(HostAppConfig.PREF_PENDING_INSTALL_TASK_ID, null)
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+        }
+        if (pendingInstallLaunchPackageName.isNullOrBlank()) {
+            pendingInstallLaunchPackageName = prefs
+                .getString(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_NAME, null)
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+        }
+        pendingInstallPackageWasInstalled = prefs.getBoolean(
+            HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_WAS_INSTALLED,
+            pendingInstallPackageWasInstalled
+        )
+    }
+
+    private fun loadPendingInstallLaunchPackageName(): String? {
+        loadPendingInstallState()
+        return pendingInstallLaunchPackageName
+    }
+
+    private fun clearPendingInstallState() {
+        pendingInstallApkFile = null
+        pendingInstallLaunchTaskId = null
+        pendingInstallLaunchPackageName = null
+        pendingInstallPackageWasInstalled = false
+        getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .remove(HostAppConfig.PREF_PENDING_INSTALL_APK_PATH)
+            .remove(HostAppConfig.PREF_PENDING_INSTALL_TASK_ID)
+            .remove(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_NAME)
+            .remove(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_WAS_INSTALLED)
+            .apply()
+    }
+
+    private fun launchPendingInstalledAppIfReady(source: String): Boolean {
+        loadPendingInstallState()
+        val packageName = pendingInstallLaunchPackageName?.trim()?.takeIf { it.isNotBlank() }
+            ?: return false
+        if (source == "onResume" && pendingInstallPackageWasInstalled) {
+            return false
+        }
+        if (!isPackageInstalled(packageName)) {
+            return false
+        }
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        if (launchIntent == null) {
+            Log.w(TAG, "Installed generated app has no launcher activity package_name=$packageName source=$source")
+            clearPendingInstallState()
+            Toast.makeText(this, R.string.generated_app_launch_failed, Toast.LENGTH_LONG).show()
+            return false
+        }
+        val launched = runCatching {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(launchIntent)
+        }.isSuccess
+        if (launched) {
+            Log.i(TAG, "Launched generated app package_name=$packageName source=$source")
+            clearPendingInstallState()
+        } else {
+            Toast.makeText(this, R.string.generated_app_launch_failed, Toast.LENGTH_LONG).show()
+        }
+        return launched
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isPackageInstalled(packageName: String): Boolean {
+        val normalizedPackageName = packageName.trim()
+        if (normalizedPackageName.isBlank()) return false
+        return runCatching {
+            packageManager.getPackageInfo(normalizedPackageName, 0)
+        }.isSuccess
     }
 
     private fun renderState() {
@@ -2933,7 +3240,17 @@ ${record.stackTrace}
             return
         }
 
-        when (screenState.inputMode) {
+        val awaitingPromptReview = screenState.inputMode == InputMode.CONTINUE_CLARIFICATION &&
+            visibleMessages.any { message ->
+                message.promptReviewTaskId == screenState.selectedTaskId &&
+                    !message.promptReviewText.isNullOrBlank() &&
+                    message.id !in handledConfirmationMessageIds
+            }
+        if (awaitingPromptReview) {
+            inputModeLabel.text = buildModeLabel(getString(R.string.input_mode_prompt_review))
+            inputPrompt.hint = getString(R.string.prompt_hint_review)
+            setComposerEnabled(false)
+        } else when (screenState.inputMode) {
             InputMode.NEW_GENERATE -> {
                 inputModeLabel.text = buildModeLabel(getString(R.string.input_mode_new_chat))
                 inputPrompt.hint = getString(R.string.prompt_hint_new)
@@ -3574,7 +3891,7 @@ ${record.stackTrace}
                 ?: persistedDownloadedApkFileForTask(taskId)
         }
         if (downloadedFile != null) {
-            installApk(downloadedFile)
+            installApk(downloadedFile, taskId = taskId)
             return
         }
         val apkUrl = artifactUrl ?: persistedApkUrlForTask(taskId)
@@ -3947,9 +4264,17 @@ ${record.stackTrace}
             val confirmationPayload = firstString(obj, "confirmation_payload")?.trim().orEmpty()
             val renderMode = firstString(obj, "render_mode")?.trim().orEmpty()
             val awaitingConfirmation = obj.get("awaiting_confirmation")?.takeIf { it.isJsonPrimitive }?.asBoolean == true
+            val awaitingPromptReview = obj.get("awaiting_prompt_review")?.takeIf { it.isJsonPrimitive }?.asBoolean == true ||
+                renderMode == "prompt_review_bubble" ||
+                confirmationAction == "submit_initial_prompt" ||
+                isPromptReviewRenderMode(response)
+            val preparedPrompt = firstString(obj, "prepared_prompt")?.trim().orEmpty()
+                .ifBlank { response.prepared_prompt?.trim().orEmpty() }
+                .ifBlank { confirmationPayload }
             if (
                 latestSummary.isNotBlank() &&
                 renderMode != "confirmation_bubble" &&
+                renderMode != "prompt_review_bubble" &&
                 !isUserPromptEcho(taskId, latestSummary, initialPrompt) &&
                 !timelineContainsBody(taskId, latestSummary)
             ) {
@@ -3966,7 +4291,26 @@ ${record.stackTrace}
             }
 
             val latestQuestions = stringList(obj, "latest_assistant_questions")
-            if (awaitingConfirmation && confirmationAction.isNotBlank()) {
+            if (awaitingPromptReview && preparedPrompt.isNotBlank()) {
+                if (!timelineContainsBody(taskId, preparedPrompt)) {
+                    appendTaskTimelineMessage(
+                        taskId,
+                        ChatMessage(
+                            id = "seed-prompt-review-$taskId-${preparedPrompt.hashCode()}",
+                            kind = MessageKind.CONFIRMATION,
+                            title = getString(R.string.confirmation_title),
+                            body = preparedPrompt,
+                            detail = latestSummary.takeIf { it.isNotBlank() },
+                            createdAt = currentTimestampString(),
+                            confirmAction = "submit_initial_prompt",
+                            confirmTaskId = taskId,
+                            confirmPayload = preparedPrompt,
+                            promptReviewTaskId = taskId,
+                            promptReviewText = preparedPrompt
+                        )
+                    )
+                }
+            } else if (awaitingConfirmation && confirmationAction.isNotBlank()) {
                 latestQuestions.firstOrNull()
                     ?.takeIf { it.isNotBlank() && !timelineContainsBody(taskId, it) }
                     ?.let { question ->
@@ -4121,6 +4465,10 @@ ${record.stackTrace}
                 body = firstString(obj, "body")?.trim().orEmpty(),
                 detail = firstString(obj, "detail")?.trim().orEmpty(),
                 eventType = firstString(obj, "event_type")?.trim().orEmpty(),
+                confirmationAction = firstString(obj, "confirmation_action") ?: payload?.let { firstString(it, "confirmation_action") },
+                confirmationPayload = firstString(obj, "confirmation_payload") ?: payload?.let { firstString(it, "confirmation_payload") },
+                preparedPrompt = firstString(obj, "prepared_prompt") ?: payload?.let { firstString(it, "prepared_prompt") },
+                renderMode = firstString(obj, "render_mode") ?: payload?.let { firstString(it, "render_mode") },
                 apkUrl = firstString(obj, "apk_url") ?: payload?.let { firstString(it, "apk_url") },
                 apkPath = firstString(obj, "apk_path") ?: payload?.let { firstString(it, "apk_path") },
                 apkSizeBytes = firstLong(obj, "apk_size_bytes") ?: payload?.let { firstLong(it, "apk_size_bytes") },
@@ -4142,13 +4490,26 @@ ${record.stackTrace}
         val messageKind = when (event.kind.lowercase()) {
             "user" -> MessageKind.USER
             "assistant" -> MessageKind.ASSISTANT
+            "confirmation" -> MessageKind.CONFIRMATION
             "status" -> MessageKind.STATUS
             else -> MessageKind.LOG
         }
+        val confirmationAction = event.confirmationAction?.trim().orEmpty()
+        val renderMode = event.renderMode?.trim().orEmpty()
+        val preparedPrompt = event.preparedPrompt?.trim().orEmpty()
+        val promptReviewText = preparedPrompt
+            .ifBlank { event.confirmationPayload?.trim().orEmpty() }
+            .ifBlank { event.body }
+            .takeIf {
+                messageKind == MessageKind.CONFIRMATION &&
+                    (confirmationAction == "submit_initial_prompt" || renderMode == "prompt_review_bubble")
+            }
         return ChatMessage(
             id = "timeline-$taskId-${event.eventId.ifBlank { event.body.hashCode().toString() }}",
             kind = messageKind,
-            title = event.title.ifBlank {
+            title = if (messageKind == MessageKind.CONFIRMATION) {
+                getString(R.string.confirmation_title)
+            } else event.title.ifBlank {
                 when (messageKind) {
                     MessageKind.USER -> getString(R.string.message_title_user)
                     MessageKind.ASSISTANT, MessageKind.CONFIRMATION -> getString(R.string.message_title_assistant)
@@ -4160,7 +4521,12 @@ ${record.stackTrace}
             body = event.body,
             detail = event.detail.ifBlank { null },
             createdAt = event.createdAt.ifBlank { currentTimestampString() },
-            eventType = event.eventType.ifBlank { null }
+            eventType = event.eventType.ifBlank { null },
+            confirmAction = confirmationAction.ifBlank { null },
+            confirmTaskId = taskId.takeIf { messageKind == MessageKind.CONFIRMATION },
+            confirmPayload = event.confirmationPayload?.trim()?.ifBlank { null } ?: promptReviewText,
+            promptReviewTaskId = taskId.takeIf { promptReviewText != null },
+            promptReviewText = promptReviewText
         )
     }
 
@@ -4763,11 +5129,18 @@ ${record.stackTrace}
         return response.render_mode?.trim()?.lowercase() == "confirmation_bubble"
     }
 
+    private fun isPromptReviewRenderMode(response: BuildResponse): Boolean {
+        return response.render_mode?.trim()?.lowercase() == "prompt_review_bubble" ||
+            response.confirmation_action?.trim()?.lowercase() == "submit_initial_prompt" ||
+            response.interaction_type?.trim()?.lowercase() == "needs_initial_prompt_review"
+    }
+
     private fun isAssistantRenderMode(response: BuildResponse): Boolean {
         return response.render_mode?.trim()?.lowercase() == "assistant_message"
     }
 
     private fun shouldRenderDecisionSummary(response: BuildResponse): Boolean {
+        if (isPromptReviewRenderMode(response)) return false
         if (isConfirmationRenderMode(response)) return false
         if (shouldSuppressDecisionAssistantMessage(response)) return false
         return response.tool == "answer_question" && isAssistantRenderMode(response)
@@ -4792,6 +5165,11 @@ ${record.stackTrace}
 
     private fun isConfirmationRenderMode(response: StatusResponse): Boolean {
         return response.render_mode?.trim()?.lowercase() == "confirmation_bubble"
+    }
+
+    private fun isPromptReviewRenderMode(response: StatusResponse): Boolean {
+        return response.render_mode?.trim()?.lowercase() == "prompt_review_bubble" ||
+            response.pending_decision_reason?.trim()?.lowercase() == "initial_prompt_review"
     }
 
     private fun suppressAssistantBubble(response: StatusResponse): Boolean {
@@ -5644,7 +6022,8 @@ ${record.stackTrace}
         return message.id.startsWith("local-") ||
             message.id.startsWith("followup-origin-") ||
             message.id.startsWith("chat-origin-") ||
-            message.id.startsWith("queued-input-")
+            message.id.startsWith("queued-input-") ||
+            message.id.startsWith("prompt-review-submit-")
     }
 
     private fun isServerUserMessage(message: ChatMessage): Boolean {
@@ -6399,7 +6778,8 @@ ${record.stackTrace}
 
     override fun onDestroy() {
         stopPolling()
-        unregisterReceiver(crashReceiver)
+        runCatching { unregisterReceiver(crashReceiver) }
+        runCatching { unregisterReceiver(packageInstallReceiver) }
         super.onDestroy()
     }
 

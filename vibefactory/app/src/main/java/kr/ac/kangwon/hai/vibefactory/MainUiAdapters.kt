@@ -98,6 +98,7 @@ class ChatMessageAdapter(
     private val isConfirmationHandled: (String) -> Boolean,
     private val onConfirmationAccept: (ChatMessage) -> Unit,
     private val onConfirmationDismiss: (ChatMessage) -> Unit,
+    private val onPromptReviewOpen: (ChatMessage) -> Unit,
     private val onArtifactDownload: (ChatMessage) -> Unit,
     private val onArtifactInstall: (ChatMessage) -> Unit,
     private val onBuildCancel: (ChatMessage) -> Unit
@@ -168,6 +169,7 @@ class ChatMessageAdapter(
             bindExpandableChatMessage(item)
             bindImagePreview(item, context)
             bindConfirmationActions(item)
+            bindPromptReviewOpen(item)
             bindArtifactActions(item, context)
 
             val blockParams = block.layoutParams as LinearLayout.LayoutParams
@@ -583,29 +585,68 @@ class ChatMessageAdapter(
         private fun bindConfirmationActions(item: ChatMessage) {
             if (item.kind != MessageKind.CONFIRMATION) {
                 confirmationActions.visibility = View.GONE
+                btnConfirmationAccept.text = itemView.context.getString(R.string.confirmation_accept)
+                btnConfirmationDismiss.text = itemView.context.getString(R.string.confirmation_cancel)
+                btnConfirmationDismiss.visibility = View.VISIBLE
                 btnConfirmationAccept.setOnClickListener(null)
                 btnConfirmationDismiss.setOnClickListener(null)
                 return
             }
 
+            val isPromptReview = isPromptReviewMessage(item)
             val handled = isConfirmationHandled(item.id)
             confirmationActions.visibility = View.VISIBLE
+            btnConfirmationDismiss.visibility = if (isPromptReview) View.GONE else View.VISIBLE
+            btnConfirmationAccept.text = itemView.context.getString(
+                if (isPromptReview) R.string.prompt_review_open else R.string.confirmation_accept
+            )
+            btnConfirmationDismiss.text = itemView.context.getString(R.string.confirmation_cancel)
             btnConfirmationAccept.isEnabled = !handled
-            btnConfirmationDismiss.isEnabled = !handled
+            btnConfirmationDismiss.isEnabled = !handled && !isPromptReview
             btnConfirmationAccept.alpha = if (handled) 0.5f else 1.0f
-            btnConfirmationDismiss.alpha = if (handled) 0.5f else 1.0f
+            btnConfirmationDismiss.alpha = if (handled || isPromptReview) 0.5f else 1.0f
             btnConfirmationAccept.setOnClickListener {
                 if (!isConfirmationHandled(item.id)) {
-                    onConfirmationAccept(item)
+                    if (isPromptReview) {
+                        onPromptReviewOpen(item)
+                    } else {
+                        onConfirmationAccept(item)
+                    }
                     bindingAdapterPosition.takeIf { it != RecyclerView.NO_POSITION }?.let(::notifyItemChanged)
                 }
             }
             btnConfirmationDismiss.setOnClickListener {
-                if (!isConfirmationHandled(item.id)) {
+                if (!isPromptReview && !isConfirmationHandled(item.id)) {
                     onConfirmationDismiss(item)
                     bindingAdapterPosition.takeIf { it != RecyclerView.NO_POSITION }?.let(::notifyItemChanged)
                 }
             }
+        }
+
+        private fun bindPromptReviewOpen(item: ChatMessage) {
+            if (!isPromptReviewMessage(item)) {
+                container.setOnLongClickListener(null)
+                container.isLongClickable = false
+                return
+            }
+            val openReview = View.OnLongClickListener {
+                if (!isConfirmationHandled(item.id)) {
+                    onPromptReviewOpen(item)
+                }
+                true
+            }
+            container.setOnLongClickListener(openReview)
+            container.isLongClickable = true
+            body.setOnLongClickListener(openReview)
+            body.isLongClickable = true
+        }
+
+        private fun isPromptReviewMessage(item: ChatMessage): Boolean {
+            return item.kind == MessageKind.CONFIRMATION &&
+                (
+                    item.confirmAction?.trim()?.lowercase() == "submit_initial_prompt" ||
+                        !item.promptReviewText.isNullOrBlank()
+                    )
         }
 
         private fun bindArtifactActions(item: ChatMessage, context: android.content.Context) {

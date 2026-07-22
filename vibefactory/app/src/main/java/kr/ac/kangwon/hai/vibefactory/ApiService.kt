@@ -27,6 +27,7 @@ data class BuildRequest(
     val user_id: String? = null,
     val phone_number: String? = null,
     val interview_consent: Boolean? = null,
+    val request_action: String? = null,
     val reference_image_path: String? = null,
     val reference_image_name: String? = null,
     val reference_image_base64: String? = null,
@@ -63,7 +64,8 @@ data class BuildResponse(
     val reason: String? = null,
     val policy_category: String? = null,
     val image_reference_summary: String? = null,
-    val image_conflict_note: String? = null
+    val image_conflict_note: String? = null,
+    val prepared_prompt: String? = null
 )
 
 data class RuntimeErrorReportRequest(
@@ -111,6 +113,7 @@ data class StatusResponse(
     val cancel_allowed: Boolean? = null,
     val allowed_next_actions: List<String>? = null,
     val retry_block_reason: String? = null,
+    val prepared_prompt: String? = "",
     val created_at: String = "",
     val updated_at: String = ""
 )

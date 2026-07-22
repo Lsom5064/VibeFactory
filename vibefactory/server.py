@@ -1303,6 +1303,7 @@ class IntentDecision:
     confirmation_payload: str = ""
     image_reference_summary: str = ""
     image_conflict_note: str = ""
+    prepared_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -1656,6 +1657,15 @@ def looks_like_structured_agent_spec_prompt(prompt: str) -> bool:
 
 def decision_ui_flags(decision: "IntentDecision") -> dict[str, Any]:
     confirmation_pending = bool(decision.confirmation_action)
+    if decision.mode == "ask_confirmation" and decision.confirmation_action == "submit_initial_prompt":
+        return {
+            "interaction_type": "needs_initial_prompt_review",
+            "render_mode": "prompt_review_bubble",
+            "requires_user_input": False,
+            "requires_confirmation": True,
+            "pending_decision_reason": "initial_prompt_review",
+            "suppress_assistant_bubble": False,
+        }
     if decision.mode == "build":
         return {
             "interaction_type": "build_started",
@@ -2467,6 +2477,145 @@ def build_pre_build_confirmation_decision(decision: IntentDecision, *, existing_
         confirmation_payload="네, 이 내용으로 앱 생성을 시작해줘" if not existing_task else "네, 이 내용으로 앱 수정을 시작해줘",
         image_reference_summary=decision.image_reference_summary,
         image_conflict_note=decision.image_conflict_note,
+    )
+
+
+def build_prepared_generation_prompt(decision: IntentDecision) -> str:
+    app_name = normalize_whitespace(decision.app_name) or infer_app_name(decision.effective_user_prompt)
+    purpose = normalize_whitespace(decision.primary_user_flow) or "사용자가 요청한 목적을 중심으로 Flutter Android 앱을 만든다."
+    feature_points = decision.feature_points or extract_feature_points(decision.effective_user_prompt)
+    secondary_requirements = normalize_secondary_requirements(decision.secondary_requirements)
+    acceptance_criteria = normalize_acceptance_criteria(decision.acceptance_criteria)
+    image_reference_summary = normalize_whitespace(decision.image_reference_summary)
+    image_conflict_note = normalize_whitespace(decision.image_conflict_note)
+    original_request = normalize_whitespace(decision.effective_user_prompt)
+
+    def bullet_lines(items: list[str], fallback: str) -> list[str]:
+        values = [normalize_whitespace(item) for item in items if normalize_whitespace(item)]
+        if not values:
+            values = [fallback]
+        return [f"- {item}" for item in values]
+
+    sections = [
+        "# 앱 생성 프롬프트",
+        "",
+        "## 앱 이름",
+        app_name,
+        "",
+        "## 앱 목적",
+        purpose,
+        "",
+        "## 주요 사용자",
+        "- 일반 Android 스마트폰 사용자",
+        "",
+        "## 주요 화면",
+        *bullet_lines(feature_points[:5], "요청한 핵심 기능을 수행하는 메인 화면을 구성한다."),
+        "",
+        "## 핵심 기능",
+        *bullet_lines((feature_points + secondary_requirements)[:8], "사용자 요청에 포함된 기능을 실제로 동작하게 구현한다."),
+        "",
+        "## 저장/기록 방식",
+        "- 사용자가 기록 저장을 요구한 경우 앱 재실행 후에도 유지되도록 로컬 저장을 사용한다.",
+        "- 여러 사용자나 여러 기기가 같은 데이터를 공유해야 하는 경우 서버 데이터 API를 사용한다.",
+        "",
+        "## 첨부 자료 반영",
+        f"- {image_reference_summary}" if image_reference_summary else "- 첨부 자료가 있으면 화면 구성, 표시 내용, 수정 대상 판단에 반영한다.",
+        *( [f"- 주의: {image_conflict_note}"] if image_conflict_note else [] ),
+        "",
+        "## 구현 시 주의사항",
+        *bullet_lines(acceptance_criteria[:8], "작은 화면에서도 overflow 없이 안정적으로 사용할 수 있게 만든다."),
+        "",
+        "## 참가자 원문",
+        original_request,
+    ]
+    return "\n".join(sections).strip()
+
+
+def build_initial_prompt_review_decision(decision: IntentDecision) -> IntentDecision:
+    if decision.request_scope != "new_app" or decision.mode not in {"build", "ask_confirmation"}:
+        return decision
+    prepared_prompt = build_prepared_generation_prompt(decision)
+    return replace(
+        decision,
+        mode="ask_confirmation",
+        status="Pending Decision",
+        tool="ask_confirmation",
+        message="앱 생성 프롬프트를 준비했어요. 확인하거나 수정한 뒤 전송해 주세요.",
+        summary="아래 프롬프트를 확인한 뒤 그대로 보내거나 필요한 내용을 직접 고쳐서 보낼 수 있어요.",
+        questions=[],
+        reason="사용자가 최종 앱 생성 프롬프트를 확인한 뒤 빌드를 시작합니다.",
+        effective_user_prompt=prepared_prompt,
+        normalized_prompt=build_normalized_prompt(
+            decision.app_name,
+            decision.package_name,
+            prepared_prompt,
+            extract_feature_points(prepared_prompt),
+            decision.primary_user_flow,
+            decision.secondary_requirements,
+            decision.acceptance_criteria,
+        ),
+        confirmation_action="submit_initial_prompt",
+        confirmation_payload=prepared_prompt,
+        prepared_prompt=prepared_prompt,
+    )
+
+
+def build_initial_prompt_submission_decision(
+    *,
+    task_id: str,
+    final_prompt: str,
+    previous_conversation_state: dict[str, Any],
+) -> IntentDecision:
+    submitted_prompt = final_prompt.strip()
+    app_name = normalize_whitespace(
+        str(
+            previous_conversation_state.get("pending_app_name")
+            or previous_conversation_state.get("app_name")
+            or previous_conversation_state.get("generated_app_name")
+            or ""
+        )
+    )
+    package_name = normalize_whitespace(
+        str(previous_conversation_state.get("pending_package_name") or previous_conversation_state.get("package_name") or "")
+    )
+    decision = build_intent_decision(
+        mode="build",
+        task_id=task_id,
+        existing_task=False,
+        existing_workspace_ready=False,
+        user_prompt=submitted_prompt,
+        effective_user_prompt=submitted_prompt,
+        reason="사용자가 확인한 최종 앱 생성 프롬프트를 그대로 사용해 빌드를 시작합니다.",
+        request_scope="new_app",
+        suggested_app_name=app_name,
+        primary_user_flow=normalize_whitespace(
+            str(
+                previous_conversation_state.get("pending_primary_user_flow")
+                or previous_conversation_state.get("latest_primary_user_flow")
+                or ""
+            )
+        ),
+        secondary_requirements=normalize_secondary_requirements(
+            previous_conversation_state.get("pending_secondary_requirements")
+            or previous_conversation_state.get("latest_secondary_requirements")
+        ),
+        secondary_scope_confirmed=bool(
+            previous_conversation_state.get("pending_secondary_scope_confirmed")
+            or previous_conversation_state.get("latest_secondary_scope_confirmed")
+        ),
+        acceptance_criteria=normalize_acceptance_criteria(
+            previous_conversation_state.get("pending_acceptance_criteria")
+            or previous_conversation_state.get("latest_acceptance_criteria")
+        ),
+        image_reference_summary=normalize_whitespace(str(previous_conversation_state.get("image_reference_summary") or "")),
+        image_conflict_note=normalize_whitespace(str(previous_conversation_state.get("image_conflict_note") or "")),
+    )
+    if package_name:
+        decision = replace(decision, package_name=package_name)
+    return replace(
+        decision,
+        effective_user_prompt=submitted_prompt,
+        prepared_prompt=str(previous_conversation_state.get("prepared_prompt") or "").strip(),
     )
 
 
@@ -3338,6 +3487,7 @@ class GenerateRequest(BaseModel):
     device_id: str = Field(..., min_length=1)
     phone_number: Optional[str] = None
     prompt: str = Field(..., min_length=1)
+    request_action: Optional[str] = None
     device_info: Optional[DeviceInfoPayload] = None
     reference_image_path: Optional[str] = None
     reference_image_name: Optional[str] = None
@@ -3678,6 +3828,8 @@ class Database:
                     apk_url TEXT,
                     app_name TEXT,
                     package_name TEXT,
+                    normalized_prompt TEXT,
+                    build_request_prompt TEXT,
                     input_tokens INTEGER,
                     cached_input_tokens INTEGER,
                     output_tokens INTEGER,
@@ -3695,6 +3847,8 @@ class Database:
             self.ensure_column(connection, "tasks", "output_tokens", "INTEGER")
             self.ensure_column(connection, "tasks", "reasoning_output_tokens", "INTEGER")
             self.ensure_column(connection, "tasks", "total_tokens", "INTEGER")
+            self.ensure_column(connection, "tasks", "normalized_prompt", "TEXT")
+            self.ensure_column(connection, "tasks", "build_request_prompt", "TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)")
             connection.execute(
                 """
@@ -3797,9 +3951,10 @@ class Database:
                 INSERT INTO tasks (
                     task_id, user_id, device_id, phone_number, prompt, status, message,
                     workspace_path, project_path, apk_path, apk_url, app_name, package_name,
+                    normalized_prompt, build_request_prompt,
                     input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
                     codex_result_json, log, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task["task_id"],
@@ -3815,6 +3970,8 @@ class Database:
                     task.get("apk_url"),
                     task.get("app_name"),
                     task.get("package_name"),
+                    task.get("normalized_prompt"),
+                    task.get("build_request_prompt"),
                     task.get("input_tokens"),
                     task.get("cached_input_tokens"),
                     task.get("output_tokens"),
@@ -5009,6 +5166,12 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
     previous_conversation_state = previous_state_payload.get("conversation_state")
     if not isinstance(previous_conversation_state, dict):
         previous_conversation_state = {}
+    conversation_state_override = task.get("conversation_state_override")
+    if isinstance(conversation_state_override, dict):
+        previous_conversation_state = {
+            **previous_conversation_state,
+            **conversation_state_override,
+        }
     preserved_state = enrich_existing_task_conversation_state(task, previous_conversation_state)
     latest_user_prompt = user_prompt or task.get("prompt") or ""
     pending_prompt = decision.effective_user_prompt if decision.mode == "ask_confirmation" else ""
@@ -5037,11 +5200,19 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
     attachments = attachment_metadata(task.get("attachments"))
     attachment_text = normalize_whitespace(str(task.get("attachment_text") or ""))[:MAX_EXTRACTED_ATTACHMENT_TEXT_CHARS]
     ui_flags = decision_ui_flags(decision)
+    awaiting_prompt_review = decision.confirmation_action == "submit_initial_prompt"
+    prepared_prompt = decision.prepared_prompt or (
+        decision.effective_user_prompt if awaiting_prompt_review else ""
+    )
+    recent_assistant_content = prepared_prompt if awaiting_prompt_review else decision.message
+    recent_assistant_type = "prompt_review" if awaiting_prompt_review else ("confirmation" if decision.confirmation_action else ("status" if ui_flags["suppress_assistant_bubble"] else decision.tool))
+    recent_assistant_role = "confirmation" if decision.confirmation_action else ("status" if ui_flags["suppress_assistant_bubble"] else "assistant")
     return {
         "status": decision.status,
         "tool": decision.tool,
         "message": decision.message,
         "summary": decision.summary,
+        "prepared_prompt": prepared_prompt,
         "questions": decision.questions,
         "reason": decision.reason,
         "request_scope": decision.request_scope,
@@ -5065,12 +5236,15 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "latest_user_prompt": latest_user_prompt,
             "latest_effective_user_prompt": decision.effective_user_prompt,
             "latest_summary": decision.summary,
+            "prepared_prompt": prepared_prompt,
+            "final_generation_prompt": preserved_state.get("final_generation_prompt") or "",
             "latest_assistant_questions": decision.questions,
             "latest_primary_user_flow": resolved_primary_user_flow,
             "latest_secondary_requirements": resolved_secondary_requirements,
             "latest_secondary_scope_confirmed": decision.secondary_scope_confirmed,
             "latest_acceptance_criteria": resolved_acceptance_criteria,
             "awaiting_confirmation": decision.mode == "ask_confirmation",
+            "awaiting_prompt_review": awaiting_prompt_review,
             "confirmation_action": decision.confirmation_action,
             "confirmation_payload": decision.confirmation_payload,
             **ui_flags,
@@ -5103,9 +5277,9 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
                 "created_at": utc_now_iso(),
             },
             {
-                "role": "confirmation" if decision.confirmation_action else ("status" if ui_flags["suppress_assistant_bubble"] else "assistant"),
-                "message_type": "confirmation" if decision.confirmation_action else ("status" if ui_flags["suppress_assistant_bubble"] else decision.tool),
-                "content": decision.message,
+                "role": recent_assistant_role,
+                "message_type": recent_assistant_type,
+                "content": recent_assistant_content,
                 "created_at": utc_now_iso(),
             }
         ],
@@ -5133,6 +5307,7 @@ def build_assistant_response_payload(decision: IntentDecision) -> dict[str, Any]
         "confirmation_payload": decision.confirmation_payload,
         "image_reference_summary": decision.image_reference_summary,
         "image_conflict_note": decision.image_conflict_note,
+        "prepared_prompt": decision.prepared_prompt,
         **ui_flags,
         "effective_user_prompt": decision.effective_user_prompt,
         "used_previous_pending_prompt": decision.used_previous_pending_prompt,
@@ -5152,9 +5327,11 @@ def build_task_status_payload(task: dict[str, Any]) -> dict[str, Any]:
         apk_path = Path(apk_path_value)
         if apk_path.exists() and apk_path.is_file():
             apk_size_bytes = apk_path.stat().st_size
+    state_payload = load_task_state_payload(task)
     return {
         "status": task.get("status") or "",
         "message": task.get("message") or "",
+        "prepared_prompt": str(state_payload.get("prepared_prompt") or ""),
         "app_name": task.get("app_name") or "",
         "package_name": task.get("package_name") or "",
         "apk_url": task.get("apk_url") or "",
@@ -5286,9 +5463,12 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
         title = "나"
         body = message_text or sanitize_user_visible_text(str(payload.get("raw_prompt") or ""))
     elif event_type == "assistant_message":
-        kind = "assistant"
+        render_mode = str(payload.get("render_mode") or "")
+        confirmation_action = str(payload.get("confirmation_action") or "")
+        prepared_prompt = sanitize_user_visible_text(str(payload.get("prepared_prompt") or ""))
+        kind = "confirmation" if render_mode == "prompt_review_bubble" and confirmation_action == "submit_initial_prompt" else "assistant"
         title = "AI"
-        body = message_text
+        body = prepared_prompt if kind == "confirmation" and prepared_prompt else message_text
     elif event_type in {"task_status", "task_succeeded", "task_failed", "task_error", "task_timeout"}:
         kind = "status"
         title = "상태"
@@ -5379,6 +5559,10 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
         "event_type": event_type,
     }
     for key in ("apk_url", "apk_path", "app_name", "package_name"):
+        value = sanitize_user_visible_text(str(payload.get(key) or ""))
+        if value:
+            event[key] = value
+    for key in ("confirmation_action", "confirmation_payload", "prepared_prompt", "render_mode"):
         value = sanitize_user_visible_text(str(payload.get(key) or ""))
         if value:
             event[key] = value
@@ -6517,6 +6701,11 @@ def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit
         "status_display_text": status_text,
         "message": sanitize_user_visible_text(str(task["message"] or "")),
         "status_message": sanitize_user_visible_text(str(task["message"] or "")),
+        "prepared_prompt": str(
+            state_payload.get("prepared_prompt")
+            or conversation_state.get("prepared_prompt")
+            or ""
+        ),
         "apk_url": task.get("apk_url") or "",
         "apk_path": apk_path_value,
         "apk_size_bytes": apk_size_bytes,
@@ -6727,6 +6916,7 @@ def create_app() -> FastAPI:
             requested_reference_image_name = normalize_reference_image_name(str(requested_image_attachment.get("name") or ""))
             requested_reference_image_base64 = normalize_reference_image_base64(str(requested_image_attachment.get("base64") or ""))
         followup_task_id = (request.task_id or "").strip()
+        request_action = normalize_whitespace(str(request.request_action or ""))
 
         if followup_task_id:
             task = db.get_task(followup_task_id)
@@ -6736,23 +6926,63 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="task not found")
             if task["status"] in {"Queued", "Running"}:
                 raise HTTPException(status_code=409, detail="task already in progress")
-            db.log_event(
-                followup_task_id,
-                actor="user",
-                event_type="user_message",
-                message_text=request.prompt,
-                payload={
-                    "task_id": followup_task_id,
-                    "device_id": request.device_id,
-                    "phone_number": request.phone_number,
-                    "raw_prompt": request.prompt,
-                },
-            )
             previous_state_payload = load_task_state_payload(task)
             previous_conversation_state = previous_state_payload.get("conversation_state")
             if not isinstance(previous_conversation_state, dict):
                 previous_conversation_state = {}
             previous_conversation_state = enrich_existing_task_conversation_state(task, previous_conversation_state)
+            existing_workspace_ready = bool(task.get("workspace_path") and task.get("project_path"))
+            is_initial_prompt_submission = request_action == "submit_initial_prompt"
+            if is_initial_prompt_submission:
+                if (
+                    existing_workspace_ready
+                    or not bool(previous_conversation_state.get("awaiting_prompt_review"))
+                    or previous_conversation_state.get("confirmation_action") != "submit_initial_prompt"
+                ):
+                    raise HTTPException(status_code=409, detail="task is not waiting for initial prompt review")
+                db.log_event(
+                    followup_task_id,
+                    actor="user",
+                    event_type="user_message",
+                    message_text="만들어진 프롬프트대로 생성요청 문구를 보냈어요",
+                    payload={
+                        "task_id": followup_task_id,
+                        "device_id": request.device_id,
+                        "phone_number": request.phone_number,
+                        "raw_prompt": "만들어진 프롬프트대로 생성요청 문구를 보냈어요",
+                        "request_action": request_action,
+                        "final_generation_prompt": request.prompt,
+                    },
+                )
+                decision = build_initial_prompt_submission_decision(
+                    task_id=followup_task_id,
+                    final_prompt=request.prompt,
+                    previous_conversation_state=previous_conversation_state,
+                )
+                previous_conversation_state = {
+                    **previous_conversation_state,
+                    "awaiting_prompt_review": False,
+                    "awaiting_confirmation": False,
+                    "final_generation_prompt": request.prompt,
+                    "latest_effective_user_prompt": request.prompt,
+                    "pending_user_prompt": "",
+                    "pending_normalized_prompt": "",
+                    "confirmation_action": "",
+                    "confirmation_payload": "",
+                }
+            else:
+                db.log_event(
+                    followup_task_id,
+                    actor="user",
+                    event_type="user_message",
+                    message_text=request.prompt,
+                    payload={
+                        "task_id": followup_task_id,
+                        "device_id": request.device_id,
+                        "phone_number": request.phone_number,
+                        "raw_prompt": request.prompt,
+                    },
+                )
             effective_reference_image_name = requested_reference_image_name or normalize_reference_image_name(
                 previous_conversation_state.get("reference_image_name")
             )
@@ -6763,20 +6993,20 @@ def create_app() -> FastAPI:
             effective_attachment_text = requested_attachment_text or normalize_whitespace(
                 str(previous_conversation_state.get("attachment_text") or "")
             )[:MAX_EXTRACTED_ATTACHMENT_TEXT_CHARS]
-            existing_workspace_ready = bool(task.get("workspace_path") and task.get("project_path"))
-            decision = decide_intent(
-                request.prompt,
-                followup_task_id,
-                existing_task=True,
-                existing_workspace_ready=existing_workspace_ready,
-                previous_conversation_state=previous_conversation_state,
-                device_info=request_device_info or previous_conversation_state.get("device_info"),
-                reference_image_name=effective_reference_image_name,
-                reference_image_base64=effective_reference_image_base64,
-                attachment_text=effective_attachment_text,
-                settings=settings,
-                db=db,
-            )
+            if not is_initial_prompt_submission:
+                decision = decide_intent(
+                    request.prompt,
+                    followup_task_id,
+                    existing_task=True,
+                    existing_workspace_ready=existing_workspace_ready,
+                    previous_conversation_state=previous_conversation_state,
+                    device_info=request_device_info or previous_conversation_state.get("device_info"),
+                    reference_image_name=effective_reference_image_name,
+                    reference_image_base64=effective_reference_image_base64,
+                    attachment_text=effective_attachment_text,
+                    settings=settings,
+                    db=db,
+                )
             if effective_reference_image_name and not decision.image_reference_summary:
                 decision = replace(
                     decision,
@@ -6806,6 +7036,7 @@ def create_app() -> FastAPI:
                             "reference_image_workspace_path": previous_conversation_state.get("reference_image_workspace_path") or "",
                             "attachments": effective_attachments,
                             "attachment_text": effective_attachment_text,
+                            "conversation_state_override": previous_conversation_state,
                         },
                         decision,
                         request.prompt,
@@ -6859,6 +7090,7 @@ def create_app() -> FastAPI:
                                 "reference_image_workspace_path": previous_conversation_state.get("reference_image_workspace_path") or "",
                                 "attachments": effective_attachments,
                                 "attachment_text": effective_attachment_text,
+                                "conversation_state_override": previous_conversation_state,
                             },
                             quota_decision,
                             request.prompt,
@@ -6971,6 +7203,8 @@ def create_app() -> FastAPI:
                 app_name=resolved_app_name,
                 package_name=resolved_package_name,
                 project_path=project_path_value,
+                normalized_prompt=decision.normalized_prompt,
+                build_request_prompt=decision.effective_user_prompt,
                 codex_result_json=json.dumps(
                     make_decision_state(
                         {
@@ -6981,6 +7215,7 @@ def create_app() -> FastAPI:
                             "reference_image_workspace_path": reference_image_workspace_path or previous_conversation_state.get("reference_image_workspace_path") or "",
                             "attachments": effective_attachments,
                             "attachment_text": effective_attachment_text,
+                            "conversation_state_override": previous_conversation_state,
                         },
                         decision,
                         request.prompt,
@@ -7035,8 +7270,7 @@ def create_app() -> FastAPI:
                 decision,
                 image_reference_summary=build_reference_image_summary(requested_reference_image_name),
             )
-        if decision.mode == "build":
-            decision = build_pre_build_confirmation_decision(decision, existing_task=False)
+        decision = build_initial_prompt_review_decision(decision)
         task = {
             "task_id": task_id,
             "user_id": resolved_user_id,

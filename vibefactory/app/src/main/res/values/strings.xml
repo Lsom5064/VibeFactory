@@ -102,6 +102,7 @@
     <string name="install_apk">설치</string>
     <string name="install_permission_required">설치 권한을 허용한 뒤 돌아오면 바로 설치를 이어갈게요.</string>
     <string name="install_failed">설치 화면을 열지 못했어요. 다운로드된 APK에서 다시 설치를 눌러주세요.</string>
+    <string name="generated_app_launch_failed">설치된 앱을 자동으로 열지 못했어요. 앱 목록에서 직접 실행해 주세요.</string>
     <string name="message_title_apk">APK</string>
     <string name="artifact_file_label">APK 파일</string>
     <string name="artifact_size_pending">크기 확인 전</string>
@@ -109,10 +110,11 @@
     <string name="crash_title">런타임 에러 감지됨</string>
     <string name="fix_runtime">AI에게 즉시 수리 요청하기</string>
     <string name="empty_chat">새 채팅을 시작하거나 이전 작업을 선택하세요.</string>
-    <string name="cold_start_assistant_message">어떤 앱을 만들까요?\n만들고 싶은 기능, 화면, 분위기를 편하게 적어주세요. 제가 먼저 정리해드릴게요.</string>
+    <string name="cold_start_assistant_message">만들고 싶은 앱을 편하게 말씀해 주세요.\n앱 생성 요청 문구를 구체적으로 작성할 수 있도록 도와드릴게요. 함께 만들어봐요.</string>
     <string name="prompt_hint_new">어떤 앱을 만들고 싶은지 입력하세요.</string>
     <string name="prompt_hint_chat">앱에 대해 궁금한 점이나 변경하고 싶은 내용을 입력하세요.</string>
     <string name="prompt_hint_continue">추가 질문에 대한 답변을 입력하세요.</string>
+    <string name="prompt_hint_review">위 프롬프트를 확인한 뒤 전송해 주세요.</string>
     <string name="prompt_hint_refine">이 작업에 대한 추가 수정 요청을 입력하세요.</string>
     <string name="prompt_hint_retry">실패한 빌드에 대한 복구/재시도 요청을 입력하세요.</string>
     <string name="prompt_hint_queue">진행 중인 작업 다음에 반영할 내용을 입력하세요.</string>
@@ -120,6 +122,7 @@
     <string name="input_mode_new_chat">입력 모드: 새 채팅 시작</string>
     <string name="input_mode_chat">입력 모드: 일반 대화</string>
     <string name="input_mode_continue">입력 모드: 추가 정보 답변</string>
+    <string name="input_mode_prompt_review">입력 모드: 생성 프롬프트 검토</string>
     <string name="input_mode_refine">입력 모드: 추가 수정 요청</string>
     <string name="input_mode_retry">입력 모드: 실패 빌드 복구 요청</string>
     <string name="input_mode_queue">입력 모드: 다음 요청 대기</string>
@@ -134,6 +137,12 @@
     <string name="confirmation_continue_preview">이 답변을 기존 확인 질문의 답변으로 이어서 처리할까요?</string>
     <string name="confirmation_generate_preview">정리한 명세대로 앱 생성을 시작할까요?</string>
     <string name="confirmation_generate_cancelled">좋아요. 추가로 반영할 명세를 입력해 주세요.</string>
+    <string name="prompt_review_title">앱 생성 프롬프트 확인</string>
+    <string name="prompt_review_open">프롬프트 확인</string>
+    <string name="prompt_review_back">뒤로가기</string>
+    <string name="prompt_review_send">전송하기</string>
+    <string name="prompt_review_empty">앱 생성 프롬프트를 입력해 주세요.</string>
+    <string name="prompt_review_sent_bubble">만들어진 프롬프트대로 생성요청 문구를 보냈어요</string>
     <string name="status_summary_template">상태: %1$s\n작업: %2$s</string>
     <string name="status_new_chat">새 채팅 준비</string>
     <string name="status_new_chat_detail">아래 입력창에 원하는 앱을 설명해 주세요.</string>

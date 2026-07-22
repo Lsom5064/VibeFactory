@@ -22,6 +22,10 @@ object HostAppConfig {
     const val PREF_MONITORED_TASK_APP_NAMES = "foreground_monitored_task_app_names"
     const val PREF_NOTIFIED_TERMINAL_TASK_IDS = "foreground_notified_terminal_task_ids"
     const val PREF_TASK_ARTIFACT_STATES = "task_artifact_states"
+    const val PREF_PENDING_INSTALL_APK_PATH = "pending_install_apk_path"
+    const val PREF_PENDING_INSTALL_TASK_ID = "pending_install_task_id"
+    const val PREF_PENDING_INSTALL_PACKAGE_NAME = "pending_install_package_name"
+    const val PREF_PENDING_INSTALL_PACKAGE_WAS_INSTALLED = "pending_install_package_was_installed"
     const val PREF_TOKEN_LIMIT = "token_limit"
     const val PREF_DARK_MODE_ENABLED = "dark_mode_enabled"
 }
