@@ -201,6 +201,13 @@
     <string name="task_log_time_missing">시간 정보 없음</string>
     <string name="task_log_revision_selector">이전 버전</string>
     <string name="task_log_revision_load_failed">이전 버전을 불러오지 못했어요. %1$s</string>
+    <string name="task_log_branch_revision">이 버전에서 새 Task로 분기</string>
+    <string name="task_log_branch_revision_progress">새 Task를 준비하는 중…</string>
+    <string name="task_log_branch_confirm_title">새 Task로 분기할까요?</string>
+    <string name="task_log_branch_confirm_message">%1$s의 앱 코드를 독립된 workspace로 복제합니다. 기존 대화, 첨부 파일, 앱 데이터는 새 Task에 복사하지 않습니다.</string>
+    <string name="task_log_branch_confirm_positive">분기하기</string>
+    <string name="task_log_branch_created">새 Task를 만들었어요.</string>
+    <string name="task_log_branch_failed">새 Task를 만들지 못했어요. %1$s</string>
     <string name="navigate_back">뒤로가기</string>
     <string name="log_scroll_bottom">맨 아래로</string>
     <string name="message_title_runtime">실행 오류</string>

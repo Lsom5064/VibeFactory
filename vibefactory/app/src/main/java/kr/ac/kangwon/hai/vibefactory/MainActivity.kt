@@ -92,9 +92,10 @@ import java.util.TimeZone
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        const val EXTRA_SELECTED_TASK_ID = "selected_task_id"
         private const val POLL_INTERVAL_MS = 3000L
         private const val TAG = "VibeFactoryHost"
-        private const val STATE_SELECTED_TASK_ID = "selected_task_id"
+        private const val STATE_SELECTED_TASK_ID = EXTRA_SELECTED_TASK_ID
         private const val STATE_INPUT_PROMPT = "input_prompt"
         private const val PROCESSING_STATUS_ANIMATION_MS = 700L
         private const val REQUEST_PHONE_NUMBER_PERMISSION = 7001
@@ -552,9 +553,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun restoreCurrentTaskState(trigger: String) {
         if (!hasRequiredPhoneNumber()) return
-        val taskId = visibleTaskIdCandidate(currentTaskId)
+        val taskId = visibleTaskIdCandidate(pendingTaskSelectionKey)
+            ?: visibleTaskIdCandidate(currentTaskId)
             ?: visibleTaskIdCandidate(screenState.selectedTaskId)
-            ?: visibleTaskIdCandidate(pendingTaskSelectionKey)
             ?: visibleTaskIdCandidate(getLastSelectedTaskId())
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()

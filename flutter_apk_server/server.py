@@ -3949,6 +3949,20 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_project_snapshot(self, task_id: str, revision_label: str) -> Optional[dict[str, Any]]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT snapshot_id, task_id, revision_label, source, workspace_path, project_path, created_at
+                FROM task_project_snapshots
+                WHERE task_id = ? AND revision_label = ?
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (task_id, revision_label),
+            ).fetchone()
+            return dict(row) if row else None
+
     def get_task(self, task_id: str) -> Optional[dict[str, Any]]:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
@@ -5050,6 +5064,84 @@ def create_followup_project_revision(
     ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(workspace_path, project_root)
     return project_root, revision_label
+
+
+BRANCH_TASK_ID_TEXT_SUFFIXES = {
+    ".dart",
+    ".gradle",
+    ".java",
+    ".json",
+    ".kts",
+    ".kt",
+    ".md",
+    ".properties",
+    ".swift",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+
+
+def replace_project_task_id(project_root: Path, source_task_id: str, branched_task_id: str) -> int:
+    if not source_task_id or source_task_id == branched_task_id:
+        return 0
+    changed_files = 0
+    for candidate in project_root.rglob("*"):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        if candidate.suffix.lower() not in BRANCH_TASK_ID_TEXT_SUFFIXES:
+            continue
+        try:
+            if candidate.stat().st_size > 10 * 1024 * 1024:
+                continue
+            original = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        updated = original.replace(source_task_id, branched_task_id)
+        if updated == original:
+            continue
+        candidate.write_text(updated, encoding="utf-8")
+        changed_files += 1
+    return changed_files
+
+
+def create_branched_task_workspace(
+    settings: Settings,
+    task: dict[str, Any],
+    source_project_path: Path,
+    *,
+    source_task_id: str,
+) -> tuple[Path, Path, int]:
+    task_root = task_workspace_root_for(settings, task)
+    project_root = task_root / "revisions" / "rev_0001" / "project"
+    source_root = source_project_path.resolve()
+
+    if task_root.exists() and ((task_root / "project").exists() or (task_root / "revisions").exists()):
+        raise RuntimeError(f"task workspace already exists: {task_root}")
+    if not source_root.exists() or not source_root.is_dir():
+        raise RuntimeError("source revision project does not exist")
+
+    settings.workspaces_root.mkdir(parents=True, exist_ok=True)
+    task_root.parent.mkdir(parents=True, exist_ok=True)
+    (task_root / "logs").mkdir(parents=True, exist_ok=True)
+    (task_root / ".codex_result").mkdir(parents=True, exist_ok=True)
+
+    def ignore_branched_project_dirs(path: str, names: list[str]) -> set[str]:
+        ignored = ignore_project_revision_cache_dirs(path, names)
+        if settings.android_only_workspace_enabled and Path(path).resolve() == source_root:
+            ignored.update(name for name in names if name in ANDROID_ONLY_WORKSPACE_ROOT_IGNORES)
+        return ignored
+
+    shutil.copytree(source_root, project_root, ignore=ignore_branched_project_dirs)
+    replaced_file_count = replace_project_task_id(project_root, source_task_id, str(task["task_id"]))
+    ensure_project_revision_version(project_root, "rev_0001")
+    if task.get("app_name") and task.get("package_name"):
+        apply_project_defaults(project_root, str(task["task_id"]), str(task["app_name"]), str(task["package_name"]))
+    ensure_workspace_project_link(task_root, project_root)
+    (task_root / "AGENTS.md").write_text(render_task_agents_md(str(task["task_id"])), encoding="utf-8")
+    (task_root / "prompt.md").write_text(render_prompt_md(task, settings), encoding="utf-8")
+    return task_root, project_root, replaced_file_count
 
 
 def clear_previous_run_artifacts(workspace_path: Path) -> None:
@@ -6230,6 +6322,23 @@ class CodexTaskRunner:
         updated_task = self.db.get_task(task_id)
         if updated_task:
             log_task_status_event(self.db, updated_task)
+
+        task_state = load_task_state_payload(task)
+        if task_state.get("task_operation") == "branch_rebuild":
+            log_build_stage_event(
+                self.db,
+                task_id,
+                stage="분기 앱 준비",
+                phase="started",
+                body="선택한 버전의 독립 복제본을 검증하고 있어요.",
+            )
+            if self.settings.mock_codex:
+                self.run_mock(task, workspace_path, stdout_path, stderr_path, result_path)
+            else:
+                self.attempt_server_side_build(task_id, workspace_path, result_path, None)
+            self.finalize_task(task_id, workspace_path, result_path, None, False)
+            return
+
         log_build_stage_event(
             self.db,
             task_id,
@@ -6813,6 +6922,7 @@ class CodexTaskRunner:
         task = self.db.get_task(task_id) or {}
         if self.is_task_cancelled(task_id):
             return
+        task_state = load_task_state_payload(task)
         usage = parse_codex_usage_from_jsonl(workspace_path / "logs" / "codex_stdout.log")
         codex_model = infer_model_name_from_codex_command(self.settings.codex_command)
         usage_update_fields = {
@@ -6928,6 +7038,20 @@ class CodexTaskRunner:
                 body=f"결과 파일 파싱에 실패했어요: {exc.msg}",
             )
             return
+
+        branch_origin = task_state.get("branch_origin") if isinstance(task_state.get("branch_origin"), dict) else None
+        if task_state.get("task_operation") == "branch_rebuild":
+            branch_conversation_state = (
+                task_state.get("conversation_state")
+                if isinstance(task_state.get("conversation_state"), dict)
+                else {}
+            )
+            result["task_operation"] = "branch_ready"
+            result["conversation_state"] = branch_conversation_state
+            if branch_origin:
+                result["branch_origin"] = branch_origin
+            if result.get("status") == "success":
+                result["message"] = "선택한 버전에서 새 Task를 만들었어요."
 
         persisted_app_name = current_task_app_name(task) or normalize_task_app_name(str(result.get("app_name") or ""))
         persisted_package_name = current_task_package_name(task) or normalize_whitespace(str(result.get("package_name") or ""))
@@ -7045,10 +7169,15 @@ class CodexTaskRunner:
                 return
 
             apk_url = f"{self.settings.server_base_url}/download/{task_id}"
+            success_message = (
+                "선택한 버전에서 새 Task를 만들었어요."
+                if task_state.get("task_operation") == "branch_rebuild"
+                else "APK 빌드가 완료되었어요."
+            )
             self.db.update_task(
                 task_id,
                 status="Success",
-                message="APK 빌드가 완료되었어요.",
+                message=success_message,
                 apk_path=str(apk_path),
                 apk_url=apk_url,
                 app_name=result.get("app_name"),
@@ -7323,6 +7452,13 @@ def serialize_project_revision(task: dict[str, Any], snapshot: dict[str, Any]) -
         "apk_url": f"/download/{task.get('task_id')}" if artifact_path else "",
         "apk_size_bytes": apk_path.stat().st_size if apk_path is not None else None,
         "has_apk": apk_path is not None,
+        "can_branch": (
+            workspace_path.exists()
+            and workspace_path.is_dir()
+            and project_path.exists()
+            and project_path.is_dir()
+            and ensure_within_root(project_path, workspace_path)
+        ),
         "is_current": str(task.get("project_path") or "").strip() == str(project_path),
     }
 
@@ -8705,6 +8841,183 @@ def create_app() -> FastAPI:
             ]
         revisions = [serialize_project_revision(task, snapshot) for snapshot in snapshots]
         return {"task_id": task_id, "revisions": revisions}
+
+    @app.post("/tasks/{task_id}/revisions/{revision_label}/branch", status_code=202)
+    def branch_task_revision(
+        task_id: str,
+        revision_label: str,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        _ = user_id
+        db: Database = app.state.db
+        settings: Settings = app.state.settings
+        runner: CodexTaskRunner = app.state.runner
+        source_task = db.get_task(task_id)
+        if not source_task:
+            raise HTTPException(status_code=404, detail="task not found")
+        if not is_task_access_allowed(source_task, device_id=device_id, phone_number=phone_number):
+            raise HTTPException(status_code=404, detail="task not found")
+
+        normalized_revision_label = normalize_whitespace(revision_label)
+        if not re.fullmatch(r"rev_\d{4}", normalized_revision_label):
+            raise HTTPException(status_code=400, detail="invalid revision label")
+        snapshot = db.get_project_snapshot(task_id, normalized_revision_label)
+        if snapshot is None:
+            current_project_value = normalize_whitespace(str(source_task.get("project_path") or ""))
+            if current_project_value and current_revision_label(Path(current_project_value)) == normalized_revision_label:
+                snapshot = {
+                    "task_id": task_id,
+                    "revision_label": normalized_revision_label,
+                    "source": "current",
+                    "workspace_path": source_task.get("workspace_path"),
+                    "project_path": current_project_value,
+                    "created_at": source_task.get("created_at"),
+                }
+            else:
+                raise HTTPException(status_code=404, detail="revision not found")
+
+        source_workspace_path = Path(str(snapshot.get("workspace_path") or "")).resolve()
+        source_project_path = Path(str(snapshot.get("project_path") or "")).resolve()
+        if (
+            not source_workspace_path.exists()
+            or not source_workspace_path.is_dir()
+            or not source_project_path.exists()
+            or not source_project_path.is_dir()
+            or not ensure_within_root(source_project_path, source_workspace_path)
+        ):
+            raise HTTPException(status_code=409, detail="revision source is unavailable")
+
+        current_project_value = normalize_whitespace(str(source_task.get("project_path") or ""))
+        if current_project_value and Path(current_project_value).resolve() == source_project_path:
+            if is_generate_blocked_task_status(str(source_task.get("status") or "")):
+                raise HTTPException(status_code=409, detail="current revision is still being updated")
+
+        branched_task_id = uuid.uuid4().hex
+        now = utc_now_iso()
+        app_name = current_task_app_name(source_task) or infer_project_app_name(source_project_path)
+        package_name = current_task_package_name(source_task) or infer_project_package_name(source_project_path)
+        version_name = revision_version_name(normalized_revision_label)
+        branch_prompt = f"{app_name or '앱'} {version_name} 버전에서 독립적으로 분기된 작업"
+        branch_origin = {
+            "source_task_id": task_id,
+            "source_revision_label": normalized_revision_label,
+            "source_snapshot_id": str(snapshot.get("snapshot_id") or ""),
+        }
+        branch_state = {
+            "status": "queued",
+            "tool": "build",
+            "message": "선택한 버전에서 새 Task를 준비하고 있어요.",
+            "request_scope": "existing_app_modification",
+            "task_operation": "branch_rebuild",
+            "branch_origin": branch_origin,
+            "conversation_state": {
+                "initial_user_prompt": branch_prompt,
+                "latest_effective_user_prompt": branch_prompt,
+                "app_name": app_name,
+                "generated_app_name": app_name,
+                "package_name": package_name,
+                "build_success": False,
+                "request_scope": "existing_app_modification",
+                "awaiting_confirmation": False,
+                "awaiting_prompt_review": False,
+                "branch_origin": branch_origin,
+            },
+            "recent_messages": [],
+        }
+        branched_task = {
+            "task_id": branched_task_id,
+            "user_id": str(source_task.get("user_id") or effective_owner_id(device_id or "", phone_number)),
+            "device_id": normalize_whitespace(device_id or str(source_task.get("device_id") or "")),
+            "phone_number": normalize_whitespace(phone_number or str(source_task.get("phone_number") or "")) or None,
+            "prompt": branch_prompt,
+            "status": "Queued",
+            "message": "선택한 버전에서 새 Task를 준비하고 있어요.",
+            "workspace_path": None,
+            "project_path": None,
+            "apk_path": None,
+            "apk_url": None,
+            "app_name": app_name,
+            "package_name": package_name,
+            "normalized_prompt": branch_prompt,
+            "build_request_prompt": branch_prompt,
+            "input_tokens": None,
+            "cached_input_tokens": None,
+            "output_tokens": None,
+            "reasoning_output_tokens": None,
+            "total_tokens": None,
+            "codex_result_json": json.dumps(branch_state, ensure_ascii=False),
+            "log": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        try:
+            workspace_path, project_path, replaced_file_count = create_branched_task_workspace(
+                settings,
+                branched_task,
+                source_project_path,
+                source_task_id=task_id,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"branch workspace preparation failed: {exc}") from exc
+
+        branched_task["workspace_path"] = str(workspace_path)
+        branched_task["project_path"] = str(project_path)
+        db.create_task(branched_task)
+        source_llm_config = db.get_app_llm_config(task_id)
+        if source_llm_config:
+            db.upsert_app_llm_config(branched_task_id, source_llm_config)
+            db.log_event(
+                branched_task_id,
+                actor="system",
+                event_type="app_llm_config_initialized",
+                message_text=app_llm_config_event_message(source_llm_config),
+                payload=app_llm_config_event_payload(source_llm_config, source="branched_task"),
+            )
+        else:
+            ensure_default_app_llm_config(db, settings, branched_task_id)
+        db.record_project_snapshot(
+            task_id=branched_task_id,
+            revision_label="rev_0001",
+            source="branched_revision",
+            workspace_path=str(workspace_path),
+            project_path=str(project_path),
+        )
+        db.log_event(
+            branched_task_id,
+            actor="system",
+            event_type="task_branched",
+            message_text=f"{version_name} 버전에서 새 Task를 만들었어요.",
+            payload={
+                **branch_origin,
+                "branched_task_id": branched_task_id,
+                "replaced_task_id_file_count": replaced_file_count,
+                "copied_conversation_history": False,
+                "copied_attachments": False,
+                "copied_app_data": False,
+            },
+        )
+        db.log_event(
+            task_id,
+            actor="system",
+            event_type="task_branched_out",
+            message_text=f"{version_name} 버전에서 새 Task가 생성되었어요.",
+            payload={
+                "branched_task_id": branched_task_id,
+                "source_revision_label": normalized_revision_label,
+            },
+        )
+        queued_task = db.get_task(branched_task_id)
+        if queued_task:
+            log_task_status_event(db, queued_task)
+        runner.enqueue(branched_task_id)
+        return serialize_task_for_status(
+            db,
+            db.get_task(branched_task_id) or branched_task,
+            settings.status_log_line_limit,
+        )
 
     @app.get("/tasks")
     def list_tasks(

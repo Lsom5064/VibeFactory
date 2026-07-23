@@ -3,6 +3,7 @@ package kr.ac.kangwon.hai.vibefactory
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.util.TypedValue
 import android.view.Gravity
@@ -13,6 +14,7 @@ import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.google.gson.GsonBuilder
@@ -37,6 +39,8 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private var isDownloadingApk = false
     private var boundPayload: TaskLogDetailPayload? = null
     private var revisionOptions: List<TaskRevisionDto> = emptyList()
+    private var selectedRevision: TaskRevisionDto? = null
+    private var isBranchingRevision = false
     private var pendingInstallApkFile: File? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -117,16 +121,20 @@ class TaskLogDetailActivity : AppCompatActivity() {
 
     private fun bindRevisionSelector(payload: TaskLogDetailPayload, revisions: List<TaskRevisionDto>) {
         val selector = findViewById<LinearLayout>(R.id.taskLogRevisionSelector)
-        val value = findViewById<TextView>(R.id.taskLogRevisionValue)
         val visibleRevisions = revisions.filter { it.revision_label.isNotBlank() || it.version_name.isNotBlank() }
         if (visibleRevisions.isEmpty()) {
+            selectedRevision = null
             selector.visibility = View.GONE
             selector.setOnClickListener(null)
+            bindBranchAction(payload, null)
             return
         }
-        val selected = visibleRevisions.firstOrNull { it.is_current } ?: visibleRevisions.last()
+        val selected = selectedRevision
+            ?.let { previous -> visibleRevisions.firstOrNull { it.revision_label == previous.revision_label } }
+            ?: visibleRevisions.firstOrNull { it.is_current }
+            ?: visibleRevisions.last()
         selector.visibility = View.VISIBLE
-        value.text = revisionDisplayLabel(selected)
+        selectRevision(payload, selected)
         selector.setOnClickListener {
             showRevisionMenu(selector, payload, visibleRevisions)
         }
@@ -139,11 +147,104 @@ class TaskLogDetailActivity : AppCompatActivity() {
         }
         menu.setOnMenuItemClickListener { item ->
             val revision = revisions.getOrNull(item.itemId) ?: return@setOnMenuItemClickListener false
-            findViewById<TextView>(R.id.taskLogRevisionValue).text = revisionDisplayLabel(revision)
-            bindApkAction(apkActionForRevision(payload, revision))
+            selectRevision(payload, revision)
             true
         }
         menu.show()
+    }
+
+    private fun selectRevision(payload: TaskLogDetailPayload, revision: TaskRevisionDto) {
+        selectedRevision = revision
+        findViewById<TextView>(R.id.taskLogRevisionValue).text = revisionDisplayLabel(revision)
+        bindApkAction(apkActionForRevision(payload, revision))
+        bindBranchAction(payload, revision)
+    }
+
+    private fun bindBranchAction(payload: TaskLogDetailPayload, revision: TaskRevisionDto?) {
+        findViewById<Button>(R.id.btnTaskLogBranchRevision).apply {
+            visibility = if (revision?.can_branch == true) View.VISIBLE else View.GONE
+            isEnabled = revision?.can_branch == true && !isBranchingRevision
+            text = getString(
+                if (isBranchingRevision) {
+                    R.string.task_log_branch_revision_progress
+                } else {
+                    R.string.task_log_branch_revision
+                }
+            )
+            setOnClickListener {
+                revision?.takeIf { it.can_branch }?.let { confirmBranchRevision(payload, it) }
+            }
+        }
+    }
+
+    private fun confirmBranchRevision(payload: TaskLogDetailPayload, revision: TaskRevisionDto) {
+        if (isBranchingRevision) return
+        AlertDialog.Builder(this)
+            .setTitle(R.string.task_log_branch_confirm_title)
+            .setMessage(
+                getString(
+                    R.string.task_log_branch_confirm_message,
+                    revisionDisplayLabel(revision).replace(" · 현재", "")
+                )
+            )
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.task_log_branch_confirm_positive) { _, _ ->
+                branchRevision(payload, revision)
+            }
+            .show()
+    }
+
+    private fun branchRevision(payload: TaskLogDetailPayload, revision: TaskRevisionDto) {
+        val taskId = payload.taskId.trim()
+        val revisionLabel = revision.revision_label.trim()
+        if (taskId.isBlank() || revisionLabel.isBlank() || isBranchingRevision) return
+        isBranchingRevision = true
+        bindBranchAction(payload, revision)
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    apiService.branchTaskRevision(
+                        taskId = taskId,
+                        revisionLabel = revisionLabel,
+                        deviceId = preferencesStore.getOrCreateDeviceId(),
+                        userId = null,
+                        phoneNumber = preferencesStore.loadPhoneNumber()
+                    )
+                }
+            }
+            result.onSuccess { response ->
+                val branchedTaskId = response.task_id.trim()
+                if (branchedTaskId.isBlank()) {
+                    isBranchingRevision = false
+                    bindBranchAction(payload, revision)
+                    Toast.makeText(
+                        this@TaskLogDetailActivity,
+                        getString(R.string.task_log_branch_failed, "새 작업 ID가 없습니다."),
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@onSuccess
+                }
+                Toast.makeText(
+                    this@TaskLogDetailActivity,
+                    R.string.task_log_branch_created,
+                    Toast.LENGTH_SHORT
+                ).show()
+                startActivity(
+                    Intent(this@TaskLogDetailActivity, MainActivity::class.java)
+                        .putExtra(MainActivity.EXTRA_SELECTED_TASK_ID, branchedTaskId)
+                        .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                )
+                finish()
+            }.onFailure { error ->
+                isBranchingRevision = false
+                bindBranchAction(payload, revision)
+                Toast.makeText(
+                    this@TaskLogDetailActivity,
+                    getString(R.string.task_log_branch_failed, userVisibleErrorMessage(error)),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
     }
 
     private fun apkActionForRevision(payload: TaskLogDetailPayload, revision: TaskRevisionDto): TaskLogApkAction? {

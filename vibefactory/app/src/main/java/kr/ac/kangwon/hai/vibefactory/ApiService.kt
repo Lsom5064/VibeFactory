@@ -176,6 +176,7 @@ data class TaskRevisionDto(
     val apk_url: String? = "",
     val apk_size_bytes: Long? = null,
     val has_apk: Boolean = false,
+    val can_branch: Boolean = false,
     val is_current: Boolean = false
 )
 
@@ -231,6 +232,15 @@ interface VibeApiService {
         @Query("user_id") userId: String? = null,
         @Query("phone_number") phoneNumber: String? = null
     ): TaskRevisionsResponse
+
+    @POST("/tasks/{task_id}/revisions/{revision_label}/branch")
+    suspend fun branchTaskRevision(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): StatusResponse
 
     @PATCH("/tasks/{task_id}")
     suspend fun renameTask(
