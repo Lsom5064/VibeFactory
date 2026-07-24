@@ -5843,6 +5843,10 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
         kind = "confirmation" if render_mode == "prompt_review_bubble" and confirmation_action == "submit_initial_prompt" else "assistant"
         title = "AI"
         body = prepared_prompt if kind == "confirmation" and prepared_prompt else message_text
+    elif event_type == "task_branched":
+        kind = "assistant"
+        title = "AI"
+        body = message_text or "선택한 버전에서 새 Task를 만들었어요. 앱을 준비하고 있어요."
     elif event_type in {"task_status", "task_succeeded", "task_failed", "task_error", "task_timeout", "task_cancelled"}:
         kind = "status"
         title = "상태"
@@ -6276,6 +6280,110 @@ class CodexTaskRunner:
     def enqueue(self, task_id: str) -> None:
         self.queue.put(task_id)
 
+    def prepare_branched_task_workspace(
+        self,
+        task: dict[str, Any],
+        task_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_id = str(task["task_id"])
+        branch_origin = task_state.get("branch_origin")
+        if not isinstance(branch_origin, dict):
+            raise RuntimeError("분기 원본 정보가 없습니다.")
+
+        source_task_id = normalize_whitespace(str(branch_origin.get("source_task_id") or ""))
+        source_revision_label = normalize_whitespace(str(branch_origin.get("source_revision_label") or ""))
+        if not source_task_id or not re.fullmatch(r"rev_\d{4}", source_revision_label):
+            raise RuntimeError("분기 원본 버전 정보가 올바르지 않습니다.")
+
+        source_task = self.db.get_task(source_task_id)
+        if not source_task:
+            raise RuntimeError("분기 원본 Task를 찾을 수 없습니다.")
+        snapshot = self.db.get_project_snapshot(source_task_id, source_revision_label)
+        if snapshot is None:
+            current_project_value = normalize_whitespace(str(source_task.get("project_path") or ""))
+            if current_project_value and current_revision_label(Path(current_project_value)) == source_revision_label:
+                snapshot = {
+                    "task_id": source_task_id,
+                    "revision_label": source_revision_label,
+                    "workspace_path": source_task.get("workspace_path"),
+                    "project_path": current_project_value,
+                }
+            else:
+                raise RuntimeError("분기 원본 버전을 찾을 수 없습니다.")
+
+        source_workspace_path = Path(str(snapshot.get("workspace_path") or "")).resolve()
+        source_project_path = Path(str(snapshot.get("project_path") or "")).resolve()
+        if (
+            not source_workspace_path.exists()
+            or not source_workspace_path.is_dir()
+            or not source_project_path.exists()
+            or not source_project_path.is_dir()
+            or not ensure_within_root(source_project_path, source_workspace_path)
+        ):
+            raise RuntimeError("분기 원본 버전의 파일을 사용할 수 없습니다.")
+
+        log_build_stage_event(
+            self.db,
+            task_id,
+            stage="분기 workspace 복사",
+            phase="started",
+            body="선택한 버전을 새 Task로 복사하고 있어요.",
+        )
+        workspace_path, project_path, replaced_file_count = create_branched_task_workspace(
+            self.settings,
+            task,
+            source_project_path,
+            source_task_id=source_task_id,
+        )
+        branch_origin["replaced_task_id_file_count"] = replaced_file_count
+        task_state["branch_origin"] = branch_origin
+        workspace_update = {
+            "workspace_path": str(workspace_path),
+            "project_path": str(project_path),
+            "codex_result_json": json.dumps(task_state, ensure_ascii=False),
+        }
+        if not self.is_task_cancelled(task_id):
+            workspace_update["message"] = "선택한 버전을 복사했어요. APK를 준비하고 있어요."
+        self.db.update_task(task_id, **workspace_update)
+        self.db.record_project_snapshot(
+            task_id=task_id,
+            revision_label="rev_0001",
+            source="branched_revision",
+            workspace_path=str(workspace_path),
+            project_path=str(project_path),
+        )
+        self.db.log_event(
+            task_id,
+            actor="system",
+            event_type="branch_workspace_ready",
+            message_text="분기된 workspace 복사가 완료되었어요.",
+            payload={
+                **branch_origin,
+                "workspace_path": str(workspace_path),
+                "project_path": str(project_path),
+            },
+        )
+        if self.is_task_cancelled(task_id):
+            return self.db.get_task(task_id) or {
+                **task,
+                "workspace_path": str(workspace_path),
+                "project_path": str(project_path),
+                "codex_result_json": json.dumps(task_state, ensure_ascii=False),
+            }
+        log_build_stage_event(
+            self.db,
+            task_id,
+            stage="분기 workspace 복사",
+            phase="succeeded",
+            body="선택한 버전을 새 Task로 복사했어요.",
+        )
+        return self.db.get_task(task_id) or {
+            **task,
+            "workspace_path": str(workspace_path),
+            "project_path": str(project_path),
+            "codex_result_json": json.dumps(task_state, ensure_ascii=False),
+        }
+
     def worker_loop(self) -> None:
         while not self.stop_event.is_set():
             task_id = self.queue.get()
@@ -6305,26 +6413,39 @@ class CodexTaskRunner:
         if self.is_task_cancelled(task_id):
             return
 
-        workspace_path = Path(task["workspace_path"])
-        result_path = workspace_path / ".codex_result" / "task_result.json"
-        stdout_path = workspace_path / "logs" / "codex_stdout.log"
-        stderr_path = workspace_path / "logs" / "codex_stderr.log"
-
+        task_state = load_task_state_payload(task)
+        is_branch_rebuild = task_state.get("task_operation") == "branch_rebuild"
         did_start = self.db.update_task_if_status(
             task_id,
             {"queued"},
             status="Running",
-            message="앱 생성 작업을 진행하고 있습니다.",
+            message=(
+                "선택한 버전을 복사하고 APK를 준비하고 있어요."
+                if is_branch_rebuild
+                else "앱 생성 작업을 진행하고 있습니다."
+            ),
         )
         if not did_start:
             return
-        clear_previous_run_artifacts(workspace_path)
         updated_task = self.db.get_task(task_id)
         if updated_task:
             log_task_status_event(self.db, updated_task)
 
-        task_state = load_task_state_payload(task)
-        if task_state.get("task_operation") == "branch_rebuild":
+        if is_branch_rebuild and (not task.get("workspace_path") or not task.get("project_path")):
+            task = self.prepare_branched_task_workspace(task, task_state)
+            if self.is_task_cancelled(task_id):
+                return
+
+        workspace_path_value = normalize_whitespace(str(task.get("workspace_path") or ""))
+        if not workspace_path_value:
+            raise RuntimeError("작업 workspace가 준비되지 않았습니다.")
+        workspace_path = Path(workspace_path_value).resolve()
+        result_path = workspace_path / ".codex_result" / "task_result.json"
+        stdout_path = workspace_path / "logs" / "codex_stdout.log"
+        stderr_path = workspace_path / "logs" / "codex_stderr.log"
+        clear_previous_run_artifacts(workspace_path)
+
+        if is_branch_rebuild:
             log_build_stage_event(
                 self.db,
                 task_id,
@@ -8905,10 +9026,14 @@ def create_app() -> FastAPI:
             "source_revision_label": normalized_revision_label,
             "source_snapshot_id": str(snapshot.get("snapshot_id") or ""),
         }
+        branch_message = (
+            f"{version_name} 버전에서 새 Task를 만들었어요. "
+            "선택한 버전을 복사하고 APK를 준비하고 있어요."
+        )
         branch_state = {
             "status": "queued",
             "tool": "build",
-            "message": "선택한 버전에서 새 Task를 준비하고 있어요.",
+            "message": branch_message,
             "request_scope": "existing_app_modification",
             "task_operation": "branch_rebuild",
             "branch_origin": branch_origin,
@@ -8922,6 +9047,7 @@ def create_app() -> FastAPI:
                 "request_scope": "existing_app_modification",
                 "awaiting_confirmation": False,
                 "awaiting_prompt_review": False,
+                "suppress_initial_prompt_bubble": True,
                 "branch_origin": branch_origin,
             },
             "recent_messages": [],
@@ -8933,7 +9059,7 @@ def create_app() -> FastAPI:
             "phone_number": normalize_whitespace(phone_number or str(source_task.get("phone_number") or "")) or None,
             "prompt": branch_prompt,
             "status": "Queued",
-            "message": "선택한 버전에서 새 Task를 준비하고 있어요.",
+            "message": branch_message,
             "workspace_path": None,
             "project_path": None,
             "apk_path": None,
@@ -8953,18 +9079,6 @@ def create_app() -> FastAPI:
             "updated_at": now,
         }
 
-        try:
-            workspace_path, project_path, replaced_file_count = create_branched_task_workspace(
-                settings,
-                branched_task,
-                source_project_path,
-                source_task_id=task_id,
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"branch workspace preparation failed: {exc}") from exc
-
-        branched_task["workspace_path"] = str(workspace_path)
-        branched_task["project_path"] = str(project_path)
         db.create_task(branched_task)
         source_llm_config = db.get_app_llm_config(task_id)
         if source_llm_config:
@@ -8978,22 +9092,14 @@ def create_app() -> FastAPI:
             )
         else:
             ensure_default_app_llm_config(db, settings, branched_task_id)
-        db.record_project_snapshot(
-            task_id=branched_task_id,
-            revision_label="rev_0001",
-            source="branched_revision",
-            workspace_path=str(workspace_path),
-            project_path=str(project_path),
-        )
         db.log_event(
             branched_task_id,
             actor="system",
             event_type="task_branched",
-            message_text=f"{version_name} 버전에서 새 Task를 만들었어요.",
+            message_text=branch_message,
             payload={
                 **branch_origin,
                 "branched_task_id": branched_task_id,
-                "replaced_task_id_file_count": replaced_file_count,
                 "copied_conversation_history": False,
                 "copied_attachments": False,
                 "copied_app_data": False,

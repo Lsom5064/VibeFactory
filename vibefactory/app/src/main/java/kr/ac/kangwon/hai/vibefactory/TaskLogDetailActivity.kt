@@ -232,6 +232,31 @@ class TaskLogDetailActivity : AppCompatActivity() {
                 startActivity(
                     Intent(this@TaskLogDetailActivity, MainActivity::class.java)
                         .putExtra(MainActivity.EXTRA_SELECTED_TASK_ID, branchedTaskId)
+                        .putExtra(MainActivity.EXTRA_BRANCHED_TASK_CREATED, true)
+                        .putExtra(
+                            MainActivity.EXTRA_BRANCHED_TASK_APP_NAME,
+                            response.generated_app_name?.takeIf { it.isNotBlank() }
+                                ?: response.app_name?.takeIf { it.isNotBlank() }
+                                ?: payload.appName
+                        )
+                        .putExtra(MainActivity.EXTRA_BRANCHED_TASK_PACKAGE_NAME, response.package_name)
+                        .putExtra(
+                            MainActivity.EXTRA_BRANCHED_TASK_STATUS,
+                            response.status_display_text?.takeIf { it.isNotBlank() } ?: response.status
+                        )
+                        .putExtra(
+                            MainActivity.EXTRA_BRANCHED_TASK_MESSAGE,
+                            response.status_message?.takeIf { it.isNotBlank() }
+                                ?: getString(
+                                    R.string.task_log_branch_chat_message,
+                                    revisionDisplayLabel(revision).replace(" · 현재", "")
+                                )
+                        )
+                        .putExtra(
+                            MainActivity.EXTRA_BRANCHED_TASK_VERSION,
+                            revisionDisplayLabel(revision).replace(" · 현재", "")
+                        )
+                        .putExtra(MainActivity.EXTRA_BRANCHED_TASK_CREATED_AT, response.created_at)
                         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 )
                 finish()

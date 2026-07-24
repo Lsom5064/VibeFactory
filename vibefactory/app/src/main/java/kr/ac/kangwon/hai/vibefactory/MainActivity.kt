@@ -93,6 +93,13 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_SELECTED_TASK_ID = "selected_task_id"
+        const val EXTRA_BRANCHED_TASK_CREATED = "branched_task_created"
+        const val EXTRA_BRANCHED_TASK_APP_NAME = "branched_task_app_name"
+        const val EXTRA_BRANCHED_TASK_PACKAGE_NAME = "branched_task_package_name"
+        const val EXTRA_BRANCHED_TASK_STATUS = "branched_task_status"
+        const val EXTRA_BRANCHED_TASK_MESSAGE = "branched_task_message"
+        const val EXTRA_BRANCHED_TASK_VERSION = "branched_task_version"
+        const val EXTRA_BRANCHED_TASK_CREATED_AT = "branched_task_created_at"
         private const val POLL_INTERVAL_MS = 3000L
         private const val TAG = "VibeFactoryHost"
         private const val STATE_SELECTED_TASK_ID = EXTRA_SELECTED_TASK_ID
@@ -405,6 +412,7 @@ class MainActivity : AppCompatActivity() {
         pendingTaskSelectionKey = visibleTaskIdCandidate(savedInstanceState?.getString(STATE_SELECTED_TASK_ID))
             ?: visibleTaskIdCandidate(intent?.getStringExtra(STATE_SELECTED_TASK_ID))
             ?: visibleTaskIdCandidate(getLastSelectedTaskId())
+        applyImmediateBranchedTaskState(intent)
         pendingTaskSelectionKey
             ?.takeIf { it.isNotBlank() && hasRequiredPhoneNumber() }
             ?.let { showPersistedTaskPreview(it) }
@@ -539,10 +547,79 @@ class MainActivity : AppCompatActivity() {
         val requestedTaskId = intent?.getStringExtra(STATE_SELECTED_TASK_ID)?.trim().orEmpty()
         if (requestedTaskId.isNotBlank() && requestedTaskId !in hiddenTaskIds) {
             pendingTaskSelectionKey = requestedTaskId
+            applyImmediateBranchedTaskState(intent)
             if (hasRequiredPhoneNumber()) {
                 restoreCurrentTaskState(trigger = "onNewIntent")
             }
         }
+    }
+
+    private fun applyImmediateBranchedTaskState(sourceIntent: Intent?): Boolean {
+        if (sourceIntent?.getBooleanExtra(EXTRA_BRANCHED_TASK_CREATED, false) != true) return false
+        val taskId = visibleTaskIdCandidate(sourceIntent.getStringExtra(EXTRA_SELECTED_TASK_ID)) ?: return false
+        val appName = taskDisplayName(sourceIntent.getStringExtra(EXTRA_BRANCHED_TASK_APP_NAME))
+        val packageName = sourceIntent.getStringExtra(EXTRA_BRANCHED_TASK_PACKAGE_NAME)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+        val versionName = sourceIntent.getStringExtra(EXTRA_BRANCHED_TASK_VERSION)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: "선택한"
+        val status = sourceIntent.getStringExtra(EXTRA_BRANCHED_TASK_STATUS)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: getString(R.string.status_generating)
+        val branchMessage = sourceIntent.getStringExtra(EXTRA_BRANCHED_TASK_MESSAGE)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: getString(R.string.task_log_branch_chat_message, versionName)
+        val createdAt = sourceIntent.getStringExtra(EXTRA_BRANCHED_TASK_CREATED_AT)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: currentTimestampString()
+
+        appendTaskTimelineMessage(
+            taskId,
+            ChatMessage(
+                id = "branch-created-$taskId",
+                kind = MessageKind.ASSISTANT,
+                title = getString(R.string.message_title_assistant),
+                body = branchMessage,
+                createdAt = createdAt,
+                eventType = "task_branched"
+            )
+        )
+        ensureTaskSummaryVisible(
+            taskId = taskId,
+            title = appName?.let { "$it $versionName" },
+            appName = appName,
+            packageName = packageName,
+            status = status,
+            hasApk = false
+        )
+        currentTaskId = taskId
+        pendingTaskSelectionKey = taskId
+        persistLastSelectedTaskId(taskId)
+        requestScrollLatestAfterResponse(force = true)
+        screenState = screenState.copy(
+            selectedTaskId = taskId,
+            displayedAppName = appName,
+            messages = buildTaskTimeline(taskId),
+            inputMode = InputMode.READ_ONLY,
+            currentStatus = status,
+            statusDetail = branchMessage,
+            canDownload = false,
+            canInstall = false
+        )
+        sourceIntent.removeExtra(EXTRA_BRANCHED_TASK_CREATED)
+        sourceIntent.removeExtra(EXTRA_BRANCHED_TASK_APP_NAME)
+        sourceIntent.removeExtra(EXTRA_BRANCHED_TASK_PACKAGE_NAME)
+        sourceIntent.removeExtra(EXTRA_BRANCHED_TASK_STATUS)
+        sourceIntent.removeExtra(EXTRA_BRANCHED_TASK_MESSAGE)
+        sourceIntent.removeExtra(EXTRA_BRANCHED_TASK_VERSION)
+        sourceIntent.removeExtra(EXTRA_BRANCHED_TASK_CREATED_AT)
+        renderState()
+        return true
     }
 
     override fun onStop() {
@@ -4227,23 +4304,52 @@ ${record.stackTrace}
         val obj = response.conversation_state?.takeIf { it.isJsonObject }?.asJsonObject
         if (obj != null) {
             val initialPrompt = firstString(obj, "initial_user_prompt")?.trim().orEmpty()
-            if (initialPrompt.isNotBlank()) {
+            val suppressInitialPromptBubble = obj.get("suppress_initial_prompt_bubble")
+                ?.takeIf { it.isJsonPrimitive }
+                ?.asBoolean == true ||
+                obj.get("branch_origin")?.isJsonObject == true
+            if (initialPrompt.isNotBlank() && suppressInitialPromptBubble) {
+                val normalizedTaskId = taskId.trim()
+                val timeline = taskConversationMessages[normalizedTaskId]
+                val removed = timeline?.removeAll { message ->
+                    message.kind == MessageKind.USER &&
+                        message.id.startsWith("seed-user-") &&
+                        hasSameMessageText(message.body, initialPrompt)
+                } == true
+                if (removed) {
+                    persistTaskChat(normalizedTaskId)
+                }
+            }
+            if (initialPrompt.isNotBlank() && !suppressInitialPromptBubble) {
                 val initialCreatedAt = response.created_at.trim().takeIf { it.isNotBlank() }
                     ?: currentTimestampString()
                 val normalizedTaskId = taskId.trim()
                 val timeline = taskConversationMessages[normalizedTaskId]
+                val hasCanonicalInitialEvent = extractTimelineEvents(response).any { event ->
+                    event.kind.equals("user", ignoreCase = true) &&
+                        event.eventType == "user_message" &&
+                        hasSameMessageText(event.body, initialPrompt)
+                }
+                val hasPersistedInitialMessage = timeline?.any { message ->
+                    message.kind == MessageKind.USER &&
+                        !message.id.startsWith("seed-user-") &&
+                        hasSameMessageText(message.body, initialPrompt)
+                } == true
                 val existingSeedIndex = timeline?.indexOfFirst { message ->
                     message.kind == MessageKind.USER &&
                         message.id.startsWith("seed-user-") &&
                         hasSameMessageText(message.body, initialPrompt)
                 } ?: -1
-                if (timeline != null && existingSeedIndex >= 0) {
+                if (timeline != null && (hasCanonicalInitialEvent || hasPersistedInitialMessage) && existingSeedIndex >= 0) {
+                    timeline.removeAt(existingSeedIndex)
+                    persistTaskChat(normalizedTaskId)
+                } else if (timeline != null && existingSeedIndex >= 0) {
                     val existingSeed = timeline[existingSeedIndex]
                     if (existingSeed.createdAt != initialCreatedAt) {
                         timeline[existingSeedIndex] = existingSeed.copy(createdAt = initialCreatedAt)
                         persistTaskChat(normalizedTaskId)
                     }
-                } else if (!taskHasUserMessageText(taskId, initialPrompt)) {
+                } else if (!hasCanonicalInitialEvent && !taskHasUserMessageText(taskId, initialPrompt)) {
                     appendTaskTimelineMessage(
                         taskId,
                         ChatMessage(
@@ -5993,6 +6099,9 @@ ${record.stackTrace}
             ?: compactMessageTextForDedupe(normalizeMessageTextForDedupe(message.body))
         if (bodyKey.isBlank()) return null
         if (message.kind != MessageKind.USER) return bodyKey
+        if (isLocalUserMessage(message) || isServerUserMessage(message)) {
+            return "user-echo:$bodyKey"
+        }
         val imageKey = message.allImagePreviews()
             .joinToString("|") { preview -> "${preview.displayName}:${preview.base64.hashCode()}" }
         return "user:$bodyKey:$imageKey"
@@ -6339,7 +6448,10 @@ ${record.stackTrace}
         val normalizedLeft = normalizeMessageTextForDedupe(left)
         val normalizedRight = normalizeMessageTextForDedupe(right)
         if (normalizedLeft == normalizedRight) return true
-        return compactMessageTextForDedupe(normalizedLeft) == compactMessageTextForDedupe(normalizedRight)
+        val compactLeft = compactMessageTextForDedupe(normalizedLeft)
+        val compactRight = compactMessageTextForDedupe(normalizedRight)
+        if (compactLeft == compactRight) return true
+        return stripInlineListMarkersForDedupe(compactLeft) == stripInlineListMarkersForDedupe(compactRight)
     }
 
     private fun normalizeMessageTextForDedupe(value: String?): String {
@@ -6368,6 +6480,13 @@ ${record.stackTrace}
 
     private fun compactMessageTextForDedupe(value: String): String {
         return value.replace(Regex("\\s+"), " ").trim()
+    }
+
+    private fun stripInlineListMarkersForDedupe(value: String): String {
+        return value
+            .replace(Regex("""(^|\s)(?:[-*•]|\d+[.)])\s+"""), "$1")
+            .replace(Regex("\\s+"), " ")
+            .trim()
     }
 
     private fun isPrebuildConfirmationHeader(value: String?): Boolean {
