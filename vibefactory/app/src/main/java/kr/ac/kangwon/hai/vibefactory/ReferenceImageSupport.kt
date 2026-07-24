@@ -5,11 +5,16 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
+import android.util.LruCache
 import android.view.View
 import android.widget.ImageView
 import java.io.ByteArrayOutputStream
+import java.lang.ref.WeakReference
 import java.util.Base64
+import java.util.concurrent.Executors
 
 fun buildReferenceImageAttachment(
     contentResolver: ContentResolver,
@@ -126,29 +131,105 @@ private fun fallbackMimeType(kind: SelectedAttachmentKind): String {
 fun bindInlineImagePreview(
     imageView: ImageView,
     imageBase64: String?,
-    fallbackVisibility: Int
+    fallbackVisibility: Int,
+    maxDimension: Int = 720
 ) {
     val encoded = imageBase64?.trim().orEmpty()
     if (encoded.isBlank()) {
+        imageView.tag = null
         imageView.setImageDrawable(null)
         imageView.visibility = fallbackVisibility
         return
     }
 
-    runCatching {
-        val bytes = Base64.getDecoder().decode(encoded)
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-    }.onSuccess { bitmap ->
-        if (bitmap != null) {
+    InlineImagePreviewLoader.load(
+        imageView = imageView,
+        encoded = encoded,
+        fallbackVisibility = fallbackVisibility,
+        maxDimension = maxDimension.coerceAtLeast(1)
+    )
+}
+
+private object InlineImagePreviewLoader {
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val decoder = Executors.newFixedThreadPool(2) { runnable ->
+        Thread(runnable, "vibefactory-image-decoder").apply { isDaemon = true }
+    }
+    private val bitmapCache = object : LruCache<String, Bitmap>(cacheSizeBytes()) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
+    fun load(
+        imageView: ImageView,
+        encoded: String,
+        fallbackVisibility: Int,
+        maxDimension: Int
+    ) {
+        val cacheKey = buildCacheKey(encoded, maxDimension)
+        imageView.tag = cacheKey
+        bitmapCache.get(cacheKey)?.let { bitmap ->
             imageView.setImageBitmap(bitmap)
             imageView.visibility = View.VISIBLE
-        } else {
-            imageView.setImageDrawable(null)
-            imageView.visibility = fallbackVisibility
+            return
         }
-    }.onFailure {
+
         imageView.setImageDrawable(null)
         imageView.visibility = fallbackVisibility
+        val target = WeakReference(imageView)
+
+        decoder.execute {
+            val bitmap = bitmapCache.get(cacheKey) ?: decodeScaledBitmap(encoded, maxDimension)
+            if (bitmap != null) {
+                bitmapCache.put(cacheKey, bitmap)
+            }
+            mainHandler.post {
+                val targetView = target.get() ?: return@post
+                if (targetView.tag != cacheKey) return@post
+                if (bitmap != null) {
+                    targetView.setImageBitmap(bitmap)
+                    targetView.visibility = View.VISIBLE
+                } else {
+                    targetView.setImageDrawable(null)
+                    targetView.visibility = fallbackVisibility
+                }
+            }
+        }
+    }
+
+    private fun decodeScaledBitmap(encoded: String, maxDimension: Int): Bitmap? {
+        return runCatching {
+            val bytes = Base64.getDecoder().decode(encoded)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+            var sampleSize = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / (sampleSize * 2) >= maxDimension) {
+                sampleSize *= 2
+            }
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+        }.getOrNull()
+    }
+
+    private fun buildCacheKey(encoded: String, maxDimension: Int): String {
+        return buildString {
+            append(encoded.length)
+            append(':')
+            append(encoded.take(48).hashCode())
+            append(':')
+            append(encoded.takeLast(48).hashCode())
+            append(':')
+            append(maxDimension)
+        }
+    }
+
+    private fun cacheSizeBytes(): Int {
+        val available = Runtime.getRuntime().maxMemory().coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        return (available / 12).coerceIn(8 * 1024 * 1024, 32 * 1024 * 1024)
     }
 }
 

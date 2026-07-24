@@ -3385,6 +3385,7 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
         return connection
 
     def ensure_column(self, connection: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
@@ -3397,6 +3398,7 @@ class Database:
     def init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -3713,17 +3715,34 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def list_events(self, task_id: str) -> list[dict[str, Any]]:
+    def list_events(self, task_id: str, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT event_id, task_id, actor, event_type, message_text, payload_json, created_at
-                FROM task_events
-                WHERE task_id = ?
-                ORDER BY rowid ASC
-                """,
-                (task_id,),
-            ).fetchall()
+            if limit is not None and limit > 0:
+                rows = connection.execute(
+                    """
+                    SELECT event_id, task_id, actor, event_type, message_text, payload_json, created_at
+                    FROM (
+                        SELECT rowid AS event_rowid, event_id, task_id, actor, event_type,
+                               message_text, payload_json, created_at
+                        FROM task_events
+                        WHERE task_id = ?
+                        ORDER BY rowid DESC
+                        LIMIT ?
+                    )
+                    ORDER BY event_rowid ASC
+                    """,
+                    (task_id, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT event_id, task_id, actor, event_type, message_text, payload_json, created_at
+                    FROM task_events
+                    WHERE task_id = ?
+                    ORDER BY rowid ASC
+                    """,
+                    (task_id,),
+                ).fetchall()
             return [dict(row) for row in rows]
 
     def upsert_app_llm_config(self, task_id: str, config: dict[str, Any]) -> None:
@@ -4011,7 +4030,24 @@ class Database:
                 f"""
                 SELECT task_id, status, message, prompt, app_name, package_name, apk_url,
                        input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-                       codex_result_json, created_at, updated_at
+                       codex_result_json, created_at, updated_at,
+                       (
+                           SELECT MAX(event.created_at)
+                           FROM task_events AS event
+                           WHERE event.task_id = tasks.task_id
+                             AND event.event_type IN (
+                                 'user_message',
+                                 'assistant_message',
+                                 'task_branched',
+                                 'task_status',
+                                 'task_succeeded',
+                                 'task_failed',
+                                 'task_error',
+                                 'task_timeout',
+                                 'task_cancelled',
+                                 'user_interaction'
+                             )
+                       ) AS last_bubble_at
                 FROM tasks
                 WHERE {where_clause}
                 ORDER BY created_at DESC
@@ -5931,13 +5967,19 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
     return event
 
 
-def build_task_timeline_events(db: Database, task_id: str) -> list[dict[str, str]]:
+def build_task_timeline_events(
+    db: Database,
+    task_id: str,
+    *,
+    limit: int = 120,
+) -> list[dict[str, str]]:
     timeline: list[dict[str, str]] = []
-    for row in db.list_events(task_id):
+    source_limit = limit * 3 if limit > 0 else None
+    for row in db.list_events(task_id, limit=source_limit):
         event = task_event_to_timeline_event(row)
         if event:
             timeline.append(event)
-    return timeline
+    return timeline[-limit:] if limit > 0 else timeline
 
 
 def derive_current_build_stage(task: dict[str, Any], timeline_events: list[dict[str, str]]) -> tuple[str, str]:
@@ -7433,15 +7475,25 @@ def build_task_workspace(settings: Settings, task: dict[str, Any]) -> tuple[Path
     return task_root, project_root
 
 
-def serialize_task_for_status(db: Database, task: dict[str, Any], log_line_limit: int) -> dict[str, Any]:
-    log_text, log_lines = collect_live_task_logs(task, log_line_limit)
+def serialize_task_for_status(
+    db: Database,
+    task: dict[str, Any],
+    log_line_limit: int,
+    *,
+    include_logs: bool = False,
+) -> dict[str, Any]:
+    if include_logs:
+        log_text, log_lines = collect_live_task_logs(task, log_line_limit)
+    else:
+        log_text = ""
+        log_lines = tail_lines(str(task.get("log") or ""), 1)
     success = task["status"] == "Success"
     status_text = status_display_text(task["status"], task.get("message"))
     timeline_events = build_task_timeline_events(db, str(task["task_id"]))
     current_build_stage, current_build_stage_detail = derive_current_build_stage(task, timeline_events)
     raw_log_sections: list[dict[str, str]] = []
     workspace_value = (task.get("workspace_path") or "").strip()
-    if workspace_value:
+    if include_logs and workspace_value:
         workspace_root = Path(workspace_value)
         if workspace_root.exists() and workspace_root.is_dir():
             raw_log_sections = collect_raw_log_sections(workspace_root, "logs/build.log")
@@ -7587,13 +7639,28 @@ def serialize_project_revision(task: dict[str, Any], snapshot: dict[str, Any]) -
 def serialize_task_summary(task: dict[str, Any]) -> dict[str, Any]:
     success = task["status"] == "Success"
     state_payload = load_task_state_payload(task)
-    conversation_state = build_task_conversation_state(task)
+    stored_conversation_state = (
+        state_payload.get("conversation_state")
+        if isinstance(state_payload.get("conversation_state"), dict)
+        else {}
+    )
+    request_scope = normalize_whitespace(
+        str(stored_conversation_state.get("request_scope") or state_payload.get("request_scope") or "")
+    )
+    if request_scope not in {"new_app", "existing_app_modification", "non_app_request"}:
+        request_scope = "existing_app_modification" if task_has_app_context(task, state_payload) else "new_app"
+    if task_has_app_context(task, state_payload) and request_scope == "non_app_request":
+        request_scope = "existing_app_modification"
+    latest_summary = sanitize_user_visible_text(
+        str(stored_conversation_state.get("latest_summary") or state_payload.get("latest_summary") or "")
+    ).strip()[:500]
+    initial_user_prompt = sanitize_user_visible_text(str(task.get("prompt") or "")).strip()[:500]
     return {
         "task_id": task["task_id"],
         "status": task["status"],
         "status_display_text": status_display_text(task["status"], task.get("message")),
-        "prompt": task["prompt"],
-        "initial_user_prompt": task["prompt"],
+        "prompt": initial_user_prompt,
+        "initial_user_prompt": initial_user_prompt,
         "app_name": task.get("app_name") or "",
         "generated_app_name": task.get("app_name") or "",
         "package_name": task.get("package_name") or "",
@@ -7606,7 +7673,11 @@ def serialize_task_summary(task: dict[str, Any]) -> dict[str, Any]:
         "total_tokens": task.get("total_tokens"),
         "created_at": task["created_at"],
         "updated_at": task["updated_at"],
-        "conversation_state": conversation_state,
+        "last_bubble_at": task.get("last_bubble_at") or task["updated_at"],
+        "conversation_state": {
+            "request_scope": request_scope,
+            "latest_summary": latest_summary,
+        },
         "interaction_type": str(state_payload.get("interaction_type") or ""),
         "render_mode": str(state_payload.get("render_mode") or ""),
     }
@@ -8464,6 +8535,7 @@ def create_app() -> FastAPI:
         device_id: Optional[str] = Query(default=None),
         phone_number: Optional[str] = Query(default=None),
         user_id: Optional[str] = Query(default=None),
+        include_logs: bool = Query(default=False),
     ) -> dict[str, Any]:
         db: Database = app.state.db
         settings: Settings = app.state.settings
@@ -8472,8 +8544,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         if not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
             raise HTTPException(status_code=404, detail="task not found")
-        log_codex_rate_limits_to_server_log(task_id, settings.codex_command)
-        return serialize_task_for_status(db, task, settings.status_log_line_limit)
+        return serialize_task_for_status(
+            db,
+            task,
+            settings.status_log_line_limit,
+            include_logs=include_logs,
+        )
 
     @app.post("/tasks/{task_id}/cancel")
     def cancel_task(

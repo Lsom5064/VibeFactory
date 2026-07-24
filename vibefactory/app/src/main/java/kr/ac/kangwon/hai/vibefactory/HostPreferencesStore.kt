@@ -6,6 +6,11 @@ import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
 
 data class PersistedTaskChats(
@@ -14,7 +19,7 @@ data class PersistedTaskChats(
 )
 
 class HostPreferencesStore(
-    private val context: Context,
+    context: Context,
     private val gson: Gson,
     private val logTag: String
 ) {
@@ -26,7 +31,15 @@ class HostPreferencesStore(
         private const val MAX_PERSISTED_DETAIL_CHARS = 4_000
         private const val MAX_PERSISTED_IMAGE_PREVIEW_CHARS = 120_000
         private const val TRUNCATED_SUFFIX = "\n\n[긴 내용은 앱 성능을 위해 일부만 저장했어요.]"
+        private val TASK_CHAT_WRITER = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "vibefactory-task-chat-writer").apply { isDaemon = true }
+        }
     }
+
+    private val context = context.applicationContext
+    private val pendingTaskChatWrites = ConcurrentHashMap<String, List<ChatMessage>>()
+    private val deletedTaskChatIds = ConcurrentHashMap.newKeySet<String>()
+    private val taskChatWriterScheduled = AtomicBoolean(false)
 
     private val prefs
         get() = context.getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
@@ -200,7 +213,7 @@ class HostPreferencesStore(
                 }
                 return@runCatching true
             }
-            file.writeText(gson.toJson(compacted), Charsets.UTF_8)
+            writeTaskChatAtomically(file, gson.toJson(compacted))
             true
         }.getOrElse {
             Log.e(logTag, "Failed to persist task chat task_id=$normalizedTaskId", it)
@@ -208,9 +221,19 @@ class HostPreferencesStore(
         }
     }
 
+    fun enqueueTaskChatSave(taskId: String, messages: List<ChatMessage>) {
+        val normalizedTaskId = normalizeTaskId(taskId)
+        if (normalizedTaskId.isBlank()) return
+        if (normalizedTaskId in deletedTaskChatIds) return
+        pendingTaskChatWrites[normalizedTaskId] = messages.toList()
+        scheduleTaskChatWriter()
+    }
+
     fun deleteTaskChat(taskId: String) {
         val normalizedTaskId = normalizeTaskId(taskId)
         if (normalizedTaskId.isBlank()) return
+        deletedTaskChatIds += normalizedTaskId
+        pendingTaskChatWrites.remove(normalizedTaskId)
         runCatching {
             val file = taskChatFile(normalizedTaskId)
             if (file.exists() && !file.delete()) {
@@ -335,7 +358,13 @@ class HostPreferencesStore(
     }
 
     private fun compactTaskMessagesForStorage(messages: List<ChatMessage>): List<ChatMessage> {
-        return messages
+        val latestById = linkedMapOf<String, ChatMessage>()
+        messages.forEachIndexed { index, message ->
+            val key = message.id.trim().ifBlank { "message-$index" }
+            latestById[key] = message
+        }
+        return latestById.values
+            .toList()
             .takeLast(MAX_PERSISTED_MESSAGES_PER_TASK)
             .map(::compactChatMessageForStorage)
     }
@@ -370,5 +399,56 @@ class HostPreferencesStore(
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
         return File(taskChatsDir, "$encodedTaskId.json")
+    }
+
+    private fun scheduleTaskChatWriter() {
+        if (!taskChatWriterScheduled.compareAndSet(false, true)) return
+        TASK_CHAT_WRITER.execute {
+            try {
+                while (true) {
+                    val batch = pendingTaskChatWrites.entries.mapNotNull { entry ->
+                        if (pendingTaskChatWrites.remove(entry.key, entry.value)) {
+                            entry.key to entry.value
+                        } else {
+                            null
+                        }
+                    }
+                    if (batch.isEmpty()) break
+                    batch.forEach { (taskId, messages) ->
+                        if (taskId !in deletedTaskChatIds) {
+                            saveTaskChat(taskId, messages)
+                        }
+                    }
+                }
+            } finally {
+                taskChatWriterScheduled.set(false)
+                if (pendingTaskChatWrites.isNotEmpty()) {
+                    scheduleTaskChatWriter()
+                }
+            }
+        }
+    }
+
+    private fun writeTaskChatAtomically(file: File, json: String) {
+        val tempFile = File(file.parentFile, ".${file.name}.${UUID.randomUUID()}.tmp")
+        tempFile.writeText(json, Charsets.UTF_8)
+        try {
+            Files.move(
+                tempFile.toPath(),
+                file.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING
+            )
+        } catch (_: Exception) {
+            Files.move(
+                tempFile.toPath(),
+                file.toPath(),
+                StandardCopyOption.REPLACE_EXISTING
+            )
+        } finally {
+            if (tempFile.exists()) {
+                tempFile.delete()
+            }
+        }
     }
 }

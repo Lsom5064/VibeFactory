@@ -104,7 +104,6 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "VibeFactoryHost"
         private const val STATE_SELECTED_TASK_ID = EXTRA_SELECTED_TASK_ID
         private const val STATE_INPUT_PROMPT = "input_prompt"
-        private const val PROCESSING_STATUS_ANIMATION_MS = 700L
         private const val REQUEST_PHONE_NUMBER_PERMISSION = 7001
         private const val REQUEST_NOTIFICATION_PERMISSION = 7002
         private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete_alerts"
@@ -207,8 +206,6 @@ class MainActivity : AppCompatActivity() {
     private var latestDownloadedApkFile: File? = null
     private var latestDownloadedTaskId: String? = null
     private var pollingJob: Job? = null
-    private var processingStatusAnimationJob: Job? = null
-    private var processingStatusAnimationFrame: Int = 0
     private var lastCrashTaskId: String? = null
     private var lastCrashPackage: String? = null
     private var lastStackTrace: String? = null
@@ -413,9 +410,6 @@ class MainActivity : AppCompatActivity() {
             ?: visibleTaskIdCandidate(intent?.getStringExtra(STATE_SELECTED_TASK_ID))
             ?: visibleTaskIdCandidate(getLastSelectedTaskId())
         applyImmediateBranchedTaskState(intent)
-        pendingTaskSelectionKey
-            ?.takeIf { it.isNotBlank() && hasRequiredPhoneNumber() }
-            ?.let { showPersistedTaskPreview(it) }
         renderState()
 
         registerReceiver(crashReceiver, IntentFilter("kr.ac.kangwon.hai.action.CRASH_REPORT"), RECEIVER_EXPORTED)
@@ -521,6 +515,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        visibleTaskIdCandidate(
+            screenState.pollingTaskId ?: currentTaskId ?: screenState.selectedTaskId ?: getLastSelectedTaskId()
+        )
+            ?.let(::stopBuildCompletionMonitoring)
         val darkModeEnabled = preferencesStore.loadDarkModeEnabled()
         AppThemeController.applyDarkModePreference(darkModeEnabled)
         if (AppThemeController.shouldRecreateForPreference(this, darkModeEnabled)) {
@@ -647,8 +645,11 @@ class MainActivity : AppCompatActivity() {
             }
 
             try {
+                ensureTaskChatLoadedAsync(taskId)
+                if (!isTaskSelectionGenerationCurrent(selectionGeneration)) {
+                    return@launch
+                }
                 showPersistedTaskPreview(taskId)
-                fetchTaskList(autoSelectPendingTask = false)
                 pendingTaskSelectionKey = null
                 syncTaskStatus(
                     taskId,
@@ -658,6 +659,7 @@ class MainActivity : AppCompatActivity() {
                     closeDrawerOnSuccess = false,
                     selectionGeneration = selectionGeneration
                 )
+                fetchTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
                 logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
             }
@@ -864,21 +866,65 @@ class MainActivity : AppCompatActivity() {
         }
 
         topLogChip.setOnClickListener {
-            val taskId = screenState.selectedTaskId?.trim()?.takeIf { it.isNotBlank() }
-                ?: currentTaskId?.trim()?.takeIf { it.isNotBlank() }
-            TaskLogDetailLauncher.open(
-                context = this,
-                taskId = taskId,
-                summary = taskId?.let { taskSummaryById[it] },
-                currentStatus = screenState.currentStatus,
-                displayedAppName = screenState.displayedAppName,
-                messages = taskId?.let { buildTaskTimeline(it) } ?: screenState.messages,
-                rawLogContents = taskId
-                    ?.let { taskRawLogSections[it].orEmpty().map { section -> section.content } }
-                    .orEmpty(),
-                formatTimestamp = ::formatMessageTimestamp
-            )
+            openTaskLogDetail()
         }
+    }
+
+    private fun openTaskLogDetail() {
+        val taskId = screenState.selectedTaskId?.trim()?.takeIf { it.isNotBlank() }
+            ?: currentTaskId?.trim()?.takeIf { it.isNotBlank() }
+        if (taskId == null) {
+            launchTaskLogDetail(taskId = null, rawLogContents = emptyList())
+            return
+        }
+
+        topLogChip.isEnabled = false
+        lifecycleScope.launch {
+            val rawLogContents = try {
+                logApiRequest(
+                    "/status/{task_id}",
+                    taskId = taskId,
+                    deviceId = deviceId,
+                    extra = "include_logs=true"
+                )
+                val response = apiService.getStatus(
+                    taskId,
+                    deviceId,
+                    null,
+                    userIdentity.phoneNumber,
+                    includeLogs = true
+                )
+                val sections = extractRawLogSections(response)
+                taskRawLogSections[taskId] = sections
+                sections.map { it.content }.ifEmpty {
+                    resolveFullLogText(response)?.let(::listOf).orEmpty()
+                }
+            } catch (e: Exception) {
+                logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.polling_failed, userVisibleErrorMessage(e)),
+                    Toast.LENGTH_LONG
+                ).show()
+                taskRawLogSections[taskId].orEmpty().map { it.content }
+            } finally {
+                topLogChip.isEnabled = true
+            }
+            launchTaskLogDetail(taskId, rawLogContents)
+        }
+    }
+
+    private fun launchTaskLogDetail(taskId: String?, rawLogContents: List<String>) {
+        TaskLogDetailLauncher.open(
+            context = this,
+            taskId = taskId,
+            summary = taskId?.let { taskSummaryById[it] },
+            currentStatus = screenState.currentStatus,
+            displayedAppName = screenState.displayedAppName,
+            messages = taskId?.let { buildTaskTimeline(it) } ?: screenState.messages,
+            rawLogContents = rawLogContents,
+            formatTimestamp = ::formatMessageTimestamp
+        )
     }
 
     private fun loadTaskList(autoSelectPendingTask: Boolean = false) {
@@ -1484,7 +1530,6 @@ class MainActivity : AppCompatActivity() {
                 val shouldStartBuildWorkflow = shouldStartBuildWorkflow(response)
                 applyGenerateDecisionResponse(response)
                 if (shouldStartBuildWorkflow) {
-                    startBuildCompletionMonitoring(response.task_id)
                     refreshCurrentTaskAfterFollowup(
                         response.task_id,
                         autoInstallOnSuccess = true,
@@ -1545,7 +1590,9 @@ class MainActivity : AppCompatActivity() {
         screenState = screenState.copy(
             selectedTaskId = resolvedTaskId,
             displayedAppName = summary?.appName,
-            messages = buildTaskTimeline(resolvedTaskId),
+            messages = taskConversationMessages[resolvedTaskId]
+                ?.let { buildTaskTimeline(resolvedTaskId) }
+                .orEmpty(),
             currentStatus = getString(R.string.status_loading_task),
             statusDetail = getString(R.string.status_loading_task_detail, resolvedTaskId),
             canDownload = persistedApkUrlForTask(resolvedTaskId) != null,
@@ -1556,6 +1603,12 @@ class MainActivity : AppCompatActivity() {
 
         taskSyncJob = lifecycleScope.launch {
             try {
+                ensureTaskChatLoadedAsync(resolvedTaskId)
+                if (!isTaskSelectionGenerationCurrent(selectionGeneration)) {
+                    return@launch
+                }
+                screenState = screenState.copy(messages = buildTaskTimeline(resolvedTaskId))
+                renderState()
                 syncTaskStatus(
                     resolvedTaskId,
                     autoInstallOnSuccess = autoInstallOnSuccess,
@@ -1621,7 +1674,6 @@ class MainActivity : AppCompatActivity() {
             canDownload = persistedApkUrlForTask(resolvedTaskId) != null,
             canInstall = persistedDownloadedApkFileForTask(resolvedTaskId) != null
         )
-        startBuildCompletionMonitoring(resolvedTaskId)
         renderState()
 
         taskSyncJob = lifecycleScope.launch {
@@ -2012,9 +2064,7 @@ class MainActivity : AppCompatActivity() {
         }
         renderState()
 
-        if (isPollingStatus) {
-            startBuildCompletionMonitoring(taskId)
-        } else {
+        if (!isPollingStatus) {
             stopBuildCompletionMonitoring(taskId)
         }
 
@@ -2632,8 +2682,23 @@ ${record.stackTrace}
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return false
         if (normalizedTaskId in loadedTaskChatIds) return true
-        val loadedMessages = preferencesStore.loadTaskChat(normalizedTaskId)
-        if (loadedMessages.isNotEmpty()) {
+        if (preferencesStore.hasTaskChat(normalizedTaskId)) {
+            Log.w(TAG, "Task chat must be loaded off main thread task_id=$normalizedTaskId")
+            return false
+        }
+        loadedTaskChatIds += normalizedTaskId
+        return true
+    }
+
+    private suspend fun ensureTaskChatLoadedAsync(taskId: String): Boolean {
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return false
+        if (normalizedTaskId in loadedTaskChatIds) return true
+        val loadedMessages = withContext(Dispatchers.IO) {
+            preferencesStore.loadTaskChat(normalizedTaskId)
+        }
+        if (normalizedTaskId in hiddenTaskIds) return false
+        if (normalizedTaskId !in loadedTaskChatIds && loadedMessages.isNotEmpty()) {
             taskConversationMessages[normalizedTaskId] = loadedMessages.toMutableList()
         }
         loadedTaskChatIds += normalizedTaskId
@@ -2742,20 +2807,17 @@ ${record.stackTrace}
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return true
         trimTaskTimelineInMemory(normalizedTaskId)
-        val committed = preferencesStore.saveTaskChat(
+        preferencesStore.enqueueTaskChatSave(
             normalizedTaskId,
             taskConversationMessages[normalizedTaskId].orEmpty()
         )
-        if (!committed) {
-            Log.w(TAG, "Failed to commit task chat task_id=$normalizedTaskId")
-        }
-        return committed
+        return true
     }
 
     private fun showPersistedTaskPreview(taskId: String) {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return
-        ensureTaskChatLoaded(normalizedTaskId)
+        if (normalizedTaskId !in loadedTaskChatIds) return
         val hasPersistedMessages = taskConversationMessages[normalizedTaskId].orEmpty().isNotEmpty()
         if (!hasPersistedMessages) return
         val wasAlreadySelected = screenState.selectedTaskId == normalizedTaskId
@@ -3243,16 +3305,7 @@ ${record.stackTrace}
             .filter { it.kind != MessageKind.LOG }
             .filterNot(::isRedundantDownloadedStatusMessage)
             .filterNot(::isRedundantModificationEchoMessage)
-        val suppressTransientChatUpdates = chatAutoScrollLockedByUser || isChatScrollInteractionActive()
-        val timelineVisibleMessages = if (
-            !suppressTransientChatUpdates &&
-            shouldAnimateProcessingStatus(screenState.messages)
-        ) {
-            animateProcessingStatusBubble(baseVisibleMessages)
-        } else {
-            baseVisibleMessages
-        }
-        val visibleMessages = withColdStartMessage(withDownloadProgressMessage(timelineVisibleMessages))
+        val visibleMessages = withColdStartMessage(withDownloadProgressMessage(baseVisibleMessages))
         val hasTransientProgressUpdate = visibleMessages.any {
             it.isLoading ||
                 it.artifactDownloading ||
@@ -3309,7 +3362,6 @@ ${record.stackTrace}
             )
         }
         emptyChatText.visibility = if (visibleMessages.isEmpty()) View.VISIBLE else View.GONE
-        syncProcessingStatusAnimation(screenState.messages)
 
         if (phoneGateVisible) {
             inputModeLabel.text = getString(R.string.phone_gate_title)
@@ -3445,7 +3497,7 @@ ${record.stackTrace}
                 append(message.cancelTaskId.orEmpty())
                 append(':')
                 append(message.allImagePreviews().joinToString(",") { preview ->
-                    "${preview.displayName}:${preview.base64.hashCode()}"
+                    "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}"
                 })
                 append('|')
             }
@@ -3454,7 +3506,18 @@ ${record.stackTrace}
 
     private fun selectedAttachmentsFingerprint(attachments: List<SelectedAttachment>): String {
         return attachments.joinToString("|") { attachment ->
-            "${attachment.kind.name}:${attachment.displayName}:${attachment.mimeType}:${attachment.base64.hashCode()}"
+            "${attachment.kind.name}:${attachment.displayName}:${attachment.mimeType}:${binaryPayloadFingerprint(attachment.base64)}"
+        }
+    }
+
+    private fun binaryPayloadFingerprint(payload: String): String {
+        if (payload.isEmpty()) return "0"
+        return buildString {
+            append(payload.length)
+            append(':')
+            append(payload.take(48).hashCode())
+            append(':')
+            append(payload.takeLast(48).hashCode())
         }
     }
 
@@ -3497,7 +3560,7 @@ ${record.stackTrace}
                 scaleType = ImageView.ScaleType.CENTER_CROP
                 contentDescription = getString(R.string.attachment_preview_open)
                 isClickable = true
-                bindInlineImagePreview(this, attachment.base64, View.INVISIBLE)
+                bindInlineImagePreview(this, attachment.base64, View.INVISIBLE, maxDimension = 320)
                 setOnClickListener {
                     showSelectedAttachmentImageDialog(attachment)
                 }
@@ -3534,7 +3597,7 @@ ${record.stackTrace}
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
         }
-        bindInlineImagePreview(imageView, attachment.base64, View.GONE)
+        bindInlineImagePreview(imageView, attachment.base64, View.GONE, maxDimension = 2048)
         val content = ScrollView(this).apply {
             setPadding(dp(16), dp(12), dp(16), dp(12))
             addView(imageView)
@@ -4228,8 +4291,13 @@ ${record.stackTrace}
                 conversationState = dto.conversation_state
             ) ?: getString(R.string.untitled_task)
             val createdAt = formatTaskSummaryTimestamp(dto.created_at)
-            val lastBubbleAt = taskSummaryLastBubbleTimestamp(taskId)
+            val lastBubbleAt = if (taskId in loadedTaskChatIds) {
+                taskSummaryLastBubbleTimestamp(taskId)
+            } else {
+                null
+            }
             val displayUpdatedAt = lastBubbleAt
+                ?: formatTaskSummaryTimestamp(dto.last_bubble_at)
                 ?: formatTaskSummaryTimestamp(dto.updated_at)
                 ?: createdAt
             TaskSummary(
@@ -4643,9 +4711,13 @@ ${record.stackTrace}
         existingTimeline: List<ChatMessage>
     ): List<ChatMessage> {
         val messages = mutableListOf<ChatMessage>()
+        val existingMessageIds = existingTimeline.asSequence().map { it.id }.toHashSet()
         extractTimelineEvents(response).forEach { event ->
             val message = timelineEventToMessage(taskId, event)
-            if (existingTimeline.none { it.sameContentAs(message) } && messages.none { it.sameContentAs(message) }) {
+            if (
+                message.id !in existingMessageIds &&
+                messages.none { it.id == message.id || it.sameContentAs(message) }
+            ) {
                 messages += message
             }
             if (event.eventType == "task_succeeded") {
@@ -5820,53 +5892,12 @@ ${record.stackTrace}
         return animatableProcessingLabels().firstOrNull { it == normalized }
     }
 
-    private fun processingStatusVariants(baseText: String): List<String> {
-        return listOf(baseText)
-    }
-
-    private fun shouldAnimateProcessingStatus(messages: List<ChatMessage>): Boolean {
-        if (isMessageTextSelectionActive) return false
-        if (!isProcessingAnimationActiveState()) return false
-        val latestStatusMessage = messages.lastOrNull { it.kind == MessageKind.STATUS } ?: return false
-        return processingAnimationBaseText(latestStatusMessage.body) != null
-    }
-
     private fun isProcessingAnimationActiveState(): Boolean {
         if (screenState.pollingTaskId?.isNotBlank() == true) return true
         if (screenState.currentStatus == getString(R.string.status_sending)) return true
         if (processingAnimationBaseText(screenState.currentStatus) != null) return true
         if (processingAnimationBaseText(screenState.statusDetail.orEmpty()) != null) return true
         return false
-    }
-
-    private fun animateProcessingStatusBubble(messages: List<ChatMessage>): List<ChatMessage> {
-        val targetIndex = messages.indexOfLast { it.kind == MessageKind.STATUS }
-        if (targetIndex < 0) return messages
-        val baseText = processingAnimationBaseText(messages[targetIndex].body) ?: return messages
-
-        val variants = processingStatusVariants(baseText)
-        val animatedBody = variants[processingStatusAnimationFrame % variants.size]
-        return messages.mapIndexed { index, message ->
-            if (index == targetIndex) message.copy(body = animatedBody) else message
-        }
-    }
-
-    private fun syncProcessingStatusAnimation(messages: List<ChatMessage>) {
-        if (!shouldAnimateProcessingStatus(messages)) {
-            processingStatusAnimationJob?.cancel()
-            processingStatusAnimationJob = null
-            processingStatusAnimationFrame = 0
-            return
-        }
-        if (processingStatusAnimationJob?.isActive == true) return
-
-        processingStatusAnimationJob = lifecycleScope.launch {
-            while (isActive && shouldAnimateProcessingStatus(screenState.messages)) {
-                delay(PROCESSING_STATUS_ANIMATION_MS)
-                processingStatusAnimationFrame = (processingStatusAnimationFrame + 1) % 4
-                renderState()
-            }
-        }
     }
 
     private fun localizePlannerText(text: String): String {
@@ -6103,7 +6134,9 @@ ${record.stackTrace}
             return "user-echo:$bodyKey"
         }
         val imageKey = message.allImagePreviews()
-            .joinToString("|") { preview -> "${preview.displayName}:${preview.base64.hashCode()}" }
+            .joinToString("|") { preview ->
+                "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}"
+            }
         return "user:$bodyKey:$imageKey"
     }
 
@@ -6153,6 +6186,7 @@ ${record.stackTrace}
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank()) return
         val timeline = editableTaskTimeline(normalizedTaskId) ?: return
+        if (message.id.startsWith("timeline-") && timeline.any { it.id == message.id }) return
         if (timeline.any { shouldDropIncomingDuplicateMessage(it, message) }) return
         if (!message.artifactTaskId.isNullOrBlank()) {
             val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(message)
@@ -6912,8 +6946,6 @@ ${record.stackTrace}
     private val messageSelectionActionModeCallback = object : ActionMode.Callback {
         override fun onCreateActionMode(mode: ActionMode?, menu: Menu?): Boolean {
             isMessageTextSelectionActive = true
-            processingStatusAnimationJob?.cancel()
-            processingStatusAnimationJob = null
             return true
         }
 

@@ -130,6 +130,7 @@ data class TaskSummaryDto(
     val build_success: Boolean = false,
     val created_at: String = "",
     val updated_at: String = "",
+    val last_bubble_at: String = "",
     val conversation_state: JsonElement? = null
 )
 
@@ -206,7 +207,8 @@ interface VibeApiService {
         @Path("task_id") taskId: String,
         @Query("device_id") deviceId: String,
         @Query("user_id") userId: String? = null,
-        @Query("phone_number") phoneNumber: String? = null
+        @Query("phone_number") phoneNumber: String? = null,
+        @Query("include_logs") includeLogs: Boolean = false
     ): StatusResponse
 
     @POST("/tasks/{task_id}/cancel")

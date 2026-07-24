@@ -31,9 +31,28 @@ class TaskSummaryAdapter(
     private var selectedTaskId: String? = null
 
     fun submitList(newItems: List<TaskSummary>, selectedTaskId: String?) {
+        val previousItems = items
+        val previousSelectedTaskId = this.selectedTaskId
+        val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+            override fun getOldListSize(): Int = previousItems.size
+
+            override fun getNewListSize(): Int = newItems.size
+
+            override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                return previousItems[oldItemPosition].taskId == newItems[newItemPosition].taskId
+            }
+
+            override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                val oldItem = previousItems[oldItemPosition]
+                val newItem = newItems[newItemPosition]
+                val oldSelected = oldItem.taskId == previousSelectedTaskId
+                val newSelected = newItem.taskId == selectedTaskId
+                return oldItem == newItem && oldSelected == newSelected
+            }
+        })
         items = newItems
         this.selectedTaskId = selectedTaskId
-        notifyDataSetChanged()
+        diff.dispatchUpdatesTo(this)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): TaskViewHolder {
@@ -483,7 +502,8 @@ class ChatMessageAdapter(
             bindInlineImagePreview(
                 imageView = imagePreview,
                 imageBase64 = preview.base64,
-                fallbackVisibility = View.GONE
+                fallbackVisibility = View.GONE,
+                maxDimension = 720
             )
             imagePreview.isClickable = true
             imagePreview.setOnClickListener {
@@ -535,7 +555,8 @@ class ChatMessageAdapter(
                 bindInlineImagePreview(
                     imageView = this,
                     imageBase64 = preview.base64,
-                    fallbackVisibility = View.GONE
+                    fallbackVisibility = View.GONE,
+                    maxDimension = 320
                 )
                 setOnClickListener {
                     showAttachedImageDialog(
@@ -565,7 +586,8 @@ class ChatMessageAdapter(
             bindInlineImagePreview(
                 imageView = imageView,
                 imageBase64 = imageBase64,
-                fallbackVisibility = View.GONE
+                fallbackVisibility = View.GONE,
+                maxDimension = 2048
             )
             val content = ScrollView(context).apply {
                 setPadding(dp(context, 16), dp(context, 12), dp(context, 16), dp(context, 12))
