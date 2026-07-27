@@ -2164,7 +2164,7 @@ def build_prepared_generation_prompt(decision: IntentDecision) -> str:
         "## 구현 시 주의사항",
         *bullet_lines(acceptance_criteria[:8], "작은 화면에서도 overflow 없이 안정적으로 사용할 수 있게 만든다."),
         "",
-        "## 참가자 원문",
+        "## 구체화된 앱 생성 요청",
         original_request,
     ]
     return "\n".join(sections).strip()
