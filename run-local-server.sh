@@ -156,7 +156,7 @@ esac
 export CODEX_FAST_MODE
 export CODEX_SERVICE_TIER
 
-if [[ ! -x "$VENV_DIR/bin/uvicorn" ]]; then
+if [[ ! -x "$VENV_DIR/bin/uvicorn" ]] || ! "$VENV_DIR/bin/python" -c "import PIL" >/dev/null 2>&1; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
   "$VENV_DIR/bin/pip" install -r "$SERVER_DIR/requirements.txt"
 fi

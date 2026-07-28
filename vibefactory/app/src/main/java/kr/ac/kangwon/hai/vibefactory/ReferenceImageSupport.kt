@@ -18,6 +18,9 @@ import java.net.URL
 import java.util.Base64
 import java.util.concurrent.Executors
 
+private const val MAX_STORED_IMAGE_BYTES = 2 * 1024 * 1024
+private const val MAX_STORED_IMAGE_DIMENSION = 1600
+
 fun buildReferenceImageAttachment(
     contentResolver: ContentResolver,
     uri: Uri,
@@ -97,14 +100,15 @@ private fun readUriBytes(contentResolver: ContentResolver, uri: Uri, maxBytes: I
 
 fun compressImagePayload(rawBytes: ByteArray, maxPayloadBytes: Int): ByteArray? {
     val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
-    val scaled = scaleBitmap(decoded, maxDimension = 2048)
+    val scaled = scaleBitmap(decoded, maxDimension = MAX_STORED_IMAGE_DIMENSION)
+    val effectiveMaxPayloadBytes = minOf(maxPayloadBytes, MAX_STORED_IMAGE_BYTES)
     try {
-        var quality = 92
-        while (quality >= 50) {
+        var quality = 88
+        while (quality >= 44) {
             val output = ByteArrayOutputStream()
             scaled.compress(Bitmap.CompressFormat.JPEG, quality, output)
             val bytes = output.toByteArray()
-            if (bytes.size <= maxPayloadBytes) return bytes
+            if (bytes.size <= effectiveMaxPayloadBytes) return bytes
             quality -= 8
         }
         return null

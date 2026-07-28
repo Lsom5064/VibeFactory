@@ -90,7 +90,7 @@
     <string name="reference_image_pick_failed">참고 이미지를 읽지 못했어요. %1$s</string>
     <string name="reference_image_too_large">참고 이미지는 최대 5MB까지 첨부할 수 있어요.</string>
     <string name="attachment_pick_failed">첨부 파일을 읽지 못했어요. %1$s</string>
-    <string name="attachment_image_too_large">이미지는 원본 15MB, 전송 payload 4MB까지 첨부할 수 있어요.</string>
+    <string name="attachment_image_too_large">이미지는 원본 15MB까지 선택할 수 있으며 저장 전에 자동으로 최적화해요.</string>
     <string name="attachment_pdf_too_large">PDF는 최대 10MB까지 첨부할 수 있어요.</string>
     <string name="attachment_text_too_large">텍스트 파일은 최대 2MB까지 첨부할 수 있어요.</string>
     <string name="send">전송</string>

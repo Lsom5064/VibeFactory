@@ -17,13 +17,22 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
+
+
+REFERENCE_IMAGE_MAX_SOURCE_BYTES = 20 * 1024 * 1024
+REFERENCE_IMAGE_MAX_STORED_BYTES = 2 * 1024 * 1024
+REFERENCE_IMAGE_MAX_DIMENSION = 1600
+REFERENCE_IMAGE_JPEG_QUALITIES = (88, 82, 76, 68, 60, 52, 44)
+REFERENCE_IMAGE_DIMENSION_STEPS = (1600, 1400, 1200, 1024, 800)
 
 
 def utc_now_iso() -> str:
@@ -683,6 +692,91 @@ def reference_attachment_file_metadata(workspace_root: Path, workspace_path: str
     }
 
 
+def optimize_reference_image_bytes(image_bytes: bytes) -> dict[str, Any]:
+    original_size_bytes = len(image_bytes)
+    if original_size_bytes > REFERENCE_IMAGE_MAX_SOURCE_BYTES:
+        return {
+            "status": "failed",
+            "error_message": (
+                f"image exceeds source size limit "
+                f"({original_size_bytes} > {REFERENCE_IMAGE_MAX_SOURCE_BYTES} bytes)"
+            ),
+        }
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as opened_image:
+            opened_image.load()
+            transposed_image = ImageOps.exif_transpose(opened_image)
+            original_width, original_height = transposed_image.size
+            if "A" in transposed_image.getbands():
+                rgba_image = transposed_image.convert("RGBA")
+                prepared_image = Image.new("RGB", rgba_image.size, "white")
+                prepared_image.paste(rgba_image, mask=rgba_image.getchannel("A"))
+                rgba_image.close()
+            else:
+                prepared_image = transposed_image.convert("RGB")
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
+        return {
+            "status": "failed",
+            "error_message": f"invalid or unsupported image: {exc}",
+        }
+
+    smallest_candidate: Optional[bytes] = None
+    stored_width = prepared_image.width
+    stored_height = prepared_image.height
+    try:
+        for max_dimension in REFERENCE_IMAGE_DIMENSION_STEPS:
+            candidate_image = prepared_image.copy()
+            candidate_image.thumbnail(
+                (max_dimension, max_dimension),
+                Image.Resampling.LANCZOS,
+            )
+            try:
+                for quality in REFERENCE_IMAGE_JPEG_QUALITIES:
+                    output = BytesIO()
+                    candidate_image.save(
+                        output,
+                        format="JPEG",
+                        quality=quality,
+                        optimize=True,
+                    )
+                    candidate = output.getvalue()
+                    if smallest_candidate is None or len(candidate) < len(smallest_candidate):
+                        smallest_candidate = candidate
+                        stored_width, stored_height = candidate_image.size
+                    if len(candidate) <= REFERENCE_IMAGE_MAX_STORED_BYTES:
+                        return {
+                            "status": "optimized",
+                            "data": candidate,
+                            "mime_type": "image/jpeg",
+                            "suffix": ".jpg",
+                            "original_size_bytes": original_size_bytes,
+                            "size_bytes": len(candidate),
+                            "original_width": original_width,
+                            "original_height": original_height,
+                            "stored_width": candidate_image.width,
+                            "stored_height": candidate_image.height,
+                            "optimized": (
+                                candidate != image_bytes
+                                or original_width != candidate_image.width
+                                or original_height != candidate_image.height
+                            ),
+                        }
+            finally:
+                candidate_image.close()
+    finally:
+        prepared_image.close()
+
+    return {
+        "status": "failed",
+        "error_message": (
+            "image could not be compressed below storage limit "
+            f"({len(smallest_candidate or b'')} > {REFERENCE_IMAGE_MAX_STORED_BYTES} bytes, "
+            f"last dimensions {stored_width}x{stored_height})"
+        ),
+    }
+
+
 def save_reference_image_attachment_result(
     workspace_root: Path,
     *,
@@ -709,19 +803,35 @@ def save_reference_image_attachment_result(
             "error_message": "empty decoded image payload",
         }
 
+    optimized = optimize_reference_image_bytes(image_bytes)
+    if optimized.get("status") != "optimized":
+        return optimized
+    stored_bytes = bytes(optimized.get("data") or b"")
+    if not stored_bytes:
+        return {
+            "status": "failed",
+            "error_message": "image optimization produced an empty payload",
+        }
+
     image_dir = workspace_root / "reference_images"
     image_dir.mkdir(parents=True, exist_ok=True)
-    suffix = infer_reference_image_suffix(normalized_name)
     safe_stem = sanitize_component(Path(normalized_name).stem or "reference_image")
-    filename = f"{utc_now_compact()}_{safe_stem}{suffix}"
+    filename = f"{utc_now_compact()}_{safe_stem}_{uuid.uuid4().hex[:8]}.jpg"
     image_path = image_dir / filename
-    image_path.write_bytes(image_bytes)
+    image_path.write_bytes(stored_bytes)
     return {
         "status": "saved",
         "workspace_path": str(image_path.relative_to(workspace_root)),
         "absolute_path": str(image_path),
-        "size_bytes": len(image_bytes),
-        "sha256": hashlib.sha256(image_bytes).hexdigest(),
+        "mime_type": "image/jpeg",
+        "size_bytes": len(stored_bytes),
+        "sha256": hashlib.sha256(stored_bytes).hexdigest(),
+        "original_size_bytes": int(optimized.get("original_size_bytes") or len(image_bytes)),
+        "original_width": int(optimized.get("original_width") or 0),
+        "original_height": int(optimized.get("original_height") or 0),
+        "stored_width": int(optimized.get("stored_width") or 0),
+        "stored_height": int(optimized.get("stored_height") or 0),
+        "optimized": bool(optimized.get("optimized")),
     }
 
 
@@ -808,12 +918,19 @@ def save_reference_attachments(workspace_root: Path, attachments: list[dict[str,
         saved.append(
             {
                 **attachment,
+                "mime_type": str(save_result.get("mime_type") or attachment.get("mime_type") or ""),
                 "workspace_path": workspace_path,
                 "base64": "" if workspace_path else attachment.get("base64", ""),
                 "save_status": str(save_result.get("status") or ""),
                 "absolute_path": str(save_result.get("absolute_path") or ""),
                 "size_bytes": str(save_result.get("size_bytes") or ""),
                 "sha256": str(save_result.get("sha256") or ""),
+                "original_size_bytes": str(save_result.get("original_size_bytes") or ""),
+                "original_width": str(save_result.get("original_width") or ""),
+                "original_height": str(save_result.get("original_height") or ""),
+                "stored_width": str(save_result.get("stored_width") or ""),
+                "stored_height": str(save_result.get("stored_height") or ""),
+                "optimized": bool(save_result.get("optimized")),
                 "error_message": str(save_result.get("error_message") or ""),
             }
         )
@@ -829,6 +946,12 @@ def reference_attachment_event_payload(attachment: dict[str, Any]) -> dict[str, 
         "absolute_path": attachment.get("absolute_path") or "",
         "size_bytes": int(attachment.get("size_bytes") or 0),
         "sha256": attachment.get("sha256") or "",
+        "original_size_bytes": int(attachment.get("original_size_bytes") or 0),
+        "original_width": int(attachment.get("original_width") or 0),
+        "original_height": int(attachment.get("original_height") or 0),
+        "stored_width": int(attachment.get("stored_width") or 0),
+        "stored_height": int(attachment.get("stored_height") or 0),
+        "optimized": bool(attachment.get("optimized")),
         "status": attachment.get("save_status") or "",
         "error_message": attachment.get("error_message") or "",
     }
@@ -4579,7 +4702,7 @@ def apply_codex_generated_app_llm_settings(
     task_id: str,
     result_payload: dict[str, Any],
 ) -> None:
-    generated_prompt = normalize_whitespace(str(result_payload.get("app_llm_system_prompt") or ""))
+    generated_prompt = str(result_payload.get("app_llm_system_prompt") or "").strip()
     generated_model = normalize_whitespace(str(result_payload.get("app_llm_model") or ""))
     runtime_needed = result_payload.get("app_llm_enabled")
 
@@ -4858,8 +4981,8 @@ Context:
         return None
 
     if not result_path.exists():
-        stdout_text = read_text_if_exists(stdout_path, limit=12000)
-        stderr_text = read_text_if_exists(stderr_path, limit=12000)
+        stdout_text = read_text_if_exists(stdout_path, limit=None)
+        stderr_text = read_text_if_exists(stderr_path, limit=None)
         db.log_event(
             str(task.get("task_id") or ""),
             actor="system",
@@ -4868,21 +4991,83 @@ Context:
             payload={
                 "exit_code": exit_code,
                 "timed_out": timed_out,
-                "stdout_tail": "\n".join(tail_lines(stdout_text, 40)),
-                "stderr_tail": "\n".join(tail_lines(stderr_text, 40)),
+                "stdout": stdout_text,
+                "stderr": stderr_text,
             },
         )
         return None
 
     try:
-        parsed = json.loads(result_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        raw_output_text = result_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        db.log_event(
+            str(task.get("task_id") or ""),
+            actor="system",
+            event_type="codex_followup_decision_read_failed",
+            message_text=str(exc),
+            payload={
+                "error": str(exc),
+                "stdout": read_text_if_exists(stdout_path, limit=None),
+                "stderr": read_text_if_exists(stderr_path, limit=None),
+            },
+        )
+        return None
+    usage = parse_codex_usage_from_jsonl(stdout_path)
+    process_response = {
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "result_path": result_relative_path,
+        "stdout": read_text_if_exists(stdout_path, limit=None),
+        "stderr": read_text_if_exists(stderr_path, limit=None),
+    }
+    try:
+        parsed = json.loads(raw_output_text)
+    except json.JSONDecodeError as exc:
+        log_agent_output_event(
+            db,
+            str(task.get("task_id") or ""),
+            agent_name="codex_existing_task_followup",
+            model=infer_model_name_from_codex_command(settings.codex_command),
+            raw_output_text=raw_output_text,
+            parsed_result={},
+            usage=codex_usage_payload(usage),
+            raw_response={
+                **process_response,
+                "parse_error": str(exc),
+            },
+        )
         return None
     if not isinstance(parsed, dict):
+        log_agent_output_event(
+            db,
+            str(task.get("task_id") or ""),
+            agent_name="codex_existing_task_followup",
+            model=infer_model_name_from_codex_command(settings.codex_command),
+            raw_output_text=raw_output_text,
+            parsed_result={},
+            usage=codex_usage_payload(usage),
+            raw_response={
+                **process_response,
+                "validation_error": "result is not a JSON object",
+            },
+        )
         return None
 
     mode = normalize_whitespace(str(parsed.get("mode") or ""))
     if mode not in {"answer_question", "build", "ask_confirmation"}:
+        log_agent_output_event(
+            db,
+            str(task.get("task_id") or ""),
+            agent_name="codex_existing_task_followup",
+            model=infer_model_name_from_codex_command(settings.codex_command),
+            raw_output_text=raw_output_text,
+            parsed_result=parsed,
+            usage=codex_usage_payload(usage),
+            raw_response={
+                **process_response,
+                "validation_error": f"unsupported mode: {mode}",
+            },
+        )
         return None
     if mode == "answer_question":
         parsed["assistant_reply"] = sanitize_codex_followup_user_text(str(parsed.get("assistant_reply") or ""))
@@ -4893,8 +5078,6 @@ Context:
             if normalize_whitespace(str(item))
         ]
 
-    usage = parse_codex_usage_from_jsonl(stdout_path)
-    raw_output_text = json.dumps(parsed, ensure_ascii=False)
     log_agent_output_event(
         db,
         str(task.get("task_id") or ""),
@@ -4903,13 +5086,7 @@ Context:
         raw_output_text=raw_output_text,
         parsed_result=parsed,
         usage=codex_usage_payload(usage),
-        raw_response={
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "result_path": result_relative_path,
-            "stdout_log": str(stdout_path.relative_to(workspace_path).as_posix()),
-            "stderr_log": str(stderr_path.relative_to(workspace_path).as_posix()),
-        },
+        raw_response=process_response,
     )
     return parsed
 
@@ -5949,7 +6126,7 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
             )
         )
     else:
-        if event_type == "agent_raw_output" or event_type.startswith("app_llm_config_"):
+        if event_type == "agent_raw_output" or event_type.startswith("app_llm_"):
             return None
         kind = "log" if actor == "system" else "assistant"
         title = "로그" if kind == "log" else "AI"
@@ -8914,6 +9091,58 @@ def create_app() -> FastAPI:
             )
             raise HTTPException(status_code=429, detail="daily token limit exceeded")
 
+        runtime_instructions = build_app_runtime_instructions(config, request)
+        request_event_id = db.log_event(
+            task_id,
+            actor="user",
+            event_type="app_llm_request",
+            message_text=request.user_message,
+            payload={
+                "package_name": request.package_name.strip(),
+                "model": config.get("model") or "",
+                "system_prompt": str(config.get("system_prompt") or ""),
+                "runtime_instructions": runtime_instructions,
+                "user_message": request.user_message,
+                "context": request.context or "",
+                "image_attached": bool(request.image_base64 and request.image_base64.strip()),
+                "image_mime_type": request.image_mime_type or "",
+            },
+        )
+        if request.image_base64 and request.image_base64.strip():
+            runtime_image_mime_type = (request.image_mime_type or "image/jpeg").strip() or "image/jpeg"
+            runtime_image_suffix = ".png" if runtime_image_mime_type.lower() == "image/png" else ".jpg"
+            try:
+                persist_reference_attachments_for_task(
+                    db,
+                    settings,
+                    task,
+                    [
+                        {
+                            "type": "image",
+                            "mime_type": runtime_image_mime_type,
+                            "name": f"app_llm_{utc_now_compact()}{runtime_image_suffix}",
+                            "base64": request.image_base64,
+                            "workspace_path": "",
+                        }
+                    ],
+                    source="app_llm_runtime_request",
+                    event_id=request_event_id,
+                    fail_on_error=True,
+                )
+            except ValueError as exc:
+                db.log_event(
+                    task_id,
+                    actor="system",
+                    event_type="app_llm_request_rejected",
+                    message_text=str(exc),
+                    payload={
+                        "request_event_id": request_event_id,
+                        "error_type": "attachment_save_failed",
+                        "error": str(exc),
+                    },
+                )
+                raise HTTPException(status_code=400, detail="attached image could not be saved") from exc
+
         try:
             model_response = invoke_app_runtime_model(config, request)
         except ValueError as exc:
@@ -8925,6 +9154,17 @@ def create_app() -> FastAPI:
                 total_tokens=None,
                 status="configuration_error",
             )
+            db.log_event(
+                task_id,
+                actor="system",
+                event_type="app_llm_error",
+                message_text=str(exc),
+                payload={
+                    "request_event_id": request_event_id,
+                    "error_type": "configuration_error",
+                    "error": str(exc),
+                },
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except httpx.HTTPStatusError as exc:
             db.record_app_llm_usage(
@@ -8935,6 +9175,19 @@ def create_app() -> FastAPI:
                 total_tokens=None,
                 status=f"http_{exc.response.status_code}",
             )
+            upstream_response_text = exc.response.text
+            db.log_event(
+                task_id,
+                actor="system",
+                event_type="app_llm_error",
+                message_text=upstream_response_text or str(exc),
+                payload={
+                    "request_event_id": request_event_id,
+                    "error_type": "upstream_http_error",
+                    "status_code": exc.response.status_code,
+                    "response_text": upstream_response_text,
+                },
+            )
             raise HTTPException(status_code=502, detail="upstream llm request failed") from exc
         except httpx.HTTPError as exc:
             db.record_app_llm_usage(
@@ -8944,6 +9197,17 @@ def create_app() -> FastAPI:
                 output_tokens=None,
                 total_tokens=None,
                 status="network_error",
+            )
+            db.log_event(
+                task_id,
+                actor="system",
+                event_type="app_llm_error",
+                message_text=str(exc),
+                payload={
+                    "request_event_id": request_event_id,
+                    "error_type": "network_error",
+                    "error": str(exc),
+                },
             )
             raise HTTPException(status_code=502, detail="upstream llm network error") from exc
 
@@ -8958,6 +9222,18 @@ def create_app() -> FastAPI:
                 total_tokens=total_tokens,
                 status="token_limit_exceeded",
             )
+            db.log_event(
+                task_id,
+                actor="system",
+                event_type="app_llm_response_rejected",
+                message_text=str(model_response.get("message") or ""),
+                payload={
+                    "request_event_id": request_event_id,
+                    "error_type": "daily_token_limit_exceeded",
+                    "usage": usage,
+                    "raw_response": model_response.get("raw_response") or {},
+                },
+            )
             raise HTTPException(status_code=429, detail="daily token limit exceeded")
 
         db.record_app_llm_usage(
@@ -8968,13 +9244,13 @@ def create_app() -> FastAPI:
             total_tokens=total_tokens,
             status="success",
         )
-        runtime_instructions = build_app_runtime_instructions(config, request)
         db.log_event(
             task_id,
             actor="system",
             event_type="app_llm_response",
             message_text=str(model_response.get("message") or ""),
             payload={
+                "request_event_id": request_event_id,
                 "package_name": request.package_name.strip(),
                 "model": config.get("model") or "",
                 "system_prompt": str(config.get("system_prompt") or ""),
@@ -8986,6 +9262,7 @@ def create_app() -> FastAPI:
                 "input_tokens": int(usage.get("input_tokens") or 0),
                 "output_tokens": int(usage.get("output_tokens") or 0),
                 "total_tokens": total_tokens,
+                "raw_response": model_response.get("raw_response") or {},
             },
         )
         return {
