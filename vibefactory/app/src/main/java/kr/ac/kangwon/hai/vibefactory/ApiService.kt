@@ -172,7 +172,7 @@ data class TaskRevisionDto(
     val version_name: String = "",
     val source: String = "",
     val created_at: String = "",
-    val project_path: String = "",
+    val request_summary: String = "",
     val apk_path: String? = "",
     val apk_url: String? = "",
     val apk_size_bytes: Long? = null,

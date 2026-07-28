@@ -37,6 +37,15 @@ internal object TaskLogDetailFormatter {
         "Succeeded",
         "Completed"
     )
+    private val developerOnlyEventTypes = setOf(
+        "command",
+        "command_execution",
+        "command_output",
+        "file_change",
+        "tool_call",
+        "tool_output"
+    )
+    private val developerOnlyLabels = setOf("명령", "파일")
 
     fun buildPayload(
         taskId: String,
@@ -50,16 +59,21 @@ internal object TaskLogDetailFormatter {
         val appName = summary?.title?.trim()?.takeIf { it.isNotBlank() }
             ?: displayedAppName?.trim()?.takeIf { it.isNotBlank() }
             ?: "앱"
-        val status = summary?.status?.trim()?.takeIf { it.isNotBlank() }
+        val rawStatus = summary?.status?.trim()?.takeIf { it.isNotBlank() }
             ?: currentStatus.trim().takeIf { it.isNotBlank() }
             ?: "상태 없음"
+        val status = if (summary?.hasRuntimeError == true) {
+            "실행 오류 확인 필요"
+        } else {
+            rawStatus
+        }
         val normalizedTaskId = taskId.trim()
         val visibleMessages = messages
             .filterNot { it.kind == MessageKind.BUILD_LOG }
             .mapNotNull { messageToItem(it, formatTimestamp) }
         val latestFirstMessages = visibleMessages.asReversed()
         val progressItems = latestFirstMessages
-            .filter { it.label in setOf("상태", "빌드", "준비", "점검", "테스트", "작업", "명령") }
+            .filter { it.label in setOf("상태", "빌드", "준비", "점검", "테스트", "작업") }
             .filterNot { isNoisyBody(it.body) }
             .distinctItems()
         val agentItems = latestFirstMessages
@@ -94,9 +108,12 @@ internal object TaskLogDetailFormatter {
         formatTimestamp: (String?) -> String?
     ): TaskLogDetailItem? {
         if (isArtifactMessage(message)) return null
+        val eventType = message.eventType?.trim()?.lowercase().orEmpty()
+        if (eventType in developerOnlyEventTypes) return null
         val body = sanitizeLogText(message.body)
         if (body.isBlank() || isHiddenBody(body)) return null
         val label = labelFor(message)
+        if (label in developerOnlyLabels) return null
         val time = formatDisplayTime(message.createdAt, formatTimestamp)
         val detail = sanitizeLogText(message.detail).takeIf {
             it.isNotBlank() && normalizeText(it) != normalizeText(body)
@@ -201,7 +218,10 @@ internal object TaskLogDetailFormatter {
                     val item = parsed.get("item")?.takeIf { it.isJsonObject }?.asJsonObject
                         ?: return@forEach
                     if (firstString(item, "type")?.trim() != "agent_message") return@forEach
-                    firstTextCandidate(item)?.let { messages += it }
+                    firstTextCandidate(item)
+                        ?.let(::sanitizeLogText)
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { messages += it }
                 }
         }
         return messages.toList()
@@ -250,13 +270,67 @@ internal object TaskLogDetailFormatter {
     private fun sanitizeLogText(value: String?): String {
         return value.orEmpty()
             .lineSequence()
-            .map { line ->
-                line
+            .mapNotNull { rawLine ->
+                val line = rawLine
                     .replace(Regex("^\\s*(단계|상태)\\s*:\\s*"), "")
                     .trim()
+                if (isDeveloperOnlyLogLine(line)) {
+                    null
+                } else {
+                    line
+                        .replace(
+                            Regex("""(?i)(?:/Users|/home|/srv|/opt|/var|/tmp|/private|/volume\d*)/[^\s"'`]+"""),
+                            "앱 내부 파일"
+                        )
+                        .replace(
+                            Regex("""(?i)[A-Z]:\\[^\s"'`]+"""),
+                            "앱 내부 파일"
+                        )
+                        .replace(
+                            Regex("""(?i)\b(?:workspace|workspaces|user_phone_[^/\s]+)(?:[/\\][^\s"'`]+)*"""),
+                            "사용자 작업 공간"
+                        )
+                        .replace(
+                            Regex("""(?i)`?[\w./\\-]+\.(?:dart|kt|java|xml|gradle|json|ya?ml|py)(?::\d+)?`?"""),
+                            "앱 내부 파일"
+                        )
+                        .replace(
+                            Regex("""(?<!\d)01[016789](?:[- ]?\d){7,8}(?!\d)"""),
+                            "사용자 정보"
+                        )
+                        .replace(Regex("""(?i)\bpackage_name\b"""), "앱 식별 정보")
+                        .replace(Regex("""(?i)\btask_id\b"""), "작업 정보")
+                        .replace(
+                            Regex("""(?<![\w가-힣])_?[A-Za-z]+(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)[A-Za-z0-9_]*(?![\w가-힣])"""),
+                            "앱 내부 설정"
+                        )
+                        .replace(Regex("""[ \t]{2,}"""), " ")
+                        .trim()
+                }
             }
             .filter { it.isNotBlank() }
             .joinToString("\n")
             .trim()
+    }
+
+    private fun isDeveloperOnlyLogLine(value: String): Boolean {
+        if (value.isBlank()) return false
+        val normalized = value.trim().lowercase()
+        if (normalized.startsWith("{") && normalized.endsWith("}")) return true
+        return listOf(
+            "$ ",
+            "command:",
+            "명령:",
+            "cd ",
+            "flutter ",
+            "dart ",
+            "gradle ",
+            "./gradlew",
+            "python ",
+            "python3 ",
+            "codex ",
+            "bash ",
+            "sh "
+        ).any(normalized::startsWith)
     }
 }

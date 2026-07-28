@@ -22,6 +22,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 class TaskLogDetailActivity : AppCompatActivity() {
     private val gson = GsonBuilder().create()
@@ -155,7 +161,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
 
     private fun selectRevision(payload: TaskLogDetailPayload, revision: TaskRevisionDto) {
         selectedRevision = revision
-        findViewById<TextView>(R.id.taskLogRevisionValue).text = revisionDisplayLabel(revision)
+        findViewById<TextView>(R.id.taskLogRevisionValue).text = revisionSelectorText(revision)
         bindApkAction(apkActionForRevision(payload, revision))
         bindBranchAction(payload, revision)
     }
@@ -279,7 +285,12 @@ class TaskLogDetailActivity : AppCompatActivity() {
         return TaskLogApkAction(
             taskId = taskId,
             title = "${payload.appName} $version APK",
-            meta = listOf(version, revision.revision_label, formatBytes(revision.apk_size_bytes))
+            meta = listOf(
+                version,
+                revisionSourceLabel(revision.source),
+                formatRevisionTimestamp(revision.created_at),
+                formatBytes(revision.apk_size_bytes)
+            )
                 .filter { it.isNotBlank() }
                 .distinct()
                 .joinToString(" · "),
@@ -295,11 +306,55 @@ class TaskLogDetailActivity : AppCompatActivity() {
     }
 
     private fun revisionMenuLabel(revision: TaskRevisionDto): String {
-        val source = revision.source.takeIf { it.isNotBlank() }
-        val apk = if (revision.has_apk) "APK" else "APK 없음"
-        return listOf(revisionDisplayLabel(revision), source, apk)
-            .filterNotNull()
-            .joinToString(" · ")
+        val summary = revision.request_summary.trim().let { value ->
+            if (value.length <= 42) value else value.take(41).trimEnd() + "…"
+        }
+        return listOf(
+            revisionDisplayLabel(revision),
+            revisionSourceLabel(revision.source),
+            formatRevisionTimestamp(revision.created_at),
+            summary.takeIf { it.isNotBlank() }
+        ).filterNotNull().joinToString(" · ")
+    }
+
+    private fun revisionSelectorText(revision: TaskRevisionDto): String {
+        val typeAndTime = listOf(
+            revisionSourceLabel(revision.source),
+            formatRevisionTimestamp(revision.created_at)
+        ).filter { it.isNotBlank() }.joinToString(" · ")
+        val summary = revision.request_summary.trim().let { value ->
+            if (value.length <= 180) value else value.take(179).trimEnd() + "…"
+        }
+        return listOf(
+            revisionDisplayLabel(revision),
+            typeAndTime.takeIf { it.isNotBlank() },
+            summary.takeIf { it.isNotBlank() }
+        ).filterNotNull().joinToString("\n")
+    }
+
+    private fun revisionSourceLabel(source: String): String {
+        return when (source.trim().lowercase()) {
+            "new_app" -> "최초 생성"
+            "existing_app_modification", "existing_app", "modification" -> "수정 요청"
+            "runtime_repair", "repair" -> "실행 오류 복구"
+            "branched_revision", "branch" -> "분기 생성"
+            "current" -> "현재 버전"
+            else -> "앱 버전"
+        }
+    }
+
+    private fun formatRevisionTimestamp(value: String): String {
+        val raw = value.trim()
+        if (raw.isBlank()) return ""
+        val zone = ZoneId.of("Asia/Seoul")
+        val dateTime = runCatching { Instant.parse(raw).atZone(zone) }.getOrNull()
+            ?: runCatching { OffsetDateTime.parse(raw).atZoneSameInstant(zone) }.getOrNull()
+            ?: runCatching {
+                LocalDateTime.parse(raw, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+                    .atZone(zone)
+            }.getOrNull()
+            ?: return ""
+        return DateTimeFormatter.ofPattern("M월 d일 a h:mm", Locale.KOREAN).format(dateTime)
     }
 
     private fun formatBytes(value: Long?): String {

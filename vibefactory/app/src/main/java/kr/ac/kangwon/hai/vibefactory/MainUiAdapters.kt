@@ -80,7 +80,9 @@ class TaskSummaryAdapter(
             runtimeBadge.visibility = if (item.hasRuntimeError) View.VISIBLE else View.GONE
             title.text = item.title
             subtitle.text = listOfNotNull(item.subtitle, item.updatedAt).joinToString(" • ")
-            status.text = if (item.hasApk) {
+            status.text = if (item.hasRuntimeError) {
+                context.getString(R.string.task_runtime_error_status)
+            } else if (item.hasApk) {
                 context.getString(R.string.task_status_with_apk, item.status)
             } else {
                 item.status

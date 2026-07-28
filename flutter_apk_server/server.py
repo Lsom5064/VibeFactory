@@ -7609,6 +7609,81 @@ def revision_version_name(revision_label: str) -> str:
     return f"v{revision_number}" if revision_number > 0 else revision_label
 
 
+def revision_request_summary(
+    task: dict[str, Any],
+    snapshot: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> str:
+    source = normalize_whitespace(str(snapshot.get("source") or "")).lower()
+    if source == "new_app":
+        return "최초 앱 생성"
+    if source == "runtime_repair":
+        return "감지된 실행 오류 자동 복구"
+    if source == "branched_revision":
+        return "선택한 버전에서 새 Task로 분기"
+
+    snapshot_time = parse_iso_datetime(str(snapshot.get("created_at") or ""))
+    eligible_events: list[dict[str, Any]] = []
+    for event in events:
+        event_time = parse_iso_datetime(str(event.get("created_at") or ""))
+        if snapshot_time is not None and event_time is not None and event_time > snapshot_time:
+            continue
+        eligible_events.append(event)
+
+    for event in reversed(eligible_events):
+        if str(event.get("event_type") or "").strip().lower() != "agent_raw_output":
+            continue
+        raw_text = str(event.get("message_text") or "").strip()
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        summary = normalize_whitespace(str(parsed.get("effective_user_prompt") or ""))
+        if summary:
+            return compact_revision_request_summary(summary)
+
+    ignored_user_messages = {
+        "만들어진 프롬프트대로 생성요청 문구를 보냈어요",
+        "만들어진 프롬프트대로 생성 요청 문구를 보냈어요",
+    }
+    for event in reversed(eligible_events):
+        if str(event.get("actor") or "").strip().lower() != "user":
+            continue
+        if str(event.get("event_type") or "").strip().lower() != "user_message":
+            continue
+        summary = normalize_whitespace(str(event.get("message_text") or ""))
+        if not summary or summary in ignored_user_messages:
+            continue
+        return compact_revision_request_summary(summary)
+
+    if source in {"existing_app_modification", "existing_app", "modification"}:
+        return "사용자 수정 요청 반영"
+    prompt = normalize_whitespace(str(task.get("build_request_prompt") or task.get("prompt") or ""))
+    return compact_revision_request_summary(prompt) if prompt else "앱 버전 생성"
+
+
+def parse_iso_datetime(value: str) -> Optional[datetime]:
+    normalized = value.strip()
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def compact_revision_request_summary(value: str, *, limit: int = 320) -> str:
+    sanitized = normalize_whitespace(sanitize_codex_followup_user_text(value))
+    if len(sanitized) <= limit:
+        return sanitized
+    return sanitized[: limit - 1].rstrip() + "…"
+
+
 def find_revision_apk(workspace_path: Path, project_path: Path, task: dict[str, Any]) -> Optional[Path]:
     candidates: list[Path] = []
     task_apk_path = normalize_whitespace(str(task.get("apk_path") or ""))
@@ -7635,7 +7710,12 @@ def find_revision_apk(workspace_path: Path, project_path: Path, task: dict[str, 
     return None
 
 
-def serialize_project_revision(task: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+def serialize_project_revision(
+    task: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    request_summary: str = "",
+) -> dict[str, Any]:
     workspace_path = Path(str(snapshot.get("workspace_path") or task.get("workspace_path") or "")).resolve()
     project_path = Path(str(snapshot.get("project_path") or "")).resolve()
     revision_label = str(snapshot.get("revision_label") or current_revision_label(project_path))
@@ -7653,7 +7733,7 @@ def serialize_project_revision(task: dict[str, Any], snapshot: dict[str, Any]) -
         "version_name": revision_version_name(revision_label),
         "source": str(snapshot.get("source") or ""),
         "created_at": str(snapshot.get("created_at") or ""),
-        "project_path": str(project_path),
+        "request_summary": request_summary,
         "apk_path": artifact_path,
         "apk_url": f"/download/{task.get('task_id')}" if artifact_path else "",
         "apk_size_bytes": apk_path.stat().st_size if apk_path is not None else None,
@@ -9069,7 +9149,15 @@ def create_app() -> FastAPI:
                     "created_at": task.get("created_at"),
                 }
             ]
-        revisions = [serialize_project_revision(task, snapshot) for snapshot in snapshots]
+        events = db.list_events(task_id)
+        revisions = [
+            serialize_project_revision(
+                task,
+                snapshot,
+                request_summary=revision_request_summary(task, snapshot, events),
+            )
+            for snapshot in snapshots
+        ]
         return {"task_id": task_id, "revisions": revisions}
 
     @app.post("/tasks/{task_id}/revisions/{revision_label}/branch", status_code=202)

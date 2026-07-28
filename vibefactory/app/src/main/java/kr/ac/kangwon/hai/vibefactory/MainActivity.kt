@@ -57,6 +57,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updateLayoutParams
 import androidx.core.view.updatePadding
 import androidx.drawerlayout.widget.DrawerLayout
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -104,6 +105,8 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "VibeFactoryHost"
         private const val STATE_SELECTED_TASK_ID = EXTRA_SELECTED_TASK_ID
         private const val STATE_INPUT_PROMPT = "input_prompt"
+        private const val STATE_CHAT_SCROLL_MESSAGE_ID = "chat_scroll_message_id"
+        private const val STATE_CHAT_SCROLL_TOP_OFFSET = "chat_scroll_top_offset"
         private const val REQUEST_PHONE_NUMBER_PERMISSION = 7001
         private const val REQUEST_NOTIFICATION_PERMISSION = 7002
         private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete_alerts"
@@ -182,6 +185,9 @@ class MainActivity : AppCompatActivity() {
     private var phoneGateContentBaseRightPadding: Int = 0
 
     private val preferencesStore by lazy { HostPreferencesStore(this, gson, TAG) }
+    private val composerDraftViewModel by lazy(LazyThreadSafetyMode.NONE) {
+        ViewModelProvider(this)[ComposerDraftViewModel::class.java]
+    }
     private val taskAdapter = TaskSummaryAdapter(
         onClick = { summary -> selectTask(summary.taskId, autoInstallOnSuccess = false) },
         onDelete = { summary -> confirmHideTaskFromChatList(summary) }
@@ -242,7 +248,10 @@ class MainActivity : AppCompatActivity() {
     private val handledConfirmationMessageIds = mutableSetOf<String>()
     private var pendingInitialChatScrollTaskId: String? = null
     private var pendingChatAnchorMessageId: String? = null
+    private var pendingChatAnchorTopOffset: Int? = null
     private var clearPendingChatAnchorAfterScroll: Boolean = false
+    private var pendingRestoredChatScrollTaskId: String? = null
+    private var pendingRestoredChatScrollSnapshot: ChatScrollSnapshot? = null
     private var pendingScrollLatestAfterResponse: Boolean = false
     private var chatScrollStartedByUser: Boolean = false
     private var chatAutoScrollLockedByUser: Boolean = false
@@ -252,7 +261,8 @@ class MainActivity : AppCompatActivity() {
     private val notifiedBuildSuccessTaskIds = mutableSetOf<String>()
     private val buildMonitorStartedTaskIds = mutableSetOf<String>()
     private var isMessageTextSelectionActive = false
-    private val selectedAttachments = mutableListOf<SelectedAttachment>()
+    private val selectedAttachments: MutableList<SelectedAttachment>
+        get() = composerDraftViewModel.selectedAttachments
     private var lastRenderedTaskListFingerprint: String? = null
     private var lastRenderedMessageListFingerprint: String? = null
     private var lastRenderedAttachmentFingerprint: String? = null
@@ -1087,6 +1097,23 @@ class MainActivity : AppCompatActivity() {
         if (savedInstanceState == null) return
 
         inputPrompt.setText(savedInstanceState.getString(STATE_INPUT_PROMPT).orEmpty())
+        val restoredTaskId = visibleTaskIdCandidate(savedInstanceState.getString(STATE_SELECTED_TASK_ID))
+        val restoredMessageId = savedInstanceState.getString(STATE_CHAT_SCROLL_MESSAGE_ID)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+        if (
+            !restoredTaskId.isNullOrBlank() &&
+            !restoredMessageId.isNullOrBlank() &&
+            savedInstanceState.containsKey(STATE_CHAT_SCROLL_TOP_OFFSET)
+        ) {
+            pendingRestoredChatScrollTaskId = restoredTaskId
+            pendingRestoredChatScrollSnapshot = ChatScrollSnapshot(
+                messageId = restoredMessageId,
+                topOffset = savedInstanceState.getInt(STATE_CHAT_SCROLL_TOP_OFFSET)
+            )
+            chatAutoScrollLockedByUser = true
+            chatShouldStickToBottom = false
+        }
     }
 
     private fun submitMessage() {
@@ -2822,7 +2849,7 @@ ${record.stackTrace}
         val hasPersistedMessages = taskConversationMessages[normalizedTaskId].orEmpty().isNotEmpty()
         if (!hasPersistedMessages) return
         val wasAlreadySelected = screenState.selectedTaskId == normalizedTaskId
-        if (!wasAlreadySelected) {
+        if (!wasAlreadySelected && !hasPendingRestoredChatScroll(normalizedTaskId)) {
             requestScrollLatestAfterResponse(force = true)
         }
 
@@ -3307,6 +3334,7 @@ ${record.stackTrace}
             .filterNot(::isRedundantDownloadedStatusMessage)
             .filterNot(::isRedundantModificationEchoMessage)
         val visibleMessages = withColdStartMessage(withDownloadProgressMessage(baseVisibleMessages))
+        activateRestoredChatScrollIfReady(screenState.selectedTaskId, visibleMessages)
         val hasTransientProgressUpdate = visibleMessages.any {
             it.isLoading ||
                 it.artifactDownloading ||
@@ -3340,6 +3368,7 @@ ${record.stackTrace}
         if (scrollLatestAfterResponse) {
             pendingScrollLatestAfterResponse = false
             pendingChatAnchorMessageId = null
+            pendingChatAnchorTopOffset = null
             clearPendingChatAnchorAfterScroll = false
         }
         val messageListFingerprint = "${screenState.selectedTaskId.orEmpty()}|${messageListRenderFingerprint(visibleMessages)}"
@@ -6832,21 +6861,25 @@ ${record.stackTrace}
         recyclerMessages.post {
             scrollChatToAnchor(anchorMessageId)
             recyclerMessages.post {
-                scrollChatToAnchor(anchorMessageId)
-                if (clearAfterScroll && pendingChatAnchorMessageId == anchorMessageId) {
+                val restored = scrollChatToAnchor(anchorMessageId)
+                if (restored && clearAfterScroll && pendingChatAnchorMessageId == anchorMessageId) {
                     pendingChatAnchorMessageId = null
+                    pendingChatAnchorTopOffset = null
                     clearPendingChatAnchorAfterScroll = false
                 }
             }
         }
     }
 
-    private fun scrollChatToAnchor(anchorMessageId: String) {
+    private fun scrollChatToAnchor(anchorMessageId: String): Boolean {
         val anchorIndex = chatAdapter.currentList.indexOfFirst { it.id == anchorMessageId }
-        if (anchorIndex < 0) return
-        val layoutManager = recyclerMessages.layoutManager as? LinearLayoutManager ?: return
-        val topOffset = (recyclerMessages.height * 0.12f).toInt().coerceAtLeast(dp(12))
+        if (anchorIndex < 0) return false
+        val layoutManager = recyclerMessages.layoutManager as? LinearLayoutManager ?: return false
+        val topOffset = pendingChatAnchorTopOffset
+            ?.takeIf { pendingChatAnchorMessageId == anchorMessageId }
+            ?: (recyclerMessages.height * 0.12f).toInt().coerceAtLeast(dp(12))
         layoutManager.scrollToPositionWithOffset(anchorIndex, topOffset)
+        return true
     }
 
     private fun scrollLatestMessageAfterLayout() {
@@ -6991,7 +7024,34 @@ ${record.stackTrace}
     private fun requestChatScrollAnchor(messageId: String) {
         clearInitialScrollForActiveTask()
         pendingChatAnchorMessageId = messageId
+        pendingChatAnchorTopOffset = null
         clearPendingChatAnchorAfterScroll = false
+    }
+
+    private fun hasPendingRestoredChatScroll(taskId: String): Boolean {
+        return pendingRestoredChatScrollTaskId == taskId &&
+            pendingRestoredChatScrollSnapshot != null
+    }
+
+    private fun activateRestoredChatScrollIfReady(
+        taskId: String?,
+        visibleMessages: List<ChatMessage>
+    ) {
+        val normalizedTaskId = taskId?.trim()?.takeIf { it.isNotBlank() } ?: return
+        if (!hasPendingRestoredChatScroll(normalizedTaskId)) return
+        val snapshot = pendingRestoredChatScrollSnapshot ?: return
+        if (visibleMessages.none { it.id == snapshot.messageId }) return
+
+        pendingRestoredChatScrollTaskId = null
+        pendingRestoredChatScrollSnapshot = null
+        pendingInitialChatScrollTaskId = null
+        pendingScrollLatestAfterResponse = false
+        pendingChatAnchorMessageId = snapshot.messageId
+        pendingChatAnchorTopOffset = snapshot.topOffset
+        clearPendingChatAnchorAfterScroll = true
+        chatAutoScrollLockedByUser = true
+        chatShouldStickToBottom = false
+        manualChatScrollSnapshot = snapshot
     }
 
     private fun requestChatAnchorScrollAgain(clearAfterScroll: Boolean) {
@@ -7052,8 +7112,16 @@ ${record.stackTrace}
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putString(STATE_SELECTED_TASK_ID, visibleTaskIdCandidate(screenState.selectedTaskId ?: currentTaskId))
+        val selectedTaskId = visibleTaskIdCandidate(screenState.selectedTaskId ?: currentTaskId)
+        outState.putString(STATE_SELECTED_TASK_ID, selectedTaskId)
         outState.putString(STATE_INPUT_PROMPT, inputPrompt.text?.toString().orEmpty())
+        if (!selectedTaskId.isNullOrBlank() && !isChatNearBottomByPixels()) {
+            val snapshot = captureChatScrollSnapshot() ?: manualChatScrollSnapshot
+            if (snapshot != null) {
+                outState.putString(STATE_CHAT_SCROLL_MESSAGE_ID, snapshot.messageId)
+                outState.putInt(STATE_CHAT_SCROLL_TOP_OFFSET, snapshot.topOffset)
+            }
+        }
     }
 
     private val messageSelectionActionModeCallback = object : ActionMode.Callback {
