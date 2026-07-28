@@ -10,8 +10,9 @@ data class ReferenceImageAttachment(
 }
 
 data class ChatImagePreview(
-    val displayName: String,
-    val base64: String
+    val displayName: String = "",
+    val base64: String = "",
+    val remoteUrl: String? = null
 )
 
 enum class SelectedAttachmentKind(

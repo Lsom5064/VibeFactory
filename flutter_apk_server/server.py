@@ -3715,6 +3715,20 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_task_attachment(self, task_id: str, attachment_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT attachment_id, task_id, event_id, source, kind, original_name, mime_type,
+                       workspace_path, absolute_path, size_bytes, sha256, status, error_message, created_at
+                FROM task_attachments
+                WHERE task_id = ? AND attachment_id = ?
+                LIMIT 1
+                """,
+                (task_id, attachment_id),
+            ).fetchone()
+            return dict(row) if row else None
+
     def list_events(self, task_id: str, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
         with self.connect() as connection:
             if limit is not None and limit > 0:
@@ -5972,12 +5986,31 @@ def build_task_timeline_events(
     task_id: str,
     *,
     limit: int = 120,
-) -> list[dict[str, str]]:
-    timeline: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    attachments_by_event_id: dict[str, list[dict[str, Any]]] = {}
+    for attachment in db.list_task_attachments(task_id):
+        event_id = str(attachment.get("event_id") or "").strip()
+        if not event_id or str(attachment.get("status") or "") != "saved":
+            continue
+        attachments_by_event_id.setdefault(event_id, []).append(
+            {
+                "attachment_id": str(attachment.get("attachment_id") or ""),
+                "kind": str(attachment.get("kind") or ""),
+                "name": str(attachment.get("original_name") or ""),
+                "mime_type": str(attachment.get("mime_type") or ""),
+                "size_bytes": int(attachment.get("size_bytes") or 0),
+            }
+        )
+
+    timeline: list[dict[str, Any]] = []
     source_limit = limit * 3 if limit > 0 else None
     for row in db.list_events(task_id, limit=source_limit):
         event = task_event_to_timeline_event(row)
         if event:
+            event_id = str(row.get("event_id") or "").strip()
+            event_attachments = attachments_by_event_id.get(event_id, [])
+            if event_attachments:
+                event["attachments"] = event_attachments
             timeline.append(event)
     return timeline[-limit:] if limit > 0 else timeline
 
@@ -9212,6 +9245,51 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="device_id or phone_number is required")
         tasks = db.query_tasks(user_id=user_id, device_id=device_id, phone_number=phone_number)
         return {"tasks": [serialize_task_summary(task) for task in tasks]}
+
+    @app.get("/tasks/{task_id}/attachments/{attachment_id}")
+    def download_task_attachment(
+        task_id: str,
+        attachment_id: str,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> FileResponse:
+        _ = user_id
+        db: Database = app.state.db
+        settings: Settings = app.state.settings
+        if not (str(device_id or "").strip() or str(phone_number or "").strip()):
+            raise HTTPException(status_code=404, detail="attachment not found")
+        task = db.get_task(task_id)
+        if not task or not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
+            raise HTTPException(status_code=404, detail="attachment not found")
+        attachment = db.get_task_attachment(task_id, attachment_id)
+        if not attachment or str(attachment.get("status") or "") != "saved":
+            raise HTTPException(status_code=404, detail="attachment not found")
+
+        workspace_root = Path(
+            str(task.get("workspace_path") or task_workspace_root_for(settings, task))
+        ).resolve()
+        path_value = str(
+            attachment.get("absolute_path")
+            or attachment.get("workspace_path")
+            or ""
+        ).strip()
+        if not path_value:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        attachment_path = Path(path_value)
+        if not attachment_path.is_absolute():
+            attachment_path = workspace_root / attachment_path
+        attachment_path = attachment_path.resolve()
+        if not ensure_within_root(attachment_path, workspace_root):
+            raise HTTPException(status_code=403, detail="invalid attachment path")
+        if not attachment_path.exists() or not attachment_path.is_file():
+            raise HTTPException(status_code=404, detail="attachment not found")
+
+        return FileResponse(
+            attachment_path,
+            media_type=str(attachment.get("mime_type") or "application/octet-stream"),
+            filename=str(attachment.get("original_name") or attachment_path.name),
+        )
 
     @app.get("/download/{task_id}")
     def download_apk(

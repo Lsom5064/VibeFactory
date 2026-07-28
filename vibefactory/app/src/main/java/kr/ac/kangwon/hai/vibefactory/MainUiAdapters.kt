@@ -502,6 +502,7 @@ class ChatMessageAdapter(
             bindInlineImagePreview(
                 imageView = imagePreview,
                 imageBase64 = preview.base64,
+                imageUrl = preview.remoteUrl,
                 fallbackVisibility = View.GONE,
                 maxDimension = 720
             )
@@ -510,6 +511,7 @@ class ChatMessageAdapter(
                 showAttachedImageDialog(
                     context = context,
                     imageBase64 = preview.base64,
+                    imageUrl = preview.remoteUrl,
                     imageName = preview.displayName
                 )
             }
@@ -555,6 +557,7 @@ class ChatMessageAdapter(
                 bindInlineImagePreview(
                     imageView = this,
                     imageBase64 = preview.base64,
+                    imageUrl = preview.remoteUrl,
                     fallbackVisibility = View.GONE,
                     maxDimension = 320
                 )
@@ -562,6 +565,7 @@ class ChatMessageAdapter(
                     showAttachedImageDialog(
                         context = context,
                         imageBase64 = preview.base64,
+                        imageUrl = preview.remoteUrl,
                         imageName = preview.displayName
                     )
                 }
@@ -571,6 +575,7 @@ class ChatMessageAdapter(
         private fun showAttachedImageDialog(
             context: android.content.Context,
             imageBase64: String?,
+            imageUrl: String?,
             imageName: String?
         ) {
             val imageView = ImageView(context).apply {
@@ -586,6 +591,7 @@ class ChatMessageAdapter(
             bindInlineImagePreview(
                 imageView = imageView,
                 imageBase64 = imageBase64,
+                imageUrl = imageUrl,
                 fallbackVisibility = View.GONE,
                 maxDimension = 2048
             )

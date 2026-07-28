@@ -13,6 +13,8 @@ import android.view.View
 import android.widget.ImageView
 import java.io.ByteArrayOutputStream
 import java.lang.ref.WeakReference
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Base64
 import java.util.concurrent.Executors
 
@@ -132,10 +134,12 @@ fun bindInlineImagePreview(
     imageView: ImageView,
     imageBase64: String?,
     fallbackVisibility: Int,
-    maxDimension: Int = 720
+    maxDimension: Int = 720,
+    imageUrl: String? = null
 ) {
     val encoded = imageBase64?.trim().orEmpty()
-    if (encoded.isBlank()) {
+    val remoteUrl = imageUrl?.trim().orEmpty()
+    if (encoded.isBlank() && remoteUrl.isBlank()) {
         imageView.tag = null
         imageView.setImageDrawable(null)
         imageView.visibility = fallbackVisibility
@@ -145,12 +149,39 @@ fun bindInlineImagePreview(
     InlineImagePreviewLoader.load(
         imageView = imageView,
         encoded = encoded,
+        imageUrl = remoteUrl,
         fallbackVisibility = fallbackVisibility,
         maxDimension = maxDimension.coerceAtLeast(1)
     )
 }
 
+fun compactImagePreviewForStorage(encoded: String, maxEncodedChars: Int): String {
+    val normalized = encoded.trim()
+    if (normalized.isBlank()) return ""
+    val sourceBytes = runCatching { Base64.getDecoder().decode(normalized) }.getOrNull() ?: return ""
+    if (!isCompleteImageBytes(sourceBytes)) return ""
+    if (normalized.length <= maxEncodedChars) return normalized
+
+    val decoded = BitmapFactory.decodeByteArray(sourceBytes, 0, sourceBytes.size) ?: return ""
+    val scaled = scaleBitmap(decoded, maxDimension = 720)
+    try {
+        var quality = 86
+        while (quality >= 46) {
+            val output = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, quality, output)
+            val compacted = Base64.getEncoder().encodeToString(output.toByteArray())
+            if (compacted.length <= maxEncodedChars) return compacted
+            quality -= 8
+        }
+        return ""
+    } finally {
+        if (scaled !== decoded) scaled.recycle()
+        decoded.recycle()
+    }
+}
+
 private object InlineImagePreviewLoader {
+    private const val MAX_REMOTE_IMAGE_BYTES = 16 * 1024 * 1024
     private val mainHandler = Handler(Looper.getMainLooper())
     private val decoder = Executors.newFixedThreadPool(2) { runnable ->
         Thread(runnable, "vibefactory-image-decoder").apply { isDaemon = true }
@@ -162,10 +193,11 @@ private object InlineImagePreviewLoader {
     fun load(
         imageView: ImageView,
         encoded: String,
+        imageUrl: String,
         fallbackVisibility: Int,
         maxDimension: Int
     ) {
-        val cacheKey = buildCacheKey(encoded, maxDimension)
+        val cacheKey = buildCacheKey(encoded, imageUrl, maxDimension)
         imageView.tag = cacheKey
         bitmapCache.get(cacheKey)?.let { bitmap ->
             imageView.setImageBitmap(bitmap)
@@ -178,7 +210,11 @@ private object InlineImagePreviewLoader {
         val target = WeakReference(imageView)
 
         decoder.execute {
-            val bitmap = bitmapCache.get(cacheKey) ?: decodeScaledBitmap(encoded, maxDimension)
+            val bitmap = bitmapCache.get(cacheKey) ?: decodeScaledBitmap(
+                encoded = encoded,
+                imageUrl = imageUrl,
+                maxDimension = maxDimension
+            )
             if (bitmap != null) {
                 bitmapCache.put(cacheKey, bitmap)
             }
@@ -196,32 +232,77 @@ private object InlineImagePreviewLoader {
         }
     }
 
-    private fun decodeScaledBitmap(encoded: String, maxDimension: Int): Bitmap? {
-        return runCatching {
-            val bytes = Base64.getDecoder().decode(encoded)
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-
-            var sampleSize = 1
-            while (maxOf(bounds.outWidth, bounds.outHeight) / (sampleSize * 2) >= maxDimension) {
-                sampleSize *= 2
-            }
-            val options = BitmapFactory.Options().apply {
-                inSampleSize = sampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-            }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-        }.getOrNull()
+    private fun decodeScaledBitmap(
+        encoded: String,
+        imageUrl: String,
+        maxDimension: Int
+    ): Bitmap? {
+        val localBytes = encoded
+            .takeIf { it.isNotBlank() }
+            ?.let { runCatching { Base64.getDecoder().decode(it) }.getOrNull() }
+        val sourceBytes = when {
+            localBytes != null && isCompleteImageBytes(localBytes) -> localBytes
+            imageUrl.isNotBlank() -> downloadImageBytes(imageUrl)
+            else -> localBytes
+        } ?: return null
+        return decodeScaledBitmapBytes(sourceBytes, maxDimension)
     }
 
-    private fun buildCacheKey(encoded: String, maxDimension: Int): String {
+    private fun decodeScaledBitmapBytes(bytes: ByteArray, maxDimension: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        var sampleSize = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sampleSize * 2) >= maxDimension) {
+            sampleSize *= 2
+        }
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    }
+
+    private fun downloadImageBytes(imageUrl: String): ByteArray? {
+        val connection = runCatching {
+            (URL(imageUrl).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10_000
+                readTimeout = 20_000
+                instanceFollowRedirects = true
+            }
+        }.getOrNull() ?: return null
+        return try {
+            if (connection.responseCode !in 200..299) return null
+            connection.inputStream.use { input ->
+                val output = ByteArrayOutputStream()
+                val buffer = ByteArray(8192)
+                var total = 0
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    total += read
+                    if (total > MAX_REMOTE_IMAGE_BYTES) return null
+                    output.write(buffer, 0, read)
+                }
+                output.toByteArray().takeIf(::isCompleteImageBytes)
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun buildCacheKey(encoded: String, imageUrl: String, maxDimension: Int): String {
         return buildString {
             append(encoded.length)
             append(':')
             append(encoded.take(48).hashCode())
             append(':')
             append(encoded.takeLast(48).hashCode())
+            append(':')
+            append(imageUrl.hashCode())
             append(':')
             append(maxDimension)
         }
@@ -230,6 +311,35 @@ private object InlineImagePreviewLoader {
     private fun cacheSizeBytes(): Int {
         val available = Runtime.getRuntime().maxMemory().coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         return (available / 12).coerceIn(8 * 1024 * 1024, 32 * 1024 * 1024)
+    }
+}
+
+private fun isCompleteImageBytes(bytes: ByteArray): Boolean {
+    if (bytes.size < 12) return false
+    val unsigned = { index: Int -> bytes[index].toInt() and 0xFF }
+    return when {
+        unsigned(0) == 0xFF && unsigned(1) == 0xD8 ->
+            unsigned(bytes.lastIndex - 1) == 0xFF && unsigned(bytes.lastIndex) == 0xD9
+        unsigned(0) == 0x89 &&
+            bytes.copyOfRange(1, 4).contentEquals(byteArrayOf(0x50, 0x4E, 0x47)) ->
+            bytes.takeLast(12).toByteArray().let { tail ->
+                tail.size >= 8 &&
+                    tail[4] == 0x49.toByte() &&
+                    tail[5] == 0x45.toByte() &&
+                    tail[6] == 0x4E.toByte() &&
+                    tail[7] == 0x44.toByte()
+            }
+        bytes.copyOfRange(0, 3).contentEquals("GIF".toByteArray()) ->
+            unsigned(bytes.lastIndex) == 0x3B
+        bytes.copyOfRange(0, 4).contentEquals("RIFF".toByteArray()) &&
+            bytes.copyOfRange(8, 12).contentEquals("WEBP".toByteArray()) -> {
+            val declaredSize = unsigned(4) or
+                (unsigned(5) shl 8) or
+                (unsigned(6) shl 16) or
+                (unsigned(7) shl 24)
+            declaredSize + 8 <= bytes.size
+        }
+        else -> true
     }
 }
 

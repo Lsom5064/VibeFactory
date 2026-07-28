@@ -63,7 +63,9 @@ data class ChatMessage(
 )
 
 fun ChatMessage.allImagePreviews(): List<ChatImagePreview> {
-    val explicitPreviews = imagePreviews.orEmpty().filter { it.base64.isNotBlank() }
+    val explicitPreviews = imagePreviews.orEmpty().filter {
+        it.base64.isNotBlank() || !it.remoteUrl.isNullOrBlank()
+    }
     if (explicitPreviews.isNotEmpty()) return explicitPreviews
     val legacyBase64 = imagePreviewBase64?.takeIf { it.isNotBlank() } ?: return emptyList()
     return listOf(ChatImagePreview(displayName = imagePreviewName.orEmpty(), base64 = legacyBase64))

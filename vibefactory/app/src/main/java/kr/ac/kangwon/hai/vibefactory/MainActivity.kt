@@ -279,7 +279,8 @@ class MainActivity : AppCompatActivity() {
         val apkPath: String?,
         val apkSizeBytes: Long?,
         val appName: String?,
-        val packageName: String?
+        val packageName: String?,
+        val imagePreviews: List<ChatImagePreview>
     )
 
     private data class LogSectionSnapshot(
@@ -3497,7 +3498,7 @@ ${record.stackTrace}
                 append(message.cancelTaskId.orEmpty())
                 append(':')
                 append(message.allImagePreviews().joinToString(",") { preview ->
-                    "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}"
+                    "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}:${preview.remoteUrl.orEmpty()}"
                 })
                 append('|')
             }
@@ -4330,6 +4331,7 @@ ${record.stackTrace}
     ): List<ChatMessage> {
         seedConversationMessages(taskId, response)
         backfillTimelineEventTypes(taskId, response)
+        backfillTimelineAttachments(taskId, response)
         val seededTimeline = buildTaskTimeline(taskId)
         val incomingMessages = when {
             seededTimeline.isNotEmpty() ->
@@ -4625,7 +4627,10 @@ ${record.stackTrace}
             .takeIf { it.isNotBlank() }
     }
 
-    private fun extractTimelineEvents(response: StatusResponse): List<TimelineEventSnapshot> {
+    private fun extractTimelineEvents(
+        response: StatusResponse,
+        taskId: String = response.task_id
+    ): List<TimelineEventSnapshot> {
         val array = response.timeline_events?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
         val startIndex = (array.size() - MAX_CHAT_TIMELINE_EVENTS_FOR_RENDER).coerceAtLeast(0)
         return (startIndex until array.size()).mapNotNull { index ->
@@ -4648,9 +4653,37 @@ ${record.stackTrace}
                 apkPath = firstString(obj, "apk_path") ?: payload?.let { firstString(it, "apk_path") },
                 apkSizeBytes = firstLong(obj, "apk_size_bytes") ?: payload?.let { firstLong(it, "apk_size_bytes") },
                 appName = firstString(obj, "app_name") ?: payload?.let { firstString(it, "app_name") },
-                packageName = firstString(obj, "package_name") ?: payload?.let { firstString(it, "package_name") }
+                packageName = firstString(obj, "package_name") ?: payload?.let { firstString(it, "package_name") },
+                imagePreviews = timelineEventImagePreviews(taskId, obj)
             ).takeIf { it.body.isNotBlank() }
         }
+    }
+
+    private fun timelineEventImagePreviews(taskId: String, obj: JsonObject): List<ChatImagePreview> {
+        val attachments = obj.get("attachments")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?: return emptyList()
+        return attachments.mapNotNull { item ->
+            val attachment = item.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
+            val attachmentId = firstString(attachment, "attachment_id")?.trim().orEmpty()
+            val kind = firstString(attachment, "kind")?.trim()?.lowercase().orEmpty()
+            val mimeType = firstString(attachment, "mime_type")?.trim()?.lowercase().orEmpty()
+            if (attachmentId.isBlank() || (kind != "image" && !mimeType.startsWith("image/"))) {
+                return@mapNotNull null
+            }
+            ChatImagePreview(
+                displayName = firstString(attachment, "name")?.trim().orEmpty().ifBlank { "첨부 이미지" },
+                remoteUrl = taskAttachmentUrl(taskId, attachmentId)
+            )
+        }
+    }
+
+    private fun taskAttachmentUrl(taskId: String, attachmentId: String): String {
+        return Uri.parse(
+            "${HostAppConfig.BASE_URL.trimEnd('/')}/tasks/$taskId/attachments/$attachmentId"
+        ).buildUpon()
+            .appendQueryParameter("device_id", deviceId)
+            .build()
+            .toString()
     }
 
     private fun timelineEventPayloadObject(obj: JsonObject): JsonObject? {
@@ -4697,12 +4730,88 @@ ${record.stackTrace}
             detail = event.detail.ifBlank { null },
             createdAt = event.createdAt.ifBlank { currentTimestampString() },
             eventType = event.eventType.ifBlank { null },
+            imagePreviewBase64 = event.imagePreviews.firstOrNull()?.base64,
+            imagePreviewName = event.imagePreviews.firstOrNull()?.displayName,
+            imagePreviews = event.imagePreviews,
             confirmAction = confirmationAction.ifBlank { null },
             confirmTaskId = taskId.takeIf { messageKind == MessageKind.CONFIRMATION },
             confirmPayload = event.confirmationPayload?.trim()?.ifBlank { null } ?: promptReviewText,
             promptReviewTaskId = taskId.takeIf { promptReviewText != null },
             promptReviewText = promptReviewText
         )
+    }
+
+    private fun backfillTimelineAttachments(taskId: String, response: StatusResponse) {
+        val normalizedTaskId = taskId.trim()
+        if (!ensureTaskChatLoaded(normalizedTaskId)) return
+        val timeline = taskConversationMessages[normalizedTaskId] ?: return
+        var changed = false
+
+        extractTimelineEvents(response)
+            .filter { it.kind.equals("user", ignoreCase = true) && it.imagePreviews.isNotEmpty() }
+            .forEach { event ->
+                val serverMessageId =
+                    "timeline-$normalizedTaskId-${event.eventId.ifBlank { event.body.hashCode().toString() }}"
+                val exactIndex = timeline.indexOfFirst { it.id == serverMessageId }
+                val matchingIndex = if (exactIndex >= 0) {
+                    exactIndex
+                } else {
+                    timeline.indices.reversed().firstOrNull { index ->
+                        val existing = timeline[index]
+                        existing.kind == MessageKind.USER &&
+                            hasSameMessageText(existing.body, event.body) &&
+                            messagesOccurredNearEachOther(existing.createdAt, event.createdAt)
+                    } ?: -1
+                }
+                if (matchingIndex < 0) return@forEach
+
+                val existing = timeline[matchingIndex]
+                val mergedPreviews = mergeImagePreviewSources(
+                    existing = existing.allImagePreviews(),
+                    incoming = event.imagePreviews
+                )
+                if (mergedPreviews != existing.allImagePreviews()) {
+                    timeline[matchingIndex] = existing.copy(
+                        imagePreviewBase64 = mergedPreviews.firstOrNull()?.base64,
+                        imagePreviewName = mergedPreviews.firstOrNull()?.displayName,
+                        imagePreviews = mergedPreviews
+                    )
+                    changed = true
+                }
+            }
+
+        if (changed) {
+            persistTaskChat(normalizedTaskId)
+        }
+    }
+
+    private fun mergeImagePreviewSources(
+        existing: List<ChatImagePreview>,
+        incoming: List<ChatImagePreview>
+    ): List<ChatImagePreview> {
+        val merged = existing.toMutableList()
+        incoming.forEach { next ->
+            val existingIndex = merged.indexOfFirst {
+                it.displayName.equals(next.displayName, ignoreCase = true)
+            }
+            if (existingIndex >= 0) {
+                val current = merged[existingIndex]
+                merged[existingIndex] = current.copy(
+                    displayName = current.displayName.ifBlank { next.displayName },
+                    base64 = current.base64.ifBlank { next.base64 },
+                    remoteUrl = next.remoteUrl?.takeIf { it.isNotBlank() } ?: current.remoteUrl
+                )
+            } else {
+                merged += next
+            }
+        }
+        return merged
+    }
+
+    private fun messagesOccurredNearEachOther(first: String?, second: String?): Boolean {
+        val firstTime = parseMessageTimestamp(first)?.time ?: return true
+        val secondTime = parseMessageTimestamp(second)?.time ?: return true
+        return kotlin.math.abs(firstTime - secondTime) <= 120_000L
     }
 
     private fun extractServerTimelineMessages(
@@ -6135,7 +6244,7 @@ ${record.stackTrace}
         }
         val imageKey = message.allImagePreviews()
             .joinToString("|") { preview ->
-                "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}"
+                "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}:${preview.remoteUrl.orEmpty()}"
             }
         return "user:$bodyKey:$imageKey"
     }
@@ -6459,8 +6568,12 @@ ${record.stackTrace}
         val sameDetail = hasSameMessageText(detail, other.detail)
         return when (kind) {
             MessageKind.USER -> {
-                val imagePreviews = allImagePreviews().map { it.base64 }
-                val otherImagePreviews = other.allImagePreviews().map { it.base64 }
+                val imagePreviews = allImagePreviews().map {
+                    it.base64.ifBlank { it.remoteUrl.orEmpty() }
+                }
+                val otherImagePreviews = other.allImagePreviews().map {
+                    it.base64.ifBlank { it.remoteUrl.orEmpty() }
+                }
                 val hasImage = imagePreviews.isNotEmpty()
                 val otherHasImage = otherImagePreviews.isNotEmpty()
                 when {
