@@ -18,8 +18,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
-import android.telephony.SubscriptionManager
-import android.telephony.TelephonyManager
 import android.text.Editable
 import android.text.InputFilter
 import android.text.InputType
@@ -75,7 +73,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import retrofit2.HttpException
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
@@ -558,7 +555,7 @@ class MainActivity : AppCompatActivity() {
         }
         loadPersistedArtifactStates()
         loadPersistedRuntimeErrors()
-        if (!hasRequiredPhoneNumber() && hasPhoneNumberPermissionGranted()) {
+        if (!hasRequiredPhoneNumber() && PhoneNumberResolver.hasPermission(this)) {
             tryFillPhoneNumberFromSim()
         }
         retryPendingApkInstallIfReady()
@@ -692,6 +689,7 @@ class MainActivity : AppCompatActivity() {
                 )
                 fetchTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
             }
         }
@@ -932,6 +930,7 @@ class MainActivity : AppCompatActivity() {
                     resolveFullLogText(response)?.let(::listOf).orEmpty()
                 }
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
                 Toast.makeText(
                     this@MainActivity,
@@ -1010,6 +1009,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } catch (e: Exception) {
+            e.rethrowIfCancellation()
             logApiFailure("/tasks", deviceId = deviceId, throwable = e)
             showLocalSystemMessage(
                 getString(R.string.message_title_status),
@@ -1233,10 +1233,6 @@ class MainActivity : AppCompatActivity() {
         val hasVisibleMessages = screenState.messages.any { it.kind != MessageKind.DATE_SEPARATOR }
         return !hasSelectedTask && !hasVisibleMessages
     }
-
-    private fun currentReferenceImageName(): String? = selectedAttachments.firstOrNull { it.kind == SelectedAttachmentKind.IMAGE }?.displayName
-
-    private fun currentReferenceImageBase64(): String? = selectedAttachments.firstOrNull { it.kind == SelectedAttachmentKind.IMAGE }?.base64
 
     private fun clearSelectedAttachment(render: Boolean = true) {
         selectedAttachments.clear()
@@ -1594,6 +1590,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 loadTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 setComposerEnabled(true)
                 removeLoadingMessages(sourceTaskId)
                 logApiFailure("/generate", deviceId = deviceId, throwable = e)
@@ -1646,7 +1643,7 @@ class MainActivity : AppCompatActivity() {
                 ?.let { buildTaskTimeline(resolvedTaskId) }
                 .orEmpty(),
             currentStatus = getString(R.string.status_loading_task),
-            statusDetail = getString(R.string.status_loading_task_detail, resolvedTaskId),
+            statusDetail = getString(R.string.status_loading_task_detail),
             canDownload = persistedApkUrlForTask(resolvedTaskId) != null,
             canInstall = persistedDownloadedApkFileForTask(resolvedTaskId) != null
         )
@@ -1672,6 +1669,7 @@ class MainActivity : AppCompatActivity() {
                 )
                 loadTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 logApiFailure("/status/{task_id}", taskId = resolvedTaskId, deviceId = deviceId, throwable = e)
                 addTaskEvent(
                     resolvedTaskId,
@@ -1722,7 +1720,7 @@ class MainActivity : AppCompatActivity() {
             selectedTaskId = resolvedTaskId,
             messages = buildTaskTimeline(resolvedTaskId),
             currentStatus = optimisticStatus ?: getString(R.string.status_loading_task),
-            statusDetail = optimisticDetail ?: getString(R.string.status_loading_task_detail, resolvedTaskId),
+            statusDetail = optimisticDetail ?: getString(R.string.status_loading_task_detail),
             canDownload = persistedApkUrlForTask(resolvedTaskId) != null,
             canInstall = persistedDownloadedApkFileForTask(resolvedTaskId) != null
         )
@@ -1741,6 +1739,7 @@ class MainActivity : AppCompatActivity() {
                 )
                 loadTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 logApiFailure("/status/{task_id}", taskId = resolvedTaskId, deviceId = deviceId, throwable = e)
                 addTaskEvent(
                     resolvedTaskId,
@@ -1773,7 +1772,7 @@ class MainActivity : AppCompatActivity() {
             ?: taskDisplayName(response.app_name)
         val responsePackageName = response.package_name?.trim()?.takeIf { it.isNotBlank() }
 
-        if (isCancelledStatus(response.status.orEmpty())) {
+        if (TaskStatusPolicy.isCancelled(response.status)) {
             addTaskEvent(
                 taskId,
                 ChatMessage(
@@ -2018,13 +2017,14 @@ class MainActivity : AppCompatActivity() {
         }
         currentTaskId = taskId
         val normalizedStatus = response.status.trim()
-        val isSuccess = isSuccessStatus(normalizedStatus)
-        val isCancelled = isCancelledStatus(normalizedStatus)
-        val isClarifying = isClarificationResponse(response) || isClarificationStatus(normalizedStatus)
-        val isFailedBuild = isRetryableStatus(normalizedStatus)
+        val isSuccess = TaskStatusPolicy.isSuccess(normalizedStatus)
+        val isCancelled = TaskStatusPolicy.isCancelled(normalizedStatus)
+        val isClarifying = isClarificationResponse(response) || TaskStatusPolicy.needsClarification(normalizedStatus)
+        val isFailedBuild = TaskStatusPolicy.isRetryableFailure(normalizedStatus)
         val isRetryable = isRetryAllowed(response)
-        val isPollingStatus = shouldPoll(normalizedStatus) && (!isClarifying || isWebResearchInProgress(response))
-        val isErrorResponse = isStatusErrorResponse(normalizedStatus)
+        val isPollingStatus = TaskStatusPolicy.shouldPollConversation(normalizedStatus) &&
+            (!isClarifying || isWebResearchInProgress(response))
+        val isErrorResponse = TaskStatusPolicy.isResponseError(normalizedStatus)
         val allowArtifactActions = isSuccess && !isPollingStatus
         val progressMode = response.progress_mode?.takeIf { it.isNotBlank() }
         taskRawLogSections[taskId] = extractRawLogSections(response)
@@ -2260,6 +2260,7 @@ class MainActivity : AppCompatActivity() {
                 )
                 Toast.makeText(this@MainActivity, R.string.rename_task_saved, Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 logApiFailure("/tasks/{task_id}", taskId = normalizedTaskId, deviceId = deviceId, throwable = e)
                 Toast.makeText(
                     this@MainActivity,
@@ -2356,10 +2357,11 @@ class MainActivity : AppCompatActivity() {
                     logApiRequest("/status/{task_id}", taskId = taskId, deviceId = deviceId)
                     val response = fetchTaskStatus(taskId)
                     applyStatus(taskId, response, autoInstallOnSuccess = true, syncPolling = false)
-                    if (!shouldPoll(response.status.trim())) {
+                    if (!TaskStatusPolicy.shouldPollConversation(response.status)) {
                         break
                     }
                 } catch (e: Exception) {
+                    e.rethrowIfCancellation()
                     logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
                     addTaskEvent(
                         taskId,
@@ -2396,21 +2398,6 @@ class MainActivity : AppCompatActivity() {
             screenState = screenState.copy(pollingTaskId = null)
             renderState()
         }
-    }
-
-    private fun beginTaskRegeneration(taskId: String, status: String, detail: String) {
-        latestApkUrl = null
-        if (latestDownloadedTaskId == taskId) {
-            latestDownloadedTaskId = null
-            latestDownloadedApkFile = null
-        }
-        screenState = screenState.copy(
-            currentStatus = status,
-            statusDetail = detail,
-            canDownload = false,
-            canInstall = false
-        )
-        renderState()
     }
 
     private fun startFollowupSynthesis(
@@ -2571,6 +2558,7 @@ ${record.stackTrace}
                     "Runtime error reported to server task_id=$taskId package_name=${record.packageName} stack_length=${record.stackTrace.length}"
                 )
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 Log.w(TAG, "Runtime error report failed task_id=$taskId", e)
             }
         }
@@ -2591,7 +2579,7 @@ ${record.stackTrace}
 
     private fun getOrCreateUserIdentity(): UserIdentity {
         val savedPhoneNumber = preferencesStore.loadPhoneNumber()
-        val phoneNumber = savedPhoneNumber ?: readPhoneNumberFromSim()
+        val phoneNumber = savedPhoneNumber ?: PhoneNumberResolver.readFromSim(this)
         if (savedPhoneNumber.isNullOrBlank() && !phoneNumber.isNullOrBlank()) {
             preferencesStore.savePhoneNumber(phoneNumber)
         }
@@ -2604,13 +2592,8 @@ ${record.stackTrace}
     private fun hasRequiredPhoneNumber(): Boolean {
         return ::deviceId.isInitialized &&
             deviceId.isNotBlank() &&
-            hasPhoneNumberPermissionGranted() &&
+            PhoneNumberResolver.hasPermission(this) &&
             !userIdentity.phoneNumber.isNullOrBlank()
-    }
-
-    private fun hasPhoneNumberPermissionGranted(): Boolean {
-        return ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_NUMBERS) == PackageManager.PERMISSION_GRANTED ||
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun requestPhoneNumberPermissionIfNeeded() {
@@ -2639,7 +2622,7 @@ ${record.stackTrace}
     }
 
     private fun tryFillPhoneNumberFromSim() {
-        val phoneNumber = readPhoneNumberFromSim()
+        val phoneNumber = PhoneNumberResolver.readFromSim(this)
         if (phoneNumber.isNullOrBlank()) {
             Toast.makeText(this, R.string.phone_permission_unavailable_message, Toast.LENGTH_LONG).show()
             renderState()
@@ -2654,49 +2637,11 @@ ${record.stackTrace}
         Toast.makeText(this, R.string.phone_gate_saved, Toast.LENGTH_SHORT).show()
     }
 
-    private fun readPhoneNumberFromSim(): String? {
-        if (!hasPhoneNumberPermissionGranted()) return null
-
-        return try {
-            val telephonyManager = getSystemService(TELEPHONY_SERVICE) as? TelephonyManager ?: return null
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val subscriptionManager = getSystemService(SubscriptionManager::class.java) ?: return null
-                val subscriptionId = SubscriptionManager.getDefaultSubscriptionId()
-                val subscriptionNumber = if (subscriptionId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-                    subscriptionManager.getPhoneNumber(subscriptionId).trim()
-                } else {
-                    ""
-                }
-                normalizePhoneNumber(subscriptionNumber) ?: normalizePhoneNumber(readLegacyLine1Number(telephonyManager))
-            } else {
-                normalizePhoneNumber(readLegacyLine1Number(telephonyManager))
-            }
-        } catch (_: SecurityException) {
-            null
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun readLegacyLine1Number(telephonyManager: TelephonyManager): String {
-        return telephonyManager.line1Number?.trim().orEmpty()
-    }
-
     private fun openAppPermissionSettings() {
         val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
             data = Uri.fromParts("package", packageName, null)
         }
         startActivity(intent)
-    }
-
-    private fun normalizePhoneNumber(raw: String?): String? {
-        val digits = raw.orEmpty().filter { it.isDigit() }
-        if (digits.isBlank()) return null
-        return when {
-            digits.startsWith("82") && digits.length >= 11 -> "0" + digits.drop(2)
-            else -> digits
-        }.takeIf { it.isNotBlank() }
     }
 
     private fun persistLastSelectedTaskId(taskId: String?) {
@@ -2919,6 +2864,7 @@ ${record.stackTrace}
                 drawerLayout.closeDrawer(GravityCompat.START)
             }
         } catch (e: Exception) {
+            e.rethrowIfCancellation()
             if (selectionGeneration != null && !isTaskSelectionGenerationCurrent(selectionGeneration)) {
                 return
             }
@@ -2983,94 +2929,55 @@ ${record.stackTrace}
             try {
                 downloadTaskId?.let { logTaskSelection(it, it) }
                 logApiRequest("/download/{task_id}", taskId = downloadTaskId, deviceId = deviceId, extra = "url=$normalizedUrl")
-                val response = if (!downloadTaskId.isNullOrBlank()) {
-                    downloadApiService.downloadApk(
-                        downloadTaskId,
-                        deviceId,
-                        null,
-                        userIdentity.phoneNumber,
-                        normalizedArtifactPath
-                    )
-                } else {
-                    throw IllegalStateException("missing task_id for download")
-                }
-                if (!response.isSuccessful) {
-                    val rawBody = response.errorBody()?.string()
-                    Log.e(
-                        TAG,
-                        "API failure endpoint=/download/{task_id} task_id=${downloadTaskId ?: "-"} device_id=$deviceId http=${response.code()} body=${rawBody ?: "<empty>"}"
-                    )
-                    throw IllegalStateException("server response ${response.code()}")
-                }
-
-                val apkFile = artifactDownloadCacheFile(downloadTaskId ?: "latest", normalizedUrl, normalizedArtifactPath)
-                val tempFile = File(apkFile.parentFile ?: externalCacheDir ?: cacheDir, "${apkFile.name}.tmp")
-                val responseBody = response.body() ?: throw IllegalStateException("empty response")
-                val contentLength = responseBody.contentLength()
-                    .takeIf { it > 0L }
-                    ?: response.headers()["Content-Length"]?.toLongOrNull()
-                    ?: -1L
-                var downloadedBytes = 0L
-                var lastProgressPercent = if (contentLength > 0L) 0 else -1
+                val resolvedDownloadTaskId = downloadTaskId
+                    ?: throw IllegalStateException("missing task_id for download")
+                var lastProgressPercent = -1
                 var lastRenderedBytes = 0L
-                withContext(Dispatchers.Main) {
-                    downloadProgressPercent = if (contentLength > 0L) 0 else null
-                    downloadProgressBytes = 0L
-                    screenState = screenState.copy(
-                        currentStatus = getString(R.string.download_apk_in_progress),
-                        statusDetail = currentDownloadProgressText(),
-                        canDownload = false
-                    )
-                    renderState()
-                }
-                responseBody.byteStream().use { input ->
-                    FileOutputStream(tempFile).use { output ->
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read < 0) break
-                            output.write(buffer, 0, read)
-                            downloadedBytes += read
-                            downloadProgressBytes = downloadedBytes
-                            if (contentLength > 0L) {
-                                val progress = ((downloadedBytes * 100L) / contentLength)
-                                    .toInt()
-                                    .coerceIn(0, 100)
-                                if (progress != lastProgressPercent) {
-                                    lastProgressPercent = progress
-                                    withContext(Dispatchers.Main) {
-                                        downloadProgressPercent = progress
-                                        screenState = screenState.copy(
-                                            currentStatus = getString(R.string.download_apk_in_progress),
-                                            statusDetail = currentDownloadProgressText(),
-                                            canDownload = false
-                                        )
-                                        renderState()
-                                    }
-                                }
-                            } else if (downloadedBytes - lastRenderedBytes >= 1024L * 1024L) {
-                                lastRenderedBytes = downloadedBytes
-                                withContext(Dispatchers.Main) {
-                                    downloadProgressPercent = null
-                                    downloadProgressBytes = downloadedBytes
-                                    screenState = screenState.copy(
-                                        currentStatus = getString(R.string.download_apk_in_progress),
-                                        statusDetail = currentDownloadProgressText(),
-                                        canDownload = false
-                                    )
-                                    renderState()
-                                }
+                val apkFile = ApkArtifactActionHandler.downloadToCache(
+                    context = this@MainActivity,
+                    apiService = downloadApiService,
+                    taskId = resolvedDownloadTaskId,
+                    url = normalizedUrl,
+                    artifactPath = normalizedArtifactPath,
+                    deviceId = deviceId,
+                    phoneNumber = userIdentity.phoneNumber,
+                    onProgress = { progress ->
+                        val percent = progress.totalBytes
+                            ?.takeIf { it > 0L }
+                            ?.let { ((progress.downloadedBytes * 100L) / it).toInt().coerceIn(0, 100) }
+                        val shouldRender = if (percent != null) {
+                            percent != lastProgressPercent
+                        } else {
+                            progress.downloadedBytes < lastRenderedBytes ||
+                                progress.downloadedBytes - lastRenderedBytes >= 1024L * 1024L
+                        }
+                        if (shouldRender) {
+                            lastProgressPercent = percent ?: -1
+                            lastRenderedBytes = progress.downloadedBytes
+                            withContext(Dispatchers.Main) {
+                                downloadProgressPercent = percent
+                                downloadProgressBytes = progress.downloadedBytes
+                                screenState = screenState.copy(
+                                    currentStatus = getString(R.string.download_apk_in_progress),
+                                    statusDetail = currentDownloadProgressText(),
+                                    canDownload = false
+                                )
+                                renderState()
                             }
                         }
+                    },
+                    onRetry = { attempt, maxAttempts ->
+                        lastProgressPercent = -1
+                        withContext(Dispatchers.Main) {
+                            screenState = screenState.copy(
+                                currentStatus = getString(R.string.download_apk_in_progress),
+                                statusDetail = getString(R.string.download_apk_retrying, attempt, maxAttempts),
+                                canDownload = false
+                            )
+                            renderState()
+                        }
                     }
-                }
-                if (apkFile.exists() && !apkFile.delete()) {
-                    throw IllegalStateException("failed to replace cached APK")
-                }
-                if (!tempFile.renameTo(apkFile)) {
-                    tempFile.copyTo(apkFile, overwrite = true)
-                    tempFile.delete()
-                }
+                )
 
                 latestDownloadedApkFile = apkFile
                 latestDownloadedTaskId = downloadTaskId
@@ -3105,6 +3012,7 @@ ${record.stackTrace}
                     installApk(apkFile, taskId = downloadTaskId)
                 }
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 withContext(Dispatchers.Main) {
                     isDownloadingApk = false
                     downloadingApkTaskId = null
@@ -4063,6 +3971,7 @@ ${record.stackTrace}
                 applyStatus(taskId, response, autoInstallOnSuccess = false, syncPolling = true)
                 loadTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 logApiFailure("/tasks/{task_id}/cancel", taskId = taskId, deviceId = deviceId, throwable = e)
                 addTaskEvent(
                     taskId,
@@ -4362,6 +4271,7 @@ ${record.stackTrace}
                 }
                 renderState()
             } catch (e: Exception) {
+                e.rethrowIfCancellation()
                 Toast.makeText(
                     this@MainActivity,
                     getString(R.string.attachment_pick_failed, userVisibleErrorMessage(e)),
@@ -4684,7 +4594,7 @@ ${record.stackTrace}
     private fun resolveFailureBubbleText(response: StatusResponse): String {
         val explicit = response.latest_failure_message?.trim().orEmpty()
         if (explicit.isNotBlank()) return explicit
-        if (!isRetryableStatus(response.status)) return ""
+        if (!TaskStatusPolicy.isRetryableFailure(response.status)) return ""
 
         val detail = listOf(
             response.latest_assistant_message,
@@ -5271,72 +5181,6 @@ ${record.stackTrace}
         return listOf(fallbackMessage)
     }
 
-    private fun extractPlannerMessages(taskId: String, response: StatusResponse): List<ChatMessage> {
-        val plannerTexts = linkedSetOf<String>()
-        collectPlannerTexts(response.log_lines, plannerTexts)
-        collectPlannerTextsFromRawLog(resolveFullLogText(response).orEmpty(), plannerTexts)
-        return plannerTexts.mapIndexed { index, text ->
-            ChatMessage(
-                id = "planner-$taskId-$index",
-                kind = MessageKind.ASSISTANT,
-                title = getString(R.string.message_title_refinement_plan),
-                body = localizePlannerText(text)
-            )
-        }
-    }
-
-    private fun collectPlannerTexts(element: JsonElement?, sink: MutableSet<String>) {
-        if (element == null || element.isJsonNull) return
-        when {
-            element.isJsonArray -> {
-                element.asJsonArray.forEach { child -> collectPlannerTexts(child, sink) }
-            }
-            element.isJsonObject -> {
-                val obj = element.asJsonObject
-                val text = firstString(obj, "message", "text", "content", "summary", "body", "detail", "details")
-                val metadata = listOfNotNull(
-                    firstString(obj, "type", "kind", "stage", "source", "role", "agent", "label", "event"),
-                    firstString(obj, "category", "step", "name")
-                ).joinToString(" ").lowercase()
-
-                if (!text.isNullOrBlank() && isPlannerText(text, metadata)) {
-                    sink += text.trim()
-                }
-
-                obj.entrySet().forEach { (_, value) -> collectPlannerTexts(value, sink) }
-            }
-            element.isJsonPrimitive && element.asJsonPrimitive.isString -> {
-                val text = element.asString.trim()
-                if (isPlannerText(text)) {
-                    sink += text
-                }
-            }
-        }
-    }
-
-    private fun collectPlannerTextsFromRawLog(rawLog: String?, sink: MutableSet<String>) {
-        rawLog
-            ?.lineSequence()
-            ?.map { it.trim() }
-            ?.filter { it.isNotBlank() && isPlannerText(it) }
-            ?.forEach { sink += it }
-    }
-
-    private fun isPlannerText(text: String, metadata: String = ""): Boolean {
-        val normalizedText = text.lowercase()
-        val normalizedMetadata = metadata.lowercase()
-        return normalizedMetadata.contains("planner") ||
-            normalizedMetadata.contains("refinement") ||
-            normalizedMetadata.contains("refine_plan") ||
-            normalizedMetadata.contains("refinement_plan") ||
-            normalizedMetadata.contains("plan") ||
-            normalizedText.contains("refinement plan") ||
-            normalizedText.contains("planner:") ||
-            normalizedText.contains("[planner]") ||
-            normalizedText.contains("수정 계획") ||
-            normalizedText.contains("어떻게 고칠지")
-    }
-
     private fun buildFallbackMessages(taskId: String, response: StatusResponse): List<ChatMessage> {
         val messages = mutableListOf<ChatMessage>()
 
@@ -5370,11 +5214,6 @@ ${record.stackTrace}
             ?: taskDisplayName(response.app_name)
             ?: ""
         return listOf(resolveStatusDisplayText(response.status, response.status_display_text.orEmpty(), response.progress_mode), appSuffix, attemptSuffix).filter { it.isNotBlank() }.joinToString(" ")
-    }
-
-    private fun extractConversationPreview(conversationState: JsonElement?): String? {
-        val obj = conversationState?.takeIf { it.isJsonObject }?.asJsonObject ?: return null
-        return firstString(obj, "initial_user_prompt", "latest_summary")?.trim()?.takeIf { it.isNotBlank() }
     }
 
     private fun buildTaskContentTitle(initialPrompt: String?, appName: String?, conversationState: JsonElement?): String? {
@@ -5528,31 +5367,9 @@ ${record.stackTrace}
         }
     }
 
-    private fun isSuccessStatus(status: String): Boolean {
-        return normalizeStatusKey(status) == "success"
-    }
-
-    private fun isCancelledStatus(status: String): Boolean {
-        return normalizeStatusKey(status) in setOf("cancelled", "canceled")
-    }
-
-    private fun isClarificationStatus(status: String): Boolean {
-        return normalizeStatusKey(status) in setOf(
-            "pending decision",
-            "clarification needed",
-            "clarification required",
-            "clarifying",
-            "rejected"
-        )
-    }
-
     private fun isClarificationResponse(response: StatusResponse): Boolean {
         return response.requires_user_input == true ||
             response.pending_decision_reason?.trim()?.lowercase() == "clarification"
-    }
-
-    private fun isRetryableStatus(status: String): Boolean {
-        return normalizeStatusKey(status) in setOf("failed", "error")
     }
 
     private fun isRetryAllowed(response: StatusResponse): Boolean {
@@ -5560,7 +5377,7 @@ ${record.stackTrace}
         response.allowed_next_actions?.let { actions ->
             return actions.any { it.equals("retry", ignoreCase = true) }
         }
-        return isRetryableStatus(response.status)
+        return TaskStatusPolicy.isRetryableFailure(response.status)
     }
 
     private fun isTaskCancellationAllowed(response: StatusResponse): Boolean {
@@ -5569,33 +5386,6 @@ ${record.stackTrace}
             return actions.any { it.equals("cancel", ignoreCase = true) }
         }
         return TaskProgressTimelinePolicy.isActiveBuildStatus(response.status)
-    }
-
-    private fun isStatusErrorResponse(status: String): Boolean {
-        return normalizeStatusKey(status) in setOf(
-            "not found",
-            "device mismatch",
-            "invalid state"
-        )
-    }
-
-    private fun shouldPoll(status: String): Boolean {
-        return normalizeStatusKey(status) in setOf(
-            "pending decision",
-            "clarification needed",
-            "clarification required",
-            "clarifying",
-            "readytobuild",
-            "ready to build",
-            "queued",
-            "building",
-            "processing",
-            "running",
-            "in progress",
-            "working",
-            "reviewing",
-            "repairing"
-        )
     }
 
     private fun shouldStartBuildWorkflow(response: BuildResponse): Boolean {
@@ -5691,18 +5481,6 @@ ${record.stackTrace}
             response.render_mode?.trim()?.lowercase() == "status_only"
     }
 
-    private fun resolveMessageKind(role: String, title: String?, content: String): MessageKind {
-        return when {
-            role.contains("user") -> MessageKind.USER
-            role.contains("confirmation") -> MessageKind.CONFIRMATION
-            role.contains("assistant") || role.contains("clarification") -> MessageKind.ASSISTANT
-            role.contains("build") || role.contains("system") -> MessageKind.ASSISTANT
-            role.contains("status") && isCompactStatus(content) -> MessageKind.STATUS
-            role.contains("status") -> MessageKind.ASSISTANT
-            else -> MessageKind.ASSISTANT
-        }
-    }
-
     private fun statusValue(status: String): String {
         return status.trim().ifBlank { getString(R.string.status_unknown) }
     }
@@ -5718,7 +5496,7 @@ ${record.stackTrace}
 
     private fun displayStatusText(status: String?, progressMode: String?): String {
         val raw = status?.trim().orEmpty()
-        return when (normalizeStatusKey(raw)) {
+        return when (TaskStatusPolicy.normalize(raw)) {
             "pending decision" -> "요청을 검토하고 있어요"
             "clarification needed", "clarification required", "clarifying" -> "추가 정보가 필요해요"
             "queued", "processing", "building", "running", "in progress", "working" -> getString(R.string.status_generating)
@@ -5766,7 +5544,7 @@ ${record.stackTrace}
     private fun isCompactStatus(text: String): Boolean {
         val compact = compactStatusLabel(text)
         if (compact.length > 48 || compact.contains(":")) return false
-        return normalizeStatusKey(compact) in setOf(
+        return TaskStatusPolicy.normalize(compact) in setOf(
             "success",
             "failed",
             "error",
@@ -5786,15 +5564,6 @@ ${record.stackTrace}
             "in progress",
             "working"
         )
-    }
-
-    private fun normalizeStatusKey(status: String): String {
-        return compactStatusLabel(status)
-            .lowercase()
-            .replace("_", " ")
-            .replace("-", " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
     }
 
     private fun resolveExactTaskIdCandidate(candidate: String, summaries: List<TaskSummary>): String? {
@@ -5893,34 +5662,6 @@ ${record.stackTrace}
         Log.d(TAG, "API task_id endpoint=$endpoint task_id=$taskId")
     }
 
-    private fun extractRefinePlanAssistantMessage(planResponse: JsonElement?): String? {
-        val jsonObject = planResponse?.takeIf { it.isJsonObject }?.asJsonObject ?: return null
-        return jsonObject.get("assistant_message")
-            ?.takeIf { it.isJsonPrimitive }
-            ?.asString
-            ?.takeIf { it.isNotBlank() }
-    }
-
-    private fun extractRefinePlanSummary(planResponse: JsonElement?): String? {
-        val jsonObject = planResponse?.takeIf { it.isJsonObject }?.asJsonObject ?: return null
-        val summary = jsonObject.get("summary") ?: return null
-        return when {
-            summary.isJsonNull -> null
-            summary.isJsonPrimitive -> summary.asString
-            else -> summary.toString()
-        }
-    }
-
-    private fun extractRefinePlanImageReferenceSummary(planResponse: JsonElement?): String? {
-        val jsonObject = planResponse?.takeIf { it.isJsonObject }?.asJsonObject ?: return null
-        return firstString(jsonObject, "image_reference_summary")?.takeIf { it.isNotBlank() }
-    }
-
-    private fun extractRefinePlanImageConflictNote(planResponse: JsonElement?): String? {
-        val jsonObject = planResponse?.takeIf { it.isJsonObject }?.asJsonObject ?: return null
-        return firstString(jsonObject, "image_conflict_note")?.takeIf { it.isNotBlank() }
-    }
-
     private fun appendImageReferenceMessages(taskId: String, summary: String?, conflictNote: String?) {
         val trimmedSummary = summary?.trim().orEmpty()
         if (trimmedSummary.isNotBlank()) {
@@ -5960,15 +5701,6 @@ ${record.stackTrace}
             rootCause is IOException -> "네트워크 문제로 요청을 처리하지 못했어요. 잠시 후 다시 시도해 주세요."
             else -> "잠시 후 다시 시도해 주세요."
         }
-    }
-
-    private fun shouldReenterRuntimeErrorTask(taskId: String): Boolean {
-        val normalizedTaskId = taskId.trim()
-        if (normalizedTaskId.isBlank()) return false
-        if (normalizedTaskId in hiddenTaskIds) return false
-        if (screenState.selectedTaskId == normalizedTaskId || currentTaskId == normalizedTaskId) return true
-        if (taskSummaryById.containsKey(normalizedTaskId)) return true
-        return taskConversationMessages[normalizedTaskId].orEmpty().isNotEmpty() || preferencesStore.hasTaskChat(normalizedTaskId)
     }
 
     private fun handleRuntimeError(
@@ -6140,7 +5872,7 @@ ${record.stackTrace}
                     logTaskIdForApi("/status/{task_id}", taskId)
                     logApiRequest("/status/{task_id}", taskId = taskId, deviceId = deviceId, extra = "reconcile_runtime_error=true")
                     val status = fetchTaskStatus(taskId, includeTimeline = false)
-                    if (isSuccessStatus(status.status) && !record.awaitingUserConfirmation) {
+                    if (TaskStatusPolicy.isSuccess(status.status) && !record.awaitingUserConfirmation) {
                         clearStaleRuntimeErrorState(taskId, removeTimeline = false)
                     }
                 } catch (e: HttpException) {
@@ -6148,6 +5880,7 @@ ${record.stackTrace}
                         clearStaleRuntimeErrorState(taskId, removeTimeline = true)
                     }
                 } catch (e: Exception) {
+                    e.rethrowIfCancellation()
                     Log.w(TAG, "Runtime error reconciliation skipped task_id=$taskId", e)
                 }
             }
@@ -6208,7 +5941,11 @@ ${record.stackTrace}
         return resolveFullLogText(response)?.trim()?.takeIf { it.isNotBlank() }
             ?: response.latest_log?.trim()?.takeIf { it.isNotBlank() }
             ?: response.status_message?.trim()?.takeIf {
-                it.isNotBlank() && (isRetryableStatus(response.status) || isStatusErrorResponse(response.status))
+                it.isNotBlank() &&
+                    (
+                        TaskStatusPolicy.isRetryableFailure(response.status) ||
+                            TaskStatusPolicy.isResponseError(response.status)
+                    )
             }
     }
 
@@ -6230,10 +5967,6 @@ ${record.stackTrace}
         if (processingAnimationBaseText(screenState.currentStatus) != null) return true
         if (processingAnimationBaseText(screenState.statusDetail.orEmpty()) != null) return true
         return false
-    }
-
-    private fun localizePlannerText(text: String): String {
-        return text
     }
 
     private fun firstString(obj: JsonObject, vararg keys: String): String? {
@@ -6303,7 +6036,11 @@ ${record.stackTrace}
 
     private fun appendStatusTransitionMessage(taskId: String, response: StatusResponse) {
         if (!isCompactStatus(response.status)) return
-        if (normalizeStatusKey(response.status) == "pending decision" && response.progress_mode.isNullOrBlank() && !isWebResearchInProgress(response)) {
+        if (
+            TaskStatusPolicy.normalize(response.status) == "pending decision" &&
+            response.progress_mode.isNullOrBlank() &&
+            !isWebResearchInProgress(response)
+        ) {
             return
         }
 
@@ -6773,7 +6510,7 @@ ${record.stackTrace}
 
     private fun buildStatusTransitionKey(response: StatusResponse): String {
         return listOf(
-            normalizeStatusKey(response.status),
+            TaskStatusPolicy.normalize(response.status),
             if (isWebResearchInProgress(response)) "web_research" else "",
             response.package_name,
             response.apk_url,
@@ -6785,8 +6522,8 @@ ${record.stackTrace}
     }
 
     private fun isWebResearchInProgress(response: StatusResponse): Boolean {
-        val statusKey = normalizeStatusKey(response.status)
-        if (!shouldPoll(response.status)) return false
+        val statusKey = TaskStatusPolicy.normalize(response.status)
+        if (!TaskStatusPolicy.shouldPollConversation(response.status)) return false
         if (statusKey in setOf("reviewing", "repairing")) return false
 
         val progressMode = response.progress_mode?.trim()?.lowercase().orEmpty()
@@ -7262,13 +6999,6 @@ ${record.stackTrace}
         }
     }
 
-    private fun requestChatScrollAnchor(messageId: String) {
-        clearInitialScrollForActiveTask()
-        pendingChatAnchorMessageId = messageId
-        pendingChatAnchorTopOffset = null
-        clearPendingChatAnchorAfterScroll = false
-    }
-
     private fun hasPendingRestoredChatScroll(taskId: String): Boolean {
         return pendingRestoredChatScrollTaskId == taskId &&
             pendingRestoredChatScrollSnapshot != null
@@ -7293,11 +7023,6 @@ ${record.stackTrace}
         chatAutoScrollLockedByUser = true
         chatShouldStickToBottom = false
         manualChatScrollSnapshot = snapshot
-    }
-
-    private fun requestChatAnchorScrollAgain(clearAfterScroll: Boolean) {
-        if (pendingChatAnchorMessageId.isNullOrBlank()) return
-        clearPendingChatAnchorAfterScroll = clearPendingChatAnchorAfterScroll || clearAfterScroll
     }
 
     private fun requestScrollLatestAfterResponse(force: Boolean = false) {

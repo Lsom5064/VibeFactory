@@ -8,11 +8,21 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.delay
 import java.io.File
+import java.io.EOFException
 import java.io.FileOutputStream
 import java.io.IOException
 
+internal data class ApkDownloadProgress(
+    val downloadedBytes: Long,
+    val totalBytes: Long?
+)
+
 internal object ApkArtifactActionHandler {
+    private const val MAX_DOWNLOAD_ATTEMPTS = 3
+    private const val RETRY_DELAY_MS = 750L
+
     fun localApkFile(
         context: Context,
         taskId: String,
@@ -59,32 +69,109 @@ internal object ApkArtifactActionHandler {
         url: String?,
         artifactPath: String?,
         deviceId: String,
-        phoneNumber: String?
+        phoneNumber: String?,
+        onProgress: suspend (ApkDownloadProgress) -> Unit = {},
+        onRetry: suspend (attempt: Int, maxAttempts: Int) -> Unit = { _, _ -> }
     ): File {
         val normalizedTaskId = taskId.trim().takeIf { it.isNotBlank() }
             ?: throw IllegalStateException("missing task_id for download")
         val normalizedArtifactPath = artifactPath?.trim()?.takeIf { it.isNotBlank() }
+        val target = artifactDownloadCacheFile(context, normalizedTaskId, url, normalizedArtifactPath)
+        val temp = File(target.parentFile ?: throw IOException("cache parent unavailable"), "${target.name}.tmp")
+
+        repeat(MAX_DOWNLOAD_ATTEMPTS) { attemptIndex ->
+            try {
+                downloadAttempt(
+                    apiService = apiService,
+                    taskId = normalizedTaskId,
+                    artifactPath = normalizedArtifactPath,
+                    deviceId = deviceId,
+                    phoneNumber = phoneNumber,
+                    temp = temp,
+                    onProgress = onProgress
+                )
+                replaceDownloadedFile(temp, target)
+                return target
+            } catch (error: IOException) {
+                if (error is NonRetryableDownloadException || attemptIndex == MAX_DOWNLOAD_ATTEMPTS - 1) {
+                    throw error
+                }
+                onRetry(attemptIndex + 2, MAX_DOWNLOAD_ATTEMPTS)
+                delay(RETRY_DELAY_MS * (attemptIndex + 1))
+            }
+        }
+        throw IOException("download failed")
+    }
+
+    private suspend fun downloadAttempt(
+        apiService: VibeApiService,
+        taskId: String,
+        artifactPath: String?,
+        deviceId: String,
+        phoneNumber: String?,
+        temp: File,
+        onProgress: suspend (ApkDownloadProgress) -> Unit
+    ) {
+        val existingBytes = temp.length().coerceAtLeast(0L)
+        val requestedRange = existingBytes.takeIf { it > 0L }?.let { "bytes=$it-" }
         val response = apiService.downloadApk(
-            normalizedTaskId,
+            taskId,
             deviceId,
             null,
             phoneNumber,
-            normalizedArtifactPath
+            artifactPath,
+            requestedRange
         )
         if (!response.isSuccessful) {
             val rawBody = response.errorBody()?.string()?.trim().orEmpty()
             val suffix = rawBody.takeIf { it.isNotBlank() }?.let { ": $it" }.orEmpty()
-            throw IOException("server response ${response.code()}$suffix")
+            val error = "server response ${response.code()}$suffix"
+            if (response.code() == 408 || response.code() == 425 || response.code() == 429 || response.code() >= 500) {
+                throw IOException(error)
+            }
+            if (response.code() == 416 && existingBytes > 0L) {
+                temp.delete()
+                throw IOException(error)
+            }
+            throw NonRetryableDownloadException(error)
         }
 
-        val target = artifactDownloadCacheFile(context, normalizedTaskId, url, normalizedArtifactPath)
-        val temp = File(target.parentFile ?: throw IOException("cache parent unavailable"), "${target.name}.tmp")
-        response.body()?.byteStream()?.use { input ->
-            FileOutputStream(temp).use { output ->
-                input.copyTo(output)
-            }
-        } ?: throw IOException("empty response")
+        val body = response.body() ?: throw IOException("empty response")
+        val append = requestedRange != null && response.code() == 206
+        val startingBytes = if (append) existingBytes else 0L
+        val totalBytes = response.headers()["Content-Range"]
+            ?.substringAfterLast('/', missingDelimiterValue = "")
+            ?.toLongOrNull()
+            ?.takeIf { it > 0L }
+            ?: body.contentLength()
+                .takeIf { it > 0L }
+                ?.let { startingBytes + it }
 
+        body.use { responseBody ->
+            responseBody.byteStream().use { input ->
+                FileOutputStream(temp, append).use { output ->
+                    var downloadedBytes = startingBytes
+                    onProgress(ApkDownloadProgress(downloadedBytes, totalBytes))
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        downloadedBytes += read
+                        onProgress(ApkDownloadProgress(downloadedBytes, totalBytes))
+                    }
+                }
+            }
+        }
+
+        val actualBytes = temp.length()
+        if (totalBytes != null && actualBytes != totalBytes) {
+            throw EOFException("incomplete download: $actualBytes of $totalBytes bytes")
+        }
+        if (actualBytes <= 0L) throw EOFException("empty download")
+    }
+
+    private fun replaceDownloadedFile(temp: File, target: File) {
         if (target.exists() && !target.delete()) {
             throw IOException("failed to replace cached APK")
         }
@@ -92,8 +179,9 @@ internal object ApkArtifactActionHandler {
             temp.copyTo(target, overwrite = true)
             temp.delete()
         }
-        return target
     }
+
+    private class NonRetryableDownloadException(message: String) : IOException(message)
 
     fun installApk(activity: Activity, file: File): Boolean {
         if (!file.exists()) return false

@@ -247,22 +247,6 @@ class HostPreferencesStore(
         }
     }
 
-    fun saveTaskChats(taskConversationMessages: Map<String, List<ChatMessage>>): Boolean {
-        return runCatching {
-            val savedAll = taskConversationMessages.all { (taskId, messages) ->
-                saveTaskChat(taskId, messages)
-            }
-            prefs.edit()
-                .remove(HostAppConfig.PREF_TASK_TIMELINES)
-                .remove(HostAppConfig.PREF_TASK_STATUS_BUBBLES)
-                .commit()
-            savedAll
-        }.getOrElse {
-            Log.e(logTag, "Failed to persist task chats", it)
-            false
-        }
-    }
-
     fun loadPendingRuntimeErrors(): Map<String, RuntimeErrorRecord> {
         val json = prefs.getString(HostAppConfig.PREF_PENDING_RUNTIME_ERRORS, null) ?: return emptyMap()
         return runCatching {

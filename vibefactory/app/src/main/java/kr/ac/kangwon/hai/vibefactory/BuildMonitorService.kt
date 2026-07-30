@@ -27,7 +27,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import retrofit2.HttpException
-import java.util.Locale
 
 class BuildMonitorService : Service() {
 
@@ -228,13 +227,14 @@ class BuildMonitorService : Service() {
                 includeTimeline = false
             )
             persistMonitoredTaskName(taskId, resolveMonitoredTaskName(taskId, response))
-            val statusKey = normalizeStatusKey(response.status)
+            val statusKey = TaskStatusPolicy.normalize(response.status)
             synchronized(taskLock) { pollFailureCounts -= taskId }
-            if (!shouldPoll(statusKey)) {
+            if (!TaskStatusPolicy.shouldMonitorBuildInBackground(statusKey)) {
                 removeTask(taskId)
                 showTerminalNotificationIfNeeded(taskId, response, statusKey)
             }
         } catch (e: Exception) {
+            e.rethrowIfCancellation()
             Log.w(TAG, "Build monitor poll failed task_id=$taskId", e)
             if (e is HttpException && e.code() in setOf(404, 410)) {
                 removeTask(taskId)
@@ -420,45 +420,11 @@ class BuildMonitorService : Service() {
         return System.currentTimeMillis() - startedAt >= MAX_MONITORING_WINDOW_MS
     }
 
-    private fun shouldPoll(statusKey: String): Boolean {
-        return statusKey in setOf(
-            "pending decision",
-            "readytobuild",
-            "ready to build",
-            "queued",
-            "building",
-            "processing",
-            "running",
-            "in progress",
-            "working",
-            "reviewing",
-            "repairing"
-        )
-    }
-
-    private fun normalizeStatusKey(status: String): String {
-        return compactStatusLabel(status)
-            .lowercase(Locale.ROOT)
-            .replace("_", " ")
-            .replace("-", " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-    }
-
-    private fun compactStatusLabel(status: String): String {
-        return status.trim()
-            .split('\n')
-            .asSequence()
-            .map { it.trim() }
-            .firstOrNull { it.isNotBlank() }
-            .orEmpty()
-    }
-
     private fun taskDisplayName(rawValue: String?): String? {
         val value = rawValue?.trim().orEmpty()
         if (value.isBlank()) return null
         return value.takeUnless {
-            normalizeStatusKey(it) in setOf(
+            TaskStatusPolicy.normalize(it) in setOf(
                 "pending decision",
                 "clarification needed",
                 "processing",

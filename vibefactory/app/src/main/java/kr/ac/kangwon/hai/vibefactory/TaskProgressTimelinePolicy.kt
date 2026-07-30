@@ -193,11 +193,6 @@ internal object TaskProgressTimelinePolicy {
     }
 
     private fun normalizeStatus(status: String?): String {
-        return status.orEmpty()
-            .trim()
-            .lowercase()
-            .replace("_", " ")
-            .replace("-", " ")
-            .replace(Regex("\\s+"), " ")
+        return TaskStatusPolicy.normalize(status)
     }
 }

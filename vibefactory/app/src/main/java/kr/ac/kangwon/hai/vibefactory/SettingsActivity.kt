@@ -69,7 +69,7 @@ class SettingsActivity : AppCompatActivity() {
     private fun refreshTokenUsageSummary(tokenLimitSummary: TextView) {
         val currentTaskId = preferencesStore.loadLastSelectedTaskId().orEmpty().trim()
         lifecycleScope.launch {
-            runCatching {
+            runSuspendCatching {
                 if (currentTaskId.isBlank()) {
                     tokenUsageRepository.loadGlobal()
                 } else {

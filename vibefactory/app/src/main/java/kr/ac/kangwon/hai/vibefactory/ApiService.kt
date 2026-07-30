@@ -5,6 +5,7 @@ import okhttp3.ResponseBody
 import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.Header
 import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.Path
@@ -279,6 +280,7 @@ interface VibeApiService {
         @Query("device_id") deviceId: String,
         @Query("user_id") userId: String? = null,
         @Query("phone_number") phoneNumber: String? = null,
-        @Query("artifact_path") artifactPath: String? = null
+        @Query("artifact_path") artifactPath: String? = null,
+        @Header("Range") range: String? = null
     ): Response<ResponseBody>
 }

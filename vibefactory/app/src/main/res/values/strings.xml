@@ -99,6 +99,7 @@
     <string name="download_apk_in_progress">다운로드 중...</string>
     <string name="download_apk_progress">다운로드 중... %1$d%%</string>
     <string name="download_apk_progress_bytes">다운로드 중... %1$s</string>
+    <string name="download_apk_retrying">연결이 끊겨 다운로드를 다시 시도하고 있어요. (%1$d/%2$d)</string>
     <string name="install_apk">설치</string>
     <string name="install_permission_required">설치 권한을 허용한 뒤 돌아오면 바로 설치를 이어갈게요.</string>
     <string name="install_failed">설치 화면을 열지 못했어요. 다운로드된 APK에서 다시 설치를 눌러주세요.</string>

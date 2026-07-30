@@ -74,7 +74,7 @@ class TokenUsageActivity : AppCompatActivity() {
     private fun loadUsage(taskId: String) {
         bindLoadingState()
         lifecycleScope.launch {
-            runCatching {
+            runSuspendCatching {
                 if (taskId.isBlank()) {
                     tokenUsageRepository.loadGlobal()
                 } else {

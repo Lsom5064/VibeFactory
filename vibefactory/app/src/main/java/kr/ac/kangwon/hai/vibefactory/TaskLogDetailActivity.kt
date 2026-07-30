@@ -103,7 +103,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
         if (taskId.isBlank()) return
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching {
+                runSuspendCatching {
                     apiService.getTaskRevisions(
                         taskId = taskId,
                         deviceId = preferencesStore.getOrCreateDeviceId(),
@@ -208,7 +208,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
         bindBranchAction(payload, revision)
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching {
+                runSuspendCatching {
                     apiService.branchTaskRevision(
                         taskId = taskId,
                         revisionLabel = revisionLabel,
@@ -403,7 +403,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
         bindApkAction(action)
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching {
+                runSuspendCatching {
                     ApkArtifactActionHandler.downloadToCache(
                         context = this@TaskLogDetailActivity,
                         apiService = downloadApiService,

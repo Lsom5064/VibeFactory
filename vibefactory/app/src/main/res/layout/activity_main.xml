@@ -283,7 +283,7 @@
                     android:layout_height="18dp"
                     android:layout_marginStart="8dp"
                     android:src="@drawable/ic_chevron_right"
-                    android:tint="@color/text_secondary" />
+                    app:tint="@color/text_secondary" />
             </LinearLayout>
         </LinearLayout>
     </FrameLayout>
@@ -339,7 +339,7 @@
                 android:layout_width="20dp"
                 android:layout_height="20dp"
                 android:src="@drawable/ic_settings_gear"
-                android:tint="@color/text_secondary" />
+                app:tint="@color/text_secondary" />
 
             <Button
                 android:id="@+id/btnOpenSettings"
@@ -380,7 +380,7 @@
                 android:layout_width="20dp"
                 android:layout_height="20dp"
                 android:src="@drawable/ic_artifact_file"
-                android:tint="@color/text_secondary" />
+                app:tint="@color/text_secondary" />
 
             <Button
                 android:id="@+id/btnOpenLibrary"
@@ -421,7 +421,7 @@
                 android:layout_width="20dp"
                 android:layout_height="20dp"
                 android:src="@drawable/ic_square_pen"
-                android:tint="@color/text_inverse" />
+                app:tint="@color/text_inverse" />
 
             <Button
                 android:id="@+id/btnNewChat"
