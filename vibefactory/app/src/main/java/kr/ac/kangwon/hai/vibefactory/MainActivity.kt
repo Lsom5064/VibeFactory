@@ -909,47 +909,11 @@ class MainActivity : AppCompatActivity() {
     private fun openTaskLogDetail() {
         val taskId = screenState.selectedTaskId?.trim()?.takeIf { it.isNotBlank() }
             ?: currentTaskId?.trim()?.takeIf { it.isNotBlank() }
-        if (taskId == null) {
-            launchTaskLogDetail(taskId = null, rawLogContents = emptyList())
-            return
-        }
-
-        topLogChip.isEnabled = false
-        lifecycleScope.launch {
-            val rawLogContents = try {
-                logApiRequest(
-                    "/status/{task_id}",
-                    taskId = taskId,
-                    deviceId = deviceId,
-                    extra = "include_logs=true"
-                )
-                val response = apiService.getStatus(
-                    taskId = taskId,
-                    deviceId = deviceId,
-                    userId = null,
-                    phoneNumber = userIdentity.phoneNumber,
-                    includeLogs = true,
-                    includeTimeline = false
-                )
-                val sections = extractRawLogSections(response)
-                taskRawLogSections[taskId] = sections
-                sections.map { it.content }.ifEmpty {
-                    resolveFullLogText(response)?.let(::listOf).orEmpty()
-                }
-            } catch (e: Exception) {
-                e.rethrowIfCancellation()
-                logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
-                Toast.makeText(
-                    this@MainActivity,
-                    getString(R.string.polling_failed, userVisibleErrorMessage(e)),
-                    Toast.LENGTH_LONG
-                ).show()
-                taskRawLogSections[taskId].orEmpty().map { it.content }
-            } finally {
-                topLogChip.isEnabled = true
-            }
-            launchTaskLogDetail(taskId, rawLogContents)
-        }
+        val cachedLogContents = taskId
+            ?.let { taskRawLogSections[it] }
+            .orEmpty()
+            .map { it.content }
+        launchTaskLogDetail(taskId, cachedLogContents)
     }
 
     private fun launchTaskLogDetail(taskId: String?, rawLogContents: List<String>) {

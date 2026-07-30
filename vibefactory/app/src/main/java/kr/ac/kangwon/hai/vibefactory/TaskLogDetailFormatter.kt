@@ -79,11 +79,7 @@ internal object TaskLogDetailFormatter {
         val agentItems = latestFirstMessages
             .filter { it.label == "작업 메모" }
             .distinctItems()
-            .ifEmpty {
-                extractAgentMessages(rawLogContents)
-                    .asReversed()
-                    .map { TaskLogDetailItem(UNKNOWN_TIME, "작업 메모", it) }
-            }
+            .ifEmpty { agentItemsFromRawLogs(rawLogContents) }
 
         val lastUpdated = visibleMessages
             .mapNotNull { it.time.takeIf { time -> time.isNotBlank() } }
@@ -101,6 +97,34 @@ internal object TaskLogDetailFormatter {
             agentItems = agentItems,
             apkAction = latestApkAction(messages, summary, taskId, appName)
         )
+    }
+
+    fun agentItemsFromStatus(response: StatusResponse): List<TaskLogDetailItem> {
+        val structuredContents = response.raw_log_sections
+            ?.takeIf { it.isJsonArray }
+            ?.asJsonArray
+            ?.mapNotNull { element ->
+                element
+                    .takeIf { it.isJsonObject }
+                    ?.asJsonObject
+                    ?.let { firstString(it, "content") }
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+            }
+            .orEmpty()
+        val rawLogContents = structuredContents.ifEmpty {
+            listOfNotNull(
+                response.full_log?.trim()?.takeIf { it.isNotBlank() }
+                    ?: response.log?.trim()?.takeIf { it.isNotBlank() }
+            )
+        }
+        return agentItemsFromRawLogs(rawLogContents)
+    }
+
+    internal fun agentItemsFromRawLogs(rawLogContents: List<String>): List<TaskLogDetailItem> {
+        return extractAgentMessages(rawLogContents)
+            .asReversed()
+            .map { TaskLogDetailItem(UNKNOWN_TIME, "작업 메모", it) }
     }
 
     private fun messageToItem(

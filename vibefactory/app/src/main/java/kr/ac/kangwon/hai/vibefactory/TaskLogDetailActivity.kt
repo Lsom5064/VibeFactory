@@ -63,6 +63,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
         findViewById<ImageButton>(R.id.btnBackTaskLog).setOnClickListener { finish() }
 
         bindPayload(payload)
+        refreshAgentLogsIfNeeded(payload)
     }
 
     override fun onResume() {
@@ -99,10 +100,49 @@ class TaskLogDetailActivity : AppCompatActivity() {
         loadRevisions(payload)
         bindApkAction(payload.apkAction)
 
+        bindLogSections(payload)
+    }
+
+    private fun bindLogSections(payload: TaskLogDetailPayload) {
         val sections = findViewById<LinearLayout>(R.id.taskLogSectionsContainer)
         sections.removeAllViews()
         sections.addView(sectionCard("진행 단계", payload.progressItems))
         sections.addView(sectionCard("작업 메모", payload.agentItems))
+    }
+
+    private fun refreshAgentLogsIfNeeded(payload: TaskLogDetailPayload) {
+        val taskId = payload.taskId.trim()
+        if (taskId.isBlank() || payload.agentItems.isNotEmpty()) return
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runSuspendCatching {
+                    apiService.getStatus(
+                        taskId = taskId,
+                        deviceId = preferencesStore.getOrCreateDeviceId(),
+                        userId = null,
+                        phoneNumber = preferencesStore.loadPhoneNumber(),
+                        includeLogs = true,
+                        includeTimeline = false
+                    )
+                }
+            }
+            result.onSuccess { response ->
+                val agentItems = TaskLogDetailFormatter.agentItemsFromStatus(response)
+                val currentPayload = boundPayload
+                    ?.takeIf { it.taskId == taskId }
+                    ?: return@onSuccess
+                if (agentItems.isEmpty() || agentItems == currentPayload.agentItems) return@onSuccess
+                val updatedPayload = currentPayload.copy(agentItems = agentItems)
+                boundPayload = updatedPayload
+                bindLogSections(updatedPayload)
+            }.onFailure { error ->
+                Toast.makeText(
+                    this@TaskLogDetailActivity,
+                    getString(R.string.polling_failed, userVisibleErrorMessage(error)),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
     }
 
     private fun loadRevisions(payload: TaskLogDetailPayload) {
