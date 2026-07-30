@@ -3,11 +3,10 @@ package kr.ac.kangwon.hai.vibefactory
 import android.content.Context
 import android.util.Base64
 import android.util.Log
+import android.util.LruCache
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -40,6 +39,7 @@ class HostPreferencesStore(
     private val pendingTaskChatWrites = ConcurrentHashMap<String, List<ChatMessage>>()
     private val deletedTaskChatIds = ConcurrentHashMap.newKeySet<String>()
     private val taskChatWriterScheduled = AtomicBoolean(false)
+    private val compactedImagePreviewCache = object : LruCache<String, String>(32) {}
 
     private val prefs
         get() = context.getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
@@ -178,17 +178,18 @@ class HostPreferencesStore(
     fun hasTaskChat(taskId: String): Boolean {
         val normalizedTaskId = normalizeTaskId(taskId)
         if (normalizedTaskId.isBlank()) return false
-        return taskChatFile(normalizedTaskId).exists()
+        return taskChatFile(normalizedTaskId).exists() || legacyTaskChatFile(normalizedTaskId).exists()
     }
 
     fun loadTaskChat(taskId: String): List<ChatMessage> {
         val normalizedTaskId = normalizeTaskId(taskId)
         if (normalizedTaskId.isBlank()) return emptyList()
-        val file = taskChatFile(normalizedTaskId)
+        val file = taskChatFile(normalizedTaskId).takeIf { it.exists() }
+            ?: legacyTaskChatFile(normalizedTaskId)
         if (!file.exists()) return emptyList()
         return runCatching {
             val type = object : TypeToken<List<ChatMessage>>() {}.type
-            val messages: List<ChatMessage> = gson.fromJson(file.readText(Charsets.UTF_8), type) ?: emptyList()
+            val messages: List<ChatMessage> = gson.fromJson(TaskChatFileCodec.read(file), type) ?: emptyList()
             compactTaskMessagesForStorage(messages)
         }.getOrElse {
             Log.w(logTag, "Failed to load task chat task_id=$normalizedTaskId", it)
@@ -207,13 +208,14 @@ class HostPreferencesStore(
             val file = taskChatFile(normalizedTaskId)
             val compacted = compactTaskMessagesForStorage(messages)
             if (compacted.isEmpty()) {
-                if (file.exists() && !file.delete()) {
+                val files = listOf(file, legacyTaskChatFile(normalizedTaskId))
+                if (files.any { it.exists() && !it.delete() }) {
                     Log.w(logTag, "Failed to delete empty task chat task_id=$normalizedTaskId")
                     return@runCatching false
                 }
                 return@runCatching true
             }
-            writeTaskChatAtomically(file, gson.toJson(compacted))
+            TaskChatFileCodec.writeAtomically(file, gson.toJson(compacted))
             true
         }.getOrElse {
             Log.e(logTag, "Failed to persist task chat task_id=$normalizedTaskId", it)
@@ -235,9 +237,10 @@ class HostPreferencesStore(
         deletedTaskChatIds += normalizedTaskId
         pendingTaskChatWrites.remove(normalizedTaskId)
         runCatching {
-            val file = taskChatFile(normalizedTaskId)
-            if (file.exists() && !file.delete()) {
-                Log.w(logTag, "Failed to delete task chat task_id=$normalizedTaskId")
+            listOf(taskChatFile(normalizedTaskId), legacyTaskChatFile(normalizedTaskId)).forEach { file ->
+                if (file.exists() && !file.delete()) {
+                    Log.w(logTag, "Failed to delete task chat task_id=$normalizedTaskId path=${file.name}")
+                }
             }
         }.onFailure {
             Log.w(logTag, "Failed to delete task chat task_id=$normalizedTaskId", it)
@@ -370,17 +373,23 @@ class HostPreferencesStore(
     }
 
     private fun compactChatMessageForStorage(message: ChatMessage): ChatMessage {
-        val compactedLegacyPreview = message.imagePreviewBase64
-            ?.let { compactImagePreviewForStorage(it, MAX_PERSISTED_IMAGE_PREVIEW_CHARS) }
-            ?.takeIf { it.isNotBlank() }
+        val hasRemotePreview = message.imagePreviews.orEmpty().any { !it.remoteUrl.isNullOrBlank() }
+        val compactedLegacyPreview = if (hasRemotePreview) {
+            null
+        } else {
+            message.imagePreviewBase64
+                ?.let(::compactImagePreviewWithCache)
+                ?.takeIf { it.isNotBlank() }
+        }
         val compactedPreviews = message.imagePreviews.orEmpty()
             .take(8)
             .map { preview ->
                 preview.copy(
-                    base64 = compactImagePreviewForStorage(
-                        preview.base64,
-                        MAX_PERSISTED_IMAGE_PREVIEW_CHARS
-                    )
+                    base64 = if (!preview.remoteUrl.isNullOrBlank()) {
+                        ""
+                    } else {
+                        compactImagePreviewWithCache(preview.base64)
+                    }
                 )
             }
         return message.copy(
@@ -403,11 +412,36 @@ class HostPreferencesStore(
     }
 
     private fun taskChatFile(taskId: String): File {
+        return File(taskChatsDir, "${encodedTaskId(taskId)}.json.gz")
+    }
+
+    private fun legacyTaskChatFile(taskId: String): File {
+        return File(taskChatsDir, "${encodedTaskId(taskId)}.json")
+    }
+
+    private fun encodedTaskId(taskId: String): String {
         val encodedTaskId = Base64.encodeToString(
             normalizeTaskId(taskId).toByteArray(Charsets.UTF_8),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
-        return File(taskChatsDir, "$encodedTaskId.json")
+        return encodedTaskId
+    }
+
+    private fun compactImagePreviewWithCache(encoded: String): String {
+        val normalized = encoded.trim()
+        if (normalized.isBlank()) return ""
+        val cacheKey = "${normalized.length}:${normalized.hashCode()}"
+        synchronized(compactedImagePreviewCache) {
+            compactedImagePreviewCache.get(cacheKey)?.let { return it }
+        }
+        val compacted = compactImagePreviewForStorage(
+            normalized,
+            MAX_PERSISTED_IMAGE_PREVIEW_CHARS
+        )
+        synchronized(compactedImagePreviewCache) {
+            compactedImagePreviewCache.put(cacheKey, compacted)
+        }
+        return compacted
     }
 
     private fun scheduleTaskChatWriter() {
@@ -438,26 +472,4 @@ class HostPreferencesStore(
         }
     }
 
-    private fun writeTaskChatAtomically(file: File, json: String) {
-        val tempFile = File(file.parentFile, ".${file.name}.${UUID.randomUUID()}.tmp")
-        tempFile.writeText(json, Charsets.UTF_8)
-        try {
-            Files.move(
-                tempFile.toPath(),
-                file.toPath(),
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING
-            )
-        } catch (_: Exception) {
-            Files.move(
-                tempFile.toPath(),
-                file.toPath(),
-                StandardCopyOption.REPLACE_EXISTING
-            )
-        } finally {
-            if (tempFile.exists()) {
-                tempFile.delete()
-            }
-        }
-    }
 }

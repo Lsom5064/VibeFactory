@@ -22,6 +22,7 @@ data class DeviceInfo(
 data class BuildRequest(
     val task_id: String? = null,
     val prompt: String,
+    val display_prompt: String? = null,
     val device_info: DeviceInfo,
     val device_id: String,
     val user_id: String? = null,
@@ -97,6 +98,7 @@ data class StatusResponse(
     val current_build_stage: String? = "",
     val current_build_stage_detail: String? = "",
     val timeline_events: JsonElement? = null,
+    val timeline_cursor: String? = null,
     val raw_log_sections: JsonElement? = null,
     val progress_mode: String? = "",
     val latest_assistant_message: String? = "",
@@ -208,7 +210,9 @@ interface VibeApiService {
         @Query("device_id") deviceId: String,
         @Query("user_id") userId: String? = null,
         @Query("phone_number") phoneNumber: String? = null,
-        @Query("include_logs") includeLogs: Boolean = false
+        @Query("include_logs") includeLogs: Boolean = false,
+        @Query("include_timeline") includeTimeline: Boolean = true,
+        @Query("timeline_after_event_id") timelineAfterEventId: String? = null
     ): StatusResponse
 
     @POST("/tasks/{task_id}/cancel")

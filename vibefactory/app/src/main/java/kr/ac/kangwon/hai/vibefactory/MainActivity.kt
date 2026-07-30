@@ -16,6 +16,7 @@ import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
@@ -114,6 +115,7 @@ class MainActivity : AppCompatActivity() {
         private const val MAX_ATTACHMENT_IMAGE_PAYLOAD_BYTES = 4 * 1024 * 1024
         private const val MAX_ATTACHMENT_PDF_BYTES = 10 * 1024 * 1024
         private const val MAX_ATTACHMENT_TEXT_BYTES = 2 * 1024 * 1024
+        private const val ATTACHMENT_MENU_TAP_GUARD_MS = 600L
         private const val MAX_CHAT_TIMELINE_EVENTS_FOR_RENDER = 120
         private const val MAX_RECENT_ASSISTANT_MESSAGES_FOR_RENDER = 24
         private const val MAX_IN_MEMORY_TASK_MESSAGES = 180
@@ -223,6 +225,8 @@ class MainActivity : AppCompatActivity() {
     private var persistedRuntimeErrorsLoaded: Boolean = false
     private val taskConversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
     private val loadedTaskChatIds = mutableSetOf<String>()
+    private val taskTimelineRenderCache = TaskTimelineRenderCache()
+    private val taskTimelineEventCursorById = mutableMapOf<String, String>()
     private val taskInputQueueManager by lazy {
         TaskInputQueueManager(
             isProcessingStatus = { processingAnimationBaseText(it) != null },
@@ -267,11 +271,19 @@ class MainActivity : AppCompatActivity() {
     private var lastRenderedMessageListFingerprint: String? = null
     private var lastRenderedAttachmentFingerprint: String? = null
     private var pendingCameraImageUri: Uri? = null
+    private var attachmentFlowInProgress: Boolean = false
     private var pendingInstallApkFile: File? = null
     private var pendingInstallLaunchTaskId: String? = null
     private var pendingInstallLaunchPackageName: String? = null
     private var pendingInstallPackageWasInstalled: Boolean = false
     private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
+    private val attachmentOnlyPromptKeys by lazy(LazyThreadSafetyMode.NONE) {
+        setOf(
+            getString(R.string.attachment_only_generate_prompt),
+            getString(R.string.attachment_only_refine_prompt),
+            getString(R.string.attachment_only_chat_prompt)
+        ).map(::normalizeMessageTextForDedupe).toSet()
+    }
 
     private data class TimelineEventSnapshot(
         val eventId: String,
@@ -293,6 +305,11 @@ class MainActivity : AppCompatActivity() {
         val imagePreviews: List<ChatImagePreview>
     )
 
+    private data class TimelineEventPage(
+        val events: List<TimelineEventSnapshot>,
+        val nextCursor: String?
+    )
+
     private data class LogSectionSnapshot(
         val title: String,
         val content: String
@@ -309,6 +326,7 @@ class MainActivity : AppCompatActivity() {
 
     private val pickReferenceImageLauncher =
         registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris: List<Uri> ->
+            finishAttachmentFlow()
             if (uris.isNotEmpty()) {
                 handleAttachmentsSelected(uris, SelectedAttachmentKind.IMAGE)
             }
@@ -316,6 +334,7 @@ class MainActivity : AppCompatActivity() {
 
     private val captureImageLauncher =
         registerForActivityResult(ActivityResultContracts.TakePicture()) { saved: Boolean ->
+            finishAttachmentFlow()
             val uri = pendingCameraImageUri
             pendingCameraImageUri = null
             if (saved && uri != null) {
@@ -325,6 +344,7 @@ class MainActivity : AppCompatActivity() {
 
     private val pickDocumentAttachmentLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+            finishAttachmentFlow()
             if (uri != null) {
                 val mimeType = contentResolver.getType(uri).orEmpty()
                 val kind = if (mimeType == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true)) {
@@ -899,11 +919,12 @@ class MainActivity : AppCompatActivity() {
                     extra = "include_logs=true"
                 )
                 val response = apiService.getStatus(
-                    taskId,
-                    deviceId,
-                    null,
-                    userIdentity.phoneNumber,
-                    includeLogs = true
+                    taskId = taskId,
+                    deviceId = deviceId,
+                    userId = null,
+                    phoneNumber = userIdentity.phoneNumber,
+                    includeLogs = true,
+                    includeTimeline = false
                 )
                 val sections = extractRawLogSections(response)
                 taskRawLogSections[taskId] = sections
@@ -1037,6 +1058,8 @@ class MainActivity : AppCompatActivity() {
         stopBuildCompletionMonitoring(normalizedTaskId)
         taskConversationMessages.remove(normalizedTaskId)
         loadedTaskChatIds.remove(normalizedTaskId)
+        taskTimelineRenderCache.remove(normalizedTaskId)
+        taskTimelineEventCursorById.remove(normalizedTaskId)
         preferencesStore.deleteTaskChat(normalizedTaskId)
         taskLastStatusKeys.remove(normalizedTaskId)
         if (currentTaskId == normalizedTaskId || screenState.selectedTaskId == normalizedTaskId) {
@@ -1518,6 +1541,7 @@ class MainActivity : AppCompatActivity() {
                     BuildRequest(
                         task_id = sourceTaskId,
                         prompt = prompt,
+                        display_prompt = displayPrompt,
                         device_info = deviceInfo,
                         device_id = deviceId,
                         user_id = null,
@@ -2044,6 +2068,7 @@ class MainActivity : AppCompatActivity() {
             upsertApkArtifactMessage(taskId, response, resolvedAppName)
             messages = buildTaskTimeline(taskId)
         }
+        reconcilePromptReviewHandling(taskId, response, messages)
         val inputMode = when {
             isPollingStatus -> InputMode.READ_ONLY
             isSuccess -> InputMode.CHAT
@@ -2301,6 +2326,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (changed) {
             taskConversationMessages[normalizedTaskId] = nextTimeline.toMutableList()
+            taskTimelineRenderCache.markChanged(normalizedTaskId)
             persistTaskChat(normalizedTaskId)
         }
     }
@@ -2328,12 +2354,7 @@ class MainActivity : AppCompatActivity() {
                     logStatusFetchTaskId(taskId, source = "polling")
                     logTaskIdForApi("/status/{task_id}", taskId)
                     logApiRequest("/status/{task_id}", taskId = taskId, deviceId = deviceId)
-                    val response = apiService.getStatus(
-                        taskId,
-                        deviceId,
-                        null,
-                        userIdentity.phoneNumber
-                    )
+                    val response = fetchTaskStatus(taskId)
                     applyStatus(taskId, response, autoInstallOnSuccess = true, syncPolling = false)
                     if (!shouldPoll(response.status.trim())) {
                         break
@@ -2703,6 +2724,8 @@ ${record.stackTrace}
     private fun loadPersistedTaskChats() {
         taskConversationMessages.clear()
         loadedTaskChatIds.clear()
+        taskTimelineRenderCache.clear()
+        taskTimelineEventCursorById.clear()
         preferencesStore.migrateLegacyTaskChatsIfNeeded(hiddenTaskIds)
     }
 
@@ -2728,6 +2751,7 @@ ${record.stackTrace}
         if (normalizedTaskId in hiddenTaskIds) return false
         if (normalizedTaskId !in loadedTaskChatIds && loadedMessages.isNotEmpty()) {
             taskConversationMessages[normalizedTaskId] = loadedMessages.toMutableList()
+            taskTimelineRenderCache.markChanged(normalizedTaskId)
         }
         loadedTaskChatIds += normalizedTaskId
         return true
@@ -2835,6 +2859,7 @@ ${record.stackTrace}
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return true
         trimTaskTimelineInMemory(normalizedTaskId)
+        taskTimelineRenderCache.markChanged(normalizedTaskId)
         preferencesStore.enqueueTaskChatSave(
             normalizedTaskId,
             taskConversationMessages[normalizedTaskId].orEmpty()
@@ -2882,12 +2907,7 @@ ${record.stackTrace}
         logTaskIdForApi("/status/{task_id}", taskId)
         logApiRequest("/status/{task_id}", taskId = taskId, deviceId = deviceId)
         try {
-            val status = apiService.getStatus(
-                taskId,
-                deviceId,
-                null,
-                userIdentity.phoneNumber
-            )
+            val status = fetchTaskStatus(taskId)
             if (selectionGeneration != null && !isTaskSelectionGenerationCurrent(selectionGeneration)) {
                 return
             }
@@ -2921,6 +2941,24 @@ ${record.stackTrace}
             }
             throw e
         }
+    }
+
+    private suspend fun fetchTaskStatus(
+        taskId: String,
+        includeLogs: Boolean = false,
+        includeTimeline: Boolean = true
+    ): StatusResponse {
+        val normalizedTaskId = taskId.trim()
+        return apiService.getStatus(
+            taskId = normalizedTaskId,
+            deviceId = deviceId,
+            userId = null,
+            phoneNumber = userIdentity.phoneNumber,
+            includeLogs = includeLogs,
+            includeTimeline = includeTimeline,
+            timelineAfterEventId = taskTimelineEventCursorById[normalizedTaskId]
+                .takeIf { includeTimeline }
+        )
     }
 
     private fun downloadAndInstall(taskId: String, url: String, artifactPath: String? = null) {
@@ -3938,6 +3976,7 @@ ${record.stackTrace}
         }
         if (!changed) return
         taskConversationMessages[normalizedTaskId] = nextTimeline.toMutableList()
+        taskTimelineRenderCache.markChanged(normalizedTaskId)
         persistTaskChat(normalizedTaskId)
         if (screenState.selectedTaskId == normalizedTaskId) {
             screenState = screenState.copy(messages = buildTaskTimeline(normalizedTaskId))
@@ -4079,10 +4118,15 @@ ${record.stackTrace}
 
     private fun setComposerEnabled(enabled: Boolean) {
         inputPrompt.isEnabled = enabled
-        btnAttachReferenceImage.isEnabled = enabled
-        btnAttachReferenceImage.alpha = if (enabled) 1.0f else 0.5f
+        updateAttachmentButtonState()
         btnSend.isEnabled = enabled
         btnSend.alpha = if (enabled) 1.0f else 0.5f
+    }
+
+    private fun updateAttachmentButtonState() {
+        val enabled = inputPrompt.isEnabled && !attachmentFlowInProgress
+        btnAttachReferenceImage.isEnabled = enabled
+        btnAttachReferenceImage.alpha = if (enabled) 1.0f else 0.5f
     }
 
     private fun hideKeyboardAndClearInputFocus() {
@@ -4134,7 +4178,17 @@ ${record.stackTrace}
     }
 
     private fun showAttachmentMenu() {
+        if (attachmentFlowInProgress) return
+        attachmentFlowInProgress = true
+        updateAttachmentButtonState()
         val dialog = BottomSheetDialog(this)
+        dialog.setOnDismissListener {
+            finishAttachmentFlow()
+        }
+        var choiceEnabledAt = Long.MAX_VALUE
+        dialog.setOnShowListener {
+            choiceEnabledAt = SystemClock.elapsedRealtime() + ATTACHMENT_MENU_TAP_GUARD_MS
+        }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(18), dp(20), dp(28))
@@ -4158,8 +4212,9 @@ ${record.stackTrace}
                 title = getString(R.string.attachment_menu_camera),
                 iconRes = android.R.drawable.ic_menu_camera
             ) {
-                dialog.dismiss()
-                launchCameraAttachment()
+                launchAttachmentPicker(dialog, choiceEnabledAt) {
+                    launchCameraAttachment()
+                }
             }
         )
         row.addView(
@@ -4167,8 +4222,9 @@ ${record.stackTrace}
                 title = getString(R.string.attachment_menu_photo),
                 iconRes = android.R.drawable.ic_menu_gallery
             ) {
-                dialog.dismiss()
-                pickReferenceImageLauncher.launch("image/*")
+                launchAttachmentPicker(dialog, choiceEnabledAt) {
+                    pickReferenceImageLauncher.launch("image/*")
+                }
             }
         )
         row.addView(
@@ -4176,13 +4232,50 @@ ${record.stackTrace}
                 title = getString(R.string.attachment_menu_file),
                 iconRes = R.drawable.ic_artifact_file
             ) {
-                dialog.dismiss()
-                pickDocumentAttachmentLauncher.launch(arrayOf("application/pdf", "text/*"))
+                launchAttachmentPicker(dialog, choiceEnabledAt) {
+                    pickDocumentAttachmentLauncher.launch(arrayOf("application/pdf", "text/*"))
+                }
             }
         )
         content.addView(row)
         dialog.setContentView(content)
-        dialog.show()
+        try {
+            dialog.show()
+        } catch (e: RuntimeException) {
+            finishAttachmentFlow()
+            Toast.makeText(
+                this,
+                getString(R.string.attachment_pick_failed, userVisibleErrorMessage(e)),
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    private fun launchAttachmentPicker(
+        dialog: BottomSheetDialog,
+        choiceEnabledAt: Long,
+        launch: () -> Unit
+    ) {
+        if (!attachmentFlowInProgress) return
+        if (SystemClock.elapsedRealtime() < choiceEnabledAt) return
+        dialog.setOnDismissListener(null)
+        dialog.dismiss()
+        try {
+            launch()
+        } catch (e: RuntimeException) {
+            finishAttachmentFlow()
+            Toast.makeText(
+                this,
+                getString(R.string.attachment_pick_failed, userVisibleErrorMessage(e)),
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    private fun finishAttachmentFlow() {
+        if (!attachmentFlowInProgress) return
+        attachmentFlowInProgress = false
+        updateAttachmentButtonState()
     }
 
     private fun buildAttachmentSheetTile(title: String, iconRes: Int, onClick: () -> Unit): View {
@@ -4222,6 +4315,7 @@ ${record.stackTrace}
     private fun launchCameraAttachment() {
         val cacheRoot = externalCacheDir
         if (cacheRoot == null) {
+            finishAttachmentFlow()
             Toast.makeText(this, R.string.attachment_camera_unavailable, Toast.LENGTH_SHORT).show()
             return
         }
@@ -4358,13 +4452,15 @@ ${record.stackTrace}
         taskId: String,
         response: StatusResponse
     ): List<ChatMessage> {
-        seedConversationMessages(taskId, response)
-        backfillTimelineEventTypes(taskId, response)
-        backfillTimelineAttachments(taskId, response)
+        val timelinePage = extractTimelineEventPage(response, taskId)
+        val timelineEvents = timelinePage.events
+        seedConversationMessages(taskId, response, timelineEvents)
+        backfillTimelineEventTypes(taskId, timelineEvents)
+        backfillTimelineAttachments(taskId, timelineEvents)
         val seededTimeline = buildTaskTimeline(taskId)
         val incomingMessages = when {
             seededTimeline.isNotEmpty() ->
-                buildIncrementalMessages(taskId, response, seededTimeline)
+                buildIncrementalMessages(taskId, response, seededTimeline, timelineEvents)
                     .filter(::shouldKeepChatTimelineMessage)
             else ->
                 emptyList()
@@ -4377,16 +4473,23 @@ ${record.stackTrace}
             )
         }
         appendStatusTransitionMessage(taskId, response)
-        return buildTaskTimeline(taskId)
+        return buildTaskTimeline(taskId).also {
+            timelinePage.nextCursor
+                ?.takeIf { cursor -> cursor.isNotBlank() }
+                ?.let { cursor -> taskTimelineEventCursorById[taskId] = cursor }
+        }
     }
 
-    private fun backfillTimelineEventTypes(taskId: String, response: StatusResponse) {
+    private fun backfillTimelineEventTypes(
+        taskId: String,
+        timelineEvents: List<TimelineEventSnapshot>
+    ) {
         val normalizedTaskId = taskId.trim()
         if (!ensureTaskChatLoaded(normalizedTaskId)) return
         val timeline = taskConversationMessages[normalizedTaskId] ?: return
         val changed = ChatTimelineEventTypeBackfill.backfill(
             timeline = timeline,
-            sourceEvents = extractTimelineEvents(response).map { event ->
+            sourceEvents = timelineEvents.map { event ->
                 ChatTimelineEventTypeBackfill.SourceEvent(
                     kind = event.kind,
                     body = event.body,
@@ -4399,7 +4502,11 @@ ${record.stackTrace}
         }
     }
 
-    private fun seedConversationMessages(taskId: String, response: StatusResponse) {
+    private fun seedConversationMessages(
+        taskId: String,
+        response: StatusResponse,
+        timelineEvents: List<TimelineEventSnapshot>
+    ) {
         val obj = response.conversation_state?.takeIf { it.isJsonObject }?.asJsonObject
         if (obj != null) {
             val initialPrompt = firstString(obj, "initial_user_prompt")?.trim().orEmpty()
@@ -4424,7 +4531,7 @@ ${record.stackTrace}
                     ?: currentTimestampString()
                 val normalizedTaskId = taskId.trim()
                 val timeline = taskConversationMessages[normalizedTaskId]
-                val hasCanonicalInitialEvent = extractTimelineEvents(response).any { event ->
+                val hasCanonicalInitialEvent = timelineEvents.any { event ->
                     event.kind.equals("user", ignoreCase = true) &&
                         event.eventType == "user_message" &&
                         hasSameMessageText(event.body, initialPrompt)
@@ -4656,13 +4763,29 @@ ${record.stackTrace}
             .takeIf { it.isNotBlank() }
     }
 
-    private fun extractTimelineEvents(
+    private fun extractTimelineEventPage(
         response: StatusResponse,
         taskId: String = response.task_id
-    ): List<TimelineEventSnapshot> {
-        val array = response.timeline_events?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
-        val startIndex = (array.size() - MAX_CHAT_TIMELINE_EVENTS_FOR_RENDER).coerceAtLeast(0)
-        return (startIndex until array.size()).mapNotNull { index ->
+    ): TimelineEventPage {
+        val array = response.timeline_events?.takeIf { it.isJsonArray }?.asJsonArray
+            ?: return TimelineEventPage(
+                events = emptyList(),
+                nextCursor = TimelineCursorPolicy.nextCursor(response.timeline_cursor, emptyList())
+            )
+        val eventIds = (0 until array.size()).map { index ->
+            array[index]
+                .takeIf { it.isJsonObject }
+                ?.asJsonObject
+                ?.let { obj -> firstString(obj, "event_id") }
+                ?.trim()
+                .orEmpty()
+        }
+        val startIndex = TimelineCursorPolicy.firstUnprocessedIndex(
+            eventIds = eventIds,
+            processedEventId = taskTimelineEventCursorById[taskId],
+            maxEvents = MAX_CHAT_TIMELINE_EVENTS_FOR_RENDER
+        )
+        val events = (startIndex until array.size()).mapNotNull { index ->
             val item = array[index]
             val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
             val payload = timelineEventPayloadObject(obj)
@@ -4684,8 +4807,12 @@ ${record.stackTrace}
                 appName = firstString(obj, "app_name") ?: payload?.let { firstString(it, "app_name") },
                 packageName = firstString(obj, "package_name") ?: payload?.let { firstString(it, "package_name") },
                 imagePreviews = timelineEventImagePreviews(taskId, obj)
-            ).takeIf { it.body.isNotBlank() }
+            ).takeIf { it.body.isNotBlank() || it.imagePreviews.isNotEmpty() }
         }
+        return TimelineEventPage(
+            events = events,
+            nextCursor = TimelineCursorPolicy.nextCursor(response.timeline_cursor, eventIds)
+        )
     }
 
     private fun timelineEventImagePreviews(taskId: String, obj: JsonObject): List<ChatImagePreview> {
@@ -4723,6 +4850,21 @@ ${record.stackTrace}
         return runCatching { gson.fromJson(payloadJson, JsonObject::class.java) }.getOrNull()
     }
 
+    private fun visibleUserMessageBody(
+        body: String,
+        imagePreviews: List<ChatImagePreview>,
+        isUserMessage: Boolean
+    ): String {
+        if (!isUserMessage) return body
+        val normalizedBody = normalizeMessageTextForDedupe(body)
+        val canonicalBody = AttachmentOnlyMessagePolicy.canonicalUserBody(
+            normalizedBody = normalizedBody,
+            hasImages = imagePreviews.isNotEmpty(),
+            normalizedSyntheticPrompts = attachmentOnlyPromptKeys
+        )
+        return if (canonicalBody.isBlank()) "" else body
+    }
+
     private fun timelineEventToMessage(taskId: String, event: TimelineEventSnapshot): ChatMessage {
         val messageKind = when (event.kind.lowercase()) {
             "user" -> MessageKind.USER
@@ -4755,7 +4897,11 @@ ${record.stackTrace}
                     MessageKind.DATE_SEPARATOR -> ""
                 }
             },
-            body = event.body,
+            body = visibleUserMessageBody(
+                body = event.body,
+                imagePreviews = event.imagePreviews,
+                isUserMessage = messageKind == MessageKind.USER
+            ),
             detail = event.detail.ifBlank { null },
             createdAt = event.createdAt.ifBlank { currentTimestampString() },
             eventType = event.eventType.ifBlank { null },
@@ -4770,15 +4916,23 @@ ${record.stackTrace}
         )
     }
 
-    private fun backfillTimelineAttachments(taskId: String, response: StatusResponse) {
+    private fun backfillTimelineAttachments(
+        taskId: String,
+        timelineEvents: List<TimelineEventSnapshot>
+    ) {
         val normalizedTaskId = taskId.trim()
         if (!ensureTaskChatLoaded(normalizedTaskId)) return
         val timeline = taskConversationMessages[normalizedTaskId] ?: return
         var changed = false
 
-        extractTimelineEvents(response)
+        timelineEvents
             .filter { it.kind.equals("user", ignoreCase = true) && it.imagePreviews.isNotEmpty() }
             .forEach { event ->
+                val visibleEventBody = visibleUserMessageBody(
+                    body = event.body,
+                    imagePreviews = event.imagePreviews,
+                    isUserMessage = true
+                )
                 val serverMessageId =
                     "timeline-$normalizedTaskId-${event.eventId.ifBlank { event.body.hashCode().toString() }}"
                 val exactIndex = timeline.indexOfFirst { it.id == serverMessageId }
@@ -4788,7 +4942,7 @@ ${record.stackTrace}
                     timeline.indices.reversed().firstOrNull { index ->
                         val existing = timeline[index]
                         existing.kind == MessageKind.USER &&
-                            hasSameMessageText(existing.body, event.body) &&
+                            hasSameMessageText(existing.body, visibleEventBody) &&
                             messagesOccurredNearEachOther(existing.createdAt, event.createdAt)
                     } ?: -1
                 }
@@ -4846,11 +5000,12 @@ ${record.stackTrace}
     private fun extractServerTimelineMessages(
         taskId: String,
         response: StatusResponse,
-        existingTimeline: List<ChatMessage>
+        existingTimeline: List<ChatMessage>,
+        timelineEvents: List<TimelineEventSnapshot>
     ): List<ChatMessage> {
         val messages = mutableListOf<ChatMessage>()
         val existingMessageIds = existingTimeline.asSequence().map { it.id }.toHashSet()
-        extractTimelineEvents(response).forEach { event ->
+        timelineEvents.forEach { event ->
             val message = timelineEventToMessage(taskId, event)
             if (
                 message.id !in existingMessageIds &&
@@ -4896,9 +5051,14 @@ ${record.stackTrace}
         return extractRawLogSections(response).isNotEmpty()
     }
 
-    private fun buildIncrementalMessages(taskId: String, response: StatusResponse, existingTimeline: List<ChatMessage>): List<ChatMessage> {
+    private fun buildIncrementalMessages(
+        taskId: String,
+        response: StatusResponse,
+        existingTimeline: List<ChatMessage>,
+        timelineEvents: List<TimelineEventSnapshot>
+    ): List<ChatMessage> {
         val messages = mutableListOf<ChatMessage>()
-        messages += extractServerTimelineMessages(taskId, response, existingTimeline)
+        messages += extractServerTimelineMessages(taskId, response, existingTimeline, timelineEvents)
         messages += extractRecentAssistantMessages(taskId, response, existingTimeline)
         if (hasStructuredRawLogs(response)) {
             return messages
@@ -5489,6 +5649,43 @@ ${record.stackTrace}
             response.pending_decision_reason?.trim()?.lowercase() == "initial_prompt_review"
     }
 
+    private fun reconcilePromptReviewHandling(
+        taskId: String,
+        response: StatusResponse,
+        messages: List<ChatMessage>
+    ) {
+        val promptReviewMessages = messages.filter { message ->
+            message.promptReviewTaskId == taskId && !message.promptReviewText.isNullOrBlank()
+        }
+        if (promptReviewMessages.isEmpty()) return
+
+        val awaitingPromptReview = isPromptReviewRenderMode(response)
+        val preparedPrompt = response.prepared_prompt?.trim().orEmpty()
+            .ifBlank {
+                response.conversation_state
+                    ?.takeIf { it.isJsonObject }
+                    ?.asJsonObject
+                    ?.let { firstString(it, "prepared_prompt") }
+                    ?.trim()
+                    .orEmpty()
+            }
+        val activeMessageId = if (awaitingPromptReview) {
+            promptReviewMessages.lastOrNull { message ->
+                preparedPrompt.isBlank() || hasSameMessageText(message.promptReviewText.orEmpty(), preparedPrompt)
+            }?.id
+        } else {
+            null
+        }
+
+        promptReviewMessages.forEach { message ->
+            if (message.id == activeMessageId) {
+                handledConfirmationMessageIds.remove(message.id)
+            } else {
+                handledConfirmationMessageIds.add(message.id)
+            }
+        }
+    }
+
     private fun suppressAssistantBubble(response: StatusResponse): Boolean {
         return response.suppress_assistant_bubble == true ||
             response.render_mode?.trim()?.lowercase() == "status_only"
@@ -5942,12 +6139,7 @@ ${record.stackTrace}
                 try {
                     logTaskIdForApi("/status/{task_id}", taskId)
                     logApiRequest("/status/{task_id}", taskId = taskId, deviceId = deviceId, extra = "reconcile_runtime_error=true")
-                    val status = apiService.getStatus(
-                        taskId,
-                        deviceId,
-                        null,
-                        userIdentity.phoneNumber
-                    )
+                    val status = fetchTaskStatus(taskId, includeTimeline = false)
                     if (isSuccessStatus(status.status) && !record.awaitingUserConfirmation) {
                         clearStaleRuntimeErrorState(taskId, removeTimeline = false)
                     }
@@ -5976,6 +6168,8 @@ ${record.stackTrace}
                 changed = true
             }
             loadedTaskChatIds.remove(normalizedTaskId)
+            taskTimelineRenderCache.remove(normalizedTaskId)
+            taskTimelineEventCursorById.remove(normalizedTaskId)
             preferencesStore.deleteTaskChat(normalizedTaskId)
         }
         if (removeTimeline && screenState.selectedTaskId == normalizedTaskId) {
@@ -6138,27 +6332,29 @@ ${record.stackTrace}
     private fun buildTaskTimeline(taskId: String): List<ChatMessage> {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank() || !ensureTaskChatLoaded(normalizedTaskId)) return emptyList()
-        return taskConversationMessages[normalizedTaskId]
-            .orEmpty()
-            .filter { shouldShowChatMessage(it) }
-            .mapIndexed { index, message -> index to message }
-            .sortedWith(
-                compareBy<Pair<Int, ChatMessage>> { (_, message) ->
-                    parseMessageTimestamp(message.createdAt)?.time ?: Long.MAX_VALUE
-                }.thenBy { (index, _) -> index }
-            )
-            .map { (_, message) -> message }
-            .let(TaskProgressTimelinePolicy::keepLatestDuplicateArtifacts)
-            .filterVisibleDuplicateMessages()
-            .map { message ->
-                TaskProgressTimelinePolicy.stripLoadingDetailWhenLogsHidden(
-                    showLogs = false,
-                    message = message,
-                    isProcessingBody = { processingAnimationBaseText(it) != null }
+        return taskTimelineRenderCache.getOrBuild(normalizedTaskId) {
+            taskConversationMessages[normalizedTaskId]
+                .orEmpty()
+                .filter { shouldShowChatMessage(it) }
+                .mapIndexed { index, message -> index to message }
+                .sortedWith(
+                    compareBy<Pair<Int, ChatMessage>> { (_, message) ->
+                        parseMessageTimestamp(message.createdAt)?.time ?: Long.MAX_VALUE
+                    }.thenBy { (index, _) -> index }
                 )
-            }
-            .let(TaskProgressTimelinePolicy::moveLoadingMessagesToEnd)
-            .let(::withDateSeparators)
+                .map { (_, message) -> message }
+                .let(TaskProgressTimelinePolicy::keepLatestDuplicateArtifacts)
+                .filterVisibleDuplicateMessages()
+                .map { message ->
+                    TaskProgressTimelinePolicy.stripLoadingDetailWhenLogsHidden(
+                        showLogs = false,
+                        message = message,
+                        isProcessingBody = { processingAnimationBaseText(it) != null }
+                    )
+                }
+                .let(TaskProgressTimelinePolicy::moveLoadingMessagesToEnd)
+                .let(::withDateSeparators)
+        }
     }
 
     private fun withDateSeparators(messages: List<ChatMessage>): List<ChatMessage> {
@@ -6264,14 +6460,31 @@ ${record.stackTrace}
         val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(message)
         if (artifactKey != null) return artifactKey
         if (isCancelledCompletionStatusMessage(message)) return "status:cancelled-complete"
+        val imagePreviews = message.allImagePreviews()
+        val normalizedBody = normalizeMessageTextForDedupe(message.body)
+        val canonicalBody = if (message.kind == MessageKind.USER) {
+            AttachmentOnlyMessagePolicy.canonicalUserBody(
+                normalizedBody = normalizedBody,
+                hasImages = imagePreviews.isNotEmpty(),
+                normalizedSyntheticPrompts = attachmentOnlyPromptKeys
+            )
+        } else {
+            normalizedBody
+        }
         val bodyKey = clarificationQuestionDedupeKey(message)
-            ?: compactMessageTextForDedupe(normalizeMessageTextForDedupe(message.body))
-        if (bodyKey.isBlank()) return null
+            ?: compactMessageTextForDedupe(canonicalBody)
+        if (bodyKey.isBlank()) {
+            return if (message.kind == MessageKind.USER && imagePreviews.isNotEmpty()) {
+                "user-image:${AttachmentOnlyMessagePolicy.imageIdentity(imagePreviews)}"
+            } else {
+                null
+            }
+        }
         if (message.kind != MessageKind.USER) return bodyKey
         if (isLocalUserMessage(message) || isServerUserMessage(message)) {
             return "user-echo:$bodyKey"
         }
-        val imageKey = message.allImagePreviews()
+        val imageKey = imagePreviews
             .joinToString("|") { preview ->
                 "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}:${preview.remoteUrl.orEmpty()}"
             }
@@ -6325,7 +6538,22 @@ ${record.stackTrace}
         if (normalizedTaskId.isBlank()) return
         val timeline = editableTaskTimeline(normalizedTaskId) ?: return
         if (message.id.startsWith("timeline-") && timeline.any { it.id == message.id }) return
-        if (timeline.any { shouldDropIncomingDuplicateMessage(it, message) }) return
+        val duplicateIndex = timeline.indexOfFirst { shouldDropIncomingDuplicateMessage(it, message) }
+        if (duplicateIndex >= 0) {
+            val existing = timeline[duplicateIndex]
+            val mergedUserEcho = when {
+                isLocalUserMessage(existing) && isServerUserMessage(message) ->
+                    AttachmentOnlyMessagePolicy.mergeLocalWithServerEcho(existing, message)
+                isServerUserMessage(existing) && isLocalUserMessage(message) ->
+                    AttachmentOnlyMessagePolicy.mergeLocalWithServerEcho(message, existing)
+                else -> null
+            }
+            if (mergedUserEcho != null && mergedUserEcho != existing) {
+                timeline[duplicateIndex] = mergedUserEcho
+                persistTaskChat(normalizedTaskId)
+            }
+            return
+        }
         if (!message.artifactTaskId.isNullOrBlank()) {
             val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(message)
             val existingArtifactIndex = timeline.indexOfFirst { it.id == message.id }
@@ -6593,21 +6821,34 @@ ${record.stackTrace}
         if (artifactKey != null || otherArtifactKey != null) {
             return artifactKey != null && artifactKey == otherArtifactKey
         }
-        val sameBody = hasSameMessageText(body, other.body)
+        val ownImagePreviews = allImagePreviews()
+        val otherImagePreviews = other.allImagePreviews()
+        val sameBody = if (kind == MessageKind.USER) {
+            val ownBody = AttachmentOnlyMessagePolicy.canonicalUserBody(
+                normalizedBody = normalizeMessageTextForDedupe(body),
+                hasImages = ownImagePreviews.isNotEmpty(),
+                normalizedSyntheticPrompts = attachmentOnlyPromptKeys
+            )
+            val otherBody = AttachmentOnlyMessagePolicy.canonicalUserBody(
+                normalizedBody = normalizeMessageTextForDedupe(other.body),
+                hasImages = otherImagePreviews.isNotEmpty(),
+                normalizedSyntheticPrompts = attachmentOnlyPromptKeys
+            )
+            hasSameMessageText(ownBody, otherBody)
+        } else {
+            hasSameMessageText(body, other.body)
+        }
         val sameDetail = hasSameMessageText(detail, other.detail)
         return when (kind) {
             MessageKind.USER -> {
-                val imagePreviews = allImagePreviews().map {
-                    it.base64.ifBlank { it.remoteUrl.orEmpty() }
-                }
-                val otherImagePreviews = other.allImagePreviews().map {
-                    it.base64.ifBlank { it.remoteUrl.orEmpty() }
-                }
-                val hasImage = imagePreviews.isNotEmpty()
+                val hasImage = ownImagePreviews.isNotEmpty()
                 val otherHasImage = otherImagePreviews.isNotEmpty()
                 when {
                     hasImage != otherHasImage -> sameBody
-                    hasImage -> sameBody && imagePreviews == otherImagePreviews
+                    hasImage -> sameBody && AttachmentOnlyMessagePolicy.imageSelectionsEquivalent(
+                        ownImagePreviews,
+                        otherImagePreviews
+                    )
                     else -> sameBody
                 }
             }

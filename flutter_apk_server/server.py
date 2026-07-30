@@ -393,6 +393,18 @@ def codex_engine_issue_from_logs(
     return None
 
 
+def should_attempt_server_side_build(
+    *,
+    result_exists: bool,
+    identity_changed: bool,
+    timed_out: bool,
+    engine_issue: Optional[tuple[str, str, str, str]],
+) -> bool:
+    if result_exists:
+        return identity_changed
+    return not timed_out and engine_issue is None
+
+
 def _read_jsonrpc_result(process: subprocess.Popen[str], request_id: int, timeout_seconds: float) -> Any:
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("Codex app-server 표준 입출력을 열지 못했습니다.")
@@ -3191,6 +3203,7 @@ class GenerateRequest(BaseModel):
     device_id: str = Field(..., min_length=1)
     phone_number: Optional[str] = None
     prompt: str = Field(..., min_length=1)
+    display_prompt: Optional[str] = None
     request_action: Optional[str] = None
     device_info: Optional[DeviceInfoPayload] = None
     reference_image_path: Optional[str] = None
@@ -3852,9 +3865,45 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    def list_events(self, task_id: str, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
+    def list_events(
+        self,
+        task_id: str,
+        *,
+        limit: Optional[int] = None,
+        after_event_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            if limit is not None and limit > 0:
+            normalized_after_event_id = normalize_whitespace(after_event_id or "")
+            after_rowid: Optional[int] = None
+            if normalized_after_event_id:
+                cursor_row = connection.execute(
+                    """
+                    SELECT rowid
+                    FROM task_events
+                    WHERE task_id = ? AND event_id = ?
+                    LIMIT 1
+                    """,
+                    (task_id, normalized_after_event_id),
+                ).fetchone()
+                if cursor_row is not None:
+                    after_rowid = int(cursor_row["rowid"])
+
+            if after_rowid is not None:
+                limit_clause = "LIMIT ?" if limit is not None and limit > 0 else ""
+                values: list[Any] = [task_id, after_rowid]
+                if limit_clause:
+                    values.append(limit)
+                rows = connection.execute(
+                    f"""
+                    SELECT event_id, task_id, actor, event_type, message_text, payload_json, created_at
+                    FROM task_events
+                    WHERE task_id = ? AND rowid > ?
+                    ORDER BY rowid ASC
+                    {limit_clause}
+                    """,
+                    values,
+                ).fetchall()
+            elif limit is not None and limit > 0:
                 rows = connection.execute(
                     """
                     SELECT event_id, task_id, actor, event_type, message_text, payload_json, created_at
@@ -3881,6 +3930,20 @@ class Database:
                     (task_id,),
                 ).fetchall()
             return [dict(row) for row in rows]
+
+    def latest_event_id(self, task_id: str) -> str:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT event_id
+                FROM task_events
+                WHERE task_id = ?
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            return str(row["event_id"] or "") if row else ""
 
     def upsert_app_llm_config(self, task_id: str, config: dict[str, Any]) -> None:
         now = utc_now_iso()
@@ -5091,20 +5154,149 @@ Context:
     return parsed
 
 
-def apply_project_defaults(project_root: Path, task_id: str, app_name: str, package_name: str) -> None:
+def normalize_dart_project_identity(
+    dart_text: str,
+    *,
+    task_id: str,
+    package_name: str,
+    previous_package_names: set[str],
+) -> str:
+    updated = dart_text
+    for previous_package_name in previous_package_names:
+        if previous_package_name and previous_package_name != package_name:
+            updated = updated.replace(previous_package_name, package_name)
+
+    string_declaration = (
+        r"(?:(?:static\s+)?(?:const|final)\s+(?:String\s+)?|(?:static\s+)?String\s+)"
+    )
+    package_assignment = re.compile(
+        rf"(?P<prefix>\b{string_declaration}"
+        r"[A-Za-z_][A-Za-z0-9_]*package[A-Za-z0-9_]*\s*=\s*)"
+        r"(?P<quote>['\"])[^'\"]*(?P=quote)",
+        flags=re.IGNORECASE,
+    )
+    task_id_assignment = re.compile(
+        rf"(?P<prefix>\b{string_declaration}"
+        r"[A-Za-z_][A-Za-z0-9_]*task[A-Za-z0-9_]*id[A-Za-z0-9_]*\s*=\s*)"
+        r"(?P<quote>['\"])[^'\"]*(?P=quote)",
+        flags=re.IGNORECASE,
+    )
+    literal_package_argument = re.compile(
+        r"(?P<prefix>\bpackageName\s*:\s*)(?P<quote>['\"])[^'\"]*(?P=quote)"
+    )
+    literal_task_argument = re.compile(
+        r"(?P<prefix>\btaskId\s*:\s*)(?P<quote>['\"])[^'\"]*(?P=quote)"
+    )
+
+    def replace_string(match: re.Match[str], value: str) -> str:
+        return f"{match.group('prefix')}{match.group('quote')}{value}{match.group('quote')}"
+
+    updated = package_assignment.sub(lambda match: replace_string(match, package_name), updated)
+    updated = task_id_assignment.sub(lambda match: replace_string(match, task_id), updated)
+    updated = literal_package_argument.sub(lambda match: replace_string(match, package_name), updated)
+    updated = literal_task_argument.sub(lambda match: replace_string(match, task_id), updated)
+    updated = re.sub(
+        r"(?P<prefix>/apps/)[0-9a-fA-F]{32}(?P<suffix>/(?:llm/respond|data)(?=[/'\"?]))",
+        rf"\g<prefix>{task_id}\g<suffix>",
+        updated,
+    )
+    return updated
+
+
+def apply_project_defaults(project_root: Path, task_id: str, app_name: str, package_name: str) -> bool:
+    changed = False
+    previous_package_names: set[str] = set()
     manifest_path = project_root / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
-    manifest_text = read_text_if_exists(manifest_path, limit=100_000)
+    manifest_text = read_text_if_exists(manifest_path, limit=None)
     if manifest_text:
-        manifest_text = re.sub(r'android:label="[^"]*"', f'android:label="{app_name}"', manifest_text, count=1)
-        manifest_path.write_text(manifest_text, encoding="utf-8")
+        next_manifest_text = re.sub(
+            r'android:label="[^"]*"',
+            f'android:label="{app_name}"',
+            manifest_text,
+            count=1,
+        )
+        if next_manifest_text != manifest_text:
+            manifest_path.write_text(next_manifest_text, encoding="utf-8")
+            changed = True
 
     gradle_path = project_root / "android" / "app" / "build.gradle.kts"
-    gradle_text = read_text_if_exists(gradle_path, limit=100_000)
+    gradle_text = read_text_if_exists(gradle_path, limit=None)
     if gradle_text:
-        gradle_text = re.sub(r'namespace\s*=\s*"[^"]+"', f'namespace = "{package_name}"', gradle_text, count=1)
-        gradle_text = re.sub(r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{package_name}"', gradle_text, count=1)
-        gradle_path.write_text(gradle_text, encoding="utf-8")
-    ensure_release_uses_debug_signing(project_root)
+        previous_package_names.update(
+            match.strip()
+            for match in re.findall(
+                r'(?:namespace|applicationId)\s*=\s*"([^"]+)"',
+                gradle_text,
+            )
+            if match.strip()
+        )
+        next_gradle_text = re.sub(
+            r'namespace\s*=\s*"[^"]+"',
+            f'namespace = "{package_name}"',
+            gradle_text,
+            count=1,
+        )
+        next_gradle_text = re.sub(
+            r'applicationId\s*=\s*"[^"]+"',
+            f'applicationId = "{package_name}"',
+            next_gradle_text,
+            count=1,
+        )
+        if next_gradle_text != gradle_text:
+            gradle_path.write_text(next_gradle_text, encoding="utf-8")
+            changed = True
+
+    kotlin_root = project_root / "android" / "app" / "src" / "main" / "kotlin"
+    for kotlin_file in kotlin_root.rglob("MainActivity.kt"):
+        kotlin_text = read_text_if_exists(kotlin_file, limit=None)
+        if not kotlin_text:
+            continue
+        package_match = re.search(r"^package\s+([A-Za-z0-9_.]+)", kotlin_text, flags=re.MULTILINE)
+        if package_match:
+            previous_package_names.add(package_match.group(1))
+        next_kotlin_text = re.sub(
+            r"^package\s+[A-Za-z0-9_.]+",
+            f"package {package_name}",
+            kotlin_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if next_kotlin_text != kotlin_text:
+            kotlin_file.write_text(next_kotlin_text, encoding="utf-8")
+            changed = True
+        break
+
+    lib_root = project_root / "lib"
+    for dart_path in lib_root.rglob("*.dart"):
+        dart_text = read_text_if_exists(dart_path, limit=None)
+        if not dart_text:
+            continue
+        next_dart_text = normalize_dart_project_identity(
+            dart_text,
+            task_id=task_id,
+            package_name=package_name,
+            previous_package_names=previous_package_names,
+        )
+        if dart_path.name == "main.dart":
+            next_dart_text = re.sub(
+                r'CrashHandler\.initialize\(\s*.*?\s*\);\s*',
+                f'CrashHandler.initialize("{task_id}", "{package_name}");\n',
+                next_dart_text,
+                count=1,
+                flags=re.DOTALL,
+            )
+            next_dart_text = next_dart_text.replace("title: 'Generated App'", f"title: '{app_name}'")
+            next_dart_text = next_dart_text.replace(
+                'Text("Generated App Running")',
+                f'Text("{app_name} 실행 중")',
+            )
+        if next_dart_text != dart_text:
+            dart_path.write_text(next_dart_text, encoding="utf-8")
+            changed = True
+
+    if ensure_release_uses_debug_signing(project_root):
+        changed = True
+    return changed
 
 
 def ensure_release_uses_debug_signing(project_root: Path) -> bool:
@@ -5134,29 +5326,6 @@ def ensure_release_uses_debug_signing(project_root: Path) -> bool:
         return False
     gradle_path.write_text(next_text, encoding="utf-8")
     return True
-
-    kotlin_root = project_root / "android" / "app" / "src" / "main" / "kotlin"
-    for kotlin_file in kotlin_root.rglob("MainActivity.kt"):
-        kotlin_text = read_text_if_exists(kotlin_file, limit=100_000)
-        if not kotlin_text:
-            continue
-        kotlin_text = re.sub(r"^package\s+[A-Za-z0-9_.]+", f"package {package_name}", kotlin_text, count=1, flags=re.MULTILINE)
-        kotlin_file.write_text(kotlin_text, encoding="utf-8")
-        break
-
-    main_dart_path = project_root / "lib" / "main.dart"
-    main_dart_text = read_text_if_exists(main_dart_path, limit=100_000)
-    if main_dart_text:
-        main_dart_text = re.sub(
-            r'CrashHandler\.initialize\(\s*.*?\s*\);\s*',
-            f'CrashHandler.initialize("{task_id}", "{package_name}");\n',
-            main_dart_text,
-            count=1,
-            flags=re.DOTALL,
-        )
-        main_dart_text = main_dart_text.replace("title: 'Generated App'", f"title: '{app_name}'")
-        main_dart_text = main_dart_text.replace('Text("Generated App Running")', f'Text("{app_name} 실행 중")')
-        main_dart_path.write_text(main_dart_text, encoding="utf-8")
 
 
 def ensure_workspace_project_link(workspace_path: Path, project_root: Path) -> Path:
@@ -6062,7 +6231,10 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
     if event_type == "user_message":
         kind = "user"
         title = "나"
-        body = message_text or sanitize_user_visible_text(str(payload.get("raw_prompt") or ""))
+        if "display_prompt" in payload:
+            body = sanitize_user_visible_text(str(payload.get("display_prompt") or ""))
+        else:
+            body = message_text or sanitize_user_visible_text(str(payload.get("raw_prompt") or ""))
     elif event_type == "assistant_message":
         render_mode = str(payload.get("render_mode") or "")
         confirmation_action = str(payload.get("confirmation_action") or "")
@@ -6134,7 +6306,14 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]
 
     body = sanitize_user_visible_text(body).strip()
     detail = sanitize_user_visible_text(detail).strip()
-    if not body:
+    try:
+        attachment_count = int(payload.get("attachment_count") or 0)
+    except (TypeError, ValueError):
+        attachment_count = 0
+    has_user_attachments = event_type == "user_message" and (
+        attachment_count > 0 or bool(payload.get("attachments"))
+    )
+    if not body and not has_user_attachments:
         return None
     event = {
         "event_id": event_id,
@@ -6163,6 +6342,7 @@ def build_task_timeline_events(
     task_id: str,
     *,
     limit: int = 120,
+    after_event_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     attachments_by_event_id: dict[str, list[dict[str, Any]]] = {}
     for attachment in db.list_task_attachments(task_id):
@@ -6181,7 +6361,11 @@ def build_task_timeline_events(
 
     timeline: list[dict[str, Any]] = []
     source_limit = limit * 3 if limit > 0 else None
-    for row in db.list_events(task_id, limit=source_limit):
+    for row in db.list_events(
+        task_id,
+        limit=source_limit,
+        after_event_id=after_event_id,
+    ):
         event = task_event_to_timeline_event(row)
         if event:
             event_id = str(row.get("event_id") or "").strip()
@@ -6636,6 +6820,34 @@ class CodexTaskRunner:
             "codex_result_json": json.dumps(task_state, ensure_ascii=False),
         }
 
+    def enforce_task_project_identity(self, task_id: str) -> bool:
+        task = self.db.get_task(task_id)
+        if not task:
+            return False
+        project_path_value = normalize_whitespace(str(task.get("project_path") or ""))
+        app_name = current_task_app_name(task)
+        package_name = current_task_package_name(task)
+        if not project_path_value or not app_name or not package_name:
+            return False
+        project_path = Path(project_path_value).resolve()
+        if not project_path.exists() or not project_path.is_dir():
+            return False
+
+        changed = apply_project_defaults(project_path, task_id, app_name, package_name)
+        if changed:
+            self.db.log_event(
+                task_id,
+                actor="system",
+                event_type="project_identity_enforced",
+                message_text="앱 식별 정보를 Task 기준으로 복원했어요.",
+                payload={
+                    "app_name": app_name,
+                    "package_name": package_name,
+                    "project_path": str(project_path),
+                },
+            )
+        return changed
+
     def worker_loop(self) -> None:
         while not self.stop_event.is_set():
             task_id = self.queue.get()
@@ -6746,9 +6958,19 @@ class CodexTaskRunner:
                     body=codex_body,
                     detail=f"종료 코드: {exit_code if exit_code is not None else '-'}, 소요 시간: {codex_elapsed_seconds:.1f}초",
                 )
-            if not timed_out and not result_path.exists() and not self.is_task_cancelled(task_id):
+            identity_changed = False
+            if not self.is_task_cancelled(task_id):
+                identity_changed = self.enforce_task_project_identity(task_id)
+            result_exists = result_path.exists()
+            if not self.is_task_cancelled(task_id):
                 codex_log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
-                if codex_engine_issue_from_logs(codex_log_text, exit_code) is None:
+                engine_issue = None if result_exists else codex_engine_issue_from_logs(codex_log_text, exit_code)
+                if should_attempt_server_side_build(
+                    result_exists=result_exists,
+                    identity_changed=identity_changed,
+                    timed_out=timed_out,
+                    engine_issue=engine_issue,
+                ):
                     self.attempt_server_side_build(task_id, workspace_path, result_path, exit_code)
 
         self.finalize_task(task_id, workspace_path, result_path, exit_code, timed_out)
@@ -6931,7 +7153,7 @@ class CodexTaskRunner:
         )
         if self.is_task_cancelled(task_id):
             raise RuntimeError("앱 생성이 중단되었습니다.")
-        if timed_out:
+        if timed_out and not result_path.exists():
             raise RuntimeError("debug APK 빌드가 시간 제한을 초과했습니다.")
         if exit_code != 0:
             raise RuntimeError(f"debug APK 빌드에 실패했습니다. exit code: {exit_code}")
@@ -7081,7 +7303,11 @@ class CodexTaskRunner:
         flutter_args = shlex.split(self.settings.flutter_command)
         stages = [
             ("pub_get", "Flutter 의존성을 설치하고 있어요.", flutter_args + ["pub", "get"]),
-            ("analyze", "Flutter 코드를 분석하고 있어요.", flutter_args + ["analyze"]),
+            (
+                "analyze",
+                "Flutter 코드를 분석하고 있어요.",
+                flutter_args + ["analyze", "--no-fatal-warnings", "--no-fatal-infos"],
+            ),
             (
                 "build",
                 "Android APK를 빌드하고 있어요.",
@@ -7691,6 +7917,8 @@ def serialize_task_for_status(
     log_line_limit: int,
     *,
     include_logs: bool = False,
+    include_timeline: bool = True,
+    timeline_after_event_id: Optional[str] = None,
 ) -> dict[str, Any]:
     if include_logs:
         log_text, log_lines = collect_live_task_logs(task, log_line_limit)
@@ -7699,7 +7927,16 @@ def serialize_task_for_status(
         log_lines = tail_lines(str(task.get("log") or ""), 1)
     success = task["status"] == "Success"
     status_text = status_display_text(task["status"], task.get("message"))
-    timeline_events = build_task_timeline_events(db, str(task["task_id"]))
+    timeline_events = (
+        build_task_timeline_events(
+            db,
+            str(task["task_id"]),
+            after_event_id=timeline_after_event_id,
+        )
+        if include_timeline
+        else []
+    )
+    timeline_cursor = db.latest_event_id(str(task["task_id"]))
     current_build_stage, current_build_stage_detail = derive_current_build_stage(task, timeline_events)
     raw_log_sections: list[dict[str, str]] = []
     workspace_value = (task.get("workspace_path") or "").strip()
@@ -7765,6 +8002,7 @@ def serialize_task_for_status(
         "latest_failure_message": latest_failure_message,
         "recent_messages": state_payload.get("recent_messages", []),
         "timeline_events": timeline_events,
+        "timeline_cursor": timeline_cursor,
         "raw_log_sections": raw_log_sections,
         "interaction_type": str(state_payload.get("interaction_type") or ""),
         "render_mode": str(state_payload.get("render_mode") or ""),
@@ -8261,16 +8499,30 @@ def create_app() -> FastAPI:
             if pending_decision_task:
                 task = pending_decision_task
                 log_task_status_event(db, pending_decision_task)
+            visible_user_prompt = (
+                request.prompt
+                if request.display_prompt is None
+                else request.display_prompt
+            )
             user_event_id = db.log_event(
                 followup_task_id,
                 actor="user",
                 event_type="user_message",
-                message_text="만들어진 프롬프트대로 생성요청 문구를 보냈어요" if is_initial_prompt_submission else request.prompt,
+                message_text=(
+                    "만들어진 프롬프트대로 생성요청 문구를 보냈어요"
+                    if is_initial_prompt_submission
+                    else visible_user_prompt
+                ),
                 payload={
                     "task_id": followup_task_id,
                     "device_id": request.device_id,
                     "phone_number": request.phone_number,
-                    "raw_prompt": "만들어진 프롬프트대로 생성요청 문구를 보냈어요" if is_initial_prompt_submission else request.prompt,
+                    "raw_prompt": request.prompt,
+                    "display_prompt": (
+                        "만들어진 프롬프트대로 생성요청 문구를 보냈어요"
+                        if is_initial_prompt_submission
+                        else visible_user_prompt
+                    ),
                     "request_action": request_action,
                     "final_generation_prompt": request.prompt if is_initial_prompt_submission else "",
                     "attachment_count": len(requested_reference_attachments),
@@ -8726,15 +8978,22 @@ def create_app() -> FastAPI:
                 "attachment_count": len(requested_reference_attachments),
             },
         )
+        visible_user_prompt = (
+            request.prompt
+            if request.display_prompt is None
+            else request.display_prompt
+        )
         user_event_id = db.log_event(
             task_id,
             actor="user",
             event_type="user_message",
-            message_text=request.prompt,
+            message_text=visible_user_prompt,
             payload={
                 "task_id": task_id,
                 "device_id": request.device_id,
                 "phone_number": request.phone_number,
+                "raw_prompt": request.prompt,
+                "display_prompt": visible_user_prompt,
                 "attachment_count": len(requested_reference_attachments),
                 "attachments": [
                     reference_attachment_event_payload(attachment)
@@ -8826,6 +9085,8 @@ def create_app() -> FastAPI:
         phone_number: Optional[str] = Query(default=None),
         user_id: Optional[str] = Query(default=None),
         include_logs: bool = Query(default=False),
+        include_timeline: bool = Query(default=True),
+        timeline_after_event_id: Optional[str] = Query(default=None),
     ) -> dict[str, Any]:
         db: Database = app.state.db
         settings: Settings = app.state.settings
@@ -8839,6 +9100,8 @@ def create_app() -> FastAPI:
             task,
             settings.status_log_line_limit,
             include_logs=include_logs,
+            include_timeline=include_timeline,
+            timeline_after_event_id=timeline_after_event_id,
         )
 
     @app.post("/tasks/{task_id}/cancel")
@@ -9066,6 +9329,17 @@ def create_app() -> FastAPI:
 
         expected_package_name = str(task.get("package_name") or "").strip()
         if expected_package_name and request.package_name.strip() != expected_package_name:
+            db.log_event(
+                task_id,
+                actor="system",
+                event_type="app_llm_request_rejected",
+                message_text="package name mismatch",
+                payload={
+                    "reason": "package_name_mismatch",
+                    "expected_package_name": expected_package_name,
+                    "received_package_name": request.package_name.strip(),
+                },
+            )
             raise HTTPException(status_code=403, detail="package name mismatch")
 
         day_start = utc_day_start_iso()

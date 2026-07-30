@@ -224,7 +224,8 @@ class BuildMonitorService : Service() {
                 taskId = taskId,
                 deviceId = loadString(HostAppConfig.PREF_DEVICE_ID),
                 userId = null,
-                phoneNumber = loadString(HostAppConfig.PREF_PHONE_NUMBER).ifBlank { null }
+                phoneNumber = loadString(HostAppConfig.PREF_PHONE_NUMBER).ifBlank { null },
+                includeTimeline = false
             )
             persistMonitoredTaskName(taskId, resolveMonitoredTaskName(taskId, response))
             val statusKey = normalizeStatusKey(response.status)
