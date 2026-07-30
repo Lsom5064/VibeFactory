@@ -105,6 +105,7 @@ class MainActivity : AppCompatActivity() {
         private const val STATE_INPUT_PROMPT = "input_prompt"
         private const val STATE_CHAT_SCROLL_MESSAGE_ID = "chat_scroll_message_id"
         private const val STATE_CHAT_SCROLL_TOP_OFFSET = "chat_scroll_top_offset"
+        private const val PREF_PENDING_INSTALLER_LAUNCHED = "pending_installer_launched"
         private const val REQUEST_PHONE_NUMBER_PERMISSION = 7001
         private const val REQUEST_NOTIFICATION_PERMISSION = 7002
         private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete_alerts"
@@ -273,6 +274,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingInstallLaunchTaskId: String? = null
     private var pendingInstallLaunchPackageName: String? = null
     private var pendingInstallPackageWasInstalled: Boolean = false
+    private var pendingInstallerLaunched: Boolean = false
+    private var pendingInstallResolutionJob: Job? = null
     private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
     private val attachmentOnlyPromptKeys by lazy(LazyThreadSafetyMode.NONE) {
         setOf(
@@ -431,7 +434,9 @@ class MainActivity : AppCompatActivity() {
         loadHiddenTaskIds()
         loadNotifiedBuildSuccessTaskIds()
         loadPersistedTaskChats()
+        loadPendingInstallState()
         loadPersistedArtifactStates()
+        clearObsoleteApkDownloads()
         loadPersistedRuntimeErrors()
         reconcilePersistedRuntimeErrors()
         pendingTaskSelectionKey = visibleTaskIdCandidate(savedInstanceState?.getString(STATE_SELECTED_TASK_ID))
@@ -558,8 +563,10 @@ class MainActivity : AppCompatActivity() {
         if (!hasRequiredPhoneNumber() && PhoneNumberResolver.hasPermission(this)) {
             tryFillPhoneNumberFromSim()
         }
-        retryPendingApkInstallIfReady()
-        launchPendingInstalledAppIfReady("onResume")
+        val launchedInstallerNow = retryPendingApkInstallIfReady()
+        if (!launchedInstallerNow && !launchPendingInstalledAppIfReady("onResume")) {
+            resolveReturnedInstallerIfNeeded()
+        }
         if (skipNextResumeRestore) {
             skipNextResumeRestore = false
             return
@@ -2710,8 +2717,27 @@ ${record.stackTrace}
 
     private fun loadPersistedArtifactStates() {
         taskArtifactStates.clear()
-        taskArtifactStates += preferencesStore.loadTaskArtifactStates()
+        val restored = preferencesStore.loadTaskArtifactStates()
+        taskArtifactStates += restored.mapValues { (_, state) ->
+            state.copy(downloadedApkPath = null)
+        }
+        if (restored.values.any { !it.downloadedApkPath.isNullOrBlank() }) {
+            persistTaskArtifactStates()
+        }
         syncArtifactPointersForActiveTask()
+    }
+
+    private fun clearObsoleteApkDownloads() {
+        val keepFile = pendingInstallApkFile?.takeIf { it.exists() }
+        lifecycleScope.launch(Dispatchers.IO) {
+            val deletedCount = ApkArtifactActionHandler.clearManagedDownloadsSafely(
+                context = this@MainActivity,
+                keepFile = keepFile
+            )
+            if (deletedCount > 0) {
+                Log.i(TAG, "Cleared obsolete generated APK cache files count=$deletedCount")
+            }
+        }
     }
 
     private fun persistTaskArtifactStates() {
@@ -2745,19 +2771,12 @@ ${record.stackTrace}
     private fun persistedDownloadedApkFileForTask(taskId: String): File? {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank()) return null
-        val path = taskArtifactStates[normalizedTaskId]?.downloadedApkPath?.trim().orEmpty()
-        if (path.isBlank()) return null
-        val file = File(path)
-        return file.takeIf { it.exists() }
+        if (pendingInstallLaunchTaskId != normalizedTaskId) return null
+        return pendingInstallApkFile?.takeIf { it.exists() }
     }
 
     private fun artifactDownloadCacheFile(taskId: String, url: String?, artifactPath: String?): File {
-        val normalizedTaskId = taskId.trim().ifBlank { "latest" }
-        val artifactIdentity = artifactPath?.trim()?.takeIf { it.isNotBlank() }
-            ?: url?.trim()?.takeIf { it.isNotBlank() }
-            ?: "latest"
-        val artifactKey = Integer.toUnsignedString("$normalizedTaskId|$artifactIdentity".hashCode(), 36)
-        return File(externalCacheDir, "generated_app_${normalizedTaskId}_$artifactKey.apk")
+        return ApkArtifactActionHandler.artifactDownloadCacheFile(this, taskId, url, artifactPath)
     }
 
     private fun cachedDownloadedApkFileForArtifact(taskId: String, url: String?, artifactPath: String?): File? {
@@ -2778,7 +2797,7 @@ ${record.stackTrace}
         } else {
             taskArtifactStates[normalizedTaskId] = PersistedArtifactState(
                 apkUrl = normalizedUrl,
-                downloadedApkPath = normalizedPath
+                downloadedApkPath = null
             )
         }
         if (currentTaskId == normalizedTaskId || screenState.selectedTaskId == normalizedTaskId) {
@@ -2997,14 +3016,13 @@ ${record.stackTrace}
                                 id = "download-$taskId-${System.currentTimeMillis()}",
                                 kind = MessageKind.STATUS,
                                 title = getString(R.string.message_title_status),
-                                body = getString(R.string.status_downloaded),
-                                detail = apkFile.absolutePath
+                                body = getString(R.string.status_downloaded)
                             )
                         )
                     }
                     screenState = screenState.copy(
                         currentStatus = getString(R.string.status_downloaded),
-                        statusDetail = apkFile.absolutePath,
+                        statusDetail = getString(R.string.install_apk),
                         canInstall = screenState.selectedTaskId?.let(::persistedDownloadedApkFileForTask) != null,
                         canDownload = false
                     )
@@ -3060,7 +3078,7 @@ ${record.stackTrace}
                 file = file,
                 taskId = normalizedTaskId,
                 packageName = resolvedPackageName,
-                keepApkPath = true
+                installerLaunched = false
             )
             Toast.makeText(this, R.string.install_permission_required, Toast.LENGTH_LONG).show()
             if (!ApkArtifactActionHandler.requestInstallPermission(this)) {
@@ -3074,21 +3092,24 @@ ${record.stackTrace}
             file = file,
             taskId = normalizedTaskId,
             packageName = resolvedPackageName,
-            keepApkPath = false
+            installerLaunched = false
         )
-        if (!ApkArtifactActionHandler.launchApkInstaller(this, file)) {
+        if (ApkArtifactActionHandler.launchApkInstaller(this, file)) {
+            markPendingInstallerLaunched()
+        } else {
             clearPendingInstallState()
             Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun retryPendingApkInstallIfReady() {
+    private fun retryPendingApkInstallIfReady(): Boolean {
         loadPendingInstallState()
-        val file = pendingInstallApkFile ?: return
+        if (pendingInstallerLaunched) return false
+        val file = pendingInstallApkFile ?: return false
         if (!file.exists()) {
             clearPendingInstallState()
             Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
-            return
+            return false
         }
         if (!ApkArtifactActionHandler.needsInstallPermission(this)) {
             installApk(
@@ -3096,7 +3117,10 @@ ${record.stackTrace}
                 taskId = pendingInstallLaunchTaskId,
                 packageName = pendingInstallLaunchPackageName
             )
+            return pendingInstallerLaunched
         }
+        clearPendingInstallState()
+        return false
     }
 
     private fun resolveInstallLaunchPackageName(
@@ -3124,22 +3148,19 @@ ${record.stackTrace}
         file: File,
         taskId: String?,
         packageName: String?,
-        keepApkPath: Boolean
+        installerLaunched: Boolean
     ) {
         val normalizedTaskId = taskId?.trim()?.takeIf { it.isNotBlank() }
         val normalizedPackageName = packageName?.trim()?.takeIf { it.isNotBlank() }
-        pendingInstallApkFile = if (keepApkPath) file else null
+        pendingInstallApkFile = file
         pendingInstallLaunchTaskId = normalizedTaskId
         pendingInstallLaunchPackageName = normalizedPackageName
         pendingInstallPackageWasInstalled = normalizedPackageName?.let(::isPackageInstalled) == true
+        pendingInstallerLaunched = installerLaunched
         getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .apply {
-                if (keepApkPath) {
-                    putString(HostAppConfig.PREF_PENDING_INSTALL_APK_PATH, file.absolutePath)
-                } else {
-                    remove(HostAppConfig.PREF_PENDING_INSTALL_APK_PATH)
-                }
+                putString(HostAppConfig.PREF_PENDING_INSTALL_APK_PATH, file.absolutePath)
                 if (normalizedTaskId != null) {
                     putString(HostAppConfig.PREF_PENDING_INSTALL_TASK_ID, normalizedTaskId)
                 } else {
@@ -3155,7 +3176,16 @@ ${record.stackTrace}
                     remove(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_NAME)
                     remove(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_WAS_INSTALLED)
                 }
+                putBoolean(PREF_PENDING_INSTALLER_LAUNCHED, installerLaunched)
             }
+            .apply()
+    }
+
+    private fun markPendingInstallerLaunched() {
+        pendingInstallerLaunched = true
+        getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_PENDING_INSTALLER_LAUNCHED, true)
             .apply()
     }
 
@@ -3185,6 +3215,10 @@ ${record.stackTrace}
             HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_WAS_INSTALLED,
             pendingInstallPackageWasInstalled
         )
+        pendingInstallerLaunched = prefs.getBoolean(
+            PREF_PENDING_INSTALLER_LAUNCHED,
+            pendingInstallerLaunched
+        )
     }
 
     private fun loadPendingInstallLaunchPackageName(): String? {
@@ -3193,24 +3227,32 @@ ${record.stackTrace}
     }
 
     private fun clearPendingInstallState() {
+        val file = pendingInstallApkFile
+        val taskId = pendingInstallLaunchTaskId
+        pendingInstallResolutionJob?.cancel()
+        pendingInstallResolutionJob = null
         pendingInstallApkFile = null
         pendingInstallLaunchTaskId = null
         pendingInstallLaunchPackageName = null
         pendingInstallPackageWasInstalled = false
+        pendingInstallerLaunched = false
         getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .remove(HostAppConfig.PREF_PENDING_INSTALL_APK_PATH)
             .remove(HostAppConfig.PREF_PENDING_INSTALL_TASK_ID)
             .remove(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_NAME)
             .remove(HostAppConfig.PREF_PENDING_INSTALL_PACKAGE_WAS_INSTALLED)
+            .remove(PREF_PENDING_INSTALLER_LAUNCHED)
             .apply()
+        ApkArtifactActionHandler.deleteTransientDownload(file)
+        taskId?.let(::clearArtifactDownloadedState)
     }
 
     private fun launchPendingInstalledAppIfReady(source: String): Boolean {
         loadPendingInstallState()
         val packageName = pendingInstallLaunchPackageName?.trim()?.takeIf { it.isNotBlank() }
             ?: return false
-        if (source == "onResume" && pendingInstallPackageWasInstalled) {
+        if (source != "package-broadcast" && pendingInstallPackageWasInstalled) {
             return false
         }
         if (!isPackageInstalled(packageName)) {
@@ -3234,6 +3276,17 @@ ${record.stackTrace}
             Toast.makeText(this, R.string.generated_app_launch_failed, Toast.LENGTH_LONG).show()
         }
         return launched
+    }
+
+    private fun resolveReturnedInstallerIfNeeded() {
+        if (!pendingInstallerLaunched || pendingInstallApkFile == null) return
+        pendingInstallResolutionJob?.cancel()
+        pendingInstallResolutionJob = lifecycleScope.launch {
+            delay(750L)
+            if (!launchPendingInstalledAppIfReady("installer-result")) {
+                clearPendingInstallState()
+            }
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -3465,6 +3518,10 @@ ${record.stackTrace}
                 append(message.artifactCanDownload)
                 append(':')
                 append(message.artifactCanInstall)
+                append(':')
+                append(message.artifactInstalled)
+                append(':')
+                append(message.artifactPackageName.orEmpty())
                 append(':')
                 append(message.artifactTaskId.orEmpty())
                 append(':')
@@ -3791,12 +3848,15 @@ ${record.stackTrace}
             artifactApkUrl = incoming.artifactApkUrl?.trim()?.takeIf { it.isNotBlank() } ?: existing.artifactApkUrl,
             artifactApkPath = incoming.artifactApkPath?.trim()?.takeIf { it.isNotBlank() } ?: existing.artifactApkPath,
             artifactDownloadedPath = incoming.artifactDownloadedPath?.trim()?.takeIf { it.isNotBlank() }
-                ?: existing.artifactDownloadedPath,
+                ?.takeIf { File(it).exists() },
             artifactRevisionLabel = incoming.artifactRevisionLabel?.trim()?.takeIf { it.isNotBlank() }
                 ?: existing.artifactRevisionLabel,
             artifactBuildAttempt = incoming.artifactBuildAttempt ?: existing.artifactBuildAttempt,
             artifactCanDownload = incoming.artifactCanDownload || existing.artifactCanDownload,
-            artifactCanInstall = incoming.artifactCanInstall || existing.artifactCanInstall,
+            artifactCanInstall = incoming.artifactCanInstall,
+            artifactInstalled = incoming.artifactInstalled,
+            artifactPackageName = incoming.artifactPackageName?.trim()?.takeIf { it.isNotBlank() }
+                ?: existing.artifactPackageName,
             artifactDownloading = incoming.artifactDownloading || existing.artifactDownloading,
             artifactDownloadProgressPercent = incoming.artifactDownloadProgressPercent
                 ?: existing.artifactDownloadProgressPercent,
@@ -3820,17 +3880,12 @@ ${record.stackTrace}
             ?: "${HostAppConfig.BASE_URL}/download/$taskId"
         val artifactApkPath = response.apk_path?.trim()?.takeIf { it.isNotBlank() }
         val revisionLabel = apkArtifactRevisionLabel(response)
-        val cachedArtifactFile = cachedDownloadedApkFileForArtifact(
-            taskId = taskId,
-            url = artifactApkUrl,
-            artifactPath = artifactApkPath
-        )
-        val fallbackDownloadedFile = if (artifactApkPath.isNullOrBlank()) {
-            persistedDownloadedApkFileForTask(taskId)
-        } else {
-            null
-        }
-        val installableFile = cachedArtifactFile ?: fallbackDownloadedFile
+        val artifactPackageName = response.package_name
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: taskSummaryById[taskId]?.packageName?.trim()?.takeIf { it.isNotBlank() }
+        val installableFile = persistedDownloadedApkFileForTask(taskId)
+        val installed = artifactPackageName?.let(::isPackageInstalled) == true
         return ChatMessage(
             id = "artifact-$taskId-$eventId",
             kind = MessageKind.STATUS,
@@ -3846,6 +3901,8 @@ ${record.stackTrace}
             artifactBuildAttempt = response.build_attempts.takeIf { it > 0 },
             artifactCanDownload = artifactApkUrl.isNotBlank(),
             artifactCanInstall = installableFile != null,
+            artifactInstalled = installed,
+            artifactPackageName = artifactPackageName,
             artifactDownloading = isCurrentDownloadArtifactFor(taskId, artifactApkPath, artifactApkUrl),
             artifactDownloadProgressPercent = if (isCurrentDownloadArtifactFor(taskId, artifactApkPath, artifactApkUrl)) {
                 downloadProgressPercent
@@ -3888,6 +3945,45 @@ ${record.stackTrace}
         persistTaskChat(normalizedTaskId)
         if (screenState.selectedTaskId == normalizedTaskId) {
             screenState = screenState.copy(messages = buildTaskTimeline(normalizedTaskId))
+        }
+    }
+
+    private fun clearArtifactDownloadedState(taskId: String) {
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank()) return
+        latestDownloadedApkFile = null
+        if (latestDownloadedTaskId == normalizedTaskId) {
+            latestDownloadedTaskId = null
+        }
+        updateTaskArtifactState(
+            taskId = normalizedTaskId,
+            apkUrl = taskArtifactStates[normalizedTaskId]?.apkUrl,
+            downloadedApkFile = null
+        )
+        if (!ensureTaskChatLoaded(normalizedTaskId)) return
+        val timeline = taskConversationMessages[normalizedTaskId] ?: return
+        taskConversationMessages[normalizedTaskId] = timeline.map { message ->
+            if (message.artifactTaskId != normalizedTaskId) {
+                message
+            } else {
+                message.copy(
+                    artifactDownloadedPath = null,
+                    artifactCanInstall = false,
+                    artifactDownloading = false,
+                    artifactDownloadProgressPercent = null,
+                    artifactDownloadProgressText = null
+                )
+            }
+        }.toMutableList()
+        taskTimelineRenderCache.markChanged(normalizedTaskId)
+        persistTaskChat(normalizedTaskId)
+        if (screenState.selectedTaskId == normalizedTaskId) {
+            screenState = screenState.copy(
+                messages = buildTaskTimeline(normalizedTaskId),
+                canInstall = false,
+                canDownload = persistedApkUrlForTask(normalizedTaskId) != null
+            )
+            renderState()
         }
     }
 
@@ -3994,6 +4090,14 @@ ${record.stackTrace}
         if (isDownloadingApk) return
         val taskId = message.artifactTaskId?.trim().orEmpty()
         if (taskId.isBlank()) return
+        val packageName = message.artifactPackageName
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: taskSummaryById[taskId]?.packageName?.trim()?.takeIf { it.isNotBlank() }
+        if (packageName != null && isPackageInstalled(packageName)) {
+            launchGeneratedApp(packageName)
+            return
+        }
         val artifactPath = message.artifactApkPath?.trim()?.takeIf { it.isNotBlank() }
         val artifactUrl = message.artifactApkUrl?.trim()?.takeIf { it.isNotBlank() }
         val messageDownloadedFile = message.artifactDownloadedPath
@@ -4015,6 +4119,13 @@ ${record.stackTrace}
         }
         val apkUrl = artifactUrl ?: persistedApkUrlForTask(taskId)
         apkUrl?.let { downloadAndInstall(taskId, it, artifactPath) }
+    }
+
+    private fun launchGeneratedApp(packageName: String) {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        if (launchIntent == null || runCatching { startActivity(launchIntent) }.isFailure) {
+            Toast.makeText(this, R.string.generated_app_launch_failed, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun formatFileSize(bytes: Long): String {

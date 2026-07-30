@@ -359,6 +359,7 @@ class ChatMessageAdapter(
                     ?: item.artifactDownloadProgressPercent
                         ?.let { context.getString(R.string.download_apk_progress, it) }
                     ?: context.getString(R.string.download_apk_in_progress)
+                item.artifactInstalled -> context.getString(R.string.open_generated_app)
                 item.artifactCanInstall -> context.getString(R.string.install_apk)
                 else -> context.getString(R.string.artifact_download_action)
             }
@@ -706,7 +707,7 @@ class ChatMessageAdapter(
             }
 
             val clickListener = View.OnClickListener {
-                if (item.artifactCanInstall) {
+                if (item.artifactCanInstall || item.artifactInstalled) {
                     onArtifactInstall(item)
                 } else {
                     onArtifactDownload(item)

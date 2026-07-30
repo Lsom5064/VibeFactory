@@ -48,6 +48,8 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private var selectedRevision: TaskRevisionDto? = null
     private var isBranchingRevision = false
     private var pendingInstallApkFile: File? = null
+    private var installPermissionRequested = false
+    private var installerLaunched = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,7 +67,12 @@ class TaskLogDetailActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        retryPendingApkInstallIfReady()
+        when {
+            installerLaunched -> clearTransientInstallState()
+            installPermissionRequested &&
+                ApkArtifactActionHandler.needsInstallPermission(this) -> clearTransientInstallState()
+            else -> retryPendingApkInstallIfReady()
+        }
     }
 
     private fun bindPayload(payload: TaskLogDetailPayload) {
@@ -420,6 +427,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
                 val updatedAction = action.copy(downloadedPath = file.absolutePath)
                 Toast.makeText(this@TaskLogDetailActivity, R.string.status_downloaded, Toast.LENGTH_SHORT).show()
                 bindApkAction(updatedAction)
+                installApk(file)
             }.onFailure { error ->
                 Toast.makeText(
                     this@TaskLogDetailActivity,
@@ -438,14 +446,20 @@ class TaskLogDetailActivity : AppCompatActivity() {
         }
         if (ApkArtifactActionHandler.needsInstallPermission(this)) {
             pendingInstallApkFile = file
+            installPermissionRequested = true
             Toast.makeText(this, R.string.install_permission_required, Toast.LENGTH_LONG).show()
             if (!ApkArtifactActionHandler.requestInstallPermission(this)) {
+                clearTransientInstallState()
                 Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
             }
             return
         }
-        pendingInstallApkFile = null
-        if (!ApkArtifactActionHandler.launchApkInstaller(this, file)) {
+        pendingInstallApkFile = file
+        installPermissionRequested = false
+        if (ApkArtifactActionHandler.launchApkInstaller(this, file)) {
+            installerLaunched = true
+        } else {
+            clearTransientInstallState()
             Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
         }
     }
@@ -453,13 +467,23 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private fun retryPendingApkInstallIfReady() {
         val file = pendingInstallApkFile ?: return
         if (!file.exists()) {
-            pendingInstallApkFile = null
+            clearTransientInstallState()
             Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
             return
         }
         if (!ApkArtifactActionHandler.needsInstallPermission(this)) {
             installApk(file)
         }
+    }
+
+    private fun clearTransientInstallState() {
+        val file = pendingInstallApkFile
+        pendingInstallApkFile = null
+        installPermissionRequested = false
+        installerLaunched = false
+        ApkArtifactActionHandler.deleteTransientDownload(file)
+        val action = apkAction ?: return
+        bindApkAction(action.copy(downloadedPath = null))
     }
 
     private fun localApkFile(action: TaskLogApkAction): File? {

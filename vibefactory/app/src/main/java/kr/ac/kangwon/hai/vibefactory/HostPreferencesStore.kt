@@ -380,7 +380,10 @@ class HostPreferencesStore(
             body = truncateForPrefs(message.body, MAX_PERSISTED_BODY_CHARS),
             detail = message.detail?.let { truncateForPrefs(it, MAX_PERSISTED_DETAIL_CHARS) },
             imagePreviewBase64 = compactedLegacyPreview,
-            imagePreviews = compactedPreviews
+            imagePreviews = compactedPreviews,
+            artifactDownloadedPath = null,
+            artifactCanInstall = false,
+            artifactInstalled = false
         )
     }
 

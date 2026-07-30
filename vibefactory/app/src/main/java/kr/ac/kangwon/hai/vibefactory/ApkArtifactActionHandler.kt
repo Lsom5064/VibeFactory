@@ -9,6 +9,8 @@ import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.EOFException
 import java.io.FileOutputStream
@@ -22,6 +24,8 @@ internal data class ApkDownloadProgress(
 internal object ApkArtifactActionHandler {
     private const val MAX_DOWNLOAD_ATTEMPTS = 3
     private const val RETRY_DELAY_MS = 750L
+    private const val MANAGED_APK_PREFIX = "generated_app_"
+    private val downloadFileMutex = Mutex()
 
     fun localApkFile(
         context: Context,
@@ -50,16 +54,42 @@ internal object ApkArtifactActionHandler {
     fun artifactDownloadCacheFile(
         context: Context,
         taskId: String,
-        url: String?,
-        artifactPath: String?
+        @Suppress("UNUSED_PARAMETER") url: String?,
+        @Suppress("UNUSED_PARAMETER") artifactPath: String?
     ): File {
         val cacheDir = context.externalCacheDir ?: throw IOException("external cache unavailable")
-        val normalizedTaskId = taskId.trim().ifBlank { "latest" }
-        val artifactIdentity = artifactPath?.trim()?.takeIf { it.isNotBlank() }
-            ?: url?.trim()?.takeIf { it.isNotBlank() }
-            ?: "latest"
-        val artifactKey = Integer.toUnsignedString("$normalizedTaskId|$artifactIdentity".hashCode(), 36)
-        return File(cacheDir, "generated_app_${normalizedTaskId}_$artifactKey.apk")
+        return File(cacheDir, transientApkFileName(taskId))
+    }
+
+    fun clearManagedDownloads(context: Context, keepFile: File? = null): Int {
+        val cacheDir = context.externalCacheDir ?: return 0
+        val keepPath = keepFile
+            ?.takeIf { it.exists() }
+            ?.canonicalPath
+        var deletedCount = 0
+        cacheDir.listFiles().orEmpty().forEach { file ->
+            if (!isManagedApkFileName(file.name)) return@forEach
+            if (keepPath != null && runCatching { file.canonicalPath }.getOrNull() == keepPath) {
+                return@forEach
+            }
+            if (file.delete()) deletedCount += 1
+        }
+        return deletedCount
+    }
+
+    suspend fun clearManagedDownloadsSafely(context: Context, keepFile: File? = null): Int {
+        return downloadFileMutex.withLock {
+            clearManagedDownloads(context, keepFile)
+        }
+    }
+
+    fun deleteTransientDownload(file: File?): Boolean {
+        val target = file ?: return true
+        if (!isManagedApkFileName(target.name)) return false
+        val temp = File(target.parentFile, "${target.name}.tmp")
+        val targetDeleted = !target.exists() || target.delete()
+        val tempDeleted = !temp.exists() || temp.delete()
+        return targetDeleted && tempDeleted
     }
 
     suspend fun downloadToCache(
@@ -73,34 +103,66 @@ internal object ApkArtifactActionHandler {
         onProgress: suspend (ApkDownloadProgress) -> Unit = {},
         onRetry: suspend (attempt: Int, maxAttempts: Int) -> Unit = { _, _ -> }
     ): File {
+        return downloadFileMutex.withLock {
+            downloadToCacheLocked(
+                context = context,
+                apiService = apiService,
+                taskId = taskId,
+                url = url,
+                artifactPath = artifactPath,
+                deviceId = deviceId,
+                phoneNumber = phoneNumber,
+                onProgress = onProgress,
+                onRetry = onRetry
+            )
+        }
+    }
+
+    private suspend fun downloadToCacheLocked(
+        context: Context,
+        apiService: VibeApiService,
+        taskId: String,
+        url: String?,
+        artifactPath: String?,
+        deviceId: String,
+        phoneNumber: String?,
+        onProgress: suspend (ApkDownloadProgress) -> Unit,
+        onRetry: suspend (attempt: Int, maxAttempts: Int) -> Unit
+    ): File {
         val normalizedTaskId = taskId.trim().takeIf { it.isNotBlank() }
             ?: throw IllegalStateException("missing task_id for download")
         val normalizedArtifactPath = artifactPath?.trim()?.takeIf { it.isNotBlank() }
         val target = artifactDownloadCacheFile(context, normalizedTaskId, url, normalizedArtifactPath)
         val temp = File(target.parentFile ?: throw IOException("cache parent unavailable"), "${target.name}.tmp")
 
-        repeat(MAX_DOWNLOAD_ATTEMPTS) { attemptIndex ->
-            try {
-                downloadAttempt(
-                    apiService = apiService,
-                    taskId = normalizedTaskId,
-                    artifactPath = normalizedArtifactPath,
-                    deviceId = deviceId,
-                    phoneNumber = phoneNumber,
-                    temp = temp,
-                    onProgress = onProgress
-                )
-                replaceDownloadedFile(temp, target)
-                return target
-            } catch (error: IOException) {
-                if (error is NonRetryableDownloadException || attemptIndex == MAX_DOWNLOAD_ATTEMPTS - 1) {
-                    throw error
+        clearManagedDownloads(context)
+        return try {
+            repeat(MAX_DOWNLOAD_ATTEMPTS) { attemptIndex ->
+                try {
+                    downloadAttempt(
+                        apiService = apiService,
+                        taskId = normalizedTaskId,
+                        artifactPath = normalizedArtifactPath,
+                        deviceId = deviceId,
+                        phoneNumber = phoneNumber,
+                        temp = temp,
+                        onProgress = onProgress
+                    )
+                    replaceDownloadedFile(temp, target)
+                    return target
+                } catch (error: IOException) {
+                    if (error is NonRetryableDownloadException || attemptIndex == MAX_DOWNLOAD_ATTEMPTS - 1) {
+                        throw error
+                    }
+                    onRetry(attemptIndex + 2, MAX_DOWNLOAD_ATTEMPTS)
+                    delay(RETRY_DELAY_MS * (attemptIndex + 1))
                 }
-                onRetry(attemptIndex + 2, MAX_DOWNLOAD_ATTEMPTS)
-                delay(RETRY_DELAY_MS * (attemptIndex + 1))
             }
+            throw IOException("download failed")
+        } catch (error: Exception) {
+            deleteTransientDownload(target)
+            throw error
         }
-        throw IOException("download failed")
     }
 
     private suspend fun downloadAttempt(
@@ -182,6 +244,21 @@ internal object ApkArtifactActionHandler {
     }
 
     private class NonRetryableDownloadException(message: String) : IOException(message)
+
+    internal fun transientApkFileName(taskId: String): String {
+        val normalizedTaskId = taskId
+            .trim()
+            .ifBlank { "latest" }
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .take(96)
+            .ifBlank { "latest" }
+        return "$MANAGED_APK_PREFIX$normalizedTaskId.apk"
+    }
+
+    internal fun isManagedApkFileName(fileName: String): Boolean {
+        if (!fileName.startsWith(MANAGED_APK_PREFIX)) return false
+        return fileName.endsWith(".apk") || fileName.endsWith(".apk.tmp")
+    }
 
     fun installApk(activity: Activity, file: File): Boolean {
         if (!file.exists()) return false
