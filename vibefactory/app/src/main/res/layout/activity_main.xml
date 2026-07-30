@@ -263,6 +263,7 @@
                 android:layout_height="46dp"
                 android:background="@drawable/bg_top_chip"
                 android:clickable="true"
+                android:descendantFocusability="blocksDescendants"
                 android:focusable="true"
                 android:foreground="?attr/selectableItemBackground"
                 android:gravity="center_vertical"
@@ -275,7 +276,6 @@
                     android:layout_height="wrap_content"
                     android:text="@string/show_logs"
                     android:textColor="@color/text_primary"
-                    android:textIsSelectable="true"
                     android:textSize="15sp" />
 
                 <ImageView
