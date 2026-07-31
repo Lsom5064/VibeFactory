@@ -2037,6 +2037,32 @@ def build_build_summary(
     return f"{intro} 주요 기능은 {', '.join(clauses)}예요."
 
 
+def build_codex_followup_build_summary(
+    app_name: str,
+    change_summary: str,
+    user_prompt: str,
+) -> str:
+    app_label = app_name if app_name and app_name != "맞춤 앱" else "요청하신 앱"
+    if len(app_label) <= 1 or app_label in {"이", "그", "저"}:
+        app_label = "앱"
+    intro = f"기존 {append_object_particle_korean(app_label)} 수정할게요."
+    fallback = f"{intro} 요청한 변경 내용을 현재 앱의 구성에 맞게 반영해요."
+    sanitized = normalize_whitespace(sanitize_codex_followup_user_text(change_summary))
+    if not sanitized:
+        return fallback
+    normalized_summary = re.sub(r"[\s\"'`.,!?]+", "", sanitized).lower()
+    normalized_prompt = re.sub(
+        r"[\s\"'`.,!?]+",
+        "",
+        normalize_whitespace(user_prompt),
+    ).lower()
+    if normalized_prompt and normalized_prompt in normalized_summary:
+        return fallback
+    if sanitized.startswith(("기존 ", "현재 앱", "요청하신 앱")):
+        return sanitized
+    return f"{intro} {sanitized}"
+
+
 def build_intent_decision(
     *,
     mode: str,
@@ -2058,6 +2084,7 @@ def build_intent_decision(
     acceptance_criteria: Optional[list[str]] = None,
     image_reference_summary: str = "",
     image_conflict_note: str = "",
+    user_visible_summary: str = "",
 ) -> IntentDecision:
     raw_effective_prompt = effective_user_prompt or user_prompt
     effective_prompt = normalize_whitespace(raw_effective_prompt)
@@ -2107,8 +2134,9 @@ def build_intent_decision(
         )
     if mode == "build":
         continue_existing_app = resolved_request_scope == "existing_app_modification"
+        explicit_summary = normalize_whitespace(user_visible_summary)
         if continue_existing_app:
-            summary = build_build_summary(
+            summary = explicit_summary or build_build_summary(
                 app_name,
                 feature_points,
                 existing_task=True,
@@ -2117,7 +2145,7 @@ def build_intent_decision(
             )
             message = ""
         else:
-            summary = build_build_summary(
+            summary = explicit_summary or build_build_summary(
                 app_name,
                 feature_points,
                 existing_task=False,
@@ -4945,6 +4973,10 @@ Do not include file paths, folder names, line numbers, package names, class name
 If implementation details matter, translate them into user-facing concepts such as "화면 전환 처리", "저장 처리", "AI 응답 처리", or "대화 기록 처리".
 Put developer-facing references only in `referenced_files`, never in `assistant_reply`.
 For `build`, leave `assistant_reply` empty and put the code-aware build instruction in `effective_user_prompt`.
+Also include `change_summary` as one or two short Korean sentences explaining what will visibly change.
+`change_summary` must be a code-aware paraphrase, not a repetition or quotation of the user's message.
+Do not use a template such as "이번 수정은 {{사용자 원문}}을 반영해요."
+Do not include paths, code identifiers, commands, or developer terminology in `change_summary`.
 If `previous_conversation_state.awaiting_confirmation` is true and the latest user message answers that pending question, merge the pending request and latest answer into `effective_user_prompt`.
 For `ask_confirmation`, include 1-5 short Korean `questions`.
 
@@ -4953,6 +4985,7 @@ Result JSON schema:
   "mode": "answer_question | build | ask_confirmation",
   "effective_user_prompt": "string",
   "assistant_reply": "string",
+  "change_summary": "string",
   "questions": ["string"],
   "reason": "string",
   "referenced_files": ["string"]
@@ -5094,6 +5127,8 @@ Context:
         return None
     if mode == "answer_question":
         parsed["assistant_reply"] = sanitize_codex_followup_user_text(str(parsed.get("assistant_reply") or ""))
+    if mode == "build":
+        parsed["change_summary"] = sanitize_codex_followup_user_text(str(parsed.get("change_summary") or ""))
     if mode == "ask_confirmation":
         parsed["questions"] = [
             sanitize_codex_followup_user_text(str(item))
@@ -8803,6 +8838,12 @@ def create_app() -> FastAPI:
                         suggested_app_name=current_task_app_name(task, previous_conversation_state),
                     )
                 else:
+                    current_app_name = current_task_app_name(task, previous_conversation_state)
+                    codex_change_summary = build_codex_followup_build_summary(
+                        current_app_name,
+                        str((codex_followup_payload or {}).get("change_summary") or ""),
+                        request.prompt,
+                    )
                     decision = build_intent_decision(
                         mode="build",
                         task_id=followup_task_id,
@@ -8817,7 +8858,7 @@ def create_app() -> FastAPI:
                             "기존 앱 workspace가 있으므로 명세 구체화 Agent를 거치지 않고 Codex가 직접 수정합니다.",
                         ),
                         request_scope="existing_app_modification",
-                        suggested_app_name=current_task_app_name(task, previous_conversation_state),
+                        suggested_app_name=current_app_name,
                         primary_user_flow=normalize_whitespace(
                             str(previous_conversation_state.get("latest_primary_user_flow") or request.prompt)
                         ),
@@ -8828,6 +8869,7 @@ def create_app() -> FastAPI:
                         acceptance_criteria=normalize_acceptance_criteria(
                             previous_conversation_state.get("latest_acceptance_criteria")
                         ),
+                        user_visible_summary=codex_change_summary,
                     )
             else:
                 decision = decide_intent(

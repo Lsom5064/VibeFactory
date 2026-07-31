@@ -57,6 +57,30 @@ class TransientApkFilePolicyTest {
     }
 
     @Test
+    fun `artifact path takes precedence over a shared download URL`() {
+        assertFalse(
+            ApkArtifactActionHandler.artifactsMatch(
+                targetTaskId = "task-1",
+                targetUrl = "/download/task-1",
+                targetArtifactPath = "revisions/rev_0001/app-release.apk",
+                candidateTaskId = "task-1",
+                candidateUrl = "/download/task-1",
+                candidateArtifactPath = "revisions/rev_0002/app-release.apk"
+            )
+        )
+        assertTrue(
+            ApkArtifactActionHandler.artifactsMatch(
+                targetTaskId = "task-1",
+                targetUrl = "/download/task-1",
+                targetArtifactPath = "revisions/rev_0001/app-release.apk",
+                candidateTaskId = "task-1",
+                candidateUrl = "/download/task-1",
+                candidateArtifactPath = "revisions/rev_0001/app-release.apk"
+            )
+        )
+    }
+
+    @Test
     fun `unsafe task id characters are removed from file name`() {
         assertEquals(
             "generated_app_task_with_spaces.apk",

@@ -289,6 +289,25 @@ internal object ApkArtifactActionHandler {
         return "$normalizedTaskId|$normalizedArtifact"
     }
 
+    internal fun artifactsMatch(
+        targetTaskId: String,
+        targetUrl: String?,
+        targetArtifactPath: String?,
+        candidateTaskId: String,
+        candidateUrl: String?,
+        candidateArtifactPath: String?
+    ): Boolean {
+        if (targetTaskId.trim() != candidateTaskId.trim()) return false
+        val normalizedTargetPath = targetArtifactPath?.trim().orEmpty()
+        val normalizedCandidatePath = candidateArtifactPath?.trim().orEmpty()
+        if (normalizedTargetPath.isNotBlank()) {
+            return normalizedTargetPath == normalizedCandidatePath
+        }
+        val normalizedTargetUrl = targetUrl?.trim().orEmpty()
+        val normalizedCandidateUrl = candidateUrl?.trim().orEmpty()
+        return normalizedTargetUrl.isNotBlank() && normalizedTargetUrl == normalizedCandidateUrl
+    }
+
     fun recordInstalledArtifact(
         context: Context,
         packageName: String,

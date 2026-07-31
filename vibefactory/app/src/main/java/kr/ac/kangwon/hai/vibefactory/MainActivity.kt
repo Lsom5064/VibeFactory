@@ -2109,7 +2109,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (isSuccess && autoInstallOnSuccess && latestApkUrl != null) {
-            downloadAndInstall(taskId, latestApkUrl!!)
+            downloadAndInstall(taskId, latestApkUrl!!, response.apk_path)
         }
 
         if (syncPolling) {
@@ -3800,17 +3800,14 @@ ${record.stackTrace}
     private fun isCurrentDownloadArtifactFor(taskId: String, artifactPath: String?, artifactUrl: String?): Boolean {
         if (!isDownloadingApk) return false
         val activeDownloadTaskId = downloadingApkTaskId?.trim()?.takeIf { it.isNotBlank() } ?: return false
-        if (taskId.trim() != activeDownloadTaskId) return false
-        val targetPath = downloadingArtifactPath?.trim().orEmpty()
-        val targetUrl = downloadingApkUrl?.trim().orEmpty()
-        val messagePath = artifactPath?.trim().orEmpty()
-        val messageUrl = artifactUrl?.trim().orEmpty()
-        return when {
-            targetPath.isNotBlank() && messagePath == targetPath -> true
-            targetUrl.isNotBlank() && messageUrl == targetUrl -> true
-            targetPath.isBlank() && targetUrl.isBlank() -> true
-            else -> false
-        }
+        return ApkArtifactActionHandler.artifactsMatch(
+            targetTaskId = activeDownloadTaskId,
+            targetUrl = downloadingApkUrl,
+            targetArtifactPath = downloadingArtifactPath,
+            candidateTaskId = taskId,
+            candidateUrl = artifactUrl,
+            candidateArtifactPath = artifactPath
+        )
     }
 
     private fun upsertApkArtifactMessage(taskId: String, response: StatusResponse, appName: String?) {
@@ -6388,6 +6385,7 @@ ${record.stackTrace}
 
     private fun shouldDropIncomingDuplicateMessage(existing: ChatMessage, incoming: ChatMessage): Boolean {
         if (incoming.isLoading) return false
+        if (PromptReviewMessagePolicy.areEquivalent(existing, incoming)) return true
         if (incoming.kind == MessageKind.USER) {
             return isLikelyUserPromptEcho(existing, incoming)
         }
@@ -6711,6 +6709,7 @@ ${record.stackTrace}
 
     private fun ChatMessage.sameContentAs(other: ChatMessage): Boolean {
         if (kind != other.kind) return false
+        if (PromptReviewMessagePolicy.areEquivalent(this, other)) return true
         val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(this)
         val otherArtifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(other)
         if (artifactKey != null || otherArtifactKey != null) {
@@ -6804,7 +6803,8 @@ ${record.stackTrace}
     private fun isPrebuildConfirmationHeader(value: String?): Boolean {
         val normalized = compactMessageTextForDedupe(normalizeMessageTextForDedupe(value))
         return normalized == "앱 생성을 시작하기 전에 몇 가지만 확인할게요." ||
-            normalized == "수정을 시작하기 전에 몇 가지만 확인할게요."
+            normalized == "수정을 시작하기 전에 몇 가지만 확인할게요." ||
+            PromptReviewMessagePolicy.isStandaloneReadyMessage(value)
     }
 
     private fun isHiddenOperationalBuildMessage(value: String?): Boolean {

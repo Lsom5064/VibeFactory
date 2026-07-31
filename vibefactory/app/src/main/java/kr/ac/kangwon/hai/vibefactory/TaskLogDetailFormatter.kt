@@ -51,6 +51,13 @@ internal object TaskLogDetailFormatter {
     private val internalLinkMarkerRegex = Regex(
         Regex.escape(INTERNAL_LINK_MARKER) + """(?:에서|으로|로|을|를|에|의)?"""
     )
+    private val internalReferenceListRegex = Regex(
+        """관련\s*(?:위치|경로|파일)(?:은|는|이|가)?\s*""" +
+            Regex.escape(INTERNAL_LINK_MARKER) +
+            """(?:\s*(?:[,，;·]|및|와|과)\s*""" +
+            Regex.escape(INTERNAL_LINK_MARKER) +
+            """)*\s*(?:입니다|이에요|예요)?[.!?]?"""
+    )
     private val internalFileReferenceRegex = Regex(
         """(?i)(?:^|[/\\])(?:project|logs|workspaces?|\.codex_result)(?:[/\\]|$)|""" +
             """(?:^|[/\\])(?:Users|home|srv|opt|var|tmp|private|volume\d*)(?:[/\\]|$)|""" +
@@ -367,7 +374,11 @@ internal object TaskLogDetailFormatter {
                 else -> label
             }
         }
-        return marked.replace(internalLinkMarkerRegex, "")
+        return marked
+            .replace(internalReferenceListRegex, "")
+            .replace(internalLinkMarkerRegex, "")
+            .replace(Regex("""\s*[,，;·]+\s*(?:입니다|이에요|예요)?[.!?]?\s*$"""), "")
+            .trimEnd()
     }
 
     private fun looksLikeInternalFileReference(value: String): Boolean {

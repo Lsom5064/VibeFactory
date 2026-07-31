@@ -45,6 +45,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private var apkAction: TaskLogApkAction? = null
     private var downloadedApkFile: File? = null
     private var isDownloadingApk = false
+    private var downloadingApkArtifactIdentity: String? = null
     private var boundPayload: TaskLogDetailPayload? = null
     private var revisionOptions: List<TaskRevisionDto> = emptyList()
     private var selectedRevision: TaskRevisionDto? = null
@@ -427,20 +428,24 @@ class TaskLogDetailActivity : AppCompatActivity() {
         }
 
         downloadedApkFile = localApkFile(action)
+        val actionIsDownloading = isDownloadingApk &&
+            downloadingApkArtifactIdentity == artifactIdentity(action)
         card.visibility = View.VISIBLE
         findViewById<TextView>(R.id.taskLogApkName).text = action.title
         findViewById<TextView>(R.id.taskLogApkMeta).text = action.meta
         findViewById<Button>(R.id.btnTaskLogApkDownload).apply {
             visibility = if (action.apkUrl.isNullOrBlank()) View.GONE else View.VISIBLE
             isEnabled = !isDownloadingApk
-            text = getString(if (isDownloadingApk) R.string.download_apk_in_progress else R.string.download_apk)
+            text = getString(
+                if (actionIsDownloading) R.string.download_apk_in_progress else R.string.download_apk
+            )
             setOnClickListener { downloadApk(action) }
         }
         findViewById<Button>(R.id.btnTaskLogApkInstall).apply {
             visibility = if (downloadedApkFile != null) View.VISIBLE else View.GONE
             isEnabled = !isDownloadingApk
             setOnClickListener {
-                localApkFile(action)?.let(::installApk)
+                localApkFile(action)?.let { file -> installApk(file, action) }
                     ?: Toast.makeText(
                         this@TaskLogDetailActivity,
                         R.string.task_log_apk_missing,
@@ -453,6 +458,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private fun downloadApk(action: TaskLogApkAction) {
         if (isDownloadingApk) return
         isDownloadingApk = true
+        downloadingApkArtifactIdentity = artifactIdentity(action)
         bindApkAction(action)
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
@@ -469,23 +475,29 @@ class TaskLogDetailActivity : AppCompatActivity() {
                 }
             }
             isDownloadingApk = false
+            downloadingApkArtifactIdentity = null
             result.onSuccess { file ->
                 val updatedAction = action.copy(downloadedPath = file.absolutePath)
                 Toast.makeText(this@TaskLogDetailActivity, R.string.status_downloaded, Toast.LENGTH_SHORT).show()
-                bindApkAction(updatedAction)
-                installApk(file)
+                val currentAction = apkAction
+                if (currentAction != null && artifactsMatch(currentAction, action)) {
+                    bindApkAction(updatedAction)
+                    installApk(file, updatedAction)
+                } else {
+                    bindApkAction(currentAction)
+                }
             }.onFailure { error ->
                 Toast.makeText(
                     this@TaskLogDetailActivity,
                     getString(R.string.download_failed, userVisibleErrorMessage(error)),
                     Toast.LENGTH_SHORT
                 ).show()
-                bindApkAction(action)
+                bindApkAction(apkAction)
             }
         }
     }
 
-    private fun installApk(file: File) {
+    private fun installApk(file: File, action: TaskLogApkAction? = apkAction) {
         if (!file.exists()) {
             Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
             return
@@ -498,13 +510,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
         pendingInstallPackageName = packageName
         pendingInstallPreviousSnapshot =
             ApkArtifactActionHandler.installedPackageSnapshot(this, packageName)
-        pendingInstallArtifactIdentity = apkAction?.let { action ->
-            ApkArtifactActionHandler.artifactIdentity(
-                action.taskId,
-                action.apkUrl,
-                action.artifactPath
-            )
-        }
+        pendingInstallArtifactIdentity = action?.let(::artifactIdentity)
         if (ApkArtifactActionHandler.needsInstallPermission(this)) {
             pendingInstallApkFile = file
             installPermissionRequested = true
@@ -523,6 +529,25 @@ class TaskLogDetailActivity : AppCompatActivity() {
             clearTransientInstallState()
             Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun artifactIdentity(action: TaskLogApkAction): String {
+        return ApkArtifactActionHandler.artifactIdentity(
+            action.taskId,
+            action.apkUrl,
+            action.artifactPath
+        )
+    }
+
+    private fun artifactsMatch(first: TaskLogApkAction, second: TaskLogApkAction): Boolean {
+        return ApkArtifactActionHandler.artifactsMatch(
+            targetTaskId = first.taskId,
+            targetUrl = first.apkUrl,
+            targetArtifactPath = first.artifactPath,
+            candidateTaskId = second.taskId,
+            candidateUrl = second.apkUrl,
+            candidateArtifactPath = second.artifactPath
+        )
     }
 
     private fun resolveReturnedInstallerIfNeeded() {

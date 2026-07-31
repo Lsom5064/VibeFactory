@@ -56,4 +56,18 @@ class TaskLogDetailFormatterTest {
             items.map { it.body }
         )
     }
+
+    @Test
+    fun agentItemsFromStatus_removesInternalReferenceOnlySentenceWithoutPunctuationResidue() {
+        val response = StatusResponse(
+            status = "succeeded",
+            full_log = """
+                {"type":"item.completed","item":{"type":"agent_message","text":"화면 구성을 개선했습니다. 관련 위치는 [main.dart](/private/tmp/task/project/lib/main.dart), [card.dart](/private/tmp/task/project/lib/card.dart), [theme.dart](/private/tmp/task/project/lib/theme.dart) 입니다."}}
+            """.trimIndent()
+        )
+
+        val items = TaskLogDetailFormatter.agentItemsFromStatus(response)
+
+        assertEquals(listOf("화면 구성을 개선했습니다."), items.map { it.body })
+    }
 }

@@ -7,6 +7,8 @@ from flutter_apk_server.server import (
     Database,
     GENERATED_APK_SIDELOAD_VERSION_CODE,
     apply_project_defaults,
+    build_codex_followup_build_summary,
+    build_intent_decision,
     built_apk_identity,
     ensure_project_revision_version,
     flutter_no_pub_args,
@@ -19,6 +21,35 @@ from flutter_apk_server.server import (
 
 
 class ProjectIdentityTests(unittest.TestCase):
+    def test_codex_followup_summary_does_not_echo_raw_user_request(self) -> None:
+        user_prompt = "첫 번째 카드 제목을 더 크게 바꾸고 오른쪽 버튼을 초록색으로 바꿔줘"
+
+        summary = build_codex_followup_build_summary(
+            "컬러카드",
+            f"기존 컬러카드를 수정할게요. 이번 수정은 {user_prompt}를 반영해요.",
+            user_prompt,
+        )
+
+        self.assertEqual(
+            summary,
+            "기존 컬러카드를 수정할게요. 요청한 변경 내용을 현재 앱의 구성에 맞게 반영해요.",
+        )
+
+    def test_build_intent_uses_explicit_codex_user_visible_summary(self) -> None:
+        summary = "기존 컬러카드를 수정할게요. 카드 제목의 강조를 높이고 동작 버튼을 더 잘 보이게 정돈해요."
+
+        decision = build_intent_decision(
+            mode="build",
+            task_id="task-1",
+            existing_task=True,
+            user_prompt="원문 요청",
+            request_scope="existing_app_modification",
+            suggested_app_name="컬러카드",
+            user_visible_summary=summary,
+        )
+
+        self.assertEqual(decision.summary, summary)
+
     def test_followup_reasoning_override_only_replaces_reasoning_config(self) -> None:
         original = [
             "codex",
