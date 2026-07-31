@@ -19,6 +19,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.google.gson.GsonBuilder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -48,8 +50,12 @@ class TaskLogDetailActivity : AppCompatActivity() {
     private var selectedRevision: TaskRevisionDto? = null
     private var isBranchingRevision = false
     private var pendingInstallApkFile: File? = null
+    private var pendingInstallPackageName: String? = null
+    private var pendingInstallPreviousSnapshot: InstalledPackageSnapshot? = null
+    private var pendingInstallArtifactIdentity: String? = null
     private var installPermissionRequested = false
     private var installerLaunched = false
+    private var installResolutionJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,7 +75,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         when {
-            installerLaunched -> clearTransientInstallState()
+            installerLaunched -> resolveReturnedInstallerIfNeeded()
             installPermissionRequested &&
                 ApkArtifactActionHandler.needsInstallPermission(this) -> clearTransientInstallState()
             else -> retryPendingApkInstallIfReady()
@@ -484,6 +490,21 @@ class TaskLogDetailActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.task_log_apk_missing, Toast.LENGTH_SHORT).show()
             return
         }
+        val packageName = ApkArtifactActionHandler.packageNameFromApk(this, file)
+        if (packageName.isNullOrBlank()) {
+            Toast.makeText(this, R.string.install_failed, Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingInstallPackageName = packageName
+        pendingInstallPreviousSnapshot =
+            ApkArtifactActionHandler.installedPackageSnapshot(this, packageName)
+        pendingInstallArtifactIdentity = apkAction?.let { action ->
+            ApkArtifactActionHandler.artifactIdentity(
+                action.taskId,
+                action.apkUrl,
+                action.artifactPath
+            )
+        }
         if (ApkArtifactActionHandler.needsInstallPermission(this)) {
             pendingInstallApkFile = file
             installPermissionRequested = true
@@ -504,6 +525,50 @@ class TaskLogDetailActivity : AppCompatActivity() {
         }
     }
 
+    private fun resolveReturnedInstallerIfNeeded() {
+        if (!installerLaunched || pendingInstallApkFile == null) return
+        installResolutionJob?.cancel()
+        installResolutionJob = lifecycleScope.launch {
+            repeat(10) {
+                delay(500L)
+                val packageName = pendingInstallPackageName ?: return@launch
+                val currentSnapshot =
+                    ApkArtifactActionHandler.installedPackageSnapshot(
+                        this@TaskLogDetailActivity,
+                        packageName
+                    )
+                if (
+                    GeneratedAppInstallPolicy.installationCompleted(
+                        pendingInstallPreviousSnapshot,
+                        currentSnapshot
+                    )
+                ) {
+                    val launched = ApkArtifactActionHandler.launchInstalledPackage(
+                        this@TaskLogDetailActivity,
+                        packageName
+                    )
+                    ApkArtifactActionHandler.recordInstalledArtifact(
+                        this@TaskLogDetailActivity,
+                        packageName,
+                        pendingInstallArtifactIdentity
+                    )
+                    installResolutionJob = null
+                    clearTransientInstallState()
+                    if (!launched) {
+                        Toast.makeText(
+                            this@TaskLogDetailActivity,
+                            R.string.generated_app_launch_failed,
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    return@launch
+                }
+            }
+            installResolutionJob = null
+            clearTransientInstallState()
+        }
+    }
+
     private fun retryPendingApkInstallIfReady() {
         val file = pendingInstallApkFile ?: return
         if (!file.exists()) {
@@ -518,7 +583,12 @@ class TaskLogDetailActivity : AppCompatActivity() {
 
     private fun clearTransientInstallState() {
         val file = pendingInstallApkFile
+        installResolutionJob?.cancel()
+        installResolutionJob = null
         pendingInstallApkFile = null
+        pendingInstallPackageName = null
+        pendingInstallPreviousSnapshot = null
+        pendingInstallArtifactIdentity = null
         installPermissionRequested = false
         installerLaunched = false
         ApkArtifactActionHandler.deleteTransientDownload(file)

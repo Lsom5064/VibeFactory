@@ -15,6 +15,7 @@ import java.io.File
 import java.io.EOFException
 import java.io.FileOutputStream
 import java.io.IOException
+import java.security.MessageDigest
 
 internal data class ApkDownloadProgress(
     val downloadedBytes: Long,
@@ -26,6 +27,7 @@ internal object ApkArtifactActionHandler {
     private const val RETRY_DELAY_MS = 750L
     private const val MANAGED_APK_PREFIX = "generated_app_"
     private const val DOWNLOAD_BUFFER_SIZE = 256 * 1024
+    private const val INSTALLED_ARTIFACT_PREFS = "generated_app_installed_artifacts"
     private val downloadFileMutex = Mutex()
 
     fun localApkFile(
@@ -55,11 +57,11 @@ internal object ApkArtifactActionHandler {
     fun artifactDownloadCacheFile(
         context: Context,
         taskId: String,
-        @Suppress("UNUSED_PARAMETER") url: String?,
-        @Suppress("UNUSED_PARAMETER") artifactPath: String?
+        url: String?,
+        artifactPath: String?
     ): File {
         val cacheDir = context.externalCacheDir ?: throw IOException("external cache unavailable")
-        return File(cacheDir, transientApkFileName(taskId))
+        return File(cacheDir, transientApkFileName(taskId, url, artifactPath))
     }
 
     fun clearManagedDownloads(context: Context, keepFile: File? = null): Int {
@@ -256,6 +258,63 @@ internal object ApkArtifactActionHandler {
         return "$MANAGED_APK_PREFIX$normalizedTaskId.apk"
     }
 
+    internal fun transientApkFileName(
+        taskId: String,
+        url: String?,
+        artifactPath: String?
+    ): String {
+        val artifactIdentity = artifactPath
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: url?.trim()?.takeIf { it.isNotBlank() }
+            ?: "latest"
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(artifactIdentity.toByteArray(Charsets.UTF_8))
+            .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+            .take(12)
+        return transientApkFileName("${taskId.trim()}-$digest")
+    }
+
+    internal fun artifactIdentity(
+        taskId: String,
+        url: String?,
+        artifactPath: String?
+    ): String {
+        val normalizedTaskId = taskId.trim()
+        val normalizedArtifact = artifactPath
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: url?.trim()?.takeIf { it.isNotBlank() }
+            ?: "latest"
+        return "$normalizedTaskId|$normalizedArtifact"
+    }
+
+    fun recordInstalledArtifact(
+        context: Context,
+        packageName: String,
+        artifactIdentity: String?
+    ) {
+        val normalizedPackageName = packageName.trim()
+        val normalizedIdentity = artifactIdentity?.trim().orEmpty()
+        if (normalizedPackageName.isBlank() || normalizedIdentity.isBlank()) return
+        context.getSharedPreferences(INSTALLED_ARTIFACT_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(normalizedPackageName, normalizedIdentity)
+            .apply()
+    }
+
+    fun installedArtifactMatches(
+        context: Context,
+        packageName: String,
+        artifactIdentity: String
+    ): Boolean {
+        val normalizedPackageName = packageName.trim()
+        val normalizedIdentity = artifactIdentity.trim()
+        if (normalizedPackageName.isBlank() || normalizedIdentity.isBlank()) return false
+        return context.getSharedPreferences(INSTALLED_ARTIFACT_PREFS, Context.MODE_PRIVATE)
+            .getString(normalizedPackageName, null) == normalizedIdentity
+    }
+
     internal fun isManagedApkFileName(fileName: String): Boolean {
         if (!fileName.startsWith(MANAGED_APK_PREFIX)) return false
         return fileName.endsWith(".apk") || fileName.endsWith(".apk.tmp")
@@ -267,6 +326,50 @@ internal object ApkArtifactActionHandler {
             return requestInstallPermission(activity)
         }
         return launchApkInstaller(activity, file)
+    }
+
+    @Suppress("DEPRECATION")
+    fun packageNameFromApk(context: Context, file: File): String? {
+        if (!file.exists()) return null
+        return runCatching {
+            context.packageManager.getPackageArchiveInfo(file.absolutePath, 0)
+                ?.packageName
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    @Suppress("DEPRECATION")
+    fun installedPackageSnapshot(
+        context: Context,
+        packageName: String
+    ): InstalledPackageSnapshot? {
+        val normalizedPackageName = packageName.trim()
+        if (normalizedPackageName.isBlank()) return null
+        return runCatching {
+            val packageInfo = context.packageManager.getPackageInfo(normalizedPackageName, 0)
+            val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                packageInfo.longVersionCode
+            } else {
+                packageInfo.versionCode.toLong()
+            }
+            InstalledPackageSnapshot(
+                versionCode = versionCode,
+                lastUpdateTime = packageInfo.lastUpdateTime
+            )
+        }.getOrNull()
+    }
+
+    fun launchInstalledPackage(activity: Activity, packageName: String): Boolean {
+        val normalizedPackageName = packageName.trim()
+        if (normalizedPackageName.isBlank()) return false
+        val launchIntent = activity.packageManager
+            .getLaunchIntentForPackage(normalizedPackageName)
+            ?: return false
+        return runCatching {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            activity.startActivity(launchIntent)
+        }.isSuccess
     }
 
     fun needsInstallPermission(activity: Activity): Boolean {

@@ -5,7 +5,10 @@ from pathlib import Path
 
 from flutter_apk_server.server import (
     Database,
+    GENERATED_APK_SIDELOAD_VERSION_CODE,
     apply_project_defaults,
+    built_apk_identity,
+    ensure_project_revision_version,
     flutter_no_pub_args,
     render_task_agents_md,
     revision_request_summary,
@@ -283,6 +286,95 @@ void main() {
                     "Branch App",
                     expected_package,
                 )
+            )
+
+    def test_project_defaults_remove_package_suffixes_and_override_all_application_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            gradle_path = project_root / "android/app/build.gradle.kts"
+            gradle_path.parent.mkdir(parents=True)
+            gradle_path.write_text(
+                """
+android {
+    namespace = "example.wrong"
+    defaultConfig {
+        applicationId = "example.wrong"
+        applicationIdSuffix = ".revision"
+    }
+    productFlavors {
+        create("demo") {
+            applicationId = "example.demo"
+        }
+    }
+}
+
+flutter {
+    source = "../.."
+}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            expected_package = "kr.ac.kangwon.hai.generated.stable"
+            self.assertTrue(
+                apply_project_defaults(
+                    project_root,
+                    "task-1",
+                    "Stable App",
+                    expected_package,
+                )
+            )
+
+            gradle_text = gradle_path.read_text(encoding="utf-8")
+            self.assertEqual(gradle_text.count(f'applicationId = "{expected_package}"'), 2)
+            self.assertNotIn("applicationIdSuffix", gradle_text)
+
+    def test_all_revisions_use_one_sideload_version_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            pubspec_path = project_root / "pubspec.yaml"
+            pubspec_path.write_text("name: sample\nversion: 1.2.3+4\n", encoding="utf-8")
+
+            self.assertTrue(ensure_project_revision_version(project_root, "rev_0009"))
+            self.assertIn(
+                f"version: 1.2.3+{GENERATED_APK_SIDELOAD_VERSION_CODE}",
+                pubspec_path.read_text(encoding="utf-8"),
+            )
+            self.assertFalse(ensure_project_revision_version(project_root, "rev_0001"))
+
+    def test_built_apk_identity_reads_gradle_output_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            apk_path = (
+                project_root
+                / "build/app/outputs/flutter-apk/app-release.apk"
+            )
+            apk_path.parent.mkdir(parents=True)
+            apk_path.write_bytes(b"apk")
+            metadata_path = (
+                project_root
+                / "build/app/outputs/apk/release/output-metadata.json"
+            )
+            metadata_path.parent.mkdir(parents=True)
+            metadata_path.write_text(
+                """
+{
+  "applicationId": "kr.ac.kangwon.hai.generated.sample",
+  "elements": [
+    {
+      "versionCode": 1900000000,
+      "outputFile": "app-release.apk"
+    }
+  ]
+}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                built_apk_identity(project_root, apk_path),
+                ("kr.ac.kangwon.hai.generated.sample", 1_900_000_000),
             )
 
 

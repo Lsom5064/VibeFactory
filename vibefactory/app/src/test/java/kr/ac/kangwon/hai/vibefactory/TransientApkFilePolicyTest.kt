@@ -7,10 +7,52 @@ import org.junit.Test
 
 class TransientApkFilePolicyTest {
     @Test
-    fun `one stable file name is used for every revision of a task`() {
+    fun `one stable file name is used for a task artifact`() {
         assertEquals(
             "generated_app_abc123.apk",
             ApkArtifactActionHandler.transientApkFileName("abc123")
+        )
+    }
+
+    @Test
+    fun `different revisions cannot reuse a stale cached APK`() {
+        val firstRevision = ApkArtifactActionHandler.transientApkFileName(
+            "abc123",
+            "/download/abc123",
+            "revisions/rev_0001/project/build/app/outputs/flutter-apk/app-release.apk"
+        )
+        val secondRevision = ApkArtifactActionHandler.transientApkFileName(
+            "abc123",
+            "/download/abc123",
+            "revisions/rev_0002/project/build/app/outputs/flutter-apk/app-release.apk"
+        )
+
+        assertTrue(firstRevision.startsWith("generated_app_abc123-"))
+        assertTrue(firstRevision.endsWith(".apk"))
+        assertFalse(firstRevision == secondRevision)
+    }
+
+    @Test
+    fun `installed artifact identity includes task and revision`() {
+        assertEquals(
+            "task-1|revisions/rev_0002/app-release.apk",
+            ApkArtifactActionHandler.artifactIdentity(
+                "task-1",
+                "/download/task-1",
+                "revisions/rev_0002/app-release.apk"
+            )
+        )
+        assertFalse(
+            ApkArtifactActionHandler.artifactIdentity(
+                "task-1",
+                "/download/task-1",
+                "revisions/rev_0001/app-release.apk"
+            ) ==
+                ApkArtifactActionHandler.artifactIdentity(
+                    "task-1",
+                    "/download/task-1",
+                    "revisions/rev_0002/app-release.apk"
+                )
         )
     }
 

@@ -34,6 +34,9 @@ REFERENCE_IMAGE_MAX_STORED_BYTES = 2 * 1024 * 1024
 REFERENCE_IMAGE_MAX_DIMENSION = 1600
 REFERENCE_IMAGE_JPEG_QUALITIES = (88, 82, 76, 68, 60, 52, 44)
 REFERENCE_IMAGE_DIMENSION_STEPS = (1600, 1400, 1200, 1024, 800)
+# Generated APKs are distributed outside an app store. Keeping one high, fixed
+# version code allows any saved revision to replace any other saved revision.
+GENERATED_APK_SIDELOAD_VERSION_CODE = 1_900_000_000
 
 
 def utc_now_iso() -> str:
@@ -5191,13 +5194,16 @@ def apply_project_defaults(project_root: Path, task_id: str, app_name: str, pack
             r'namespace\s*=\s*"[^"]+"',
             f'namespace = "{package_name}"',
             gradle_text,
-            count=1,
         )
         next_gradle_text = re.sub(
             r'applicationId\s*=\s*"[^"]+"',
             f'applicationId = "{package_name}"',
             next_gradle_text,
-            count=1,
+        )
+        next_gradle_text = re.sub(
+            r"(?m)^[ \t]*applicationIdSuffix\s*=\s*[^\n]+\n?",
+            "",
+            next_gradle_text,
         )
         if next_gradle_text != gradle_text:
             gradle_path.write_text(next_gradle_text, encoding="utf-8")
@@ -5312,8 +5318,7 @@ def revision_number_from_label(revision_label: str) -> int:
 
 
 def ensure_project_revision_version(project_root: Path, revision_label: Optional[str] = None) -> bool:
-    label = revision_label or current_revision_label(project_root)
-    revision_number = revision_number_from_label(label)
+    _ = revision_label or current_revision_label(project_root)
     pubspec_path = project_root / "pubspec.yaml"
     pubspec_text = read_text_if_exists(pubspec_path, limit=100_000)
     if not pubspec_text:
@@ -5323,11 +5328,9 @@ def ensure_project_revision_version(project_root: Path, revision_label: Optional
     if version_match:
         current_value = version_match.group(1).strip()
         suffix = version_match.group(2)
-        version_name, _, build_number_text = current_value.partition("+")
+        version_name, _, _ = current_value.partition("+")
         version_name = version_name.strip() or "1.0.0"
-        existing_build_number = int(build_number_text) if build_number_text.isdigit() else 0
-        build_number = max(existing_build_number, revision_number)
-        next_line = f"version: {version_name}+{build_number}{suffix}"
+        next_line = f"version: {version_name}+{GENERATED_APK_SIDELOAD_VERSION_CODE}{suffix}"
         next_text = (
             pubspec_text[: version_match.start()]
             + next_line
@@ -5335,12 +5338,70 @@ def ensure_project_revision_version(project_root: Path, revision_label: Optional
         )
     else:
         separator = "" if pubspec_text.endswith("\n") else "\n"
-        next_text = f"{pubspec_text}{separator}version: 1.0.0+{revision_number}\n"
+        next_text = (
+            f"{pubspec_text}{separator}"
+            f"version: 1.0.0+{GENERATED_APK_SIDELOAD_VERSION_CODE}\n"
+        )
 
     if next_text == pubspec_text:
         return False
     pubspec_path.write_text(next_text, encoding="utf-8")
     return True
+
+
+def built_apk_identity(project_root: Path, apk_path: Path) -> tuple[str, Optional[int]]:
+    metadata_candidates = (
+        project_root / "build" / "app" / "outputs" / "apk" / "release" / "output-metadata.json",
+        project_root / "build" / "app" / "outputs" / "apk" / "debug" / "output-metadata.json",
+    )
+    for metadata_path in metadata_candidates:
+        if not metadata_path.is_file():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        application_id = normalize_whitespace(str(metadata.get("applicationId") or ""))
+        elements = metadata.get("elements")
+        if not application_id or not isinstance(elements, list):
+            continue
+        matching_element: Optional[dict[str, Any]] = None
+        fallback_element: Optional[dict[str, Any]] = None
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            fallback_element = fallback_element or element
+            if str(element.get("outputFile") or "") == apk_path.name:
+                matching_element = element
+                break
+        selected_element = matching_element or fallback_element
+        if selected_element is None:
+            continue
+        version_code = optional_int_value(selected_element.get("versionCode"))
+        return application_id, version_code
+    return "", None
+
+
+def validate_built_apk_install_contract(
+    project_root: Path,
+    apk_path: Path,
+    expected_package_name: str,
+) -> None:
+    application_id, version_code = built_apk_identity(project_root, apk_path)
+    if not application_id:
+        raise RuntimeError("APK 빌드 메타데이터에서 패키지 이름을 확인할 수 없습니다.")
+    if application_id != expected_package_name:
+        raise RuntimeError(
+            "APK 패키지 이름이 Task 식별자와 일치하지 않습니다: "
+            f"{application_id} != {expected_package_name}"
+        )
+    if version_code != GENERATED_APK_SIDELOAD_VERSION_CODE:
+        raise RuntimeError(
+            "APK 설치 버전 코드가 사이드로드 정책과 일치하지 않습니다: "
+            f"{version_code} != {GENERATED_APK_SIDELOAD_VERSION_CODE}"
+        )
 
 
 def flutter_no_pub_args(project_root: Path) -> list[str]:
@@ -6567,6 +6628,7 @@ class CodexTaskRunner:
         self.active_processes: dict[int, subprocess.Popen] = {}
         self.active_task_processes: dict[str, subprocess.Popen] = {}
         self.process_lock = threading.Lock()
+        self.sideload_build_lock = threading.Lock()
 
     def start(self) -> None:
         if self.threads:
@@ -6798,6 +6860,8 @@ class CodexTaskRunner:
             return False
 
         changed = apply_project_defaults(project_path, task_id, app_name, package_name)
+        if ensure_project_revision_version(project_path):
+            changed = True
         if changed:
             self.db.log_event(
                 task_id,
@@ -7253,6 +7317,86 @@ class CodexTaskRunner:
         )
         return self.ensure_debug_apk(task_id, workspace_path, project_path, current_apk_path)
 
+    def prepare_saved_revision_apk(
+        self,
+        task: dict[str, Any],
+        workspace_path: Path,
+        project_path: Path,
+    ) -> Path:
+        expected_package_name = current_task_package_name(task)
+        app_name = current_task_app_name(task)
+        if not expected_package_name or not app_name:
+            raise RuntimeError("Task 앱 식별 정보가 없습니다.")
+
+        with self.sideload_build_lock:
+            identity_changed = apply_project_defaults(
+                project_path,
+                str(task["task_id"]),
+                app_name,
+                expected_package_name,
+            )
+            version_changed = ensure_project_revision_version(project_path)
+            existing_apk = find_revision_apk(workspace_path, project_path, task)
+            if (
+                existing_apk is not None
+                and not identity_changed
+                and not version_changed
+            ):
+                try:
+                    validate_built_apk_install_contract(
+                        project_path,
+                        existing_apk,
+                        expected_package_name,
+                    )
+                    return existing_apk
+                except RuntimeError:
+                    pass
+
+            ensure_release_uses_debug_signing(project_path)
+            build_log_path = workspace_path / "logs" / "revision_download_build.log"
+            env = self.build_task_env(workspace_path)
+            flutter_args = shlex.split(self.settings.flutter_command)
+            commands: list[list[str]] = []
+            if not flutter_no_pub_args(project_path):
+                commands.append(flutter_args + ["pub", "get"])
+            commands.append(
+                flutter_args
+                + [
+                    "build",
+                    "apk",
+                    "--release",
+                    "--target-platform",
+                    "android-arm64",
+                    "--build-number",
+                    str(GENERATED_APK_SIDELOAD_VERSION_CODE),
+                ]
+                + flutter_no_pub_args(project_path)
+            )
+
+            for args in commands:
+                exit_code, timed_out, _ = self.run_logged_command(
+                    args,
+                    cwd=project_path,
+                    env=env,
+                    log_path=build_log_path,
+                )
+                if timed_out:
+                    raise RuntimeError("과거 버전 설치용 APK 준비 시간이 초과되었습니다.")
+                if exit_code != 0:
+                    raise RuntimeError(
+                        f"과거 버전 설치용 APK 빌드에 실패했습니다. exit code: {exit_code}"
+                    )
+
+            prepared_apk = find_revision_apk(workspace_path, project_path, task)
+            if prepared_apk is None:
+                raise RuntimeError("과거 버전 설치용 APK 산출물을 찾을 수 없습니다.")
+            validate_built_apk_install_contract(
+                project_path,
+                prepared_apk,
+                expected_package_name,
+            )
+            return prepared_apk
+
     def attempt_server_side_build(
         self,
         task_id: str,
@@ -7659,6 +7803,12 @@ class CodexTaskRunner:
             if current_project_path is not None:
                 try:
                     apk_path = self.ensure_download_apk(task_id, workspace_path, current_project_path, apk_path)
+                    if not self.settings.mock_codex and persisted_package_name:
+                        validate_built_apk_install_contract(
+                            current_project_path,
+                            apk_path,
+                            persisted_package_name,
+                        )
                 except Exception as exc:
                     if self.is_task_cancelled(task_id):
                         return
@@ -8092,6 +8242,36 @@ def find_revision_apk(workspace_path: Path, project_path: Path, task: dict[str, 
         apk_path = apk_path.resolve()
         if ensure_within_root(apk_path, workspace_path) and apk_path.exists() and apk_path.is_file() and apk_path.suffix.lower() == ".apk":
             return apk_path
+    return None
+
+
+def project_path_for_apk_artifact(
+    task: dict[str, Any],
+    snapshots: list[dict[str, Any]],
+    apk_path: Path,
+) -> Optional[Path]:
+    workspace_value = normalize_whitespace(str(task.get("workspace_path") or ""))
+    if not workspace_value:
+        return None
+    workspace_path = Path(workspace_value).resolve()
+    project_values = [
+        str(task.get("project_path") or ""),
+        *(str(snapshot.get("project_path") or "") for snapshot in snapshots),
+    ]
+    seen: set[Path] = set()
+    for project_value in project_values:
+        if not normalize_whitespace(project_value):
+            continue
+        project_path = Path(project_value).resolve()
+        if project_path in seen:
+            continue
+        seen.add(project_path)
+        if (
+            ensure_within_root(project_path, workspace_path)
+            and ensure_within_root(apk_path, project_path)
+            and (project_path / "pubspec.yaml").is_file()
+        ):
+            return project_path
     return None
 
 
@@ -9916,6 +10096,7 @@ def create_app() -> FastAPI:
         artifact_path: Optional[str] = Query(default=None),
     ) -> FileResponse:
         db: Database = app.state.db
+        runner: CodexTaskRunner = app.state.runner
         task = db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="task not found")
@@ -9936,6 +10117,35 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=403, detail="invalid apk path")
         if not apk_path.exists() or apk_path.suffix.lower() != ".apk":
             raise HTTPException(status_code=404, detail="apk not found")
+
+        project_path = project_path_for_apk_artifact(
+            task,
+            db.list_project_snapshots(task_id),
+            apk_path,
+        )
+        if project_path is not None and not runner.settings.mock_codex:
+            try:
+                apk_path = runner.prepare_saved_revision_apk(
+                    task,
+                    workspace_path.resolve(),
+                    project_path,
+                )
+            except Exception as exc:
+                db.log_event(
+                    task_id,
+                    actor="system",
+                    event_type="apk_install_contract_failed",
+                    message_text="설치 가능한 APK 준비에 실패했습니다.",
+                    payload={
+                        "artifact_path": artifact_path or "",
+                        "project_path": str(project_path),
+                        "error": str(exc),
+                    },
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="installable apk preparation failed",
+                ) from exc
 
         db.log_event(
             task_id,
