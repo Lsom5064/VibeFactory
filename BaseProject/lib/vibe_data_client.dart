@@ -45,19 +45,27 @@ class VibeDataRecord {
 }
 
 class VibeDataClient {
+  static const Duration _requestTimeout = Duration(seconds: 30);
+
   VibeDataClient({
     required this.serverBaseUrl,
     required this.taskId,
     required this.packageName,
     this.ownerId = '',
     HttpClient? httpClient,
-  }) : _httpClient = httpClient ?? HttpClient();
+  }) : _httpClient = httpClient ??
+            (HttpClient()
+              ..connectionTimeout = const Duration(seconds: 15));
 
   final String serverBaseUrl;
   final String taskId;
   final String packageName;
   final String ownerId;
   final HttpClient _httpClient;
+
+  void close({bool force = false}) {
+    _httpClient.close(force: force);
+  }
 
   Uri _collectionUri(String collection, [String? recordId, Map<String, String>? query]) {
     final base = serverBaseUrl.endsWith('/')
@@ -149,14 +157,14 @@ class VibeDataClient {
     Uri uri, {
     Map<String, dynamic>? payload,
   }) async {
-    final request = await _httpClient.openUrl(method, uri);
+    final request = await _httpClient.openUrl(method, uri).timeout(_requestTimeout);
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     if (payload != null) {
       request.headers.contentType = ContentType.json;
       request.write(jsonEncode(payload));
     }
-    final response = await request.close();
-    final responseText = await response.transform(utf8.decoder).join();
+    final response = await request.close().timeout(_requestTimeout);
+    final responseText = await response.transform(utf8.decoder).join().timeout(_requestTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw HttpException(
         'VibeData request failed: ${response.statusCode} $responseText',

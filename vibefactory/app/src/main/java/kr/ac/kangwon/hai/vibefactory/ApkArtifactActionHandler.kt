@@ -25,6 +25,7 @@ internal object ApkArtifactActionHandler {
     private const val MAX_DOWNLOAD_ATTEMPTS = 3
     private const val RETRY_DELAY_MS = 750L
     private const val MANAGED_APK_PREFIX = "generated_app_"
+    private const val DOWNLOAD_BUFFER_SIZE = 256 * 1024
     private val downloadFileMutex = Mutex()
 
     fun localApkFile(
@@ -214,7 +215,7 @@ internal object ApkArtifactActionHandler {
                 FileOutputStream(temp, append).use { output ->
                     var downloadedBytes = startingBytes
                     onProgress(ApkDownloadProgress(downloadedBytes, totalBytes))
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
                     while (true) {
                         val read = input.read(buffer)
                         if (read < 0) break

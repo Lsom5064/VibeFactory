@@ -1,6 +1,7 @@
 import base64
 import binascii
 import hashlib
+import importlib
 import json
 import os
 import queue
@@ -19,12 +20,12 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError  # type: ignore[import-untyped]
 from pydantic import BaseModel, Field
 
 
@@ -165,6 +166,28 @@ def default_codex_command(root: Path) -> str:
     return f'{" ".join(args)} "{{prompt}}"'
 
 
+def normalize_codex_reasoning_effort(value: str, *, default: str = "medium") -> str:
+    normalized = value.strip().lower()
+    return normalized if normalized in {"minimal", "low", "medium", "high", "xhigh"} else default
+
+
+def with_codex_reasoning_effort(args: list[str], reasoning_effort: str) -> list[str]:
+    normalized_effort = normalize_codex_reasoning_effort(reasoning_effort, default="low")
+    updated = list(args)
+    config_value = f'model_reasoning_effort="{normalized_effort}"'
+    for index in range(len(updated) - 1):
+        if updated[index] != "-c":
+            continue
+        if updated[index + 1].split("=", 1)[0].strip() != "model_reasoning_effort":
+            continue
+        updated[index + 1] = config_value
+        return updated
+
+    insert_at = max(0, len(updated) - 1)
+    updated[insert_at:insert_at] = ["-c", config_value]
+    return updated
+
+
 def default_flutter_command(root: Path) -> str:
     flutter_command = os.getenv("FLUTTER_COMMAND", "").strip()
     if flutter_command:
@@ -256,44 +279,6 @@ def parse_backend_rate_limits_payload(payload: Any) -> "CodexRateLimitSnapshot":
         limit_name="codex",
         primary=parse_backend_rate_limit_window(rate_limit.get("primary_window")),
         secondary=parse_backend_rate_limit_window(rate_limit.get("secondary_window")),
-    )
-
-
-def format_duration_korean(total_seconds: int) -> str:
-    seconds = max(0, int(total_seconds))
-    days, remainder = divmod(seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, remainder = divmod(remainder, 60)
-    parts: list[str] = []
-    if days:
-        parts.append(f"{days}일")
-    if hours:
-        parts.append(f"{hours}시간")
-    if minutes:
-        parts.append(f"{minutes}분")
-    if not parts:
-        parts.append(f"{remainder}초")
-    return " ".join(parts[:2])
-
-
-def format_rate_limit_window_korean(label: str, window: Optional["CodexRateLimitWindow"], *, now_ts: Optional[int] = None) -> str:
-    if window is None:
-        return f"{label} 정보 없음"
-    remaining_percent = max(0, 100 - int(window.used_percent))
-    current_ts = int(now_ts if now_ts is not None else time.time())
-    if window.resets_at is None:
-        reset_text = "초기화 시각 미상"
-    else:
-        reset_text = f"{format_duration_korean(max(0, window.resets_at - current_ts))} 후 초기화"
-    return f"{label} 잔여 {remaining_percent}% (사용 {window.used_percent}%, {reset_text})"
-
-
-def format_codex_rate_limit_summary(snapshot: "CodexRateLimitSnapshot", *, now_ts: Optional[int] = None) -> str:
-    return " | ".join(
-        [
-            format_rate_limit_window_korean("5시간 한도", snapshot.primary, now_ts=now_ts),
-            format_rate_limit_window_korean("주간 한도", snapshot.secondary, now_ts=now_ts),
-        ]
     )
 
 
@@ -422,7 +407,7 @@ def _read_jsonrpc_result(process: subprocess.Popen[str], request_id: int, timeou
             if not events and process.poll() is not None:
                 break
             for key, _ in events:
-                line = key.fileobj.readline()
+                line = cast(Any, key.fileobj).readline()
                 if not line:
                     continue
                 if key.data == "stderr":
@@ -578,20 +563,6 @@ def fetch_codex_rate_limits(
         raise
 
 
-def log_codex_rate_limits_to_server_log(
-    task_id: str,
-    codex_command: str,
-    *,
-    env: Optional[dict[str, str]] = None,
-    home_path: Optional[Path] = None,
-) -> None:
-    try:
-        snapshot = fetch_codex_rate_limits(codex_command, env=env, home_path=home_path)
-        print(f"[codex-limit] task_id={task_id} {format_codex_rate_limit_summary(snapshot)}", flush=True)
-    except Exception as exc:
-        print(f"[codex-limit] task_id={task_id} 한도 조회 실패: {exc}", flush=True)
-
-
 def ensure_within_root(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -669,20 +640,6 @@ def build_reference_image_summary(reference_image_name: str) -> str:
     if not reference_image_name:
         return ""
     return f"참고 이미지 `{reference_image_name}`를 함께 전달받았어요. 앱 구조, UI, 스타일, 콘텐츠 맥락을 이 이미지를 참고해 해석합니다."
-
-
-def save_reference_image_attachment(
-    workspace_root: Path,
-    *,
-    reference_image_name: str,
-    reference_image_base64: str,
-) -> Optional[str]:
-    result = save_reference_image_attachment_result(
-        workspace_root,
-        reference_image_name=reference_image_name,
-        reference_image_base64=reference_image_base64,
-    )
-    return str(result.get("workspace_path") or "") or None
 
 
 def reference_attachment_file_metadata(workspace_root: Path, workspace_path: str) -> Optional[dict[str, Any]]:
@@ -853,7 +810,7 @@ def normalize_reference_attachments(value: Any) -> list[dict[str, str]]:
     normalized: list[dict[str, str]] = []
     for item in value[:8]:
         if isinstance(item, BaseModel):
-            raw = item.model_dump()
+            raw = pydantic_model_to_dict(item)
         elif isinstance(item, dict):
             raw = item
         else:
@@ -882,6 +839,12 @@ def normalize_reference_attachments(value: Any) -> list[dict[str, str]]:
     return normalized
 
 
+def pydantic_model_to_dict(model: BaseModel) -> dict[str, Any]:
+    model_dump = getattr(model, "model_dump", None)
+    payload = model_dump() if callable(model_dump) else model.dict()
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
 def request_reference_attachments(request: "GenerateRequest") -> list[dict[str, str]]:
     attachments = normalize_reference_attachments(request.attachments)
     legacy_name = normalize_reference_image_name(request.reference_image_name)
@@ -903,8 +866,8 @@ def first_reference_attachment(attachments: list[dict[str, str]]) -> dict[str, s
     return next((item for item in attachments if item.get("base64") or item.get("workspace_path")), {})
 
 
-def save_reference_attachments(workspace_root: Path, attachments: list[dict[str, str]]) -> list[dict[str, str]]:
-    saved: list[dict[str, str]] = []
+def save_reference_attachments(workspace_root: Path, attachments: list[dict[str, str]]) -> list[dict[str, Any]]:
+    saved: list[dict[str, Any]] = []
     for attachment in normalize_reference_attachments(attachments):
         workspace_path = attachment.get("workspace_path") or ""
         save_result: dict[str, Any] = {}
@@ -1050,6 +1013,7 @@ class Settings:
     intent_agent_timeout_seconds: int
     codex_existing_task_followup_enabled: bool
     codex_followup_decision_timeout_seconds: int
+    codex_followup_reasoning_effort: str
     app_runtime_enabled_by_default: bool
     app_runtime_provider: str
     app_runtime_model: str
@@ -1111,6 +1075,10 @@ def load_settings() -> Settings:
         intent_agent_timeout_seconds=max(5, int(os.getenv("INTENT_AGENT_TIMEOUT_SECONDS", "20"))),
         codex_existing_task_followup_enabled=env_flag("CODEX_EXISTING_TASK_FOLLOWUP_ENABLED", True),
         codex_followup_decision_timeout_seconds=max(10, int(os.getenv("CODEX_FOLLOWUP_DECISION_TIMEOUT_SECONDS", "90"))),
+        codex_followup_reasoning_effort=normalize_codex_reasoning_effort(
+            os.getenv("CODEX_FOLLOWUP_REASONING_EFFORT", "low"),
+            default="low",
+        ),
         app_runtime_enabled_by_default=runtime_enabled_default,
         app_runtime_provider=os.getenv("APP_RUNTIME_PROVIDER", "openai").strip() or "openai",
         app_runtime_model=os.getenv("APP_RUNTIME_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini",
@@ -1224,7 +1192,7 @@ def korean_text_or_fallback(value: str, fallback: str) -> str:
 
 def serialize_device_info(device_info: Optional[DeviceInfoPayload | dict[str, Any]]) -> dict[str, Any]:
     if isinstance(device_info, DeviceInfoPayload):
-        payload = device_info.dict() if hasattr(device_info, "dict") else device_info.model_dump()
+        payload = pydantic_model_to_dict(device_info)
     elif isinstance(device_info, dict):
         payload = dict(device_info)
     else:
@@ -1278,9 +1246,12 @@ def extract_response_output_text(payload: dict[str, Any]) -> str:
 
 
 def parse_response_usage_payload(payload: dict[str, Any]) -> dict[str, Optional[int]]:
-    usage_payload = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-    input_details = usage_payload.get("input_tokens_details") if isinstance(usage_payload.get("input_tokens_details"), dict) else {}
-    output_details = usage_payload.get("output_tokens_details") if isinstance(usage_payload.get("output_tokens_details"), dict) else {}
+    raw_usage_payload = payload.get("usage")
+    usage_payload: dict[str, Any] = raw_usage_payload if isinstance(raw_usage_payload, dict) else {}
+    raw_input_details = usage_payload.get("input_tokens_details")
+    input_details: dict[str, Any] = raw_input_details if isinstance(raw_input_details, dict) else {}
+    raw_output_details = usage_payload.get("output_tokens_details")
+    output_details: dict[str, Any] = raw_output_details if isinstance(raw_output_details, dict) else {}
 
     def as_optional_int(value: Any) -> Optional[int]:
         if value in (None, ""):
@@ -2222,38 +2193,6 @@ def build_intent_decision(
     )
 
 
-def build_pre_build_confirmation_decision(decision: IntentDecision, *, existing_task: bool) -> IntentDecision:
-    if decision.mode != "build":
-        return decision
-    question = "정리한 명세대로 바로 앱 생성을 시작할까요?" if not existing_task else "정리한 수정 방향대로 바로 반영을 시작할까요?"
-    message = "빌드 전에 정리한 명세를 한 번만 확인해 주세요." if not existing_task else "수정 전에 정리한 방향을 한 번만 확인해 주세요."
-    return IntentDecision(
-        mode="ask_confirmation",
-        status="Pending Decision",
-        tool="ask_confirmation",
-        message=message,
-        summary=decision.summary,
-        questions=[question],
-        reason="정리된 요구사항이 맞는지 확인받은 뒤 빌드를 시작해요.",
-        request_scope=decision.request_scope,
-        requires_existing_task_context=decision.requires_existing_task_context,
-        app_name=decision.app_name,
-        package_name=decision.package_name,
-        normalized_prompt=decision.normalized_prompt,
-        feature_points=decision.feature_points,
-        primary_user_flow=decision.primary_user_flow,
-        secondary_requirements=decision.secondary_requirements,
-        secondary_scope_confirmed=decision.secondary_scope_confirmed,
-        acceptance_criteria=decision.acceptance_criteria,
-        effective_user_prompt=decision.effective_user_prompt,
-        used_previous_pending_prompt=decision.used_previous_pending_prompt,
-        confirmation_action="generate_confirm",
-        confirmation_payload="네, 이 내용으로 앱 생성을 시작해줘" if not existing_task else "네, 이 내용으로 앱 수정을 시작해줘",
-        image_reference_summary=decision.image_reference_summary,
-        image_conflict_note=decision.image_conflict_note,
-    )
-
-
 def build_prepared_generation_prompt(decision: IntentDecision) -> str:
     app_name = normalize_whitespace(decision.app_name) or infer_app_name(decision.effective_user_prompt)
     purpose = normalize_whitespace(decision.primary_user_flow) or "사용자가 요청한 목적을 중심으로 Flutter Android 앱을 만든다."
@@ -2577,6 +2516,7 @@ def run_openai_structured_agent(
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return None
+    request_started_at = time.monotonic()
 
     base_url = os.getenv("OPENAI_RESPONSES_URL", "https://api.openai.com/v1/responses").strip() or "https://api.openai.com/v1/responses"
     payload = {
@@ -2637,22 +2577,13 @@ def run_openai_structured_agent(
     enriched_result["__agent_meta"] = {
         "model": settings.intent_agent_model,
         "raw_output_text": output_text,
-        "raw_response": response_payload,
+        "raw_response": {
+            **response_payload,
+            "server_elapsed_seconds": round(time.monotonic() - request_started_at, 3),
+        },
         "usage": parse_response_usage_payload(response_payload),
     }
     return enriched_result
-
-
-def run_intent_agent(
-    settings: Settings,
-    *,
-    prompt: str,
-    task_id: str,
-    existing_task: bool,
-    existing_workspace_ready: bool = False,
-    previous_conversation_state: Optional[dict[str, Any]] = None,
-) -> Optional[dict[str, Any]]:
-    return None
 
 
 def run_spec_clarification_agent(
@@ -3574,6 +3505,15 @@ class Database:
             self.ensure_column(connection, "tasks", "build_request_prompt", "TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)")
             connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_user_id_created_at ON tasks(user_id, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_device_id_created_at ON tasks(device_id, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_phone_number_created_at ON tasks(phone_number, created_at DESC)"
+            )
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_events (
                     event_id TEXT PRIMARY KEY,
@@ -3677,10 +3617,12 @@ class Database:
                     source TEXT NOT NULL,
                     workspace_path TEXT NOT NULL,
                     project_path TEXT NOT NULL,
+                    request_summary TEXT,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            self.ensure_column(connection, "task_project_snapshots", "request_summary", "TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_task_project_snapshots_task_id_created_at ON task_project_snapshots(task_id, created_at)")
             connection.execute(
                 """
@@ -3983,7 +3925,7 @@ class Database:
                     config.get("system_prompt"),
                     int(config.get("daily_request_limit") or 100),
                     int(config.get("daily_token_limit") or 50000),
-                    int(config.get("max_output_tokens") if config.get("max_output_tokens") is not None else 0),
+                    int(config.get("max_output_tokens") or 0),
                     float(config.get("temperature") or 0.4),
                     created_at,
                     now,
@@ -4135,13 +4077,15 @@ class Database:
         source: str,
         workspace_path: str,
         project_path: str,
+        request_summary: str = "",
     ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO task_project_snapshots (
-                    snapshot_id, task_id, revision_label, source, workspace_path, project_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    snapshot_id, task_id, revision_label, source, workspace_path, project_path,
+                    request_summary, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     uuid.uuid4().hex,
@@ -4150,6 +4094,7 @@ class Database:
                     source,
                     workspace_path,
                     project_path,
+                    compact_revision_request_summary(request_summary) if request_summary else "",
                     utc_now_iso(),
                 ),
             )
@@ -4159,7 +4104,8 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT snapshot_id, task_id, revision_label, source, workspace_path, project_path, created_at
+                SELECT snapshot_id, task_id, revision_label, source, workspace_path, project_path,
+                       request_summary, created_at
                 FROM task_project_snapshots
                 WHERE task_id = ?
                 ORDER BY rowid ASC
@@ -4172,7 +4118,8 @@ class Database:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT snapshot_id, task_id, revision_label, source, workspace_path, project_path, created_at
+                SELECT snapshot_id, task_id, revision_label, source, workspace_path, project_path,
+                       request_summary, created_at
                 FROM task_project_snapshots
                 WHERE task_id = ? AND revision_label = ?
                 ORDER BY rowid DESC
@@ -4349,9 +4296,12 @@ def render_task_agents_md(task_id: str) -> str:
 - iOS/Xcode는 사용하지 않는다.
 - 사용자의 명세를 반영해 `project` 폴더의 Flutter 앱을 수정한다.
 - 가급적 `project/lib/main.dart`, `project/pubspec.yaml`, `project/android/app/` 아래만 집중해서 수정한다.
-- `flutter pub get`, `flutter analyze`, `flutter build apk --release --target-platform android-arm64` 중 필요한 명령을 실행한다.
-- APK가 필요하면 다운로드가 빠른 arm64 release APK를 우선 만든다.
-- release APK 빌드가 실패할 때만 debug APK를 fallback으로 만든다.
+- `prompt.md`에 지정된 Task ID, 앱 이름, Android package name, `applicationId`, `namespace`, Kotlin package 선언과 `MainActivity` 경로는 서버가 관리하는 불변 식별자다. 새 앱 생성과 모든 수정에서 이 값을 바꾸거나 새 패키지를 만들지 않는다.
+- 런타임 API의 `taskId`, `packageName`, endpoint 경로도 `prompt.md`의 값과 정확히 일치시킨다. `task_result.json`에는 실제 프로젝트와 동일한 `task_id` 및 `package_name`을 기록한다.
+- 기존 Android release debug signing 설정과 `CrashHandler.initialize(...)`의 Task ID 및 package name을 유지한다.
+- 코드 생성 중에는 `flutter pub get`과 `flutter analyze`로 의존성과 정적 오류를 검증한다.
+- 최종 APK 빌드는 Task 식별자 보정 뒤 서버가 한 번만 수행하므로 `flutter build apk`를 직접 실행하지 않는다.
+- `task_result.json`의 `apk_path`에는 서버가 생성할 예상 release APK 경로인 `project/build/app/outputs/flutter-apk/app-release.apk`를 기록한다.
 - 사용자가 요청한 핵심 기능을 더 쉬운 대체 구현으로 바꾸지 않는다.
 - `prompt.md`에 적힌 `1차 핵심 흐름`을 이번 빌드의 최우선 범위로 본다.
 - `2차 고도화 요구`는 1차가 안정적으로 성립한 뒤에 반영한다. 시간이 부족하거나 충돌하면 1차를 우선하고, 못 넣은 2차 요구는 `known_limitations`에 남긴다.
@@ -4380,7 +4330,7 @@ def render_task_agents_md(task_id: str) -> str:
   "task_id": "{task_id}",
   "app_name": "...",
   "package_name": "...",
-  "apk_path": "project/build/app/outputs/flutter-apk/app-debug.apk",
+  "apk_path": "project/build/app/outputs/flutter-apk/app-release.apk",
   "implemented_requirements": ["실제로 동작하는 핵심 요구사항 1", "실제로 동작하는 핵심 요구사항 2"],
   "verification_notes": ["직접 확인한 동작이나 점검 내용"],
   "known_limitations": [],
@@ -4432,7 +4382,10 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
     runtime_meta = build_app_runtime_metadata(task, settings)
     data_meta = build_app_data_runtime_metadata(task, settings)
     state_payload = load_task_state_payload(task)
-    conversation_state = state_payload.get("conversation_state") if isinstance(state_payload.get("conversation_state"), dict) else {}
+    raw_conversation_state = state_payload.get("conversation_state")
+    conversation_state: dict[str, Any] = (
+        raw_conversation_state if isinstance(raw_conversation_state, dict) else {}
+    )
     primary_user_flow = normalize_whitespace(
         str(
             state_payload.get("primary_user_flow")
@@ -5021,11 +4974,13 @@ Context:
 
     args = shlex.split(command_text)
     args = [part.replace(placeholder, codex_prompt) for part in args]
+    args = with_codex_reasoning_effort(args, settings.codex_followup_reasoning_effort)
     env = os.environ.copy()
     env["CI"] = "1"
 
     exit_code: Optional[int] = None
     timed_out = False
+    decision_started_at = time.monotonic()
     try:
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             completed = subprocess.run(
@@ -5054,6 +5009,7 @@ Context:
             payload={
                 "exit_code": exit_code,
                 "timed_out": timed_out,
+                "elapsed_seconds": round(time.monotonic() - decision_started_at, 3),
                 "stdout": stdout_text,
                 "stderr": stderr_text,
             },
@@ -5079,6 +5035,7 @@ Context:
     process_response = {
         "exit_code": exit_code,
         "timed_out": timed_out,
+        "elapsed_seconds": round(time.monotonic() - decision_started_at, 3),
         "result_path": result_relative_path,
         "stdout": read_text_if_exists(stdout_path, limit=None),
         "stderr": read_text_if_exists(stderr_path, limit=None),
@@ -5384,6 +5341,11 @@ def ensure_project_revision_version(project_root: Path, revision_label: Optional
         return False
     pubspec_path.write_text(next_text, encoding="utf-8")
     return True
+
+
+def flutter_no_pub_args(project_root: Path) -> list[str]:
+    package_config = project_root / ".dart_tool" / "package_config.json"
+    return ["--no-pub"] if package_config.is_file() else []
 
 
 ANDROID_ONLY_WORKSPACE_ROOT_IGNORES = {
@@ -5809,8 +5771,9 @@ def task_has_app_context(task: dict[str, Any], state_payload: Optional[dict[str,
 
 def build_task_conversation_state(task: dict[str, Any]) -> dict[str, Any]:
     state_payload = load_task_state_payload(task)
-    existing_state = state_payload.get("conversation_state") if isinstance(state_payload.get("conversation_state"), dict) else {}
-    conversation_state = dict(existing_state)
+    raw_existing_state = state_payload.get("conversation_state")
+    existing_state: dict[str, Any] = raw_existing_state if isinstance(raw_existing_state, dict) else {}
+    conversation_state: dict[str, Any] = dict(existing_state)
     conversation_state_override = task.get("conversation_state_override")
     if isinstance(conversation_state_override, dict):
         conversation_state.update(conversation_state_override)
@@ -6215,7 +6178,7 @@ def parse_event_payload(row: dict[str, Any]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, str]]:
+def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, Any]]:
     event_type = str(row.get("event_type") or "")
     actor = str(row.get("actor") or "")
     message_text = sanitize_user_visible_text(str(row.get("message_text") or ""))
@@ -6376,7 +6339,7 @@ def build_task_timeline_events(
     return timeline[-limit:] if limit > 0 else timeline
 
 
-def derive_current_build_stage(task: dict[str, Any], timeline_events: list[dict[str, str]]) -> tuple[str, str]:
+def derive_current_build_stage(task: dict[str, Any], timeline_events: list[dict[str, Any]]) -> tuple[str, str]:
     status = str(task.get("status") or "")
     message = sanitize_user_visible_text(str(task.get("message") or ""))
     if status == "Running":
@@ -6787,6 +6750,7 @@ class CodexTaskRunner:
             source="branched_revision",
             workspace_path=str(workspace_path),
             project_path=str(project_path),
+            request_summary="선택한 버전에서 새 Task로 분기",
         )
         self.db.log_event(
             task_id,
@@ -7124,6 +7088,7 @@ class CodexTaskRunner:
         build_log_path = workspace_path / "logs" / "build.log"
         env = self.build_task_env(workspace_path)
         flutter_args = shlex.split(self.settings.flutter_command)
+        debug_apk = (project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk").resolve()
         status_message = "설치 가능한 디버그 APK를 준비하고 있어요."
         did_update = self.db.update_task_if_status(
             task_id,
@@ -7145,7 +7110,7 @@ class CodexTaskRunner:
             detail="최적화 APK 준비에 실패했거나 비활성화되어 debug APK를 준비합니다.",
         )
         exit_code, timed_out, elapsed_seconds = self.run_logged_command(
-            flutter_args + ["build", "apk", "--debug"],
+            flutter_args + ["build", "apk", "--debug"] + flutter_no_pub_args(project_path),
             cwd=project_path,
             env=env,
             log_path=build_log_path,
@@ -7153,12 +7118,11 @@ class CodexTaskRunner:
         )
         if self.is_task_cancelled(task_id):
             raise RuntimeError("앱 생성이 중단되었습니다.")
-        if timed_out and not result_path.exists():
+        if timed_out and not debug_apk.exists():
             raise RuntimeError("debug APK 빌드가 시간 제한을 초과했습니다.")
-        if exit_code != 0:
+        if exit_code != 0 and not debug_apk.exists():
             raise RuntimeError(f"debug APK 빌드에 실패했습니다. exit code: {exit_code}")
 
-        debug_apk = (project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk").resolve()
         if not ensure_within_root(debug_apk, workspace_path) or not debug_apk.exists() or debug_apk.stat().st_size <= 0:
             raise RuntimeError("debug APK 산출물을 찾을 수 없습니다.")
 
@@ -7250,7 +7214,9 @@ class CodexTaskRunner:
             detail="arm64 release APK를 생성합니다.",
         )
         exit_code, timed_out, elapsed_seconds = self.run_logged_command(
-            flutter_args + ["build", "apk", "--release", "--target-platform", "android-arm64"],
+            flutter_args
+            + ["build", "apk", "--release", "--target-platform", "android-arm64"]
+            + flutter_no_pub_args(project_path),
             cwd=project_path,
             env=env,
             log_path=build_log_path,
@@ -7306,12 +7272,13 @@ class CodexTaskRunner:
             (
                 "analyze",
                 "Flutter 코드를 분석하고 있어요.",
-                flutter_args + ["analyze", "--no-fatal-warnings", "--no-fatal-infos"],
+                flutter_args + ["analyze", "--no-pub", "--no-fatal-warnings", "--no-fatal-infos"],
             ),
             (
                 "build",
                 "Android APK를 빌드하고 있어요.",
-                flutter_args + ["build", "apk", "--release", "--target-platform", "android-arm64"],
+                flutter_args
+                + ["build", "apk", "--release", "--target-platform", "android-arm64", "--no-pub"],
             ),
         ]
 
@@ -7545,9 +7512,9 @@ class CodexTaskRunner:
                 ),
                 **usage_update_fields,
             )
-            task = self.db.get_task(task_id)
-            if task:
-                log_task_status_event(self.db, task, event_type="task_timeout")
+            updated_task = self.db.get_task(task_id)
+            if updated_task:
+                log_task_status_event(self.db, updated_task, event_type="task_timeout")
                 if usage:
                     log_token_usage_event(self.db, task_id, usage, model=codex_model)
             log_build_stage_event(
@@ -7575,9 +7542,9 @@ class CodexTaskRunner:
                     ),
                     **usage_update_fields,
                 )
-                task = self.db.get_task(task_id)
-                if task:
-                    log_task_status_event(self.db, task, event_type=event_type)
+                updated_task = self.db.get_task(task_id)
+                if updated_task:
+                    log_task_status_event(self.db, updated_task, event_type=event_type)
                     if usage:
                         log_token_usage_event(self.db, task_id, usage, model=codex_model)
                 log_build_stage_event(
@@ -7598,9 +7565,9 @@ class CodexTaskRunner:
                 log=log_text,
                 **usage_update_fields,
             )
-            task = self.db.get_task(task_id)
-            if task:
-                log_task_status_event(self.db, task, event_type="task_failed")
+            updated_task = self.db.get_task(task_id)
+            if updated_task:
+                log_task_status_event(self.db, updated_task, event_type="task_failed")
                 if usage:
                     log_token_usage_event(self.db, task_id, usage, model=codex_model)
             log_build_stage_event(
@@ -7624,9 +7591,9 @@ class CodexTaskRunner:
                 codex_result_json=result_path.read_text(encoding="utf-8", errors="replace"),
                 **usage_update_fields,
             )
-            task = self.db.get_task(task_id)
-            if task:
-                log_task_status_event(self.db, task, event_type="task_failed")
+            updated_task = self.db.get_task(task_id)
+            if updated_task:
+                log_task_status_event(self.db, updated_task, event_type="task_failed")
                 if usage:
                     log_token_usage_event(self.db, task_id, usage, model=codex_model)
             log_build_stage_event(
@@ -7791,16 +7758,16 @@ class CodexTaskRunner:
                 task_id=task_id,
                 result_payload=result,
             )
-            task = self.db.get_task(task_id)
-            if task:
-                log_task_status_event(self.db, task, event_type="task_succeeded")
+            updated_task = self.db.get_task(task_id)
+            if updated_task:
+                log_task_status_event(self.db, updated_task, event_type="task_succeeded")
                 if usage:
                     log_token_usage_event(self.db, task_id, usage, model=codex_model)
                 log_package_name_event(
                     self.db,
                     task_id,
-                    package_name=str(task.get("package_name") or result.get("package_name") or ""),
-                    app_name=str(task.get("app_name") or result.get("app_name") or ""),
+                    package_name=str(updated_task.get("package_name") or result.get("package_name") or ""),
+                    app_name=str(updated_task.get("app_name") or result.get("app_name") or ""),
                     event_type="package_name_confirmed",
                 )
             log_build_stage_event(
@@ -7822,9 +7789,9 @@ class CodexTaskRunner:
                 log=log_text,
                 **usage_update_fields,
             )
-            task = self.db.get_task(task_id)
-            if task:
-                log_task_status_event(self.db, task, event_type="task_failed")
+            updated_task = self.db.get_task(task_id)
+            if updated_task:
+                log_task_status_event(self.db, updated_task, event_type="task_failed")
                 if usage:
                     log_token_usage_event(self.db, task_id, usage, model=codex_model)
             log_build_stage_event(
@@ -7844,9 +7811,9 @@ class CodexTaskRunner:
             log=log_text,
             **usage_update_fields,
         )
-        task = self.db.get_task(task_id)
-        if task:
-            log_task_status_event(self.db, task, event_type="task_failed")
+        updated_task = self.db.get_task(task_id)
+        if updated_task:
+            log_task_status_event(self.db, updated_task, event_type="task_failed")
             if usage:
                 log_token_usage_event(self.db, task_id, usage, model=codex_model)
         log_build_stage_event(
@@ -8036,6 +8003,9 @@ def revision_request_summary(
         return "감지된 실행 오류 자동 복구"
     if source == "branched_revision":
         return "선택한 버전에서 새 Task로 분기"
+    stored_summary = normalize_whitespace(str(snapshot.get("request_summary") or ""))
+    if stored_summary:
+        return compact_revision_request_summary(stored_summary)
 
     snapshot_time = parse_iso_datetime(str(snapshot.get("created_at") or ""))
     eligible_events: list[dict[str, Any]] = []
@@ -8141,6 +8111,8 @@ def serialize_project_revision(
             artifact_path = str(apk_path.relative_to(workspace_path).as_posix())
         except ValueError:
             artifact_path = str(apk_path)
+    task_project_path = normalize_whitespace(str(task.get("project_path") or ""))
+    is_current = bool(task_project_path) and Path(task_project_path).resolve() == project_path
     return {
         "snapshot_id": str(snapshot.get("snapshot_id") or ""),
         "task_id": str(task.get("task_id") or snapshot.get("task_id") or ""),
@@ -8160,16 +8132,17 @@ def serialize_project_revision(
             and project_path.is_dir()
             and ensure_within_root(project_path, workspace_path)
         ),
-        "is_current": str(task.get("project_path") or "").strip() == str(project_path),
+        "is_current": is_current,
     }
 
 
 def serialize_task_summary(task: dict[str, Any]) -> dict[str, Any]:
     success = task["status"] == "Success"
     state_payload = load_task_state_payload(task)
-    stored_conversation_state = (
-        state_payload.get("conversation_state")
-        if isinstance(state_payload.get("conversation_state"), dict)
+    raw_stored_conversation_state = state_payload.get("conversation_state")
+    stored_conversation_state: dict[str, Any] = (
+        raw_stored_conversation_state
+        if isinstance(raw_stored_conversation_state, dict)
         else {}
     )
     request_scope = normalize_whitespace(
@@ -8366,12 +8339,13 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Flutter APK Builder Server", lifespan=lifespan)
-    try:
-        from admin_dashboard import register_admin_dashboard_routes
-    except ModuleNotFoundError:
-        from .admin_dashboard import register_admin_dashboard_routes
-
-    register_admin_dashboard_routes(app, require_admin_token)
+    dashboard_module_name = (
+        f"{__package__}.admin_dashboard"
+        if __package__
+        else "admin_dashboard"
+    )
+    dashboard_module = importlib.import_module(dashboard_module_name)
+    dashboard_module.register_admin_dashboard_routes(app, require_admin_token)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -8804,6 +8778,7 @@ def create_app() -> FastAPI:
                     source=decision.request_scope,
                     workspace_path=workspace_path_value,
                     project_path=project_path_value,
+                    request_summary=decision.effective_user_prompt,
                 )
             else:
                 workspace_path_obj = Path(workspace_path_value)
@@ -8834,6 +8809,7 @@ def create_app() -> FastAPI:
                     source="runtime_repair" if looks_like_runtime_repair_request(request.prompt) else decision.request_scope,
                     workspace_path=workspace_path_value,
                     project_path=project_path_value,
+                    request_summary=decision.effective_user_prompt,
                 )
 
             cancelled_task = db.get_task(followup_task_id)
@@ -9073,6 +9049,7 @@ def create_app() -> FastAPI:
                 source=decision.request_scope,
                 workspace_path=str(workspace_path),
                 project_path=str(project_path),
+                request_summary=decision.effective_user_prompt,
             )
             runner.enqueue(task_id)
 

@@ -11,6 +11,7 @@ import java.util.Locale
 
 internal object TaskLogDetailFormatter {
     private const val UNKNOWN_TIME = ""
+    private const val INTERNAL_LINK_MARKER = "\u0000"
     private val gson = Gson()
     private val displayTimeFormatter = DateTimeFormatter.ofPattern("a h:mm", Locale.KOREAN)
     private val hiddenBodies = setOf(
@@ -46,6 +47,24 @@ internal object TaskLogDetailFormatter {
         "tool_output"
     )
     private val developerOnlyLabels = setOf("명령", "파일")
+    private val markdownLinkRegex = Regex("""\[([^\]]+)]\(([^)]+)\)""")
+    private val internalLinkMarkerRegex = Regex(
+        Regex.escape(INTERNAL_LINK_MARKER) + """(?:에서|으로|로|을|를|에|의)?"""
+    )
+    private val internalFileReferenceRegex = Regex(
+        """(?i)(?:^|[/\\])(?:project|logs|workspaces?|\.codex_result)(?:[/\\]|$)|""" +
+            """(?:^|[/\\])(?:Users|home|srv|opt|var|tmp|private|volume\d*)(?:[/\\]|$)|""" +
+            """\.(?:dart|kt|java|xml|gradle|json|ya?ml|py)(?::\d+)?$"""
+    )
+    private val developerDetailMarkers = listOf(
+        "flutter pub get",
+        "flutter analyze",
+        "no issues found",
+        ".codex_result",
+        "task_result.json",
+        "logs/build.log",
+        "결과 계약 파일"
+    )
 
     fun buildPayload(
         taskId: String,
@@ -295,7 +314,7 @@ internal object TaskLogDetailFormatter {
         return value.orEmpty()
             .lineSequence()
             .mapNotNull { rawLine ->
-                val line = rawLine
+                val line = stripInternalMarkdownLinks(rawLine)
                     .replace(Regex("^\\s*(단계|상태)\\s*:\\s*"), "")
                     .trim()
                 if (isDeveloperOnlyLogLine(line)) {
@@ -328,6 +347,7 @@ internal object TaskLogDetailFormatter {
                             Regex("""(?<![\w가-힣])_?[A-Za-z]+(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)[A-Za-z0-9_]*(?![\w가-힣])"""),
                             "앱 내부 설정"
                         )
+                        .replace(Regex("""\s+([,.!?])"""), "$1")
                         .replace(Regex("""[ \t]{2,}"""), " ")
                         .trim()
                 }
@@ -337,10 +357,28 @@ internal object TaskLogDetailFormatter {
             .trim()
     }
 
+    private fun stripInternalMarkdownLinks(value: String): String {
+        val marked = markdownLinkRegex.replace(value) { match ->
+            val label = match.groupValues[1].trim()
+            val target = match.groupValues[2].trim()
+            when {
+                !looksLikeInternalFileReference(target) -> label
+                looksLikeInternalFileReference(label) -> INTERNAL_LINK_MARKER
+                else -> label
+            }
+        }
+        return marked.replace(internalLinkMarkerRegex, "")
+    }
+
+    private fun looksLikeInternalFileReference(value: String): Boolean {
+        return internalFileReferenceRegex.containsMatchIn(value.trim().trim('`'))
+    }
+
     private fun isDeveloperOnlyLogLine(value: String): Boolean {
         if (value.isBlank()) return false
         val normalized = value.trim().lowercase()
         if (normalized.startsWith("{") && normalized.endsWith("}")) return true
+        if (developerDetailMarkers.any(normalized::contains)) return true
         return listOf(
             "$ ",
             "command:",

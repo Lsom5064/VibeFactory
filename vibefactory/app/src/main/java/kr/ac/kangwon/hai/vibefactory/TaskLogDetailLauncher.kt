@@ -14,7 +14,6 @@ internal object TaskLogDetailLauncher {
         currentStatus: String,
         displayedAppName: String?,
         messages: List<ChatMessage>,
-        rawLogContents: List<String>,
         formatTimestamp: (String?) -> String?
     ) {
         val payload = TaskLogDetailFormatter.buildPayload(
@@ -23,7 +22,7 @@ internal object TaskLogDetailLauncher {
             currentStatus = currentStatus,
             displayedAppName = displayedAppName,
             messages = messages,
-            rawLogContents = rawLogContents,
+            rawLogContents = emptyList(),
             formatTimestamp = formatTimestamp
         )
         context.startActivity(

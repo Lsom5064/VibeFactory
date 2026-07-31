@@ -12,15 +12,40 @@ from PIL import Image
 
 from flutter_apk_server.server import (
     Database,
+    GenerateAttachmentPayload,
     REFERENCE_IMAGE_MAX_DIMENSION,
     REFERENCE_IMAGE_MAX_STORED_BYTES,
     create_app,
+    normalize_reference_attachments,
     save_reference_image_attachment_result,
     utc_now_iso,
 )
 
 
 class FullLoggingAndImageStorageTests(unittest.TestCase):
+    def test_generate_attachment_payload_supports_installed_pydantic_version(self) -> None:
+        attachment = GenerateAttachmentPayload(
+            type="image",
+            mime_type="image/png",
+            name="screen.png",
+            base64="encoded-image",
+        )
+
+        normalized = normalize_reference_attachments([attachment])
+
+        self.assertEqual(
+            normalized,
+            [
+                {
+                    "type": "image",
+                    "mime_type": "image/png",
+                    "name": "screen.png",
+                    "base64": "encoded-image",
+                    "workspace_path": "",
+                }
+            ],
+        )
+
     def test_task_event_preserves_full_message_and_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Database(Path(temp_dir) / "tasks.db")

@@ -276,7 +276,6 @@ class MainActivity : AppCompatActivity() {
     private var pendingInstallPackageWasInstalled: Boolean = false
     private var pendingInstallerLaunched: Boolean = false
     private var pendingInstallResolutionJob: Job? = null
-    private val taskRawLogSections = mutableMapOf<String, List<LogSectionSnapshot>>()
     private val attachmentOnlyPromptKeys by lazy(LazyThreadSafetyMode.NONE) {
         setOf(
             getString(R.string.attachment_only_generate_prompt),
@@ -308,11 +307,6 @@ class MainActivity : AppCompatActivity() {
     private data class TimelineEventPage(
         val events: List<TimelineEventSnapshot>,
         val nextCursor: String?
-    )
-
-    private data class LogSectionSnapshot(
-        val title: String,
-        val content: String
     )
 
     private data class ChatScrollSnapshot(
@@ -909,14 +903,10 @@ class MainActivity : AppCompatActivity() {
     private fun openTaskLogDetail() {
         val taskId = screenState.selectedTaskId?.trim()?.takeIf { it.isNotBlank() }
             ?: currentTaskId?.trim()?.takeIf { it.isNotBlank() }
-        val cachedLogContents = taskId
-            ?.let { taskRawLogSections[it] }
-            .orEmpty()
-            .map { it.content }
-        launchTaskLogDetail(taskId, cachedLogContents)
+        launchTaskLogDetail(taskId)
     }
 
-    private fun launchTaskLogDetail(taskId: String?, rawLogContents: List<String>) {
+    private fun launchTaskLogDetail(taskId: String?) {
         TaskLogDetailLauncher.open(
             context = this,
             taskId = taskId,
@@ -924,7 +914,6 @@ class MainActivity : AppCompatActivity() {
             currentStatus = screenState.currentStatus,
             displayedAppName = screenState.displayedAppName,
             messages = taskId?.let { buildTaskTimeline(it) } ?: screenState.messages,
-            rawLogContents = rawLogContents,
             formatTimestamp = ::formatMessageTimestamp
         )
     }
@@ -1998,7 +1987,6 @@ class MainActivity : AppCompatActivity() {
         val isErrorResponse = TaskStatusPolicy.isResponseError(normalizedStatus)
         val allowArtifactActions = isSuccess && !isPollingStatus
         val progressMode = response.progress_mode?.takeIf { it.isNotBlank() }
-        taskRawLogSections[taskId] = extractRawLogSections(response)
         latestApkUrl = resolveApkUrl(taskId, response, isSuccess)
         val hasArtifact = latestApkUrl != null || persistedApkUrlForTask(taskId) != null
         updateTaskArtifactState(
@@ -2893,6 +2881,7 @@ ${record.stackTrace}
     private fun downloadAndInstall(taskId: String, url: String, artifactPath: String? = null) {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank()) return
+        val downloadStartedAt = SystemClock.elapsedRealtime()
         val normalizedUrl = url.trim()
         val normalizedArtifactPath = artifactPath?.trim()?.takeIf { it.isNotBlank() }
         isDownloadingApk = true
@@ -2914,8 +2903,7 @@ ${record.stackTrace}
                 logApiRequest("/download/{task_id}", taskId = downloadTaskId, deviceId = deviceId, extra = "url=$normalizedUrl")
                 val resolvedDownloadTaskId = downloadTaskId
                     ?: throw IllegalStateException("missing task_id for download")
-                var lastProgressPercent = -1
-                var lastRenderedBytes = 0L
+                val progressRenderPolicy = DownloadProgressRenderPolicy()
                 val apkFile = ApkArtifactActionHandler.downloadToCache(
                     context = this@MainActivity,
                     apiService = downloadApiService,
@@ -2925,20 +2913,14 @@ ${record.stackTrace}
                     deviceId = deviceId,
                     phoneNumber = userIdentity.phoneNumber,
                     onProgress = { progress ->
-                        val percent = progress.totalBytes
-                            ?.takeIf { it > 0L }
-                            ?.let { ((progress.downloadedBytes * 100L) / it).toInt().coerceIn(0, 100) }
-                        val shouldRender = if (percent != null) {
-                            percent != lastProgressPercent
-                        } else {
-                            progress.downloadedBytes < lastRenderedBytes ||
-                                progress.downloadedBytes - lastRenderedBytes >= 1024L * 1024L
-                        }
-                        if (shouldRender) {
-                            lastProgressPercent = percent ?: -1
-                            lastRenderedBytes = progress.downloadedBytes
+                        val renderDecision = progressRenderPolicy.evaluate(
+                            downloadedBytes = progress.downloadedBytes,
+                            totalBytes = progress.totalBytes,
+                            nowMs = SystemClock.elapsedRealtime()
+                        )
+                        if (renderDecision.shouldRender) {
                             withContext(Dispatchers.Main) {
-                                downloadProgressPercent = percent
+                                downloadProgressPercent = renderDecision.percent
                                 downloadProgressBytes = progress.downloadedBytes
                                 screenState = screenState.copy(
                                     currentStatus = getString(R.string.download_apk_in_progress),
@@ -2950,7 +2932,7 @@ ${record.stackTrace}
                         }
                     },
                     onRetry = { attempt, maxAttempts ->
-                        lastProgressPercent = -1
+                        progressRenderPolicy.reset()
                         withContext(Dispatchers.Main) {
                             screenState = screenState.copy(
                                 currentStatus = getString(R.string.download_apk_in_progress),
@@ -2966,6 +2948,11 @@ ${record.stackTrace}
                 latestDownloadedTaskId = downloadTaskId
                 downloadTaskId?.let { updateTaskArtifactState(it, apkUrl = normalizedUrl, downloadedApkFile = apkFile) }
                 withContext(Dispatchers.Main) {
+                    Log.i(
+                        TAG,
+                        "APK download completed task_id=$normalizedTaskId " +
+                            "duration_ms=${SystemClock.elapsedRealtime() - downloadStartedAt} size_bytes=${apkFile.length()}"
+                    )
                     isDownloadingApk = false
                     downloadingApkTaskId = null
                     downloadingApkUrl = null
@@ -2996,6 +2983,12 @@ ${record.stackTrace}
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
                 withContext(Dispatchers.Main) {
+                    Log.w(
+                        TAG,
+                        "APK download failed task_id=$normalizedTaskId " +
+                            "duration_ms=${SystemClock.elapsedRealtime() - downloadStartedAt}",
+                        e
+                    )
                     isDownloadingApk = false
                     downloadingApkTaskId = null
                     downloadingApkUrl = null
@@ -4314,6 +4307,7 @@ ${record.stackTrace}
     }
 
     private fun handleAttachmentsSelected(uris: List<Uri>, kind: SelectedAttachmentKind) {
+        val attachmentStartedAt = SystemClock.elapsedRealtime()
         lifecycleScope.launch {
             try {
                 val attachments = withContext(Dispatchers.IO) {
@@ -4344,6 +4338,11 @@ ${record.stackTrace}
                     selectedAttachments.clear()
                     selectedAttachments += attachments.first()
                 }
+                Log.i(
+                    TAG,
+                    "Attachments prepared kind=${kind.name} requested=${uris.size} saved=${attachments.size} " +
+                        "duration_ms=${SystemClock.elapsedRealtime() - attachmentStartedAt}"
+                )
                 renderState()
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
@@ -5022,18 +5021,13 @@ ${record.stackTrace}
         return messages
     }
 
-    private fun extractRawLogSections(response: StatusResponse): List<LogSectionSnapshot> {
-        val array = response.raw_log_sections?.takeIf { it.isJsonArray }?.asJsonArray ?: return emptyList()
-        return array.mapNotNull { item ->
-            val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
-            val title = firstString(obj, "title")?.trim().orEmpty()
-            val content = firstString(obj, "content")?.trim().orEmpty()
-            LogSectionSnapshot(title = title, content = content).takeIf { it.content.isNotBlank() }
-        }
-    }
-
     private fun hasStructuredRawLogs(response: StatusResponse): Boolean {
-        return extractRawLogSections(response).isNotEmpty()
+        val array = response.raw_log_sections?.takeIf { it.isJsonArray }?.asJsonArray ?: return false
+        return array.any { item ->
+            val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: return@any false
+            val content = firstString(obj, "content")?.trim().orEmpty()
+            content.isNotBlank()
+        }
     }
 
     private fun buildIncrementalMessages(
@@ -5106,10 +5100,6 @@ ${record.stackTrace}
         }
 
         val timeline = editableTaskTimeline(taskId) ?: return currentMessages
-        val removedStaleLoading = TaskProgressTimelinePolicy.removeActiveLoadingMessages(timeline)
-        if (removedStaleLoading) {
-            persistTaskChat(taskId)
-        }
 
         val logLine = TaskProgressTimelinePolicy.buildProgressDetail(
             response.current_build_stage,
@@ -5130,9 +5120,9 @@ ${record.stackTrace}
             )
         }
 
-        appendTaskTimelineMessage(
-            taskId,
-            ChatMessage(
+        val loadingMessageChanged = TaskProgressTimelinePolicy.upsertSingleActiveLoadingMessage(
+            timeline = timeline,
+            incoming = ChatMessage(
                 id = "current-build-stage-$taskId",
                 kind = MessageKind.STATUS,
                 title = getString(R.string.message_title_status),
@@ -5141,9 +5131,11 @@ ${record.stackTrace}
                 createdAt = currentTimestampString(),
                 cancelTaskId = if (isTaskCancellationAllowed(response)) taskId else null,
                 isLoading = true
-            ),
-            allowDuplicateContent = true
+            )
         )
+        if (loadingMessageChanged) {
+            persistTaskChat(taskId)
+        }
         return buildTaskTimeline(taskId)
     }
 

@@ -105,12 +105,6 @@ class TokenUsageActivity : AppCompatActivity() {
         textStatusMessage.text = getString(R.string.token_usage_status_loading)
     }
 
-    private fun bindEmptyState(message: String) {
-        val fallback = TokenUsageMockRepository.load(this)
-        bindSnapshot(fallback.copy(statusMessage = message, isFallback = true))
-        textTokenUsageEmptyState.visibility = View.GONE
-    }
-
     private fun bindSnapshot(snapshot: TokenUsageSnapshot) {
         textFiveHourTitle.text = snapshot.fiveHourWindowLabel
         textWeeklyTitle.text = snapshot.weeklyWindowLabel

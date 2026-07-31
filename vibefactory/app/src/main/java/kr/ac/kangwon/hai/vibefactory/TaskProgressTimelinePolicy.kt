@@ -68,6 +68,36 @@ internal object TaskProgressTimelinePolicy {
         }
     }
 
+    fun upsertSingleActiveLoadingMessage(
+        timeline: MutableList<ChatMessage>,
+        incoming: ChatMessage
+    ): Boolean {
+        if (!incoming.isLoading || incoming.kind != MessageKind.STATUS) return false
+
+        var changed = false
+        for (index in timeline.lastIndex downTo 0) {
+            val existing = timeline[index]
+            if (existing.isLoading && existing.kind == MessageKind.STATUS && existing.id != incoming.id) {
+                timeline.removeAt(index)
+                changed = true
+            }
+        }
+
+        val existingIndex = timeline.indexOfFirst { it.id == incoming.id }
+        if (existingIndex < 0) {
+            timeline += incoming
+            return true
+        }
+
+        val existing = timeline[existingIndex]
+        val stableIncoming = incoming.copy(createdAt = existing.createdAt ?: incoming.createdAt)
+        if (existing != stableIncoming) {
+            timeline[existingIndex] = stableIncoming
+            changed = true
+        }
+        return changed
+    }
+
     fun removeMatchingProgressMessages(
         timeline: MutableList<ChatMessage>,
         message: ChatMessage,

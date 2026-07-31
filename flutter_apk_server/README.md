@@ -38,6 +38,7 @@ pip install -r requirements.txt
 - `INTENT_AGENT_TIMEOUT_SECONDS`: intent agent 판단 timeout 초, 기본값 `20`
 - `FLUTTER_COMMAND`: 서버가 직접 `flutter pub get`, `flutter analyze`, `flutter build apk`를 실행할 때 사용할 Flutter 명령
 - `CODEX_TIMEOUT_SECONDS`: Codex 실행 timeout 초
+- `CODEX_FOLLOWUP_REASONING_EFFORT`: 기존 앱 요청이 질문인지 수정인지 판별하는 읽기 전용 Codex 실행의 reasoning 수준. 기본값 `low`; 실제 앱 수정 실행의 `CODEX_REASONING_EFFORT`에는 영향을 주지 않음
 - `SERVER_BASE_URL`: 다운로드 URL 생성에 사용할 서버 기본 주소
 - `MAX_CONCURRENT_CODEX_RUNS`: 동시에 실행할 Codex 작업 수
 

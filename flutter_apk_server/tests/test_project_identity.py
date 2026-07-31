@@ -1,11 +1,142 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from flutter_apk_server.server import apply_project_defaults, should_attempt_server_side_build
+from flutter_apk_server.server import (
+    Database,
+    apply_project_defaults,
+    flutter_no_pub_args,
+    render_task_agents_md,
+    revision_request_summary,
+    serialize_project_revision,
+    should_attempt_server_side_build,
+    with_codex_reasoning_effort,
+)
 
 
 class ProjectIdentityTests(unittest.TestCase):
+    def test_followup_reasoning_override_only_replaces_reasoning_config(self) -> None:
+        original = [
+            "codex",
+            "exec",
+            "--model",
+            "gpt-5.4",
+            "-c",
+            'model_reasoning_effort="medium"',
+            "-c",
+            'service_tier="default"',
+            "prompt",
+        ]
+
+        updated = with_codex_reasoning_effort(original, "low")
+
+        self.assertEqual(original[5], 'model_reasoning_effort="medium"')
+        self.assertEqual(updated[5], 'model_reasoning_effort="low"')
+        self.assertEqual(updated[7], 'service_tier="default"')
+        self.assertEqual(updated[-1], "prompt")
+
+    def test_followup_reasoning_override_inserts_missing_config_before_prompt(self) -> None:
+        self.assertEqual(
+            with_codex_reasoning_effort(["codex", "exec", "prompt"], "high"),
+            ["codex", "exec", "-c", 'model_reasoning_effort="high"', "prompt"],
+        )
+
+    def test_task_agent_contract_keeps_server_managed_identity(self) -> None:
+        instructions = render_task_agents_md("test-task")
+
+        for immutable_identity in (
+            "Task ID",
+            "Android package name",
+            "`applicationId`",
+            "`namespace`",
+            "Kotlin package",
+            "`MainActivity`",
+            "release debug signing",
+            "`CrashHandler.initialize(...)`",
+        ):
+            self.assertIn(immutable_identity, instructions)
+        self.assertIn('"task_id": "test-task"', instructions)
+        self.assertIn("app-release.apk", instructions)
+
+    def test_task_agent_contract_delegates_final_apk_build_to_server(self) -> None:
+        instructions = render_task_agents_md("test-task")
+
+        self.assertIn("`flutter build apk`를 직접 실행하지 않는다", instructions)
+        self.assertIn("`flutter pub get`과 `flutter analyze`", instructions)
+        self.assertIn(
+            "project/build/app/outputs/flutter-apk/app-release.apk",
+            instructions,
+        )
+
+    def test_database_has_owner_list_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "tasks.db")
+            database.init_db()
+
+            with sqlite3.connect(database.db_path) as connection:
+                index_names = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index'"
+                    )
+                }
+
+            self.assertIn("idx_tasks_user_id_created_at", index_names)
+            self.assertIn("idx_tasks_device_id_created_at", index_names)
+            self.assertIn("idx_tasks_phone_number_created_at", index_names)
+
+    def test_project_snapshot_persists_its_own_revision_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "tasks.db")
+            database.init_db()
+            database.record_project_snapshot(
+                task_id="task-1",
+                revision_label="rev_0002",
+                source="existing_app_modification",
+                workspace_path="/tmp/workspace",
+                project_path="/tmp/workspace/revisions/rev_0002/project",
+                request_summary="두 번째 카드의 제목을 굵게 표시해줘",
+            )
+
+            snapshot = database.list_project_snapshots("task-1")[0]
+
+            self.assertEqual(
+                revision_request_summary({}, snapshot, []),
+                "두 번째 카드의 제목을 굵게 표시해줘",
+            )
+
+    def test_current_revision_compares_resolved_project_paths(self) -> None:
+        revision = serialize_project_revision(
+            {
+                "task_id": "task-1",
+                "workspace_path": "/tmp/workspace",
+                "project_path": "/tmp/workspace/revisions/rev_0002/../rev_0002/project",
+            },
+            {
+                "task_id": "task-1",
+                "revision_label": "rev_0002",
+                "source": "existing_app_modification",
+                "workspace_path": "/tmp/workspace",
+                "project_path": "/tmp/workspace/revisions/rev_0002/project",
+                "created_at": "2026-07-30T00:00:00+00:00",
+            },
+        )
+
+        self.assertTrue(revision["is_current"])
+
+    def test_flutter_no_pub_is_used_only_with_resolved_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+
+            self.assertEqual(flutter_no_pub_args(project_root), [])
+
+            package_config = project_root / ".dart_tool/package_config.json"
+            package_config.parent.mkdir(parents=True)
+            package_config.write_text("{}", encoding="utf-8")
+
+            self.assertEqual(flutter_no_pub_args(project_root), ["--no-pub"])
+
     def test_server_rebuild_decision_prioritizes_valid_results_and_engine_errors(self) -> None:
         auth_issue = ("Error", "auth failed", "codex_auth_error", "engine")
 

@@ -21,31 +21,6 @@ import java.util.concurrent.Executors
 private const val MAX_STORED_IMAGE_BYTES = 2 * 1024 * 1024
 private const val MAX_STORED_IMAGE_DIMENSION = 1600
 
-fun buildReferenceImageAttachment(
-    contentResolver: ContentResolver,
-    uri: Uri,
-    maxBytes: Int
-): ReferenceImageAttachment? {
-    val displayName = queryDisplayName(contentResolver, uri) ?: "reference_image"
-    contentResolver.openInputStream(uri)?.use { input ->
-        val output = ByteArrayOutputStream()
-        val buffer = ByteArray(8192)
-        var total = 0
-        while (true) {
-            val read = input.read(buffer)
-            if (read <= 0) break
-            total += read
-            if (total > maxBytes) {
-                return null
-            }
-            output.write(buffer, 0, read)
-        }
-        val encoded = Base64.getEncoder().encodeToString(output.toByteArray())
-        return ReferenceImageAttachment(displayName = displayName, base64 = encoded)
-    }
-    return null
-}
-
 fun buildSelectedAttachment(
     contentResolver: ContentResolver,
     uri: Uri,
@@ -99,7 +74,7 @@ private fun readUriBytes(contentResolver: ContentResolver, uri: Uri, maxBytes: I
 }
 
 fun compressImagePayload(rawBytes: ByteArray, maxPayloadBytes: Int): ByteArray? {
-    val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
+    val decoded = decodeScaledBitmapBytes(rawBytes, MAX_STORED_IMAGE_DIMENSION) ?: return null
     val scaled = scaleBitmap(decoded, maxDimension = MAX_STORED_IMAGE_DIMENSION)
     val effectiveMaxPayloadBytes = minOf(maxPayloadBytes, MAX_STORED_IMAGE_BYTES)
     try {
@@ -124,6 +99,28 @@ private fun scaleBitmap(bitmap: Bitmap, maxDimension: Int): Bitmap {
     val scale = maxDimension.toFloat() / largest.toFloat()
     val matrix = Matrix().apply { postScale(scale, scale) }
     return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+}
+
+internal fun calculateBitmapSampleSize(width: Int, height: Int, maxDimension: Int): Int {
+    if (width <= 0 || height <= 0 || maxDimension <= 0) return 1
+    val largestDimension = maxOf(width, height)
+    var sampleSize = 1
+    while (largestDimension / (sampleSize * 2) >= maxDimension) {
+        sampleSize *= 2
+    }
+    return sampleSize
+}
+
+private fun decodeScaledBitmapBytes(bytes: ByteArray, maxDimension: Int): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = calculateBitmapSampleSize(bounds.outWidth, bounds.outHeight, maxDimension)
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+    }
+    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
 }
 
 private fun fallbackMimeType(kind: SelectedAttachmentKind): String {
@@ -250,22 +247,6 @@ private object InlineImagePreviewLoader {
             else -> localBytes
         } ?: return null
         return decodeScaledBitmapBytes(sourceBytes, maxDimension)
-    }
-
-    private fun decodeScaledBitmapBytes(bytes: ByteArray, maxDimension: Int): Bitmap? {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-
-        var sampleSize = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / (sampleSize * 2) >= maxDimension) {
-            sampleSize *= 2
-        }
-        val options = BitmapFactory.Options().apply {
-            inSampleSize = sampleSize
-            inPreferredConfig = Bitmap.Config.ARGB_8888
-        }
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
     }
 
     private fun downloadImageBytes(imageUrl: String): ByteArray? {
