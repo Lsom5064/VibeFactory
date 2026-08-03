@@ -3164,7 +3164,7 @@ class GenerateRequest(BaseModel):
     task_id: Optional[str] = None
     device_id: str = Field(..., min_length=1)
     phone_number: Optional[str] = None
-    prompt: str = Field(..., min_length=1)
+    prompt: str = ""
     display_prompt: Optional[str] = None
     request_action: Optional[str] = None
     device_info: Optional[DeviceInfoPayload] = None
@@ -4909,6 +4909,7 @@ def run_codex_existing_task_followup_decision(
     previous_conversation_state: dict[str, Any],
     device_info: Optional[dict[str, Any]] = None,
     reference_image_name: Optional[str] = None,
+    reference_attachments: Optional[list[dict[str, str]]] = None,
 ) -> Optional[dict[str, Any]]:
     workspace_value = normalize_whitespace(str(task.get("workspace_path") or ""))
     project_value = normalize_whitespace(str(task.get("project_path") or ""))
@@ -4936,6 +4937,15 @@ def run_codex_existing_task_followup_decision(
     safe_previous_conversation_state = dict(previous_conversation_state)
     if safe_previous_conversation_state.get("reference_image_base64"):
         safe_previous_conversation_state["reference_image_base64"] = "[omitted]"
+    safe_reference_attachments = [
+        {
+            "type": attachment.get("type") or "image",
+            "mime_type": attachment.get("mime_type") or "",
+            "name": attachment.get("name") or "reference_image",
+            "workspace_path": attachment.get("workspace_path") or "",
+        }
+        for attachment in normalize_reference_attachments(reference_attachments or [])
+    ]
     context_payload = {
         "task_id": task.get("task_id") or "",
         "app_name": current_task_app_name(task, previous_conversation_state),
@@ -4945,6 +4955,7 @@ def run_codex_existing_task_followup_decision(
         "previous_conversation_state": safe_previous_conversation_state,
         "device_info": device_info or {},
         "reference_image_name": normalize_reference_image_name(reference_image_name),
+        "reference_attachments": safe_reference_attachments,
         "project_path": str(project_path),
     }
     context_json = json.dumps(context_payload, ensure_ascii=False, indent=2)
@@ -4952,6 +4963,8 @@ def run_codex_existing_task_followup_decision(
 
 The existing app source code is already available in the `project` directory inside this workspace.
 Read the actual code and project files as needed before deciding.
+When `reference_attachments` contains workspace paths, inspect those image files as part of the latest request.
+If `latest_user_prompt` is empty and reference images exist, treat the images themselves as the complete latest user message.
 
 User-facing language must be Korean.
 The user is a non-technical end user. User-visible text must explain behavior in plain words.
@@ -8656,6 +8669,8 @@ def create_app() -> FastAPI:
         requested_reference_image_base64 = normalize_reference_image_base64(
             requested_first_reference.get("base64") or request.reference_image_base64
         )
+        if not request.prompt.strip() and not requested_reference_attachments:
+            raise HTTPException(status_code=422, detail="prompt or image attachment is required")
         followup_task_id = (request.task_id or "").strip()
         request_action = normalize_whitespace(str(request.request_action or ""))
 
@@ -8780,6 +8795,7 @@ def create_app() -> FastAPI:
                     previous_conversation_state=previous_conversation_state,
                     device_info=request_device_info or previous_conversation_state.get("device_info"),
                     reference_image_name=effective_reference_image_name,
+                    reference_attachments=effective_reference_attachments,
                 )
 
                 codex_followup_mode = normalize_whitespace(str((codex_followup_payload or {}).get("mode") or ""))

@@ -1113,7 +1113,7 @@ class MainActivity : AppCompatActivity() {
         val displayPrompt = inputPrompt.text.toString().trim()
         val attachments = selectedAttachments.toList()
         if (displayPrompt.isBlank() && attachments.isEmpty()) return
-        val prompt = displayPrompt.ifBlank { attachmentOnlyPromptForMode(screenState.inputMode) }
+        val prompt = displayPrompt
         val attachedImagePreview = attachments.toChatImagePreview()
 
         if (isComposerOnNewChatSurface()) {
@@ -1183,17 +1183,6 @@ class MainActivity : AppCompatActivity() {
     private fun clearComposerDraftAfterSubmit() {
         inputPrompt.setText("")
         clearSelectedAttachment(render = false)
-    }
-
-    private fun attachmentOnlyPromptForMode(mode: InputMode): String {
-        return when (mode) {
-            InputMode.NEW_GENERATE -> getString(R.string.attachment_only_generate_prompt)
-            InputMode.REFINE_EXISTING,
-            InputMode.RETRY_FAILED,
-            InputMode.READ_ONLY -> getString(R.string.attachment_only_refine_prompt)
-            InputMode.CHAT,
-            InputMode.CONTINUE_CLARIFICATION -> getString(R.string.attachment_only_chat_prompt)
-        }
     }
 
     private fun isComposerOnNewChatSurface(): Boolean {

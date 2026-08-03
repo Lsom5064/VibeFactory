@@ -46,6 +46,56 @@ class FullLoggingAndImageStorageTests(unittest.TestCase):
             ],
         )
 
+    def test_generate_accepts_image_without_prompt_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_image = Image.new("RGB", (64, 64), "#4caf50")
+            source_output = BytesIO()
+            source_image.save(source_output, format="PNG")
+            source_image.close()
+            environment = {
+                "BASE_PROJECT_PATH": str(root / "base"),
+                "WORKSPACES_ROOT": str(root / "workspaces"),
+                "DB_PATH": str(root / "tasks.db"),
+                "APP_DATA_DB_PATH": str(root / "app_data.db"),
+                "MOCK_CODEX": "1",
+                "INTENT_AGENT_ENABLED": "0",
+            }
+
+            with patch.dict(os.environ, environment, clear=False):
+                app = create_app()
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/generate",
+                        json={
+                            "device_id": "test-device",
+                            "prompt": "",
+                            "display_prompt": "",
+                            "attachments": [
+                                {
+                                    "type": "image",
+                                    "mime_type": "image/png",
+                                    "name": "screen.png",
+                                    "base64": base64.b64encode(source_output.getvalue()).decode("ascii"),
+                                }
+                            ],
+                        },
+                    )
+
+                    self.assertEqual(response.status_code, 200, response.text)
+                    task_id = response.json()["task_id"]
+                    user_event = next(
+                        event
+                        for event in app.state.db.list_events(task_id)
+                        if event["event_type"] == "user_message"
+                    )
+                    event_payload = json.loads(user_event["payload_json"])
+                    self.assertEqual(user_event["message_text"], "")
+                    self.assertEqual(event_payload["raw_prompt"], "")
+                    self.assertEqual(event_payload["display_prompt"], "")
+                    self.assertEqual(event_payload["attachment_count"], 1)
+                    self.assertEqual(len(app.state.db.list_task_attachments(task_id)), 1)
+
     def test_task_event_preserves_full_message_and_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Database(Path(temp_dir) / "tasks.db")
