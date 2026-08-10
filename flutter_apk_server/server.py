@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -1142,6 +1142,10 @@ class IntentDecision:
     image_reference_summary: str = ""
     image_conflict_note: str = ""
     prepared_prompt: str = ""
+    target_users: list[str] = field(default_factory=list)
+    key_screens: list[str] = field(default_factory=list)
+    storage_mode: str = "unspecified"
+    stored_data: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1758,6 +1762,102 @@ def normalize_secondary_requirements(items: Optional[list[Any]]) -> list[str]:
     return requirements
 
 
+def normalize_prompt_items(items: Optional[list[Any]], *, max_items: int) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in items or []:
+        text = normalize_whitespace(str(item or ""))
+        text = re.sub(r"^[-*•]\s*", "", text).strip(" .,!?:;-")
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        values.append(text)
+        if len(values) >= max_items:
+            break
+    return values
+
+
+def normalize_target_users(items: Optional[list[Any]]) -> list[str]:
+    generic_audiences = {
+        "일반 사용자",
+        "모든 사용자",
+        "일반 android 사용자",
+        "일반 android 스마트폰 사용자",
+        "android 스마트폰 사용자",
+        "스마트폰 사용자",
+    }
+    return [
+        item
+        for item in normalize_prompt_items(items, max_items=5)
+        if item.lower() not in generic_audiences
+    ]
+
+
+def normalize_storage_mode(value: Any) -> str:
+    normalized = normalize_whitespace(str(value or "")).lower()
+    aliases = {
+        "none": "none",
+        "없음": "none",
+        "local": "local",
+        "로컬": "local",
+        "기기": "local",
+        "server": "server",
+        "서버": "server",
+        "cloud": "server",
+        "클라우드": "server",
+        "unspecified": "unspecified",
+        "미정": "unspecified",
+    }
+    return aliases.get(normalized, "unspecified")
+
+
+def infer_target_users(prompt: str) -> list[str]:
+    normalized = normalize_whitespace(prompt)
+    candidate_roles = (
+        "원장", "수강생", "학부모", "학생", "교사", "강사", "의사", "간호사", "환자",
+        "관리자", "직원", "고객", "보호자", "참가자", "운전자", "보행자", "판매자", "구매자",
+    )
+    return [role for role in candidate_roles if role in normalized][:5]
+
+
+def infer_storage_details(prompt: str) -> tuple[str, list[str]]:
+    normalized = normalize_whitespace(prompt)
+    lowered = normalized.lower()
+    server_markers = (
+        "여러 사용자", "사용자 간", "공유", "동기화", "여러 기기", "다중 기기", "계정",
+        "로그인", "서버", "클라우드",
+    )
+    local_markers = (
+        "저장", "기록", "히스토리", "보관", "목록 유지", "메모", "즐겨찾기", "체크리스트",
+        "달력", "일정", "일기", "가계부", "진도", "출석",
+    )
+    storage_mode = "server" if any(marker in lowered for marker in server_markers) else (
+        "local" if any(marker in lowered for marker in local_markers) else "none"
+    )
+    stored_data = [
+        item
+        for item in extract_feature_points(prompt)
+        if any(marker in item.lower() for marker in local_markers + server_markers)
+    ][:6]
+    return storage_mode, stored_data
+
+
+def infer_key_screens(prompt: str, feature_points: list[str]) -> list[str]:
+    normalized = normalize_whitespace(prompt)
+    screen_names: list[str] = []
+    explicit_patterns = (
+        r"([가-힣A-Za-z0-9 ]{2,20}(?:화면|페이지|탭|대시보드|달력|목록))",
+    )
+    for pattern in explicit_patterns:
+        for match in re.finditer(pattern, normalized):
+            candidate = normalize_whitespace(match.group(1)).strip(" .,!?:;-")
+            if candidate and candidate not in screen_names:
+                screen_names.append(candidate)
+            if len(screen_names) >= 6:
+                return screen_names
+    return normalize_prompt_items(feature_points[:4], max_items=4)
+
+
 def infer_primary_user_flow(prompt: str, feature_points: list[str], app_name: str) -> str:
     clauses = build_summary_clauses(feature_points, app_name)
     if clauses:
@@ -2085,11 +2185,16 @@ def build_intent_decision(
     image_reference_summary: str = "",
     image_conflict_note: str = "",
     user_visible_summary: str = "",
+    core_features: Optional[list[str]] = None,
+    target_users: Optional[list[str]] = None,
+    key_screens: Optional[list[str]] = None,
+    storage_mode: str = "unspecified",
+    stored_data: Optional[list[str]] = None,
 ) -> IntentDecision:
     raw_effective_prompt = effective_user_prompt or user_prompt
     effective_prompt = normalize_whitespace(raw_effective_prompt)
     normalized_user_prompt = normalize_whitespace(user_prompt)
-    feature_points = extract_feature_points(raw_effective_prompt)
+    feature_points = normalize_prompt_items(core_features, max_items=8) or extract_feature_points(raw_effective_prompt)
     app_name = normalize_whitespace(suggested_app_name)
     if app_name in {"맞춤 앱", "요청 앱", "새 앱", "앱"}:
         app_name = ""
@@ -2099,12 +2204,22 @@ def build_intent_decision(
     resolved_primary_user_flow = normalize_whitespace(primary_user_flow) or infer_primary_user_flow(raw_effective_prompt, feature_points, app_name)
     resolved_secondary_requirements = normalize_secondary_requirements(secondary_requirements)
     resolved_acceptance_criteria = normalize_acceptance_criteria(acceptance_criteria)
+    resolved_target_users = normalize_target_users(target_users) or infer_target_users(raw_effective_prompt)
+    resolved_key_screens = normalize_prompt_items(key_screens, max_items=6) or infer_key_screens(
+        raw_effective_prompt,
+        feature_points,
+    )
+    inferred_storage_mode, inferred_stored_data = infer_storage_details(raw_effective_prompt)
+    resolved_storage_mode = normalize_storage_mode(storage_mode)
+    if resolved_storage_mode == "unspecified":
+        resolved_storage_mode = inferred_storage_mode
+    resolved_stored_data = normalize_prompt_items(stored_data, max_items=6) or inferred_stored_data
     if mode in {"build", "ask_confirmation"} and not resolved_acceptance_criteria:
         resolved_acceptance_criteria = infer_acceptance_criteria(raw_effective_prompt, feature_points)
     resolved_request_scope = request_scope or ("existing_app_modification" if existing_task else "new_app")
     if mode == "answer_question":
         answer_message = assistant_message or make_answer_message(user_prompt)
-        answer_request_scope = resolved_request_scope if existing_task else "non_app_request"
+        answer_request_scope = resolved_request_scope
         if answer_request_scope not in {"new_app", "existing_app_modification"}:
             answer_request_scope = "non_app_request"
         return IntentDecision(
@@ -2131,6 +2246,10 @@ def build_intent_decision(
             confirmation_payload="",
             image_reference_summary=image_reference_summary,
             image_conflict_note=image_conflict_note,
+            target_users=[],
+            key_screens=[],
+            storage_mode="unspecified",
+            stored_data=[],
         )
     if mode == "build":
         continue_existing_app = resolved_request_scope == "existing_app_modification"
@@ -2185,6 +2304,10 @@ def build_intent_decision(
             confirmation_payload="",
             image_reference_summary=image_reference_summary,
             image_conflict_note=image_conflict_note,
+            target_users=resolved_target_users,
+            key_screens=resolved_key_screens,
+            storage_mode=resolved_storage_mode,
+            stored_data=resolved_stored_data,
         )
     clarification_questions = questions or build_clarification_questions(effective_prompt)
     clarification_message = "수정을 시작하기 전에 몇 가지만 확인할게요." if resolved_request_scope == "existing_app_modification" else "앱 생성을 시작하기 전에 몇 가지만 확인할게요."
@@ -2221,57 +2344,68 @@ def build_intent_decision(
         confirmation_payload="",
         image_reference_summary=image_reference_summary,
         image_conflict_note=image_conflict_note,
+        target_users=resolved_target_users,
+        key_screens=resolved_key_screens,
+        storage_mode=resolved_storage_mode,
+        stored_data=resolved_stored_data,
     )
 
 
 def build_prepared_generation_prompt(decision: IntentDecision) -> str:
     app_name = normalize_whitespace(decision.app_name) or infer_app_name(decision.effective_user_prompt)
     purpose = normalize_whitespace(decision.primary_user_flow) or "사용자가 요청한 목적을 중심으로 Flutter Android 앱을 만든다."
-    feature_points = decision.feature_points or extract_feature_points(decision.effective_user_prompt)
+    feature_points = normalize_prompt_items(decision.feature_points, max_items=8) or extract_feature_points(
+        decision.effective_user_prompt
+    )
     secondary_requirements = normalize_secondary_requirements(decision.secondary_requirements)
     acceptance_criteria = normalize_acceptance_criteria(decision.acceptance_criteria)
+    target_users = normalize_target_users(decision.target_users)
+    key_screens = normalize_prompt_items(decision.key_screens, max_items=6) or infer_key_screens(
+        decision.effective_user_prompt,
+        feature_points,
+    )
+    storage_mode = normalize_storage_mode(decision.storage_mode)
+    stored_data = normalize_prompt_items(decision.stored_data, max_items=6)
     image_reference_summary = normalize_whitespace(decision.image_reference_summary)
     image_conflict_note = normalize_whitespace(decision.image_conflict_note)
     original_request = normalize_whitespace(decision.effective_user_prompt)
 
-    def bullet_lines(items: list[str], fallback: str) -> list[str]:
-        values = [normalize_whitespace(item) for item in items if normalize_whitespace(item)]
-        if not values:
-            values = [fallback]
-        return [f"- {item}" for item in values]
+    sections: list[str] = ["# 앱 생성 프롬프트"]
 
-    sections = [
-        "# 앱 생성 프롬프트",
-        "",
-        "## 앱 이름",
-        app_name,
-        "",
-        "## 앱 목적",
-        purpose,
-        "",
-        "## 주요 사용자",
-        "- 일반 Android 스마트폰 사용자",
-        "",
-        "## 주요 화면",
-        *bullet_lines(feature_points[:5], "요청한 핵심 기능을 수행하는 메인 화면을 구성한다."),
-        "",
-        "## 핵심 기능",
-        *bullet_lines((feature_points + secondary_requirements)[:8], "사용자 요청에 포함된 기능을 실제로 동작하게 구현한다."),
-        "",
-        "## 저장/기록 방식",
-        "- 사용자가 기록 저장을 요구한 경우 앱 재실행 후에도 유지되도록 로컬 저장을 사용한다.",
-        "- 여러 사용자나 여러 기기가 같은 데이터를 공유해야 하는 경우 서버 데이터 API를 사용한다.",
-        "",
-        "## 첨부 자료 반영",
-        f"- {image_reference_summary}" if image_reference_summary else "- 첨부 자료가 있으면 화면 구성, 표시 내용, 수정 대상 판단에 반영한다.",
-        *( [f"- 주의: {image_conflict_note}"] if image_conflict_note else [] ),
-        "",
-        "## 구현 시 주의사항",
-        *bullet_lines(acceptance_criteria[:8], "작은 화면에서도 overflow 없이 안정적으로 사용할 수 있게 만든다."),
-        "",
-        "## 구체화된 앱 생성 요청",
-        original_request,
-    ]
+    def add_text_section(title: str, value: str) -> None:
+        normalized = normalize_whitespace(value)
+        if normalized:
+            sections.extend(["", f"## {title}", normalized])
+
+    def add_list_section(title: str, values: list[str]) -> None:
+        normalized_values = normalize_prompt_items(values, max_items=8)
+        if normalized_values:
+            sections.extend(["", f"## {title}", *(f"- {item}" for item in normalized_values)])
+
+    add_text_section("앱 이름", app_name)
+    add_text_section("앱 목적", purpose)
+    add_list_section("주요 사용자", target_users)
+    add_list_section("주요 화면", key_screens)
+    add_list_section("핵심 기능", feature_points)
+    add_list_section("추가 기능", secondary_requirements)
+
+    if storage_mode == "local":
+        storage_lines = stored_data or ["앱에서 사용자가 작성하거나 변경한 정보"]
+        storage_lines = [*storage_lines, "해당 정보는 앱을 다시 열어도 유지되도록 기기에 저장한다."]
+        add_list_section("저장할 정보와 방식", storage_lines)
+    elif storage_mode == "server":
+        storage_lines = stored_data or ["여러 사용자 또는 여러 기기가 함께 사용하는 정보"]
+        storage_lines = [*storage_lines, "공유 정보는 서버 데이터 API를 통해 저장하고 불러온다."]
+        add_list_section("공유 데이터와 저장 방식", storage_lines)
+
+    attachment_lines = []
+    if image_reference_summary:
+        attachment_lines.append(image_reference_summary)
+    if image_conflict_note:
+        attachment_lines.append(f"주의: {image_conflict_note}")
+    add_list_section("첨부 자료 반영", attachment_lines)
+    add_list_section("완성 조건", acceptance_criteria)
+    add_text_section("구체화된 앱 생성 요청", original_request)
     return "\n".join(sections).strip()
 
 
@@ -2350,6 +2484,25 @@ def build_initial_prompt_submission_decision(
         acceptance_criteria=normalize_acceptance_criteria(
             previous_conversation_state.get("pending_acceptance_criteria")
             or previous_conversation_state.get("latest_acceptance_criteria")
+        ),
+        target_users=normalize_target_users(
+            previous_conversation_state.get("pending_target_users")
+            or previous_conversation_state.get("latest_target_users")
+        ),
+        key_screens=normalize_prompt_items(
+            previous_conversation_state.get("pending_key_screens")
+            or previous_conversation_state.get("latest_key_screens"),
+            max_items=6,
+        ),
+        storage_mode=str(
+            previous_conversation_state.get("pending_storage_mode")
+            or previous_conversation_state.get("latest_storage_mode")
+            or "unspecified"
+        ),
+        stored_data=normalize_prompt_items(
+            previous_conversation_state.get("pending_stored_data")
+            or previous_conversation_state.get("latest_stored_data"),
+            max_items=6,
         ),
         image_reference_summary=normalize_whitespace(str(previous_conversation_state.get("image_reference_summary") or "")),
         image_conflict_note=normalize_whitespace(str(previous_conversation_state.get("image_conflict_note") or "")),
@@ -2617,6 +2770,157 @@ def run_openai_structured_agent(
     return enriched_result
 
 
+def build_agent_conversation_history(db: Optional["Database"], task_id: str) -> list[dict[str, Any]]:
+    if db is None or not normalize_whitespace(task_id):
+        return []
+    history: list[dict[str, Any]] = []
+    for event in db.list_events(task_id):
+        actor = normalize_whitespace(str(event.get("actor") or ""))
+        event_type = normalize_whitespace(str(event.get("event_type") or ""))
+        if actor == "user" and event_type != "user_message":
+            continue
+        if actor == "assistant" and event_type != "assistant_message":
+            continue
+        if actor not in {"user", "assistant"}:
+            continue
+        message = str(event.get("message_text") or "").strip()
+        attachment_names: list[str] = []
+        raw_payload = event.get("payload_json")
+        if raw_payload:
+            try:
+                payload = json.loads(str(raw_payload))
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                attachments = payload.get("attachments")
+                if isinstance(attachments, list):
+                    attachment_names = normalize_prompt_items(
+                        [
+                            item.get("name") or item.get("original_name")
+                            for item in attachments
+                            if isinstance(item, dict)
+                        ],
+                        max_items=20,
+                    )
+        if not message and not attachment_names:
+            continue
+        entry = {
+            "role": actor,
+            "content": message,
+            "attachment_names": attachment_names,
+            "created_at": str(event.get("created_at") or ""),
+        }
+        if history and all(
+            history[-1].get(key) == entry.get(key)
+            for key in ("role", "content", "attachment_names")
+        ):
+            continue
+        history.append(entry)
+    return history
+
+
+def contains_conversation_placeholder(value: Any) -> bool:
+    normalized = normalize_whitespace(str(value or ""))
+    if not normalized:
+        return False
+    patterns = (
+        r"이전\s*대화(?:\s*맥락)?",
+        r"앞(?:선|서)\s*(?:대화|내용|요청)",
+        r"위\s*(?:내용|요청|대화)(?:과|을|를|대로)?",
+        r"기존\s*(?:요청|대화)\s*(?:을|를)?\s*그대로",
+        r"(?:그|이)\s*내용대로",
+        r"앞에서\s*정한",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def spec_payload_needs_standalone_rewrite(
+    payload: Optional[dict[str, Any]],
+    conversation_history: list[dict[str, Any]],
+) -> bool:
+    if not payload or str(payload.get("mode") or "") not in {"build", "ask_confirmation"}:
+        return False
+    values: list[Any] = [
+        payload.get("effective_user_prompt"),
+        payload.get("primary_user_flow"),
+        *(payload.get("key_screens") or []),
+        *(payload.get("core_features") or []),
+        *(payload.get("acceptance_criteria") or []),
+    ]
+    if any(contains_conversation_placeholder(value) for value in values):
+        return True
+    effective_prompt = normalize_whitespace(str(payload.get("effective_user_prompt") or ""))
+    substantive_prior_messages = [
+        entry
+        for entry in conversation_history[:-1]
+        if len(normalize_whitespace(str(entry.get("content") or ""))) >= 20
+    ]
+    return bool(substantive_prior_messages and len(effective_prompt) < 40)
+
+
+def materialize_conversation_spec_payload(
+    payload: dict[str, Any],
+    conversation_history: list[dict[str, Any]],
+    latest_prompt: str,
+) -> dict[str, Any]:
+    concrete_entries = [
+        entry
+        for entry in conversation_history
+        if normalize_whitespace(str(entry.get("content") or ""))
+    ]
+    if not concrete_entries:
+        return payload
+    transcript_lines = ["생성 전 대화에서 확인된 앱 요구사항은 다음과 같다."]
+    for entry in concrete_entries:
+        role = "참가자" if entry.get("role") == "user" else "생성 전 안내"
+        content = normalize_whitespace(str(entry.get("content") or ""))
+        attachment_names = normalize_prompt_items(entry.get("attachment_names"), max_items=20)
+        attachment_suffix = f" (첨부: {', '.join(attachment_names)})" if attachment_names else ""
+        transcript_lines.append(f"- {role}: {content}{attachment_suffix}")
+    standalone_prompt = "\n".join(transcript_lines)
+    participant_text = "\n".join(
+        normalize_whitespace(str(entry.get("content") or ""))
+        for entry in concrete_entries
+        if entry.get("role") == "user" and not looks_like_generic_confirmation(str(entry.get("content") or ""))
+    ).strip() or normalize_whitespace(latest_prompt)
+    feature_points = extract_feature_points(participant_text)
+    app_name = normalize_whitespace(str(payload.get("app_name") or ""))
+    if not app_name or app_name in {"새앱", "새 앱", "요청 앱", "맞춤 앱", "앱"}:
+        app_name = infer_app_name(participant_text)
+    primary_user_flow = normalize_whitespace(str(payload.get("primary_user_flow") or ""))
+    if contains_conversation_placeholder(primary_user_flow):
+        primary_user_flow = infer_primary_user_flow(participant_text, feature_points, app_name)
+    storage_mode, stored_data = infer_storage_details(participant_text)
+    materialized = {
+        **payload,
+        "app_name": app_name,
+        "effective_user_prompt": standalone_prompt,
+        "primary_user_flow": primary_user_flow,
+        "target_users": normalize_target_users(payload.get("target_users"))
+        or infer_target_users(participant_text),
+        "key_screens": normalize_prompt_items(payload.get("key_screens"), max_items=6),
+        "core_features": normalize_prompt_items(payload.get("core_features"), max_items=8),
+        "storage_mode": normalize_storage_mode(payload.get("storage_mode")),
+        "stored_data": normalize_prompt_items(payload.get("stored_data"), max_items=6),
+    }
+    if not materialized["key_screens"] or any(
+        contains_conversation_placeholder(item) for item in materialized["key_screens"]
+    ):
+        materialized["key_screens"] = infer_key_screens(participant_text, feature_points)
+    if not materialized["core_features"] or any(
+        contains_conversation_placeholder(item) for item in materialized["core_features"]
+    ):
+        materialized["core_features"] = feature_points[:8]
+    if materialized["storage_mode"] == "unspecified":
+        materialized["storage_mode"] = storage_mode
+    if not materialized["stored_data"]:
+        materialized["stored_data"] = stored_data
+    criteria = normalize_acceptance_criteria(payload.get("acceptance_criteria"))
+    if not criteria or any(contains_conversation_placeholder(item) for item in criteria):
+        materialized["acceptance_criteria"] = infer_acceptance_criteria(participant_text, feature_points)
+    return materialized
+
+
 def run_spec_clarification_agent(
     settings: Settings,
     *,
@@ -2628,6 +2932,7 @@ def run_spec_clarification_agent(
     device_info: Optional[dict[str, Any]] = None,
     reference_image_name: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
+    conversation_history: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[dict[str, Any]]:
     normalized_reference_image_name = normalize_reference_image_name(reference_image_name)
     normalized_reference_image_base64 = normalize_reference_image_base64(reference_image_base64)
@@ -2638,6 +2943,7 @@ def run_spec_clarification_agent(
         "latest_user_prompt": prompt,
         "device_info": device_info or {},
         "previous_conversation_state": previous_conversation_state or {},
+        "conversation_history": conversation_history or [],
         "current_app_context": build_current_app_context(previous_conversation_state),
         "reference_image_attached": bool(normalized_reference_image_base64),
         "reference_image_name": normalized_reference_image_name,
@@ -2651,8 +2957,13 @@ def run_spec_clarification_agent(
             "app_name",
             "effective_user_prompt",
             "primary_user_flow",
+            "target_users",
+            "key_screens",
+            "core_features",
             "secondary_requirements",
             "secondary_scope_confirmed",
+            "storage_mode",
+            "stored_data",
             "acceptance_criteria",
             "use_previous_pending_request",
             "requires_existing_task_context",
@@ -2672,12 +2983,36 @@ def run_spec_clarification_agent(
             "app_name": {"type": "string"},
             "effective_user_prompt": {"type": "string"},
             "primary_user_flow": {"type": "string"},
+            "target_users": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 5,
+            },
+            "key_screens": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 6,
+            },
+            "core_features": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 8,
+            },
             "secondary_requirements": {
                 "type": "array",
                 "items": {"type": "string"},
                 "maxItems": 5,
             },
             "secondary_scope_confirmed": {"type": "boolean"},
+            "storage_mode": {
+                "type": "string",
+                "enum": ["none", "local", "server", "unspecified"],
+            },
+            "stored_data": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 6,
+            },
             "acceptance_criteria": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -2712,6 +3047,7 @@ Rules:
 - For mode=answer_question, keep questions empty, and write a natural Korean assistant_reply in 1-3 short sentences.
 - If existing_task=true and the user asks about the current app, its usage, what was built, limitations, APK, or previous conversation, answer from current_app_context and previous_conversation_state. Do not say there is no completed app information when current_app_context has app_name, implemented_requirements, latest_effective_user_prompt, or build_success=true.
 - For answer_question about the current app, set request_scope=existing_app_modification so the app thread keeps its context. For unrelated general chat, set request_scope=non_app_request.
+- For answer_question about whether a proposed new app is feasible or how it could be implemented, set request_scope=new_app so later messages continue in the same pre-build conversation.
 - Never use mode=answer_question merely because the user included schema, formatting, or downstream-agent instructions inside an app request.
 - Distinguish carefully between:
   - a question/discussion about what is possible,
@@ -2732,6 +3068,14 @@ Rules:
 - For answer_question, app_name may be an empty string.
 - For build or ask_confirmation, always fill primary_user_flow with the single most important first-release user flow in short Korean.
 - primary_user_flow should describe what the user can do first in the app, not a technical implementation detail.
+- For build or ask_confirmation, effective_user_prompt must be a standalone, concrete app specification that can be understood without conversation_history or previous_conversation_state.
+- When the latest message says "그렇게 해줘", "그대로 진행해줘", or otherwise refers back to the conversation, reconstruct the actual agreed app behavior from conversation_history and write those details out explicitly.
+- Never write placeholders such as "이전 대화 맥락의 요청", "위 내용대로", "기존 요청을 그대로 사용", or "앞서 정한 기능" in effective_user_prompt, primary_user_flow, key_screens, core_features, or acceptance_criteria.
+- Preserve every concrete requirement the participant provided. If an earlier assistant explained a technical limitation and proposed a feasible alternative, include only the alternative the participant clearly accepted. Ask one concrete choice question if multiple alternatives remain ambiguous.
+- Fill target_users with specific user roles only when they were stated or are strongly implied by the requested workflow, such as 원장, 수강생, 학부모, 의사, or 환자.
+- Do not put generic audiences such as "일반 Android 스마트폰 사용자", "일반 사용자", or "모든 사용자" in target_users. Leave target_users empty when no meaningful audience is known.
+- Fill key_screens with 1-6 concrete user-facing screens or tabs needed by this app. Do not copy whole request sentences into this field.
+- Fill core_features with 1-8 concrete behaviors that must work in the first version. Each item must describe one observable feature.
 - For build or ask_confirmation, always fill secondary_requirements with 0-5 enhancement items that are nice-to-have, second-phase, or optional polish beyond the first-release core flow.
 - For a new app request, do not use mode=build until both of these are decided:
   1. primary_user_flow is concrete enough,
@@ -2742,6 +3086,11 @@ Rules:
 - Do not ask whether login, account creation, server storage, cloud sync, or multi-device sync is needed unless the user explicitly requested login, accounts, sharing across users, teams, cloud sync, or multi-device use.
 - If persistent storage is implied or requested, assume local on-device persistence by default.
 - Do not ask where data should be stored. Only ask what user-visible data or actions must be saved when that materially changes the app.
+- Set storage_mode=none when the app has no information that must survive an app restart.
+- Set storage_mode=local when one device should retain records, settings, favorites, history, or user-created content.
+- Set storage_mode=server only when the request explicitly needs sharing between users/devices, accounts, collaboration, or synchronization.
+- Set storage_mode=unspecified only for answer_question. For build or ask_confirmation, choose none, local, or server.
+- Fill stored_data with the actual records that must persist, such as 일정, 출석 기록, 메모, 즐겨찾기, or 사용자별 진도. Leave it empty when storage_mode=none.
 - Ask concrete option questions about user-visible behavior, such as:
   - 작성만 있으면 될까요, 수정과 삭제도 같이 필요할까요?
   - 첫 화면은 입력 중심으로 할까요, 목록이나 대시보드 중심으로 할까요?
@@ -2789,11 +3138,9 @@ Rules:
 - For build or ask_confirmation, do not leave acceptance_criteria empty.
 - For answer_question, acceptance_criteria must be an empty array.
 - For answer_question, secondary_scope_confirmed must be false.
+- For answer_question, target_users, key_screens, core_features, and stored_data must be empty arrays, and storage_mode must be unspecified.
 
 Return JSON only.
-
-Context JSON:
-{json.dumps(context_payload, ensure_ascii=False, indent=2)}
 """
 
     user_content: list[dict[str, Any]] = [
@@ -2823,13 +3170,52 @@ Context JSON:
             }
         )
 
-    return run_openai_structured_agent(
+    result = run_openai_structured_agent(
         settings,
         schema=schema,
         schema_name="spec_clarification_decision",
         instructions=agent_prompt,
         user_content=user_content,
     )
+    normalized_history = conversation_history or []
+    if not spec_payload_needs_standalone_rewrite(result, normalized_history):
+        return result
+
+    previous_result = {
+        key: value
+        for key, value in (result or {}).items()
+        if key != "__agent_meta"
+    }
+    repair_instructions = f"""{agent_prompt}
+
+The previous result below was rejected because it referred to prior conversation instead of writing the agreed requirements explicitly.
+Rewrite it as a standalone specification. Expand all references such as "그렇게", "이전 대화", or "위 내용" into concrete screens, features, users, storage behavior, and acceptance criteria from conversation_history.
+If the conversation does not establish one implementable interpretation, return ask_confirmation with one concrete choice question instead of inventing a placeholder.
+
+Rejected result:
+{json.dumps(previous_result, ensure_ascii=False, indent=2)}
+"""
+    repaired = run_openai_structured_agent(
+        settings,
+        schema=schema,
+        schema_name="spec_clarification_decision_repair",
+        instructions=repair_instructions,
+        user_content=user_content,
+    )
+    if repaired and not spec_payload_needs_standalone_rewrite(repaired, normalized_history):
+        return repaired
+    fallback_source = repaired or result
+    if not fallback_source:
+        return None
+    fallback_meta = fallback_source.get("__agent_meta")
+    materialized = materialize_conversation_spec_payload(
+        {key: value for key, value in fallback_source.items() if key != "__agent_meta"},
+        normalized_history,
+        prompt,
+    )
+    if fallback_meta:
+        materialized["__agent_meta"] = fallback_meta
+    return materialized
 
 
 def decide_intent(
@@ -2903,6 +3289,7 @@ def decide_intent(
         )
 
     if settings and settings.intent_agent_enabled:
+        conversation_history = build_agent_conversation_history(db, task_id)
         spec_payload = run_spec_clarification_agent(
             settings,
             prompt=prompt,
@@ -2913,6 +3300,7 @@ def decide_intent(
             device_info=device_info,
             reference_image_name=reference_image_name,
             reference_image_base64=reference_image_base64,
+            conversation_history=conversation_history,
         )
         if spec_payload:
             agent_meta = spec_payload.get("__agent_meta") if isinstance(spec_payload.get("__agent_meta"), dict) else None
@@ -2941,8 +3329,13 @@ def decide_intent(
             spec_mode = str(spec_payload.get("mode") or "").strip()
             spec_app_name = normalize_whitespace(str(spec_payload.get("app_name") or ""))
             spec_primary_user_flow = normalize_whitespace(str(spec_payload.get("primary_user_flow") or ""))
+            spec_target_users = normalize_target_users(spec_payload.get("target_users"))
+            spec_key_screens = normalize_prompt_items(spec_payload.get("key_screens"), max_items=6)
+            spec_core_features = normalize_prompt_items(spec_payload.get("core_features"), max_items=8)
             spec_secondary_requirements = normalize_secondary_requirements(spec_payload.get("secondary_requirements"))
             spec_secondary_scope_confirmed = bool(spec_payload.get("secondary_scope_confirmed"))
+            spec_storage_mode = normalize_storage_mode(spec_payload.get("storage_mode"))
+            spec_stored_data = normalize_prompt_items(spec_payload.get("stored_data"), max_items=6)
             spec_acceptance_criteria = normalize_acceptance_criteria(spec_payload.get("acceptance_criteria"))
             supported_revision = revise_prompt_for_supported_android_scope(prompt)
             if supported_revision and looks_like_build_request(prompt, existing_task):
@@ -3001,6 +3394,11 @@ def decide_intent(
                         secondary_requirements=spec_secondary_requirements,
                         secondary_scope_confirmed=spec_secondary_scope_confirmed,
                         acceptance_criteria=spec_acceptance_criteria,
+                        core_features=spec_core_features,
+                        target_users=spec_target_users,
+                        key_screens=spec_key_screens,
+                        storage_mode=spec_storage_mode,
+                        stored_data=spec_stored_data,
                     )
                 return build_intent_decision(
                     mode="answer_question",
@@ -3066,6 +3464,11 @@ def decide_intent(
                         secondary_requirements=spec_secondary_requirements,
                         secondary_scope_confirmed=spec_secondary_scope_confirmed,
                         acceptance_criteria=spec_acceptance_criteria,
+                        core_features=spec_core_features,
+                        target_users=spec_target_users,
+                        key_screens=spec_key_screens,
+                        storage_mode=spec_storage_mode,
+                        stored_data=spec_stored_data,
                     )
                 if (
                     spec_mode == "ask_confirmation"
@@ -3094,6 +3497,11 @@ def decide_intent(
                         secondary_requirements=spec_secondary_requirements,
                         secondary_scope_confirmed=spec_secondary_scope_confirmed,
                         acceptance_criteria=spec_acceptance_criteria,
+                        core_features=spec_core_features,
+                        target_users=spec_target_users,
+                        key_screens=spec_key_screens,
+                        storage_mode=spec_storage_mode,
+                        stored_data=spec_stored_data,
                     )
                 if request_scope == "new_app" and not spec_secondary_scope_confirmed:
                     forced_questions = questions or build_scope_clarification_questions(
@@ -3119,6 +3527,11 @@ def decide_intent(
                         secondary_requirements=spec_secondary_requirements,
                         secondary_scope_confirmed=False,
                         acceptance_criteria=spec_acceptance_criteria,
+                        core_features=spec_core_features,
+                        target_users=spec_target_users,
+                        key_screens=spec_key_screens,
+                        storage_mode=spec_storage_mode,
+                        stored_data=spec_stored_data,
                     )
                 return build_intent_decision(
                     mode=spec_mode,
@@ -3140,6 +3553,11 @@ def decide_intent(
                     secondary_requirements=spec_secondary_requirements,
                     secondary_scope_confirmed=spec_secondary_scope_confirmed,
                     acceptance_criteria=spec_acceptance_criteria,
+                    core_features=spec_core_features,
+                    target_users=spec_target_users,
+                    key_screens=spec_key_screens,
+                    storage_mode=spec_storage_mode,
+                    stored_data=spec_stored_data,
                     image_reference_summary=build_reference_image_summary(normalize_reference_image_name(reference_image_name)),
                 )
 
@@ -5258,24 +5676,55 @@ def apply_project_defaults(project_root: Path, task_id: str, app_name: str, pack
             changed = True
 
     kotlin_root = project_root / "android" / "app" / "src" / "main" / "kotlin"
-    for kotlin_file in kotlin_root.rglob("MainActivity.kt"):
+    kotlin_files = sorted(kotlin_root.rglob("*.kt")) if kotlin_root.exists() else []
+    kotlin_sources: dict[Path, str] = {}
+    generated_package_pattern = re.compile(
+        r"\bkr\.ac\.kangwon\.hai\.generated\.customapp[A-Za-z0-9_]+\b"
+    )
+    stale_package_roots = {
+        candidate
+        for candidate in previous_package_names
+        if candidate and candidate != package_name
+    }
+    stale_package_roots.add("kr.ac.kangwon.hai.baseproject")
+
+    for kotlin_file in kotlin_files:
         kotlin_text = read_text_if_exists(kotlin_file, limit=None)
         if not kotlin_text:
             continue
+        kotlin_sources[kotlin_file] = kotlin_text
         package_match = re.search(r"^package\s+([A-Za-z0-9_.]+)", kotlin_text, flags=re.MULTILINE)
-        if package_match:
-            previous_package_names.add(package_match.group(1))
-        next_kotlin_text = re.sub(
-            r"^package\s+[A-Za-z0-9_.]+",
-            f"package {package_name}",
-            kotlin_text,
-            count=1,
-            flags=re.MULTILINE,
-        )
+        if not package_match:
+            continue
+        declared_package = package_match.group(1)
+        generated_match = generated_package_pattern.match(declared_package)
+        if generated_match and generated_match.group(0) != package_name:
+            stale_package_roots.add(generated_match.group(0))
+        elif declared_package != package_name and not declared_package.startswith(f"{package_name}."):
+            matching_previous_root = next(
+                (
+                    previous
+                    for previous in previous_package_names
+                    if declared_package == previous or declared_package.startswith(f"{previous}.")
+                ),
+                None,
+            )
+            if matching_previous_root is None:
+                stale_package_roots.add(declared_package)
+
+    for kotlin_file, kotlin_text in kotlin_sources.items():
+        next_kotlin_text = kotlin_text
+        for stale_package in sorted(stale_package_roots, key=len, reverse=True):
+            if stale_package == package_name:
+                continue
+            next_kotlin_text = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(stale_package)}(?=\.|[^A-Za-z0-9_]|$)",
+                package_name,
+                next_kotlin_text,
+            )
         if next_kotlin_text != kotlin_text:
             kotlin_file.write_text(next_kotlin_text, encoding="utf-8")
             changed = True
-        break
 
     lib_root = project_root / "lib"
     for dart_path in lib_root.rglob("*.dart"):
@@ -5308,6 +5757,33 @@ def apply_project_defaults(project_root: Path, task_id: str, app_name: str, pack
     if ensure_release_uses_debug_signing(project_root):
         changed = True
     return changed
+
+
+def project_android_identity_issues(project_root: Path, package_name: str) -> list[str]:
+    issues: list[str] = []
+    gradle_path = project_root / "android" / "app" / "build.gradle.kts"
+    gradle_text = read_text_if_exists(gradle_path, limit=None)
+    for key, configured_package in re.findall(
+        r"(namespace|applicationId)\s*=\s*\"([^\"]+)\"",
+        gradle_text,
+    ):
+        if configured_package != package_name:
+            issues.append(f"{key}={configured_package}")
+
+    kotlin_root = project_root / "android" / "app" / "src" / "main" / "kotlin"
+    if kotlin_root.exists():
+        for kotlin_file in sorted(kotlin_root.rglob("*.kt")):
+            kotlin_text = read_text_if_exists(kotlin_file, limit=None)
+            if not kotlin_text:
+                continue
+            package_match = re.search(r"^package\s+([A-Za-z0-9_.]+)", kotlin_text, flags=re.MULTILINE)
+            if package_match is None:
+                issues.append(f"{kotlin_file.relative_to(project_root)}:missing-package")
+                continue
+            declared_package = package_match.group(1)
+            if declared_package != package_name and not declared_package.startswith(f"{package_name}."):
+                issues.append(f"{kotlin_file.relative_to(project_root)}:{declared_package}")
+    return issues
 
 
 def ensure_release_uses_debug_signing(project_root: Path) -> bool:
@@ -5959,6 +6435,16 @@ def build_current_app_context(conversation_state: Optional[dict[str, Any]]) -> d
         "acceptance_criteria": normalize_context_list(
             state.get("latest_acceptance_criteria") or state.get("pending_acceptance_criteria")
         ),
+        "target_users": normalize_context_list(
+            state.get("latest_target_users") or state.get("pending_target_users")
+        ),
+        "key_screens": normalize_context_list(
+            state.get("latest_key_screens") or state.get("pending_key_screens")
+        ),
+        "storage_mode": state.get("latest_storage_mode") or state.get("pending_storage_mode") or "unspecified",
+        "stored_data": normalize_context_list(
+            state.get("latest_stored_data") or state.get("pending_stored_data")
+        ),
         "implemented_requirements": normalize_context_list(state.get("implemented_requirements")),
         "verification_notes": normalize_context_list(state.get("verification_notes")),
         "known_limitations": normalize_context_list(state.get("known_limitations")),
@@ -6045,6 +6531,18 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
     latest_acceptance_criteria = decision.acceptance_criteria or normalize_context_list(
         previous_conversation_state.get("latest_acceptance_criteria")
     )
+    latest_target_users = decision.target_users or normalize_context_list(
+        previous_conversation_state.get("latest_target_users")
+    )
+    latest_key_screens = decision.key_screens or normalize_context_list(
+        previous_conversation_state.get("latest_key_screens")
+    )
+    latest_storage_mode = normalize_storage_mode(decision.storage_mode)
+    if latest_storage_mode == "unspecified":
+        latest_storage_mode = normalize_storage_mode(previous_conversation_state.get("latest_storage_mode"))
+    latest_stored_data = decision.stored_data or normalize_context_list(
+        previous_conversation_state.get("latest_stored_data")
+    )
     latest_summary = decision.summary or str(previous_conversation_state.get("latest_summary") or "")
     return {
         "status": decision.status,
@@ -6062,6 +6560,10 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
         "secondary_requirements": decision.secondary_requirements,
         "secondary_scope_confirmed": decision.secondary_scope_confirmed,
         "acceptance_criteria": decision.acceptance_criteria,
+        "target_users": decision.target_users,
+        "key_screens": decision.key_screens,
+        "storage_mode": decision.storage_mode,
+        "stored_data": decision.stored_data,
         "confirmation_action": decision.confirmation_action,
         "confirmation_payload": decision.confirmation_payload,
         "image_reference_summary": decision.image_reference_summary,
@@ -6083,6 +6585,10 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "latest_secondary_requirements": latest_secondary_requirements,
             "latest_secondary_scope_confirmed": decision.secondary_scope_confirmed or bool(previous_conversation_state.get("latest_secondary_scope_confirmed")),
             "latest_acceptance_criteria": latest_acceptance_criteria,
+            "latest_target_users": latest_target_users,
+            "latest_key_screens": latest_key_screens,
+            "latest_storage_mode": latest_storage_mode,
+            "latest_stored_data": latest_stored_data,
             "awaiting_confirmation": decision.mode == "ask_confirmation",
             "awaiting_prompt_review": awaiting_prompt_review,
             "confirmation_action": decision.confirmation_action,
@@ -6096,6 +6602,10 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "pending_secondary_requirements": decision.secondary_requirements if decision.mode == "ask_confirmation" else [],
             "pending_secondary_scope_confirmed": decision.secondary_scope_confirmed if decision.mode == "ask_confirmation" else False,
             "pending_acceptance_criteria": pending_acceptance_criteria,
+            "pending_target_users": decision.target_users if decision.mode == "ask_confirmation" else [],
+            "pending_key_screens": decision.key_screens if decision.mode == "ask_confirmation" else [],
+            "pending_storage_mode": decision.storage_mode if decision.mode == "ask_confirmation" else "unspecified",
+            "pending_stored_data": decision.stored_data if decision.mode == "ask_confirmation" else [],
             "used_previous_pending_prompt": decision.used_previous_pending_prompt,
             "request_scope": state_request_scope,
             "requires_existing_task_context": decision.requires_existing_task_context,
@@ -6142,6 +6652,10 @@ def build_assistant_response_payload(decision: IntentDecision) -> dict[str, Any]
         "secondary_requirements": decision.secondary_requirements,
         "secondary_scope_confirmed": decision.secondary_scope_confirmed,
         "acceptance_criteria": decision.acceptance_criteria,
+        "target_users": decision.target_users,
+        "key_screens": decision.key_screens,
+        "storage_mode": decision.storage_mode,
+        "stored_data": decision.stored_data,
         "confirmation_action": decision.confirmation_action,
         "confirmation_payload": decision.confirmation_payload,
         "image_reference_summary": decision.image_reference_summary,
@@ -7383,6 +7897,9 @@ class CodexTaskRunner:
                 app_name,
                 expected_package_name,
             )
+            identity_issues = project_android_identity_issues(project_path, expected_package_name)
+            if identity_issues:
+                raise RuntimeError("Android 앱 식별 정보를 복원하지 못했습니다.")
             version_changed = ensure_project_revision_version(project_path)
             existing_apk = find_revision_apk(workspace_path, project_path, task)
             if (
@@ -7454,6 +7971,48 @@ class CodexTaskRunner:
     ) -> None:
         task = self.db.get_task(task_id) or {}
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
+        expected_app_name = current_task_app_name(task)
+        expected_package_name = current_task_package_name(task)
+        if expected_app_name and expected_package_name:
+            apply_project_defaults(
+                project_path,
+                task_id,
+                expected_app_name,
+                expected_package_name,
+            )
+            identity_issues = project_android_identity_issues(project_path, expected_package_name)
+            if identity_issues:
+                build_log_path = workspace_path / "logs" / "build.log"
+                build_log_path.parent.mkdir(parents=True, exist_ok=True)
+                build_log_path.write_text(
+                    "[server] Android project identity validation failed.\n"
+                    + "\n".join(identity_issues)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                message = (
+                    "앱 내부 구성 정보가 일치하지 않아 빌드를 시작하지 못했어요. "
+                    "요청 내용은 보존되어 있으니 다시 시도해 주세요."
+                )
+                log_build_stage_event(
+                    self.db,
+                    task_id,
+                    stage="앱 식별 정보 확인",
+                    phase="failed",
+                    body=message,
+                    detail=f"불일치 항목: {len(identity_issues)}개",
+                )
+                write_result_json(
+                    result_path,
+                    {
+                        "status": "failed",
+                        "task_id": task_id,
+                        "error_stage": "identity",
+                        "message": message,
+                        "build_log_path": "logs/build.log",
+                    },
+                )
+                return
         ensure_project_revision_version(project_path)
         ensure_release_uses_debug_signing(project_path)
         build_log_path = workspace_path / "logs" / "build.log"
@@ -7669,6 +8228,46 @@ class CodexTaskRunner:
         )
         return 0, False
 
+    def finalize_failure(
+        self,
+        task_id: str,
+        *,
+        message: str,
+        log_text: str,
+        usage_update_fields: dict[str, Optional[int]],
+        usage: Optional[CodexUsage],
+        codex_model: str,
+        stage: str,
+        event_type: str = "task_failed",
+        status: str = "Failed",
+        stage_body: Optional[str] = None,
+        stage_detail: Optional[str] = None,
+        codex_result_json: Optional[str] = None,
+    ) -> None:
+        update_fields: dict[str, Any] = {
+            "status": status,
+            "message": message,
+            "log": log_text,
+            **usage_update_fields,
+        }
+        if codex_result_json is not None:
+            update_fields["codex_result_json"] = codex_result_json
+        self.db.update_task(task_id, **update_fields)
+
+        updated_task = self.db.get_task(task_id)
+        if updated_task:
+            log_task_status_event(self.db, updated_task, event_type=event_type)
+            if usage:
+                log_token_usage_event(self.db, task_id, usage, model=codex_model)
+        log_build_stage_event(
+            self.db,
+            task_id,
+            stage=stage,
+            phase="failed",
+            body=stage_body or message,
+            detail=stage_detail,
+        )
+
     def finalize_task(
         self,
         task_id: str,
@@ -7693,28 +8292,20 @@ class CodexTaskRunner:
 
         if timed_out:
             log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
-            self.db.update_task(
+            message = "앱 생성 작업 시간이 제한을 초과했습니다."
+            self.finalize_failure(
                 task_id,
-                status="Failed",
-                message="앱 생성 작업 시간이 제한을 초과했습니다.",
-                log=log_text,
+                message=message,
+                log_text=log_text,
+                usage_update_fields=usage_update_fields,
+                usage=usage,
+                codex_model=codex_model,
+                stage="앱 생성 작업",
+                event_type="task_timeout",
                 codex_result_json=json.dumps(
-                    make_error_result(task_id, "앱 생성 작업 시간이 제한을 초과했습니다."),
+                    make_error_result(task_id, message),
                     ensure_ascii=False,
                 ),
-                **usage_update_fields,
-            )
-            updated_task = self.db.get_task(task_id)
-            if updated_task:
-                log_task_status_event(self.db, updated_task, event_type="task_timeout")
-                if usage:
-                    log_token_usage_event(self.db, task_id, usage, model=codex_model)
-            log_build_stage_event(
-                self.db,
-                task_id,
-                stage="앱 생성 작업",
-                phase="failed",
-                body="앱 생성 작업 시간이 제한을 초과했습니다.",
             )
             return
 
@@ -7723,51 +8314,33 @@ class CodexTaskRunner:
             engine_issue = codex_engine_issue_from_logs(log_text, exit_code)
             if engine_issue is not None:
                 status, message, event_type, stage = engine_issue
-                self.db.update_task(
+                self.finalize_failure(
                     task_id,
                     status=status,
                     message=message,
-                    log=log_text,
+                    log_text=log_text,
+                    usage_update_fields=usage_update_fields,
+                    usage=usage,
+                    codex_model=codex_model,
+                    stage=stage,
+                    event_type=event_type,
                     codex_result_json=json.dumps(
                         make_error_result(task_id, message),
                         ensure_ascii=False,
                     ),
-                    **usage_update_fields,
-                )
-                updated_task = self.db.get_task(task_id)
-                if updated_task:
-                    log_task_status_event(self.db, updated_task, event_type=event_type)
-                    if usage:
-                        log_token_usage_event(self.db, task_id, usage, model=codex_model)
-                log_build_stage_event(
-                    self.db,
-                    task_id,
-                    stage=stage,
-                    phase="failed",
-                    body=message,
                 )
                 return
             message = "결과 파일이 생성되지 않았습니다."
             if exit_code not in (0, None):
                 message = f"{message} worker exit code: {exit_code}"
-            self.db.update_task(
+            self.finalize_failure(
                 task_id,
-                status="Failed",
                 message=message,
-                log=log_text,
-                **usage_update_fields,
-            )
-            updated_task = self.db.get_task(task_id)
-            if updated_task:
-                log_task_status_event(self.db, updated_task, event_type="task_failed")
-                if usage:
-                    log_token_usage_event(self.db, task_id, usage, model=codex_model)
-            log_build_stage_event(
-                self.db,
-                task_id,
+                log_text=log_text,
+                usage_update_fields=usage_update_fields,
+                usage=usage,
+                codex_model=codex_model,
                 stage="결과 확인",
-                phase="failed",
-                body=message,
             )
             return
 
@@ -7775,25 +8348,17 @@ class CodexTaskRunner:
             result = json.loads(result_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
-            self.db.update_task(
+            message = f"task_result.json 파싱 실패: {exc.msg}"
+            self.finalize_failure(
                 task_id,
-                status="Failed",
-                message=f"task_result.json 파싱 실패: {exc.msg}",
-                log=log_text,
-                codex_result_json=result_path.read_text(encoding="utf-8", errors="replace"),
-                **usage_update_fields,
-            )
-            updated_task = self.db.get_task(task_id)
-            if updated_task:
-                log_task_status_event(self.db, updated_task, event_type="task_failed")
-                if usage:
-                    log_token_usage_event(self.db, task_id, usage, model=codex_model)
-            log_build_stage_event(
-                self.db,
-                task_id,
+                message=message,
+                log_text=log_text,
+                usage_update_fields=usage_update_fields,
+                usage=usage,
+                codex_model=codex_model,
                 stage="결과 확인",
-                phase="failed",
-                body=f"결과 파일 파싱에 실패했어요: {exc.msg}",
+                stage_body=f"결과 파일 파싱에 실패했어요: {exc.msg}",
+                codex_result_json=result_path.read_text(encoding="utf-8", errors="replace"),
             )
             return
 
@@ -7824,13 +8389,15 @@ class CodexTaskRunner:
         if result.get("status") == "success":
             apk_value = result.get("apk_path")
             if not apk_value:
-                self.db.update_task(
+                self.finalize_failure(
                     task_id,
-                    status="Failed",
                     message="성공 결과에 apk_path가 없습니다.",
-                    log=log_text,
+                    log_text=log_text,
+                    usage_update_fields=usage_update_fields,
+                    usage=usage,
+                    codex_model=codex_model,
+                    stage="APK 결과 확인",
                     codex_result_json=codex_result_json,
-                    **usage_update_fields,
                 )
                 return
 
@@ -7838,13 +8405,15 @@ class CodexTaskRunner:
             try:
                 apk_path = resolve_task_artifact_path(workspace_path, str(apk_value), current_project_path)
             except ValueError:
-                self.db.update_task(
+                self.finalize_failure(
                     task_id,
-                    status="Failed",
                     message="apk_path가 workspace 밖을 가리킵니다.",
-                    log=log_text,
+                    log_text=log_text,
+                    usage_update_fields=usage_update_fields,
+                    usage=usage,
+                    codex_model=codex_model,
+                    stage="APK 결과 확인",
                     codex_result_json=codex_result_json,
-                    **usage_update_fields,
                 )
                 return
 
@@ -7860,25 +8429,17 @@ class CodexTaskRunner:
                 except Exception as exc:
                     if self.is_task_cancelled(task_id):
                         return
-                    self.db.update_task(
+                    message = f"설치 가능한 APK 준비 실패: {exc}"
+                    self.finalize_failure(
                         task_id,
-                        status="Failed",
-                        message=f"설치 가능한 APK 준비 실패: {exc}",
-                        log=log_text,
-                        codex_result_json=codex_result_json,
-                        **usage_update_fields,
-                    )
-                    failed_task = self.db.get_task(task_id)
-                    if failed_task:
-                        log_task_status_event(self.db, failed_task, event_type="task_failed")
-                        if usage:
-                            log_token_usage_event(self.db, task_id, usage, model=codex_model)
-                    log_build_stage_event(
-                        self.db,
-                        task_id,
+                        message=message,
+                        log_text=log_text,
+                        usage_update_fields=usage_update_fields,
+                        usage=usage,
+                        codex_model=codex_model,
                         stage="APK 준비",
-                        phase="failed",
-                        body=f"설치 가능한 APK를 준비하지 못했어요: {exc}",
+                        stage_body=f"설치 가능한 APK를 준비하지 못했어요: {exc}",
+                        codex_result_json=codex_result_json,
                     )
                     return
                 result["apk_path"] = str(apk_path.relative_to(workspace_path).as_posix())
@@ -7888,47 +8449,42 @@ class CodexTaskRunner:
                     return
 
                 if project_looks_like_placeholder_app(current_project_path):
-                    self.db.update_task(
+                    message = "생성 결과가 기본 템플릿 화면에서 벗어나지 않았어요."
+                    self.finalize_failure(
                         task_id,
-                        status="Failed",
-                        message="생성 결과가 기본 템플릿 화면에서 벗어나지 않았어요.",
-                        log=log_text,
-                        codex_result_json=codex_result_json,
-                        **usage_update_fields,
-                    )
-                    failed_task = self.db.get_task(task_id)
-                    if failed_task:
-                        log_task_status_event(self.db, failed_task, event_type="task_failed")
-                        if usage:
-                            log_token_usage_event(self.db, task_id, usage, model=codex_model)
-                    log_build_stage_event(
-                        self.db,
-                        task_id,
+                        message=message,
+                        log_text=log_text,
+                        usage_update_fields=usage_update_fields,
+                        usage=usage,
+                        codex_model=codex_model,
                         stage="결과 확인",
-                        phase="failed",
-                        body="생성 결과가 기본 템플릿 화면에서 벗어나지 않았어요.",
+                        codex_result_json=codex_result_json,
                     )
                     return
 
             if apk_path.suffix.lower() != ".apk":
-                self.db.update_task(
+                self.finalize_failure(
                     task_id,
-                    status="Failed",
                     message="apk_path 확장자가 .apk가 아닙니다.",
-                    log=log_text,
+                    log_text=log_text,
+                    usage_update_fields=usage_update_fields,
+                    usage=usage,
+                    codex_model=codex_model,
+                    stage="APK 결과 확인",
                     codex_result_json=codex_result_json,
-                    **usage_update_fields,
                 )
                 return
 
             if not apk_path.exists() or apk_path.stat().st_size <= 0:
-                self.db.update_task(
+                self.finalize_failure(
                     task_id,
-                    status="Failed",
                     message="APK 파일이 없거나 비어 있습니다.",
-                    log=log_text,
+                    log_text=log_text,
+                    usage_update_fields=usage_update_fields,
+                    usage=usage,
+                    codex_model=codex_model,
+                    stage="APK 결과 확인",
                     codex_result_json=codex_result_json,
-                    **usage_update_fields,
                 )
                 return
 
@@ -7979,47 +8535,30 @@ class CodexTaskRunner:
             return
 
         if result.get("status") == "failed":
-            self.db.update_task(
+            message = str(result.get("message", "앱 생성에 실패했습니다."))
+            self.finalize_failure(
                 task_id,
-                status="Failed",
-                message=result.get("message", "앱 생성에 실패했습니다."),
+                message=message,
                 codex_result_json=codex_result_json,
-                log=log_text,
-                **usage_update_fields,
-            )
-            updated_task = self.db.get_task(task_id)
-            if updated_task:
-                log_task_status_event(self.db, updated_task, event_type="task_failed")
-                if usage:
-                    log_token_usage_event(self.db, task_id, usage, model=codex_model)
-            log_build_stage_event(
-                self.db,
-                task_id,
+                log_text=log_text,
+                usage_update_fields=usage_update_fields,
+                usage=usage,
+                codex_model=codex_model,
                 stage="앱 생성 결과",
-                phase="failed",
-                body=str(result.get("message", "앱 생성에 실패했습니다.")),
             )
             return
 
-        self.db.update_task(
+        message = "task_result.json status 값이 올바르지 않습니다."
+        self.finalize_failure(
             task_id,
-            status="Failed",
-            message="task_result.json status 값이 올바르지 않습니다.",
+            message=message,
             codex_result_json=codex_result_json,
-            log=log_text,
-            **usage_update_fields,
-        )
-        updated_task = self.db.get_task(task_id)
-        if updated_task:
-            log_task_status_event(self.db, updated_task, event_type="task_failed")
-            if usage:
-                log_token_usage_event(self.db, task_id, usage, model=codex_model)
-        log_build_stage_event(
-            self.db,
-            task_id,
+            log_text=log_text,
+            usage_update_fields=usage_update_fields,
+            usage=usage,
+            codex_model=codex_model,
             stage="앱 생성 결과",
-            phase="failed",
-            body="결과 상태 값이 올바르지 않습니다.",
+            stage_body="결과 상태 값이 올바르지 않습니다.",
         )
 
 
@@ -8111,10 +8650,11 @@ def serialize_task_for_status(
             raw_log_sections = collect_raw_log_sections(workspace_root, "logs/build.log")
     state_payload = load_task_state_payload(task)
     conversation_state = build_task_conversation_state(task)
-    latest_assistant_message = sanitize_user_visible_text(str(state_payload.get("message") or task.get("message") or ""))
+    task_message = sanitize_user_visible_text(str(task.get("message") or ""))
+    latest_assistant_message = sanitize_user_visible_text(str(state_payload.get("message") or task_message))
     latest_assistant_message_type = str(state_payload.get("tool") or "status")
     latest_failure_message = (
-        latest_assistant_message if task["status"] in {"Failed", "Error"} else sanitize_user_visible_text(str(state_payload.get("latest_failure_message") or ""))
+        task_message if task["status"] in {"Failed", "Error"} else sanitize_user_visible_text(str(state_payload.get("latest_failure_message") or ""))
     )
     retry_allowed = task["status"] in {"Failed", "Error"}
     cancel_allowed = is_cancellable_task_status(str(task.get("status") or ""))
@@ -8910,6 +9450,8 @@ def create_app() -> FastAPI:
                     or build_reference_image_summary(effective_reference_image_name),
                 )
             decision = preserve_followup_task_identity(decision, task, previous_conversation_state)
+            if not existing_workspace_ready and not is_initial_prompt_submission:
+                decision = build_initial_prompt_review_decision(decision)
             if decision.used_previous_pending_prompt:
                 db.log_event(
                     followup_task_id,

@@ -227,9 +227,10 @@ class BuildMonitorService : Service() {
                 includeTimeline = false
             )
             persistMonitoredTaskName(taskId, resolveMonitoredTaskName(taskId, response))
-            val statusKey = TaskStatusPolicy.normalize(response.status)
+            val evaluation = TaskStatusPolicy.evaluate(response)
+            val statusKey = evaluation.normalizedStatus
             synchronized(taskLock) { pollFailureCounts -= taskId }
-            if (!TaskStatusPolicy.shouldMonitorBuildInBackground(statusKey)) {
+            if (!evaluation.isPolling) {
                 removeTask(taskId)
                 showTerminalNotificationIfNeeded(taskId, response, statusKey)
             }

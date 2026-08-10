@@ -43,4 +43,36 @@ class TimelineCursorPolicyTest {
             )
         )
     }
+
+    @Test
+    fun restoresLatestServerCursorFromPersistedTimelineMessages() {
+        val older = "1".repeat(32)
+        val latest = "a".repeat(32)
+
+        assertEquals(
+            latest,
+            TimelineCursorPolicy.restoredCursor(
+                taskId = "task-1",
+                messageIds = listOf(
+                    "timeline-task-1-$older",
+                    "local-task-1-message",
+                    "artifact-task-1-$latest"
+                )
+            )
+        )
+    }
+
+    @Test
+    fun ignoresSyntheticMessageSuffixesWhenRestoringCursor() {
+        assertEquals(
+            null,
+            TimelineCursorPolicy.restoredCursor(
+                taskId = "task-1",
+                messageIds = listOf(
+                    "timeline-task-1-123456789",
+                    "artifact-task-1-latest-7"
+                )
+            )
+        )
+    }
 }

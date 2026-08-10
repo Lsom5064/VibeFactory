@@ -273,9 +273,9 @@ class MainActivity : AppCompatActivity() {
     private var isMessageTextSelectionActive = false
     private val selectedAttachments: MutableList<SelectedAttachment>
         get() = composerDraftViewModel.selectedAttachments
-    private var lastRenderedTaskListFingerprint: String? = null
-    private var lastRenderedMessageListFingerprint: String? = null
-    private var lastRenderedAttachmentFingerprint: String? = null
+    private var lastRenderedTaskListFingerprint: Long? = null
+    private var lastRenderedMessageListFingerprint: Long? = null
+    private var lastRenderedAttachmentFingerprint: Long? = null
     private var pendingCameraImageUri: Uri? = null
     private var attachmentFlowInProgress: Boolean = false
     private var pendingInstallApkFile: File? = null
@@ -990,6 +990,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun resetForNewChat() {
+        handOffVisibleBuildToBackground()
         stopPolling()
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
@@ -1056,7 +1057,7 @@ class MainActivity : AppCompatActivity() {
     private fun startBuildCompletionMonitoring(taskId: String) {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank() || normalizedTaskId in hiddenTaskIds) return
-        if (!buildMonitorStartedTaskIds.add(normalizedTaskId)) return
+        buildMonitorStartedTaskIds.add(normalizedTaskId)
         try {
             BuildMonitorService.startMonitoring(this, normalizedTaskId)
         } catch (e: RuntimeException) {
@@ -1078,6 +1079,22 @@ class MainActivity : AppCompatActivity() {
             ?: screenState.selectedTaskId
             ?: return
         if (
+            screenState.inputMode == InputMode.READ_ONLY ||
+            processingAnimationBaseText(screenState.currentStatus) != null ||
+            processingAnimationBaseText(screenState.statusDetail.orEmpty()) != null
+        ) {
+            startBuildCompletionMonitoring(activeTaskId)
+        }
+    }
+
+    private fun handOffVisibleBuildToBackground(nextTaskId: String? = null) {
+        val activeTaskId = screenState.pollingTaskId
+            ?: screenState.selectedTaskId
+            ?: currentTaskId
+            ?: return
+        if (activeTaskId == nextTaskId || activeTaskId in hiddenTaskIds) return
+        if (
+            screenState.pollingTaskId == activeTaskId ||
             screenState.inputMode == InputMode.READ_ONLY ||
             processingAnimationBaseText(screenState.currentStatus) != null ||
             processingAnimationBaseText(screenState.statusDetail.orEmpty()) != null
@@ -1507,27 +1524,6 @@ class MainActivity : AppCompatActivity() {
                         attachments = attachmentPayloads
                     )
                 )
-                if (sourceTaskId == null && isNonAppAnswerResponse(response)) {
-                    removeLoadingMessages(null)
-                    currentTaskId = null
-                    persistLastSelectedTaskId(null)
-                    appendLocalAssistantMessage(response.message?.trim().orEmpty().ifBlank {
-                        response.summary?.trim().orEmpty()
-                    })
-                    screenState = screenState.copy(
-                        selectedTaskId = null,
-                        displayedAppName = null,
-                        inputMode = InputMode.NEW_GENERATE,
-                        currentStatus = getString(R.string.status_new_chat),
-                        statusDetail = getString(R.string.status_new_chat_detail),
-                        canDownload = false,
-                        canInstall = false
-                    )
-                    renderState()
-                    setComposerEnabled(true)
-                    loadTaskList(autoSelectPendingTask = false)
-                    return@launch
-                }
                 if (sourceTaskId == null) {
                     moveLocalConversationToTask(response.task_id)
                     pendingResponseScrollTaskIds += response.task_id
@@ -1586,7 +1582,9 @@ class MainActivity : AppCompatActivity() {
     private fun selectTask(taskId: String, autoInstallOnSuccess: Boolean) {
         val resolvedTaskId = resolveApiTaskId(taskId, "/status/{task_id}") ?: return
         if (resolvedTaskId.isBlank() || resolvedTaskId in hiddenTaskIds) return
+        handOffVisibleBuildToBackground(nextTaskId = resolvedTaskId)
         stopPolling()
+        stopBuildCompletionMonitoring(resolvedTaskId)
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
         val selectionGeneration = advanceTaskSelectionGeneration()
@@ -1974,18 +1972,22 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
+        if (!TaskStatusUpdatePolicy.targetsVisibleTask(taskId, screenState.selectedTaskId)) {
+            applyInactiveTaskStatus(taskId, response)
+            return
+        }
         currentTaskId = taskId
-        val normalizedStatus = response.status.trim()
-        val isSuccess = TaskStatusPolicy.isSuccess(normalizedStatus)
-        val isCancelled = TaskStatusPolicy.isCancelled(normalizedStatus)
-        val isClarifying = isClarificationResponse(response) || TaskStatusPolicy.needsClarification(normalizedStatus)
+        val evaluation = TaskStatusPolicy.evaluate(response)
+        val normalizedStatus = evaluation.normalizedStatus
+        val isSuccess = evaluation.isSuccess
+        val isCancelled = evaluation.isCancelled
+        val isClarifying = evaluation.isClarifying
         val isFailedBuild = TaskStatusPolicy.isRetryableFailure(normalizedStatus)
-        val isRetryable = isRetryAllowed(response)
-        val isPollingStatus = TaskStatusPolicy.shouldPollConversation(normalizedStatus) &&
-            (!isClarifying || isWebResearchInProgress(response))
-        val isErrorResponse = TaskStatusPolicy.isResponseError(normalizedStatus)
+        val isRetryable = evaluation.isRetryable
+        val isPollingStatus = evaluation.isPolling
+        val isErrorResponse = evaluation.isResponseError
         val allowArtifactActions = isSuccess && !isPollingStatus
-        val progressMode = response.progress_mode?.takeIf { it.isNotBlank() }
+        val progressMode = evaluation.progressMode
         latestApkUrl = resolveApkUrl(taskId, response, isSuccess)
         val hasArtifact = latestApkUrl != null || persistedApkUrlForTask(taskId) != null
         updateTaskArtifactState(
@@ -2110,6 +2112,75 @@ class MainActivity : AppCompatActivity() {
                 setComposerEnabled(inputMode != InputMode.READ_ONLY)
             }
         }
+    }
+
+    private fun applyInactiveTaskStatus(taskId: String, response: StatusResponse) {
+        val evaluation = TaskStatusPolicy.evaluate(response)
+        val normalizedStatus = evaluation.normalizedStatus
+        val isSuccess = evaluation.isSuccess
+        val isErrorResponse = evaluation.isResponseError
+        val progressMode = evaluation.progressMode
+        val resolvedApkUrl = resolveApkUrl(taskId, response, isSuccess)
+        val resolvedAppName = taskDisplayName(response.generated_app_name)
+            ?: taskDisplayName(response.app_name)
+            ?: taskSummaryById[taskId]?.appName
+        updateTaskArtifactState(
+            taskId,
+            apkUrl = resolvedApkUrl,
+            downloadedApkFile = persistedDownloadedApkFileForTask(taskId)
+        )
+
+        if (!isSuccess && notifiedBuildSuccessTaskIds.remove(taskId)) {
+            persistNotifiedBuildSuccessTaskIds()
+        }
+        val pendingRuntimeError = pendingRuntimeErrors[taskId]
+        if (isSuccess && pendingRuntimeError?.awaitingUserConfirmation == false) {
+            runtimeErrorTaskIds -= taskId
+            pendingRuntimeErrors.remove(taskId)
+            persistPendingRuntimeErrors()
+        }
+
+        val statusText = if (isErrorResponse) {
+            getString(R.string.status_error)
+        } else {
+            resolveStatusDisplayText(
+                normalizedStatus,
+                response.status_display_text.orEmpty(),
+                progressMode
+            )
+        }
+        refreshTaskSummaryFromStatus(
+            taskId = taskId,
+            response = response,
+            resolvedAppName = resolvedAppName,
+            statusText = statusText,
+            hasApk = resolvedApkUrl != null
+        )
+
+        if (!evaluation.isPolling) {
+            stopBuildCompletionMonitoring(taskId)
+        }
+        if (isSuccess) {
+            loadNotifiedBuildSuccessTaskIds()
+        }
+        if (isSuccess && notifiedBuildSuccessTaskIds.add(taskId)) {
+            persistNotifiedBuildSuccessTaskIds()
+            notifyBuildCompleted(
+                taskId,
+                buildTaskContentTitle(
+                    initialPrompt = response.conversation_state
+                        ?.takeIf { it.isJsonObject }
+                        ?.asJsonObject
+                        ?.let { firstString(it, "initial_user_prompt") },
+                    appName = resolvedAppName,
+                    conversationState = response.conversation_state
+                ) ?: taskSummaryById[taskId]?.title ?: resolvedAppName
+            )
+        }
+
+        // Only the drawer row is allowed to change for an inactive task. The
+        // visible chat, composer draft, and selected task remain untouched.
+        renderState()
     }
 
     private fun notifyBuildCompleted(taskId: String, appName: String?) {
@@ -2314,13 +2385,23 @@ class MainActivity : AppCompatActivity() {
                     logTaskIdForApi("/status/{task_id}", taskId)
                     logApiRequest("/status/{task_id}", taskId = taskId, deviceId = deviceId)
                     val response = fetchTaskStatus(taskId)
+                    val stillVisible = TaskStatusUpdatePolicy.targetsVisibleTask(
+                        taskId,
+                        screenState.selectedTaskId
+                    )
                     applyStatus(taskId, response, autoInstallOnSuccess = true, syncPolling = false)
-                    if (!TaskStatusPolicy.shouldPollConversation(response.status)) {
+                    if (!stillVisible) {
+                        break
+                    }
+                    if (!TaskStatusPolicy.evaluate(response).isPolling) {
                         break
                     }
                 } catch (e: Exception) {
                     e.rethrowIfCancellation()
                     logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
+                    if (!TaskStatusUpdatePolicy.targetsVisibleTask(taskId, screenState.selectedTaskId)) {
+                        break
+                    }
                     addTaskEvent(
                         taskId,
                         ChatMessage(
@@ -2340,12 +2421,16 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            screenState = screenState.copy(pollingTaskId = null)
-            renderState()
-            if (processNextQueuedInputIfReady(taskId)) {
-                return@launch
+            if (screenState.pollingTaskId == taskId) {
+                screenState = screenState.copy(pollingTaskId = null)
+                renderState()
             }
-            setComposerEnabled(screenState.inputMode != InputMode.READ_ONLY)
+            if (TaskStatusUpdatePolicy.targetsVisibleTask(taskId, screenState.selectedTaskId)) {
+                if (processNextQueuedInputIfReady(taskId)) {
+                    return@launch
+                }
+                setComposerEnabled(screenState.inputMode != InputMode.READ_ONLY)
+            }
         }
     }
 
@@ -2655,6 +2740,10 @@ ${record.stackTrace}
         if (normalizedTaskId !in loadedTaskChatIds && loadedMessages.isNotEmpty()) {
             taskConversationMessages[normalizedTaskId] = loadedMessages.toMutableList()
             taskTimelineRenderCache.markChanged(normalizedTaskId)
+            TimelineCursorPolicy.restoredCursor(
+                taskId = normalizedTaskId,
+                messageIds = loadedMessages.map(ChatMessage::id)
+            )?.let { cursor -> taskTimelineEventCursorById[normalizedTaskId] = cursor }
         }
         loadedTaskChatIds += normalizedTaskId
         return true
@@ -3329,10 +3418,16 @@ ${record.stackTrace}
         inputPhoneGate.visibility = if (phoneGateVisible) View.GONE else View.VISIBLE
         btnSavePhoneGate.isEnabled = true
 
-        val taskListForRender = screenState.taskList.map { it.copy(hasRuntimeError = it.taskId in runtimeErrorTaskIds) }
-        val taskListFingerprint = taskListRenderFingerprint(taskListForRender, screenState.selectedTaskId)
+        val taskListFingerprint = UiRenderFingerprint.taskList(
+            screenState.taskList,
+            screenState.selectedTaskId,
+            runtimeErrorTaskIds
+        )
         if (taskListFingerprint != lastRenderedTaskListFingerprint) {
             lastRenderedTaskListFingerprint = taskListFingerprint
+            val taskListForRender = screenState.taskList.map { task ->
+                task.copy(hasRuntimeError = task.taskId in runtimeErrorTaskIds)
+            }
             taskAdapter.submitList(taskListForRender, screenState.selectedTaskId)
         }
         val baseVisibleMessages = screenState.messages
@@ -3378,7 +3473,7 @@ ${record.stackTrace}
             pendingChatAnchorTopOffset = null
             clearPendingChatAnchorAfterScroll = false
         }
-        val messageListFingerprint = "${screenState.selectedTaskId.orEmpty()}|${messageListRenderFingerprint(visibleMessages)}"
+        val messageListFingerprint = UiRenderFingerprint.messages(screenState.selectedTaskId, visibleMessages)
         val shouldSubmitMessages = messageListFingerprint != lastRenderedMessageListFingerprint ||
             scrollLatestAfterResponse ||
             !anchorMessageId.isNullOrBlank()
@@ -3478,92 +3573,8 @@ ${record.stackTrace}
         }
     }
 
-    private fun taskListRenderFingerprint(tasks: List<TaskSummary>, selectedTaskId: String?): String {
-        return buildString {
-            append(selectedTaskId.orEmpty())
-            tasks.forEach { task ->
-                append('|')
-                append(task.taskId)
-                append(':')
-                append(task.title)
-                append(':')
-                append(task.appName.orEmpty())
-                append(':')
-                append(task.status)
-                append(':')
-                append(task.updatedAt.orEmpty())
-                append(':')
-                append(task.hasApk)
-                append(':')
-                append(task.hasRuntimeError)
-            }
-        }
-    }
-
-    private fun messageListRenderFingerprint(messages: List<ChatMessage>): String {
-        return buildString {
-            messages.forEach { message ->
-                append(message.id)
-                append(':')
-                append(message.kind.name)
-                append(':')
-                append(message.title.orEmpty().hashCode())
-                append(':')
-                append(message.body.hashCode())
-                append(':')
-                append(message.detail.orEmpty().hashCode())
-                append(':')
-                append(message.createdAt.orEmpty())
-                append(':')
-                append(message.isLoading)
-                append(':')
-                append(message.artifactDownloading)
-                append(':')
-                append(message.artifactDownloadProgressPercent ?: -1)
-                append(':')
-                append(message.artifactDownloadProgressText.orEmpty())
-                append(':')
-                append(message.artifactCanDownload)
-                append(':')
-                append(message.artifactCanInstall)
-                append(':')
-                append(message.artifactInstalled)
-                append(':')
-                append(message.artifactPackageName.orEmpty())
-                append(':')
-                append(message.artifactTaskId.orEmpty())
-                append(':')
-                append(message.artifactRevisionLabel.orEmpty())
-                append(':')
-                append(message.cancelTaskId.orEmpty())
-                append(':')
-                append(message.allImagePreviews().joinToString(",") { preview ->
-                    "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}:${preview.remoteUrl.orEmpty()}"
-                })
-                append('|')
-            }
-        }
-    }
-
-    private fun selectedAttachmentsFingerprint(attachments: List<SelectedAttachment>): String {
-        return attachments.joinToString("|") { attachment ->
-            "${attachment.kind.name}:${attachment.displayName}:${attachment.mimeType}:${binaryPayloadFingerprint(attachment.base64)}"
-        }
-    }
-
-    private fun binaryPayloadFingerprint(payload: String): String {
-        if (payload.isEmpty()) return "0"
-        return buildString {
-            append(payload.length)
-            append(':')
-            append(payload.take(48).hashCode())
-            append(':')
-            append(payload.takeLast(48).hashCode())
-        }
-    }
-
     private fun renderSelectedAttachmentsIfChanged(force: Boolean = false) {
-        val fingerprint = selectedAttachmentsFingerprint(selectedAttachments)
+        val fingerprint = UiRenderFingerprint.attachments(selectedAttachments)
         if (!force && fingerprint == lastRenderedAttachmentFingerprint) return
         lastRenderedAttachmentFingerprint = fingerprint
 
@@ -4215,22 +4226,6 @@ ${record.stackTrace}
         renderState()
     }
 
-    private fun appendLocalAssistantMessage(message: String) {
-        if (message.isBlank()) return
-        val assistantMessage = ChatMessage(
-            id = "local-assistant-${System.currentTimeMillis()}",
-            kind = MessageKind.ASSISTANT,
-            title = getString(R.string.message_title_assistant),
-            body = message,
-            createdAt = currentTimestampString()
-        )
-        screenState = screenState.copy(
-            messages = screenState.messages + assistantMessage
-        )
-        requestScrollLatestAfterResponse(force = true)
-        renderState()
-    }
-
     private fun showAttachmentMenu() {
         if (attachmentFlowInProgress) return
         attachmentFlowInProgress = true
@@ -4728,7 +4723,10 @@ ${record.stackTrace}
         }
 
         val latestFailure = resolveFailureBubbleText(response)
-        if (latestFailure.isNotBlank() && !timelineContainsBody(taskId, latestFailure)) {
+        if (
+            latestFailure.isNotBlank() &&
+            !timelineContainsBody(taskId, latestFailure, kind = MessageKind.ASSISTANT)
+        ) {
             appendTaskTimelineMessage(
                 taskId,
                 ChatMessage(
@@ -4744,15 +4742,14 @@ ${record.stackTrace}
 
     private fun resolveFailureBubbleText(response: StatusResponse): String {
         val explicit = response.latest_failure_message?.trim().orEmpty()
-        if (explicit.isNotBlank()) return explicit
         if (!TaskStatusPolicy.isRetryableFailure(response.status)) return ""
 
-        val detail = listOf(
+        val detail = (listOf(explicit) + listOf(
             response.latest_assistant_message,
             response.status_message,
             response.latest_log,
             response.log
-        )
+        ))
             .asSequence()
             .map { it?.trim().orEmpty() }
             .firstOrNull { it.isNotBlank() }
@@ -4767,15 +4764,20 @@ ${record.stackTrace}
             ?.take(220)
             .orEmpty()
 
-        return if (detail.isNotBlank()) {
-            "앱 빌드에 실패했어요. 원인은 $detail"
-        } else {
-            "앱 빌드에 실패했어요. 마지막 진행 상태를 확인하고 필요하면 로그를 열어보세요."
+        val visibleDetail = detail.ifBlank {
+            "앱 생성 과정에서 빌드 오류가 발생했어요."
         }
+        return getString(R.string.build_failure_bubble, visibleDetail)
     }
 
-    private fun timelineContainsBody(taskId: String, body: String): Boolean {
-        return buildTaskTimeline(taskId).any { hasSameMessageText(it.body, body) }
+    private fun timelineContainsBody(
+        taskId: String,
+        body: String,
+        kind: MessageKind? = null
+    ): Boolean {
+        return buildTaskTimeline(taskId).any { message ->
+            (kind == null || message.kind == kind) && hasSameMessageText(message.body, body)
+        }
     }
 
     private fun taskHasUserMessageText(taskId: String, body: String): Boolean {
@@ -5511,19 +5513,6 @@ ${record.stackTrace}
         }
     }
 
-    private fun isClarificationResponse(response: StatusResponse): Boolean {
-        return response.requires_user_input == true ||
-            response.pending_decision_reason?.trim()?.lowercase() == "clarification"
-    }
-
-    private fun isRetryAllowed(response: StatusResponse): Boolean {
-        response.retry_allowed?.let { return it }
-        response.allowed_next_actions?.let { actions ->
-            return actions.any { it.equals("retry", ignoreCase = true) }
-        }
-        return TaskStatusPolicy.isRetryableFailure(response.status)
-    }
-
     private fun isTaskCancellationAllowed(response: StatusResponse): Boolean {
         response.cancel_allowed?.let { return it }
         response.allowed_next_actions?.let { actions ->
@@ -5566,12 +5555,6 @@ ${record.stackTrace}
         val looksLikeRevision = requestScope in setOf("existing_app", "existing_task", "revision", "modification") ||
             interactionType in setOf("build_started", "revision_started", "modification_started")
         return looksLikeRevision && isModificationBuildResponse(response)
-    }
-
-    private fun isNonAppAnswerResponse(response: BuildResponse): Boolean {
-        return response.tool?.trim()?.lowercase() == "answer_question" &&
-            response.request_scope?.trim()?.lowercase() == "non_app_request" &&
-            isAssistantRenderMode(response)
     }
 
     private fun isConfirmationRenderMode(response: StatusResponse): Boolean {
@@ -6183,7 +6166,7 @@ ${record.stackTrace}
         if (
             TaskStatusPolicy.normalize(response.status) == "pending decision" &&
             response.progress_mode.isNullOrBlank() &&
-            !isWebResearchInProgress(response)
+            !TaskStatusPolicy.isWebResearchInProgress(response)
         ) {
             return
         }
@@ -6198,7 +6181,7 @@ ${record.stackTrace}
                 id = "status-$taskId-${System.currentTimeMillis()}",
                 kind = MessageKind.STATUS,
                 title = getString(R.string.message_title_status),
-                body = if (isWebResearchInProgress(response)) {
+                body = if (TaskStatusPolicy.isWebResearchInProgress(response)) {
                     getString(R.string.status_web_researching)
                 } else {
                     resolveStatusDisplayText(response.status, response.status_display_text.orEmpty(), progressMode)
@@ -6367,7 +6350,7 @@ ${record.stackTrace}
         }
         val imageKey = imagePreviews
             .joinToString("|") { preview ->
-                "${preview.displayName}:${binaryPayloadFingerprint(preview.base64)}:${preview.remoteUrl.orEmpty()}"
+                "${preview.displayName}:${UiRenderFingerprint.binaryPayload(preview.base64)}:${preview.remoteUrl.orEmpty()}"
             }
         return "user:$bodyKey:$imageKey"
     }
@@ -6656,7 +6639,7 @@ ${record.stackTrace}
     private fun buildStatusTransitionKey(response: StatusResponse): String {
         return listOf(
             TaskStatusPolicy.normalize(response.status),
-            if (isWebResearchInProgress(response)) "web_research" else "",
+            if (TaskStatusPolicy.isWebResearchInProgress(response)) "web_research" else "",
             response.package_name,
             response.apk_url,
             response.apk_path,
@@ -6664,36 +6647,6 @@ ${record.stackTrace}
             response.build_success.toString(),
             response.build_attempts.toString()
         ).joinToString("|")
-    }
-
-    private fun isWebResearchInProgress(response: StatusResponse): Boolean {
-        val statusKey = TaskStatusPolicy.normalize(response.status)
-        if (!TaskStatusPolicy.shouldPollConversation(response.status)) return false
-        if (statusKey in setOf("reviewing", "repairing")) return false
-
-        val progressMode = response.progress_mode?.trim()?.lowercase().orEmpty()
-        if (progressMode in setOf("refine", "retry", "repair", "runtime_repair")) return false
-        if (progressMode in setOf("web_research", "research_then_build", "api_research")) return true
-
-        val currentProgressText = listOf(
-            response.status_display_text.orEmpty(),
-            response.status_message.orEmpty(),
-            response.latest_log.orEmpty()
-        ).joinToString("\n").lowercase()
-        if (currentProgressText.isBlank()) return false
-
-        return listOf(
-            "외부 정보 탐색",
-            "웹 검색",
-            "웹검색",
-            "공개 api",
-            "api 우선 탐색",
-            "대표 api",
-            "대표 웹 페이지",
-            "웹 페이지 확보",
-            "웹 데이터 구조 분석",
-            "외부 정보 품질"
-        ).any { marker -> currentProgressText.contains(marker.lowercase()) }
     }
 
     private fun ChatMessage.sameContentAs(other: ChatMessage): Boolean {

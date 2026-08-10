@@ -25,34 +25,27 @@ import androidx.recyclerview.widget.RecyclerView
 class TaskSummaryAdapter(
     private val onClick: (TaskSummary) -> Unit,
     private val onDelete: (TaskSummary) -> Unit
-) : RecyclerView.Adapter<TaskSummaryAdapter.TaskViewHolder>() {
+) : ListAdapter<TaskSummaryAdapter.TaskRow, TaskSummaryAdapter.TaskViewHolder>(TaskRowDiffCallback) {
 
-    private var items: List<TaskSummary> = emptyList()
-    private var selectedTaskId: String? = null
+    data class TaskRow(
+        val task: TaskSummary,
+        val selected: Boolean
+    )
+
+    companion object {
+        private val TaskRowDiffCallback = object : DiffUtil.ItemCallback<TaskRow>() {
+            override fun areItemsTheSame(oldItem: TaskRow, newItem: TaskRow): Boolean {
+                return oldItem.task.taskId == newItem.task.taskId
+            }
+
+            override fun areContentsTheSame(oldItem: TaskRow, newItem: TaskRow): Boolean {
+                return oldItem == newItem
+            }
+        }
+    }
 
     fun submitList(newItems: List<TaskSummary>, selectedTaskId: String?) {
-        val previousItems = items
-        val previousSelectedTaskId = this.selectedTaskId
-        val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
-            override fun getOldListSize(): Int = previousItems.size
-
-            override fun getNewListSize(): Int = newItems.size
-
-            override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
-                return previousItems[oldItemPosition].taskId == newItems[newItemPosition].taskId
-            }
-
-            override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
-                val oldItem = previousItems[oldItemPosition]
-                val newItem = newItems[newItemPosition]
-                val oldSelected = oldItem.taskId == previousSelectedTaskId
-                val newSelected = newItem.taskId == selectedTaskId
-                return oldItem == newItem && oldSelected == newSelected
-            }
-        })
-        items = newItems
-        this.selectedTaskId = selectedTaskId
-        diff.dispatchUpdatesTo(this)
+        submitList(newItems.map { task -> TaskRow(task, task.taskId == selectedTaskId) })
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): TaskViewHolder {
@@ -61,10 +54,9 @@ class TaskSummaryAdapter(
     }
 
     override fun onBindViewHolder(holder: TaskViewHolder, position: Int) {
-        holder.bind(items[position], items[position].taskId == selectedTaskId)
+        val row = getItem(position)
+        holder.bind(row.task, row.selected)
     }
-
-    override fun getItemCount(): Int = items.size
 
     class TaskViewHolder(
         view: View,

@@ -105,6 +105,7 @@
     <string name="install_permission_required">설치 권한을 허용한 뒤 돌아오면 바로 설치를 이어갈게요.</string>
     <string name="install_failed">설치 화면을 열지 못했어요. 다운로드된 APK에서 다시 설치를 눌러주세요.</string>
     <string name="generated_app_launch_failed">설치된 앱을 자동으로 열지 못했어요. 앱 목록에서 직접 실행해 주세요.</string>
+    <string name="build_failure_bubble">앱을 완성하지 못했어요.\n\n%1$s\n\n요청 내용은 보존되어 있어요. 다시 시도해도 같은 문제가 발생하면 연구원에게 알려주세요.</string>
     <string name="message_title_apk">APK</string>
     <string name="artifact_file_label">APK 파일</string>
     <string name="artifact_size_pending">크기 확인 전</string>

@@ -12,6 +12,7 @@ from flutter_apk_server.server import (
     built_apk_identity,
     ensure_project_revision_version,
     flutter_no_pub_args,
+    project_android_identity_issues,
     render_task_agents_md,
     revision_request_summary,
     serialize_project_revision,
@@ -318,6 +319,111 @@ void main() {
                     expected_package,
                 )
             )
+
+    def test_apply_project_defaults_restores_all_kotlin_package_references(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            gradle_path = project_root / "android/app/build.gradle.kts"
+            kotlin_root = project_root / "android/app/src/main/kotlin/example"
+            main_activity_path = kotlin_root / "MainActivity.kt"
+            service_path = kotlin_root / "NotificationCaptureService.kt"
+            store_path = kotlin_root / "NotificationInboxStore.kt"
+
+            gradle_path.parent.mkdir(parents=True)
+            kotlin_root.mkdir(parents=True)
+            gradle_path.write_text(
+                """
+android {
+    namespace = "kr.ac.kangwon.hai.generated.customappsource01"
+    defaultConfig {
+        applicationId = "kr.ac.kangwon.hai.generated.customappsource01"
+    }
+}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            main_activity_path.write_text(
+                """
+package kr.ac.kangwon.hai.generated.customappsource01
+
+import kr.ac.kangwon.hai.generated.customappbranch02.NotificationInboxStore
+
+class MainActivity {
+    val store = NotificationInboxStore()
+}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            service_path.write_text(
+                """
+package kr.ac.kangwon.hai.generated.customappbranch02
+
+class NotificationCaptureService
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            store_path.write_text(
+                """
+package kr.ac.kangwon.hai.generated.customappbranch02
+
+class NotificationInboxStore
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            expected_package = "kr.ac.kangwon.hai.generated.customappsource01"
+            self.assertTrue(
+                apply_project_defaults(
+                    project_root,
+                    "branched-task",
+                    "Branch App",
+                    expected_package,
+                )
+            )
+
+            for kotlin_path in (main_activity_path, service_path, store_path):
+                kotlin_text = kotlin_path.read_text(encoding="utf-8")
+                self.assertIn(f"package {expected_package}", kotlin_text)
+                self.assertNotIn("customappbranch02", kotlin_text)
+            self.assertEqual(project_android_identity_issues(project_root, expected_package), [])
+            self.assertFalse(
+                apply_project_defaults(
+                    project_root,
+                    "branched-task",
+                    "Branch App",
+                    expected_package,
+                )
+            )
+
+    def test_project_android_identity_issues_reports_unmanaged_kotlin_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            gradle_path = project_root / "android/app/build.gradle.kts"
+            kotlin_path = project_root / "android/app/src/main/kotlin/example/Service.kt"
+            gradle_path.parent.mkdir(parents=True)
+            kotlin_path.parent.mkdir(parents=True)
+            gradle_path.write_text(
+                """
+android {
+    namespace = "example.expected"
+    defaultConfig {
+        applicationId = "example.expected"
+    }
+}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            kotlin_path.write_text("package example.unexpected\n", encoding="utf-8")
+
+            issues = project_android_identity_issues(project_root, "example.expected")
+
+            self.assertEqual(len(issues), 1)
+            self.assertIn("example.unexpected", issues[0])
 
     def test_project_defaults_remove_package_suffixes_and_override_all_application_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

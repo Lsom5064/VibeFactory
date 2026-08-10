@@ -1,6 +1,8 @@
 package kr.ac.kangwon.hai.vibefactory
 
 object TimelineCursorPolicy {
+    private val persistedEventIdPattern = Regex("^[0-9a-fA-F]{32}$")
+
     fun firstUnprocessedIndex(
         eventIds: List<String>,
         processedEventId: String?,
@@ -23,5 +25,20 @@ object TimelineCursorPolicy {
             ?.trim()
             ?.takeIf { it.isNotBlank() }
             ?: eventIds.asReversed().firstOrNull { it.isNotBlank() }
+    }
+
+    fun restoredCursor(taskId: String, messageIds: List<String>): String? {
+        val normalizedTaskId = taskId.trim()
+        if (normalizedTaskId.isBlank()) return null
+        val prefixes = listOf(
+            "timeline-$normalizedTaskId-",
+            "artifact-$normalizedTaskId-"
+        )
+        return messageIds.asReversed().firstNotNullOfOrNull { messageId ->
+            prefixes.firstNotNullOfOrNull { prefix ->
+                messageId.removePrefix(prefix)
+                    .takeIf { messageId.startsWith(prefix) && it.matches(persistedEventIdPattern) }
+            }
+        }
     }
 }
