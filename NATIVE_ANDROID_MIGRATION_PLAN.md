@@ -724,7 +724,7 @@ ADB 기기: R5CT60A8H4R (SM-S908N, API 36). 임시 테스트 APK 검증 후 서�
 APK 크기: 원본 rev4 약 4.9MB로 재설치. 런타임 이미지는 저장 정책에 따라 JPEG 746x1600, 108,781 bytes로 저장되고 DB SHA-256과 실제 파일이 일치
 발견된 문제: 환경 API key를 기본 Task 설정에 복사하면 SQLite에 secret이 영구 저장될 수 있음. 호스트 설치 후 자동 실행 측정은 Samsung UnknownSourceConfirmActivity의 '앱 설치가 권장되지 않음' 보안 승인에서 중단. AWS 최신 기록 IP 43.200.231.104:22도 timeout이며 로컬 AWS CLI는 미설치
 해결 내용: 환경 키는 요청 처리 시에만 메모리에서 Task config와 결합하고 default/Task DB·event에 저장하지 않도록 수정·테스트. run-local-server.sh는 APP_RUNTIME_OPENAI_API_KEY가 없을 때만 OPENAI_API_KEY를 process-only fallback으로 사용. 실제 DB api_key length=0, API api_key_configured=true 검증. 보안 경고에서 '설치 안 함'을 선택하고 우회하지 않음
-커밋 SHA: 미커밋
+커밋 SHA: 4ed6531871bd7e71242d71a8e43bdb7fea3872c0
 다음 단계: 사용자가 Samsung '무시하고 설치' 흐름을 직접 승인할 수 있는 회차에 설치 후 자동 실행 시간 3회 측정. EC2 security group·공인 IP·instance 상태 복구 후 AWS Native canary 배포·smoke test. 메인 8000 서버는 사용자가 작업을 멈춘 뒤 최신 소스로 재시작
 ```
 
