@@ -82,14 +82,11 @@ class TokenUsageActivity : AppCompatActivity() {
                 }
             }.onSuccess { snapshot ->
                 bindSnapshot(snapshot)
-            }.onFailure { throwable ->
-                val fallback = TokenUsageMockRepository.load(this@TokenUsageActivity)
+            }.onFailure {
+                val fallback = TokenUsageFallbackFactory.load(this@TokenUsageActivity)
                 bindSnapshot(
                     fallback.copy(
-                        statusMessage = getString(
-                            R.string.token_usage_status_failed,
-                            throwable.message ?: getString(R.string.token_usage_value_unavailable)
-                        ),
+                        statusMessage = getString(R.string.token_usage_status_failed),
                         isFallback = true
                     )
                 )
@@ -125,7 +122,14 @@ class TokenUsageActivity : AppCompatActivity() {
         }
     }
 
-    private fun bindPercentCard(progressBar: ProgressBar, valueView: TextView, percent: Int) {
+    private fun bindPercentCard(progressBar: ProgressBar, valueView: TextView, percent: Int?) {
+        if (percent == null) {
+            progressBar.progress = 0
+            progressBar.visibility = View.INVISIBLE
+            valueView.text = getString(R.string.token_usage_value_unavailable)
+            return
+        }
+        progressBar.visibility = View.VISIBLE
         progressBar.progress = percent.coerceIn(0, 100)
         valueView.text = getString(R.string.token_usage_remaining_percent, percent.coerceIn(0, 100))
     }

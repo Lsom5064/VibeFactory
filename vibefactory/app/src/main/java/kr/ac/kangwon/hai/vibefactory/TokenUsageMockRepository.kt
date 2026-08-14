@@ -10,10 +10,10 @@ import retrofit2.HttpException
 data class TokenUsageSnapshot(
     val currentModel: String,
     val fiveHourWindowLabel: String,
-    val fiveHourRemainingPercent: Int,
+    val fiveHourRemainingPercent: Int?,
     val fiveHourResetAtLabel: String,
     val weeklyWindowLabel: String,
-    val weeklyRemainingPercent: Int,
+    val weeklyRemainingPercent: Int?,
     val weeklyResetAtLabel: String,
     val totalTokensLabel: String,
     val inputTokensLabel: String,
@@ -24,35 +24,44 @@ data class TokenUsageSnapshot(
     val isFallback: Boolean = false
 )
 
-object TokenUsageMockRepository {
+object TokenUsageFallbackFactory {
     fun load(context: Context): TokenUsageSnapshot {
         return TokenUsageSnapshot(
             currentModel = context.getString(R.string.token_usage_limit_name_unknown),
             fiveHourWindowLabel = "5시간 한도",
-            fiveHourRemainingPercent = 72,
+            fiveHourRemainingPercent = null,
             fiveHourResetAtLabel = context.getString(R.string.token_usage_reset_unknown),
             weeklyWindowLabel = "주간 한도",
-            weeklyRemainingPercent = 54,
+            weeklyRemainingPercent = null,
             weeklyResetAtLabel = context.getString(R.string.token_usage_reset_unknown),
-            totalTokensLabel = formatTokenCount(context, 12430),
-            inputTokensLabel = formatTokenCount(context, 8200),
-            outputTokensLabel = formatTokenCount(context, 4230),
-            cachedInputTokensLabel = formatTokenCount(context, 2100),
-            reasoningTokensLabel = formatTokenCount(context, 900),
-            statusMessage = context.getString(R.string.token_usage_status_fallback),
+            totalTokensLabel = formatTokenCount(context, null),
+            inputTokensLabel = formatTokenCount(context, null),
+            outputTokensLabel = formatTokenCount(context, null),
+            cachedInputTokensLabel = formatTokenCount(context, null),
+            reasoningTokensLabel = formatTokenCount(context, null),
+            statusMessage = context.getString(R.string.token_usage_status_unavailable),
             isFallback = true
         )
     }
+}
 
-    fun summary(context: Context): String {
-        val snapshot = load(context)
-        return context.getString(
-            R.string.settings_token_limit_summary_template,
-            snapshot.fiveHourRemainingPercent,
-            snapshot.weeklyRemainingPercent,
-            snapshot.currentModel
-        )
+fun formatTokenUsageSummary(context: Context, snapshot: TokenUsageSnapshot): String {
+    val windows = listOfNotNull(
+        snapshot.fiveHourRemainingPercent?.let {
+            context.getString(R.string.settings_token_limit_window, snapshot.fiveHourWindowLabel, it)
+        },
+        snapshot.weeklyRemainingPercent?.let {
+            context.getString(R.string.settings_token_limit_window, snapshot.weeklyWindowLabel, it)
+        }
+    )
+    if (windows.isEmpty()) {
+        return context.getString(R.string.settings_token_limit_summary_unavailable)
     }
+    return context.getString(
+        R.string.settings_token_limit_summary_template,
+        windows.joinToString(" · "),
+        snapshot.currentModel
+    )
 }
 
 class TokenUsageRepository(
@@ -98,10 +107,10 @@ private fun TokenUsageResponse.toSnapshot(context: Context): TokenUsageSnapshot 
     return TokenUsageSnapshot(
         currentModel = limit_name?.takeIf { it.isNotBlank() } ?: context.getString(R.string.token_usage_limit_name_unknown),
         fiveHourWindowLabel = primaryWindow?.window_label?.takeIf { it.isNotBlank() } ?: context.getString(R.string.token_usage_card_5h),
-        fiveHourRemainingPercent = clampPercent(primaryWindow?.remaining_percent),
+        fiveHourRemainingPercent = normalizeRemainingPercent(primaryWindow),
         fiveHourResetAtLabel = formatResetAt(context, primaryWindow?.resets_at),
         weeklyWindowLabel = secondaryWindow?.window_label?.takeIf { it.isNotBlank() } ?: context.getString(R.string.token_usage_card_weekly),
-        weeklyRemainingPercent = clampPercent(secondaryWindow?.remaining_percent),
+        weeklyRemainingPercent = normalizeRemainingPercent(secondaryWindow),
         weeklyResetAtLabel = formatResetAt(context, secondaryWindow?.resets_at),
         totalTokensLabel = formatTokenCount(context, usageSnapshot?.total_tokens),
         inputTokensLabel = formatTokenCount(context, usageSnapshot?.input_tokens),
@@ -113,8 +122,8 @@ private fun TokenUsageResponse.toSnapshot(context: Context): TokenUsageSnapshot 
     )
 }
 
-private fun clampPercent(value: Int?): Int {
-    return (value ?: 0).coerceIn(0, 100)
+internal fun normalizeRemainingPercent(window: TokenUsageWindowDto?): Int? {
+    return window?.remaining_percent?.coerceIn(0, 100)
 }
 
 private fun formatResetAt(context: Context, epochSeconds: Long?): String {

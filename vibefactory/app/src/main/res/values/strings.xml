@@ -38,8 +38,11 @@
     <string name="settings_workspace">워크스페이스</string>
     <string name="settings_workspace_value">개인</string>
     <string name="settings_token_limit">사용량 보기</string>
-    <string name="settings_token_limit_summary_placeholder" formatted="false">5h 0% · weekly 0% · 모델 -</string>
-    <string name="settings_token_limit_summary_template">5h %1$d%% · weekly %2$d%% · %3$s</string>
+    <string name="settings_token_limit_summary_placeholder">사용량 정보를 불러오는 중이에요.</string>
+    <string name="settings_token_limit_summary_loading">사용량 정보를 불러오는 중이에요.</string>
+    <string name="settings_token_limit_summary_unavailable">사용량 정보를 불러오지 못했어요.</string>
+    <string name="settings_token_limit_summary_template">%1$s · %2$s</string>
+    <string name="settings_token_limit_window">%1$s %2$d%% 남음</string>
     <string name="settings_token_limit_summary_empty">표시할 작업이 아직 없어요.</string>
     <string name="settings_chevron">›</string>
     <string name="settings_dark_mode">다크 모드</string>
@@ -62,11 +65,11 @@
     <string name="token_usage_reset_unknown">초기화 시각을 아직 모르겠어요.</string>
     <string name="token_usage_status_loading">토큰 사용량을 불러오는 중이에요.</string>
     <string name="token_usage_status_ready">최신 토큰 사용량을 보여주고 있어요.</string>
-    <string name="token_usage_status_failed">토큰 사용량을 불러오지 못했어요. %1$s</string>
-    <string name="token_usage_status_fallback">서버 연결 전 예시 사용량을 보여주고 있어요.</string>
+    <string name="token_usage_status_failed">토큰 사용량을 불러오지 못했어요. 잠시 후 다시 확인해 주세요.</string>
+    <string name="token_usage_status_unavailable">사용량 정보를 확인할 수 없어요.</string>
     <string name="token_usage_empty_default">표시할 사용량이 아직 없어요.</string>
     <string name="token_usage_empty_no_task">먼저 작업을 하나 선택해 주세요.</string>
-    <string name="token_usage_empty_fallback">실제 데이터를 가져오지 못해 예시 사용량을 보여주고 있어요.</string>
+    <string name="token_usage_empty_fallback">실제 사용량을 가져오지 못했어요. 연결 상태를 확인한 뒤 다시 시도해 주세요.</string>
     <string name="token_usage_value_unavailable">정보 없음</string>
     <string name="token_usage_token_count">%1$s 토큰</string>
     <string name="token_usage_limit_name_unknown">정보 없음</string>
@@ -90,6 +93,7 @@
     <string name="reference_image_pick_failed">참고 이미지를 읽지 못했어요. %1$s</string>
     <string name="reference_image_too_large">참고 이미지는 최대 5MB까지 첨부할 수 있어요.</string>
     <string name="attachment_pick_failed">첨부 파일을 읽지 못했어요. %1$s</string>
+    <string name="attachment_temp_save_failed">첨부 파일을 임시 저장하지 못했어요. 다시 선택해 주세요.</string>
     <string name="attachment_image_too_large">이미지는 원본 15MB까지 선택할 수 있으며 저장 전에 자동으로 최적화해요.</string>
     <string name="attachment_pdf_too_large">PDF는 최대 10MB까지 첨부할 수 있어요.</string>
     <string name="attachment_text_too_large">텍스트 파일은 최대 2MB까지 첨부할 수 있어요.</string>

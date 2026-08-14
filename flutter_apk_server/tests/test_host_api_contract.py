@@ -145,7 +145,7 @@ class HostApiContractTests(unittest.TestCase):
 
         self.settings = replace(
             load_settings(),
-            base_project_path=root / "BaseProject",
+            base_project_path=Path(__file__).resolve().parents[2] / "BaseProject",
             workspaces_root=root / "workspaces",
             build_cache_root=root / ".tooling",
             db_path=root / "tasks.db",

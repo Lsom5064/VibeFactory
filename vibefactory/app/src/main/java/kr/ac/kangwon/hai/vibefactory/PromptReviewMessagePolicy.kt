@@ -18,9 +18,16 @@ internal object PromptReviewMessagePolicy {
         return firstPrompt.isNotBlank() && firstPrompt == secondPrompt
     }
 
-    private fun isPromptReview(message: ChatMessage): Boolean {
-        return message.confirmAction == "submit_initial_prompt" ||
-            !message.promptReviewText.isNullOrBlank()
+    fun isPromptReview(message: ChatMessage): Boolean {
+        return message.kind == MessageKind.CONFIRMATION &&
+            (message.confirmAction == "submit_initial_prompt" ||
+                !message.promptReviewText.isNullOrBlank()
+            )
+    }
+
+    fun shouldShowConfirmationActions(message: ChatMessage, handled: Boolean): Boolean {
+        if (message.kind != MessageKind.CONFIRMATION) return false
+        return !handled || !isPromptReview(message)
     }
 
     private fun canonicalPrompt(message: ChatMessage): String {

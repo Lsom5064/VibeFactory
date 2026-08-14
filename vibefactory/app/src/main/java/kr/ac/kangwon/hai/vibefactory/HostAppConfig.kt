@@ -7,7 +7,7 @@ import retrofit2.converter.gson.GsonConverterFactory
 import java.util.concurrent.TimeUnit
 
 object HostAppConfig {
-    const val BASE_URL = "http://KangwonHaiLab.iptime.org:8000"
+    val BASE_URL: String = BuildConfig.VIBE_SERVER_BASE_URL
     const val PREFS_NAME = "vibefactory_prefs"
     const val PREF_DEVICE_ID = "device_id"
     const val PREF_PHONE_NUMBER = "phone_number"

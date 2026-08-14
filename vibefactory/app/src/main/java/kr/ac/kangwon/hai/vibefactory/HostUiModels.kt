@@ -19,7 +19,8 @@ data class SelectedAttachment(
     val kind: SelectedAttachmentKind,
     val displayName: String,
     val mimeType: String,
-    val base64: String
+    val base64: String,
+    val draftFilePath: String? = null
 ) {
     fun toPayload(): AttachmentPayload {
         return AttachmentPayload(

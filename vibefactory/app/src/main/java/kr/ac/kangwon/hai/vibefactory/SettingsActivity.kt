@@ -39,7 +39,7 @@ class SettingsActivity : AppCompatActivity() {
         val profileName = findViewById<TextView>(R.id.settingsProfileName)
 
         profileName.text = getString(R.string.app_title)
-        tokenLimitSummary.text = TokenUsageMockRepository.summary(this)
+        tokenLimitSummary.text = getString(R.string.settings_token_limit_summary_loading)
         switchDarkMode.isChecked = preferencesStore.loadDarkModeEnabled()
         switchDarkMode.setOnCheckedChangeListener { _, isChecked ->
             preferencesStore.saveDarkModeEnabled(isChecked)
@@ -76,12 +76,9 @@ class SettingsActivity : AppCompatActivity() {
                     tokenUsageRepository.load(currentTaskId)
                 }
             }.onSuccess { snapshot ->
-                tokenLimitSummary.text = getString(
-                    R.string.settings_token_limit_summary_template,
-                    snapshot.fiveHourRemainingPercent,
-                    snapshot.weeklyRemainingPercent,
-                    snapshot.currentModel
-                )
+                tokenLimitSummary.text = formatTokenUsageSummary(this@SettingsActivity, snapshot)
+            }.onFailure {
+                tokenLimitSummary.text = getString(R.string.settings_token_limit_summary_unavailable)
             }
         }
     }

@@ -103,6 +103,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "VibeFactoryHost"
         private const val STATE_SELECTED_TASK_ID = EXTRA_SELECTED_TASK_ID
         private const val STATE_INPUT_PROMPT = "input_prompt"
+        private const val STATE_COMPOSER_ATTACHMENTS = "composer_attachments"
         private const val STATE_CHAT_SCROLL_MESSAGE_ID = "chat_scroll_message_id"
         private const val STATE_CHAT_SCROLL_TOP_OFFSET = "chat_scroll_top_offset"
         private const val PREF_PENDING_INSTALLER_LAUNCHED = "pending_installer_launched"
@@ -195,6 +196,9 @@ class MainActivity : AppCompatActivity() {
     private val preferencesStore by lazy { HostPreferencesStore(this, gson, TAG) }
     private val composerDraftViewModel by lazy(LazyThreadSafetyMode.NONE) {
         ViewModelProvider(this)[ComposerDraftViewModel::class.java]
+    }
+    private val composerDraftAttachmentStore by lazy(LazyThreadSafetyMode.NONE) {
+        ComposerDraftAttachmentStore(File(cacheDir, "composer_draft_attachments"))
     }
     private val taskAdapter = TaskSummaryAdapter(
         onClick = { summary -> selectTask(summary.taskId, autoInstallOnSuccess = false) },
@@ -434,6 +438,9 @@ class MainActivity : AppCompatActivity() {
         }
         setupListeners()
         applyWindowInsets()
+        if (savedInstanceState == null && selectedAttachments.isEmpty()) {
+            composerDraftAttachmentStore.clearStaleFiles()
+        }
         restoreUiState(savedInstanceState)
         loadHiddenTaskIds()
         loadNotifiedBuildSuccessTaskIds()
@@ -1005,7 +1012,7 @@ class MainActivity : AppCompatActivity() {
         latestApkUrl = null
         latestDownloadedApkFile = null
         latestDownloadedTaskId = null
-        selectedAttachments.clear()
+        clearSelectedAttachment(render = false)
         inputPrompt.setText("")
         screenState = screenState.copy(
             selectedTaskId = null,
@@ -1107,6 +1114,17 @@ class MainActivity : AppCompatActivity() {
         if (savedInstanceState == null) return
 
         inputPrompt.setText(savedInstanceState.getString(STATE_INPUT_PROMPT).orEmpty())
+        if (selectedAttachments.isEmpty()) {
+            val descriptors = savedInstanceState.getString(STATE_COMPOSER_ATTACHMENTS)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { serialized ->
+                    runCatching {
+                        gson.fromJson(serialized, Array<PersistedComposerAttachment>::class.java).toList()
+                    }.getOrNull()
+                }
+                .orEmpty()
+            selectedAttachments += descriptors.mapNotNull(composerDraftAttachmentStore::restore)
+        }
         val restoredTaskId = visibleTaskIdCandidate(savedInstanceState.getString(STATE_SELECTED_TASK_ID))
         val restoredMessageId = savedInstanceState.getString(STATE_CHAT_SCROLL_MESSAGE_ID)
             ?.trim()
@@ -1211,6 +1229,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun clearSelectedAttachment(render: Boolean = true) {
+        composerDraftAttachmentStore.clear(selectedAttachments)
         selectedAttachments.clear()
         lastRenderedAttachmentFingerprint = null
         if (render) {
@@ -1350,7 +1369,9 @@ class MainActivity : AppCompatActivity() {
         }
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         if (promptReviewMessageId.isNotBlank()) {
-            handledConfirmationMessageIds += promptReviewMessageId
+            if (handledConfirmationMessageIds.add(promptReviewMessageId)) {
+                refreshConfirmationActions(setOf(promptReviewMessageId))
+            }
         }
         val displayPrompt = getString(R.string.prompt_review_sent_bubble)
         ensureTaskChatLoaded(apiTaskId)
@@ -3464,7 +3485,13 @@ ${record.stackTrace}
             !chatAutoScrollLockedByUser &&
             !shouldPreserveManualScroll &&
             !shouldPinBottomForTransientUpdate
-        if (pendingScrollLatestAfterResponse && !scrollLatestAfterResponse) {
+        if (
+            ChatResponseScrollPolicy.shouldClearPendingScroll(
+                pending = pendingScrollLatestAfterResponse,
+                scrollNow = scrollLatestAfterResponse,
+                pinBottomForTransientUpdate = shouldPinBottomForTransientUpdate
+            )
+        ) {
             pendingScrollLatestAfterResponse = false
         }
         if (scrollLatestAfterResponse) {
@@ -3630,6 +3657,7 @@ ${record.stackTrace}
                 isClickable = true
                 isFocusable = true
                 setOnClickListener {
+                    composerDraftAttachmentStore.delete(attachment)
                     selectedAttachments.remove(attachment)
                     renderSelectedAttachmentsIfChanged(force = true)
                 }
@@ -4404,15 +4432,31 @@ ${record.stackTrace}
                     Toast.makeText(this@MainActivity, messageRes, Toast.LENGTH_SHORT).show()
                     return@launch
                 }
-                if (kind == SelectedAttachmentKind.IMAGE) {
-                    selectedAttachments += attachments
+                val attachmentsToPersist = if (kind == SelectedAttachmentKind.IMAGE) {
+                    attachments
                 } else {
-                    selectedAttachments.clear()
-                    selectedAttachments += attachments.first()
+                    attachments.take(1)
+                }
+                val persistedAttachments = withContext(Dispatchers.IO) {
+                    attachmentsToPersist.mapNotNull(composerDraftAttachmentStore::persist)
+                }
+                if (persistedAttachments.isEmpty()) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        R.string.attachment_temp_save_failed,
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@launch
+                }
+                if (kind == SelectedAttachmentKind.IMAGE) {
+                    selectedAttachments += persistedAttachments
+                } else {
+                    clearSelectedAttachment(render = false)
+                    selectedAttachments += persistedAttachments.first()
                 }
                 Log.i(
                     TAG,
-                    "Attachments prepared kind=${kind.name} requested=${uris.size} saved=${attachments.size} " +
+                    "Attachments prepared kind=${kind.name} requested=${uris.size} saved=${persistedAttachments.size} " +
                         "duration_ms=${SystemClock.elapsedRealtime() - attachmentStartedAt}"
                 )
                 renderState()
@@ -5572,7 +5616,8 @@ ${record.stackTrace}
         messages: List<ChatMessage>
     ) {
         val promptReviewMessages = messages.filter { message ->
-            message.promptReviewTaskId == taskId && !message.promptReviewText.isNullOrBlank()
+            PromptReviewMessagePolicy.isPromptReview(message) &&
+                (message.promptReviewTaskId ?: message.confirmTaskId) == taskId
         }
         if (promptReviewMessages.isEmpty()) return
 
@@ -5594,12 +5639,25 @@ ${record.stackTrace}
             null
         }
 
+        val changedMessageIds = mutableSetOf<String>()
         promptReviewMessages.forEach { message ->
             if (message.id == activeMessageId) {
-                handledConfirmationMessageIds.remove(message.id)
+                if (handledConfirmationMessageIds.remove(message.id)) {
+                    changedMessageIds += message.id
+                }
             } else {
-                handledConfirmationMessageIds.add(message.id)
+                if (handledConfirmationMessageIds.add(message.id)) {
+                    changedMessageIds += message.id
+                }
             }
+        }
+        refreshConfirmationActions(changedMessageIds)
+    }
+
+    private fun refreshConfirmationActions(messageIds: Set<String>) {
+        if (messageIds.isEmpty()) return
+        recyclerMessages.post {
+            chatAdapter.refreshConfirmationActions(messageIds)
         }
     }
 
@@ -7181,6 +7239,10 @@ ${record.stackTrace}
         val selectedTaskId = visibleTaskIdCandidate(screenState.selectedTaskId ?: currentTaskId)
         outState.putString(STATE_SELECTED_TASK_ID, selectedTaskId)
         outState.putString(STATE_INPUT_PROMPT, inputPrompt.text?.toString().orEmpty())
+        val persistedAttachments = selectedAttachments.mapNotNull(composerDraftAttachmentStore::describe)
+        if (persistedAttachments.isNotEmpty()) {
+            outState.putString(STATE_COMPOSER_ATTACHMENTS, gson.toJson(persistedAttachments))
+        }
         if (!selectedTaskId.isNullOrBlank() && !isChatNearBottomByPixels()) {
             val snapshot = captureChatScrollSnapshot() ?: manualChatScrollSnapshot
             if (snapshot != null) {

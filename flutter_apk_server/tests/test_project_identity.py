@@ -197,6 +197,36 @@ class ProjectIdentityTests(unittest.TestCase):
             for runner_name in ("logs", ".codex_result"):
                 self.assertFalse((destination / runner_name).exists())
 
+    def test_native_runtime_contracts_are_restored_without_overwriting_app_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir) / "project"
+            native_android_project_builder.copy_project(BASE_PROJECT, project_root)
+            llm_relative = Path(
+                "app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeLlmClient.kt"
+            )
+            activity_relative = Path(
+                "app/src/main/kotlin/kr/ac/kangwon/hai/generated/MainActivity.kt"
+            )
+            (project_root / llm_relative).write_text("// stale runtime client\n", encoding="utf-8")
+            activity_text = (project_root / activity_relative).read_text(encoding="utf-8")
+            customized_activity = activity_text + "\n// participant UI customization\n"
+            (project_root / activity_relative).write_text(customized_activity, encoding="utf-8")
+
+            restored = native_android_project_builder.restore_runtime_contracts(
+                BASE_PROJECT,
+                project_root,
+            )
+
+            self.assertIn(llm_relative.as_posix(), restored)
+            self.assertEqual(
+                (BASE_PROJECT / llm_relative).read_bytes(),
+                (project_root / llm_relative).read_bytes(),
+            )
+            self.assertEqual(
+                customized_activity,
+                (project_root / activity_relative).read_text(encoding="utf-8"),
+            )
+
     def test_native_identity_collapses_duplicate_managed_properties(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir) / "project"

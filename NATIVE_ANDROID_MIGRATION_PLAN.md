@@ -357,7 +357,7 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 - [x] INTERNET과 필요한 기본 manifest 설정을 추가한다.
 - [x] 앱 label, application ID, Task ID, version code를 서버가 주입할 구조를 만든다.
 - [x] 빈 템플릿을 signed release APK로 빌드한다.
-- [ ] APK를 ADB로 설치하고 실행한다.
+- [x] APK를 ADB로 설치하고 실행한다.
 
 ### Phase 3. 서버 빌드 계층 분리
 
@@ -380,7 +380,7 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 - [x] 텍스트·이미지 LLM 요청을 검증한다.
 - [x] 전체 prompt, context, response, raw response, error logging을 검증한다.
 - [x] `VibeDataClient.kt`를 구현한다.
-- [ ] app data CRUD를 실기기에서 검증한다.
+- [x] app data CRUD를 실기기에서 검증한다.
 - [x] cleartext HTTP와 HTTPS 환경을 모두 점검한다.
 - [x] timeout과 cancellation 처리를 검증한다.
 
@@ -401,9 +401,9 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 - [x] 암호화된 별도 백업을 만든다.
 - [x] Gradle signing config를 환경변수 기반으로 연결한다.
 - [x] 서명 설정이 없으면 명확한 서버 오류를 반환한다.
-- [ ] 동일 Task 리비전 APK가 기존 앱을 덮어쓰는지 확인한다.
+- [x] 동일 Task 리비전 APK가 기존 앱을 덮어쓰는지 확인한다.
 - [x] 분기 Task APK가 의도한 package를 유지하는지 확인한다.
-- [ ] 설치 후 호스트 앱이 생성 앱을 자동 실행하는지 확인한다.
+- [x] 설치 후 호스트 앱이 생성 앱을 자동 실행하는지 확인한다.
 
 ### Phase 7. 자동 검증
 
@@ -421,27 +421,27 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 
 ### Phase 8. ADB 실기기 검증
 
-- [ ] 새 채팅방 생성
-- [ ] 최초 생성 요청 및 prompt 확인·전송
-- [ ] 텍스트만 사용한 앱 생성
-- [ ] 이미지 여러 장을 첨부한 앱 생성
-- [ ] PDF 또는 일반 파일 첨부 생성
-- [ ] 생성 중 백그라운드 전환과 복귀
-- [ ] 생성 중 중단 및 중단 버블 확인
-- [ ] APK 다운로드 퍼센트 확인
-- [ ] APK 설치와 자동 실행 확인
-- [ ] 수정 요청 5회 이상 수행
-- [ ] 모든 수정 APK가 같은 앱을 덮어쓰는지 확인
-- [ ] 리비전 목록과 과거 APK 설치 확인
-- [ ] 특정 리비전에서 새 Task 분기
-- [ ] 분기 후 package와 서명 동작 확인
+- [x] 새 채팅방 생성
+- [x] 최초 생성 요청 및 prompt 확인·전송
+- [x] 텍스트만 사용한 앱 생성
+- [x] 이미지 여러 장을 첨부한 앱 생성
+- [x] PDF 또는 일반 파일 첨부 생성
+- [x] 생성 중 백그라운드 전환과 복귀
+- [x] 생성 중 중단 및 중단 버블 확인
+- [x] APK 다운로드 퍼센트 확인
+- [x] APK 설치와 자동 실행 확인
+- [x] 수정 요청 5회 이상 수행
+- [x] 모든 수정 APK가 같은 앱을 덮어쓰는지 확인
+- [x] 리비전 목록과 과거 APK 설치 확인
+- [x] 특정 리비전에서 새 Task 분기
+- [x] 분기 후 package와 서명 동작 확인
 - [ ] 생성 앱에서 런타임 LLM 텍스트 요청
 - [ ] 생성 앱에서 런타임 LLM 이미지 요청
-- [ ] 생성 앱 데이터 생성·조회·수정·삭제
-- [ ] 생성 앱 오류를 발생시켜 호스트 앱 보고 확인
-- [ ] 자동 복구 요청과 후속 APK 설치 확인
-- [ ] 화면 회전, 작은 화면, 긴 텍스트, 키보드 상태 확인
-- [ ] 호스트 앱 채팅 스크롤과 첨부 초안 유지 확인
+- [x] 생성 앱 데이터 생성·조회·수정·삭제
+- [x] 생성 앱 오류를 발생시켜 호스트 앱 보고 확인
+- [x] 자동 복구 요청과 후속 APK 설치 확인
+- [x] 화면 회전, 작은 화면, 긴 텍스트, 키보드 상태 확인
+- [x] 호스트 앱 채팅 스크롤과 첨부 초안 유지 확인
 
 ### Phase 9. 성능 측정
 
@@ -453,11 +453,11 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 - [x] 실제 수정 앱 warm build 시간
 - [x] Codex 수행 시간과 Gradle build 시간을 분리 기록
 - [x] signed release APK 크기
-- [ ] 서버에서 호스트까지 다운로드 시간
-- [ ] 설치 UI 진입 시간
+- [x] 서버에서 호스트까지 다운로드 시간
+- [x] 설치 UI 진입 시간
 - [ ] 설치 후 자동 실행 시간
-- [ ] 호스트 앱 Task 목록과 로그 화면 전환 지연
-- [ ] 생성 중 상태 polling이 UI 입력을 방해하지 않는지 확인
+- [x] 호스트 앱 Task 목록과 로그 화면 전환 지연
+- [x] 생성 중 상태 polling이 UI 입력을 방해하지 않는지 확인
 
 측정 기록:
 
@@ -469,7 +469,13 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 | 실제 수정 앱 incremental build | 20.64초 | 11.94초 | 11.85초 | 11.94초 | 실제 rev_0002 소스의 string resource를 매회 변경, lint + signed release |
 | BaseProject APK 크기 | 5,094,598B | 5,094,598B | 5,094,598B | 5,094,598B | 최종 BuildConfig 계약 반영본, R8/resource shrink 비활성화 |
 | 실제 생성 앱 APK 크기 | 5,135,235B | 5,138,951B | 5,138,955B | 5,138,951B | V1, V2, 성능 측정용 V2 변경본 |
-| APK 다운로드 | | | | | |
+| APK 다운로드 | 714ms | 669ms | 663ms | 669ms | ADB reverse 로컬 서버, 5,115,158B v4, 매회 전체 재다운로드 후 설치 UI 진입 |
+| 설치 UI 진입 | 714ms | 669ms | 663ms | 669ms | 다운로드 탭부터 PackageInstaller Activity 표시까지, 로컬 ADB reverse 기준 |
+| APK 다운로드 진행률 | 15% | 48% | 84% | - | 임시 저속 프록시에서 2/5/8초 캡처, 같은 버블 위치 유지 후 설치 UI 진입 |
+| 호스트 Task 목록 전환 | <=100ms | <=100ms | <=100ms | <=100ms | 세 차례 모두 탭 100ms 후 Task 목록과 상태 카드가 완전히 표시됨 |
+| 호스트 로그 화면 전환 | 86ms | 65ms | 73ms | 73ms | 로그 보기 왼쪽·가운데·오른쪽 터치, ActivityTaskManager Displayed 기준 |
+| 호스트 서버 API | Task 목록 2ms | 상태 5ms | 리비전 4ms | - | 각 API 3회 median 반올림. Codex usage 조회는 약 0.80초 |
+| Codex 비수정 질문 응답 | 33초 | 34초 | 25초 | 33초 | 같은 Native Task에서 answer-only 요청, 사용자·답변 버블 각각 1건 |
 | 설치 후 실행 | | | | | |
 
 실제 서버 단계 분리 기록:
@@ -538,11 +544,11 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 - [x] 서버 빌드 로직이 route에서 분리됐다.
 - [x] 기존 호스트 앱 API DTO를 깨는 변경이 없다.
 - [x] APK가 고정 키로 정상 서명된다.
-- [ ] 최초 생성, 수정, revision, branch, cancel이 동작한다.
-- [ ] 다운로드, 설치, 자동 실행이 동작한다.
+- [x] 최초 생성, 수정, revision, branch, cancel이 동작한다.
+- [x] 다운로드, 설치, 자동 실행이 동작한다.
 - [ ] 런타임 LLM, 첨부 이미지, 전체 로깅이 동작한다.
-- [ ] app data CRUD가 동작한다.
-- [ ] 런타임 오류 보고가 동작한다.
+- [x] app data CRUD가 동작한다.
+- [x] 런타임 오류 보고가 동작한다.
 - [ ] 자동 테스트와 ADB 실기기 테스트가 통과한다.
 - [x] APK 크기와 build delay 측정 결과가 기록됐다.
 - [x] 기존 DB와 workspace가 삭제되지 않았다.
@@ -630,6 +636,81 @@ APK 크기: 5,094,598 bytes
 해결 내용: 직접 증명된 완료 조건만 체크하고 실기기·배포 조건은 미완료로 유지
 커밋 SHA: 92997e417 상태 기준
 다음 단계: ADB 기기 연결 후 Phase 8 전체 시나리오, 이후 별도 Native AWS canary 배포
+```
+
+```text
+일시: 2026-08-14 17:20-18:40 KST
+Phase: 2, 4, 6, 8 ADB 실기기 검증 및 첨부 회전 복원 보강
+변경 파일: flutter_apk_server/server.py, tests/test_native_build_pipeline.py, tests/test_full_logging_and_image_storage.py, vibefactory/app/build.gradle.kts, HostAppConfig.kt, MainActivity.kt, MainUiAdapters.kt, HostUiModels.kt, ComposerDraftAttachmentStore.kt, PromptReviewMessagePolicy.kt 및 관련 테스트, NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: codex login status, 실제 /generate 및 follow-up, ADB install/launch/rotate/process recreation, SQLite task/event/attachment 확인, Python unittest/py_compile, host Gradle unit/compile/assemble
+테스트 결과: Codex ChatGPT 인증 정상, 실제 gpt-5.4로 Native V1 및 V2-V6 생성 성공, 서버 전체 55개 테스트 통과, 호스트 unit/Kotlin compile/assemble 통과
+ADB 기기: R5CT60A8H4R (SM-S908N, API 36). 원본 Task 8b69aac6cb7140f098f3101db2a1ea29, 분기 Task 8c8129b1cc8648ada186971a8137e2c6
+빌드 시간: V6 cold launch 192ms. 실제 최초·수정 Codex/Gradle 시간은 앞선 Phase 9 기록 유지
+APK 크기: 실제 생성 APK 약 5.1MB, V1과 V6 모두 동일 applicationId 및 고정 signer 확인
+발견된 문제: 처리 완료된 최초 prompt 확인 버튼이 cold relaunch 후 다시 노출됨. PDF 첨부는 회전 후 View 칩만 남고 모델 상태가 유실될 수 있었음. 서버가 image/* 외 PDF·텍스트 첨부를 normalize 단계에서 조용히 제거하여 attachment_count=0으로 기록함. 런타임 LLM 키가 없어 성공 호출은 검증하지 못함
+해결 내용: prompt 확인 action을 message ID 단위로 재바인딩. 첨부 payload를 앱 전용 임시 파일에 보존하고 회전·프로세스 재생성 시 작은 metadata로 복원하며 전송·삭제 시 정리. 서버 첨부 정규화·파일 저장·DB kind·Codex prompt/context를 image/pdf/text 공통으로 일반화하고 PDF/텍스트 크기·형식 검증 및 회귀 테스트 추가
+커밋 SHA: 미커밋
+다음 단계: 사용자가 8000번 서버를 새 코드로 재시작한 뒤 PDF 실기기 attachment_count=1 및 workspace 저장 재검증. APP_RUNTIME_OPENAI_API_KEY 설정 후 런타임 LLM 텍스트·이미지 성공 검증. 다운로드 퍼센트·설치 전환 성능 3회 측정 후 Native AWS canary 배포
+```
+
+```text
+일시: 2026-08-14 19:06-19:42 KST
+Phase: 7-9 서버 재시작 후 첨부·사용량·다운로드·UI 실기기 후속 검증
+변경 파일: flutter_apk_server/server.py, tests/test_native_build_pipeline.py, TokenUsageMockRepository.kt, TokenUsageActivity.kt, SettingsActivity.kt, activity_token_usage.xml, values/strings.xml, values/colors.xml, values-night/colors.xml, TokenUsagePresentationTest.kt, NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: ADB install/launch/rotate/photo picker/package installer, SQLite task_events/task_attachments 조회, server unittest discover, host Gradle unit/compile/assemble, gfxinfo/logcat
+테스트 결과: 서버 58개 통과, 호스트 unit/Kotlin compile/assemble 통과. PDF는 v4 수정 build까지 성공했고 DB/workspace/Codex referenced_files를 확인. 일반 text 파일은 kind=text, MIME, SHA-256, workspace 저장 및 Codex 마커 판독을 확인. 이미지 2장과 텍스트 초안은 회전 후 모두 유지
+ADB 기기: R5CT60A8H4R (SM-S908N, API 36), 라이트 모드·자동 회전 복구, tcp:8000/tcp:8012 reverse 유지
+빌드 시간: 호스트 최종 Gradle unit/compile/assemble 7초. APK 다운로드 714/669/663ms, median 669ms
+APK 크기: v4 5,115,158 bytes
+발견된 문제: secondary usage window null이 주간 남은 용량 0%로 표시되고 API 실패 시 예시 토큰이 실제 값처럼 표시됨. 다크모드 overview 제목 대비 부족. Codex의 정상 마커 응답을 사용자용 보안 필터가 코드 변수로 오인해 '앱 내부 구현'으로 변경함. 완성 Task의 질문 응답 후 status가 Pending Decision으로 퇴행함. 시스템 설치 승인 후 Samsung/Play Protect/생체 인증이 개입해 이번 회차의 자동 실행 시간은 미측정
+해결 내용: 없는 usage window를 null/정보 없음으로 유지하고 가짜 fallback 수치 제거, 설정 요약 동적 구성, dark overview 전용 고대비 색상 추가, 오류 문구에서 내부 endpoint 제거. 후속 응답 필터는 경로·코드 식별자를 계속 가리되 사용자 마커는 보존하고, APK가 있는 Task의 질문은 Success 상태를 유지하도록 수정. 일반 UI 부하 재측정은 603 frame, jank 1.99%, p95 10ms, missed vsync 0
+커밋 SHA: 미커밋
+다음 단계: 현재 server.py는 --reload 없이 실행 중이므로 다음 명시적 재시작 후 text marker 응답·Success status 유지 E2E 재검증. APP_RUNTIME_OPENAI_API_KEY 설정 후 런타임 LLM 텍스트·이미지 검증. 다운로드 중간 퍼센트는 더 큰 APK 또는 제한 네트워크에서 시각 확인. 별도 Native AWS canary 배포
+```
+
+```text
+일시: 2026-08-14 19:48-20:00 KST
+Phase: 8-9 런타임 API, 다운로드 진행률, Task 목록 전환 실기기 후속 검증
+변경 파일: NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: 생성 앱 ADB launch/input/tap/scroll, runtime LLM text 요청, runtime image API 요청, SQLite task_events/task_attachments/app_llm_usage 대조, 임시 저속 HTTP proxy, ADB reverse 원복, Task drawer 100ms 반복 캡처
+테스트 결과: 생성 앱의 text 요청은 실제 서버에 도달해 요청·컨텍스트 전문과 configuration_error 사용량이 각각 기록됨. image 요청은 9.9ms에 수신되어 image_attached/MIME/event 연결과 최적화 JPEG 파일·DB 크기·SHA-256 일치를 확인. API 키 미설정으로 실제 모델 성공 응답은 미검증. 저속 다운로드는 같은 APK 버블에서 15%/48%/84%로 갱신되고 완료 후 PackageInstaller 업데이트 화면 진입. Task 목록은 세 차례 모두 100ms 캡처에서 완전히 표시
+ADB 기기: R5CT60A8H4R (SM-S908N, API 36), 검증 후 tcp:8000->tcp:8000 및 tcp:8012->tcp:8012 복구
+빌드 시간: 이번 회차 신규 빌드 없음. runtime image 저장·configuration error 응답 9.9ms
+APK 크기: v4 5,115,158 bytes
+발견된 문제: 기존 Task의 app_llm_configs에 API 키가 없어 실제 LLM text/image 성공 호출 불가. 생성 앱은 이 상태를 일반 400 서버 실패로만 안내함. 현재 설치된 생성 앱의 AI Advice 버튼 영문 표기와 다크 테마 색 대비가 낮음. 현재 실행 서버는 --reload가 아니어서 앞서 수정한 text marker 보존·Success 상태 유지 코드는 아직 반영되지 않음
+해결 내용: 검증용 저속 프록시는 종료하고 ADB reverse를 원복. 다운로드 진행률과 Task 목록·로그 전환 검증 항목을 완료 처리. API 키가 필요한 실제 모델 성공 검증과 생성 앱 표현 개선은 완료 처리하지 않음
+커밋 SHA: 미커밋
+다음 단계: APP_RUNTIME_OPENAI_API_KEY를 안전하게 설정하고 기존 Task 설정에 적용한 뒤 생성 앱 text/image 실제 성공 응답과 전문 raw_response 로깅 검증. 다음 명시적 서버 재시작 후 text marker/Success 상태 E2E 재검증. 설치 UI 진입 및 자동 실행 시간을 사용자 승인 흐름이 가능한 환경에서 측정하고 별도 Native AWS canary 배포
+```
+
+```text
+일시: 2026-08-14 20:10-20:39 KST
+Phase: 7-9 서버·호스트 회귀 및 미검증 UI 실기기 검증
+변경 파일: BaseProject VibeLlmClient.kt 및 unit test, flutter_apk_server/project_builder.py, server.py, server tests, ChatResponseScrollPolicy.kt 및 test, MainActivity.kt, NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: server unittest discover/py_compile, BaseProject unit/compile/lint/signed release, host unit/compile/assemble, ADB install/launch/input/tap/swipe/screencap/logcat, SQLite event 대조, curl API 3회 측정, 임시 8012 source server와 ADB reverse 원복
+테스트 결과: 서버 65개 통과, 호스트 unit/Kotlin compile/assemble 통과, BaseProject unit/Kotlin compile/lint/signed release 통과. 로그 보기와 사용량 카드 왼쪽 가장자리, 첨부 + 왼쪽 가장자리에서 전체 클릭 영역이 동작. 다크 모드 사용량 화면의 배경·카드·텍스트 대비 정상. Task 목록/상태/리비전 API median 약 2/5/4ms, usage 약 0.80초. 세 차례 answer-only 요청은 사용자·답변 event가 각각 1건이며 최종 요청은 FINAL_SCROLL_OK 원문이 DB와 화면에 1회 표시되고 입력창 위로 자동 정렬됨. crash buffer 비어 있음
+ADB 기기: R5CT60A8H4R (SM-S908N, API 36), 호스트 versionCode 6, 검증 후 tcp:8000->tcp:8000 및 tcp:8012->tcp:8012 복구, 라이트 모드 복구
+빌드 시간: host unit/compile/assemble 12초, BaseProject warm signed release 검증 통과. answer-only 응답 33/34/25초, median 33초
+APK 크기: BaseProject signed release 5,095,498 bytes, SHA-256 f280a495b80ee1c14b551aa6bffcd9380e1ce3e705b515639bec278236c315fd
+발견된 문제: Codex가 반환한 7일 창 10080분을 서버가 무조건 5시간 한도로 표기함. 사용자가 전송한 뒤 진행 버블이 최종 답변 자동 스크롤 예약을 취소함. 사용자 요청의 SCROLL_OK 같은 리터럴을 내부 식별자 필터가 앱 내부 구현으로 바꿔 동일 과거 답변과 중복 처리함. 생성 앱 runtime LLM 키는 계속 미설정. AWS 13.124.86.162:22 SSH는 timeout
+해결 내용: 한도 window duration으로 단기/주간 창을 분류하여 7일 창을 주간 카드에 표시. 진행 중에는 사용자 위치를 고정하되 명시적 전송의 최종 스크롤 예약을 유지. 요청에 포함된 리터럴과 전체 마커 응답은 보존하고 영어 답변도 비어 있지 않으면 유지. BaseProject runtime helper를 최초·수정·분기·최종 build 직전에 템플릿 원본으로 복원해 오래된 workspace에도 최신 런타임 계약을 적용. 생성 앱 LLM HTTP/configuration 오류는 endpoint/API key를 노출하지 않는 사용자 문구로 변환
+커밋 SHA: 미커밋
+다음 단계: APP_RUNTIME_OPENAI_API_KEY를 안전하게 설정하고 기존 Task app_llm_config에 적용하여 text/image 실제 모델 성공과 raw_response 전문 로깅 검증. 사용자 승인 가능한 설치 흐름에서 설치 후 자동 실행 시간 측정. AWS SSH 접근 복구 후 별도 Native canary 배포
+```
+
+```text
+일시: 2026-08-14 20:40-20:52 KST
+Phase: 7-9 서버 재시작 상태 확인 및 미검증 UI·오류·지연 실기기 후속 검증
+변경 파일: NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: lsof/ps/curl, server unittest discover/py_compile, host Gradle unit/compile/assemble, BaseProject unit/compile/lint/signed release, ADB tap/swipe/reverse/uiautomator/screencap/logcat/gfxinfo, SQLite task_events/app_llm_configs 대조, 임시 8012 latest-source server
+테스트 결과: 서버 65개 통과, 호스트 unit/Kotlin compile/assemble 통과, BaseProject unit/Kotlin compile/lint/고정 서명 release 통과. 로그 보기·설정·사용량·리비전 선택의 왼쪽 배경 터치가 모두 동작. 첨부 +를 3회 빠르게 눌러도 선택창 1개만 표시되고 뒤로가기 1회로 완전히 닫힘. 사용량 로딩 중 상태와 연결 실패 fallback이 빈 화면 없이 표시됨. latest-source에서 10080분 창은 주간 한도 61%로 표시됨
+ADB 기기: R5CT60A8H4R (SM-S908N, API 36), 호스트 versionCode 6, 검증 후 tcp:8000->tcp:8000만 유지하고 임시 tcp:8012 reverse·서버 종료
+빌드 시간: 호스트 warm unit/compile/assemble 3초, BaseProject warm signed release 3초. 사용량 API 약 0.90-0.92초, 호스트 warm launch 191ms
+APK 크기: BaseProject signed release 5,095,498 bytes, SHA-256 f280a495b80ee1c14b551aa6bffcd9380e1ce3e705b515639bec278236c315fd
+발견된 문제: 실행 중인 메인 서버는 19:00:45에 시작되었고 server.py 최신 수정은 20:35:09이므로 최신 한도 분류·응답 보존 코드가 메인 프로세스에 미반영. 두 Task의 app_llm_configs.api_key가 비어 실제 text/image 모델 성공 호출은 불가. 473 frame 중 jank 7.40%, p50 5ms, p90 8ms, p95 13ms, p99 105ms이며 ANR·crash·Skipped frames는 없음
+해결 내용: 메인 서버를 종료하지 않고 8012 보조 서버로 최신 소스를 실기기 검증한 뒤 종료하고 ADB reverse를 원복. 실행 중 메인 서버는 PID 77178로 계속 유지
+커밋 SHA: 미커밋
+다음 단계: 사용자가 현재 작업을 멈춘 후 메인 서버를 최신 소스로 명시적 재시작. APP_RUNTIME_OPENAI_API_KEY 설정 후 새 Task에서 runtime LLM text/image 성공·raw_response 전문 로깅 검증. 설치 후 자동 실행 시간 측정과 AWS Native canary 배포
 ```
 
 각 작업 단계가 끝날 때 아래 형식으로 기록한다.

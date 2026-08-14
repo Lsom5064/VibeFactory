@@ -44,4 +44,25 @@ class PromptReviewMessagePolicyTest {
 
         assertFalse(PromptReviewMessagePolicy.areEquivalent(first, second))
     }
+
+    @Test
+    fun `handled prompt review hides its action while normal confirmation remains visible`() {
+        val promptReview = ChatMessage(
+            id = "prompt-review",
+            kind = MessageKind.CONFIRMATION,
+            title = "확인",
+            body = "프롬프트",
+            confirmAction = "submit_initial_prompt",
+            promptReviewText = "프롬프트"
+        )
+        val normalConfirmation = promptReview.copy(
+            id = "normal-confirmation",
+            confirmAction = "repair_runtime",
+            promptReviewText = null
+        )
+
+        assertTrue(PromptReviewMessagePolicy.shouldShowConfirmationActions(promptReview, handled = false))
+        assertFalse(PromptReviewMessagePolicy.shouldShowConfirmationActions(promptReview, handled = true))
+        assertTrue(PromptReviewMessagePolicy.shouldShowConfirmationActions(normalConfirmation, handled = true))
+    }
 }

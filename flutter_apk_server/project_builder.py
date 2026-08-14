@@ -23,6 +23,13 @@ CACHE_DIRECTORY_NAMES = {
     "__pycache__",
 }
 PROJECT_ROOT_RUNNER_DIRECTORY_NAMES = {".codex_result", "logs"}
+RUNTIME_CONTRACT_RELATIVE_PATHS = (
+    Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedApplication.kt"),
+    Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeCrashReporter.kt"),
+    Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeDataClient.kt"),
+    Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeHttpClient.kt"),
+    Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeLlmClient.kt"),
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +43,8 @@ class ProjectBuilder(Protocol):
     expected_apk_relative: Path
 
     def copy_project(self, source: Path, destination: Path) -> None: ...
+
+    def restore_runtime_contracts(self, template_root: Path, project_root: Path) -> tuple[str, ...]: ...
 
     def validate_project_structure(self, project_root: Path) -> None: ...
 
@@ -173,6 +182,21 @@ class NativeAndroidProjectBuilder:
             return ignored
 
         shutil.copytree(source, destination, ignore=ignore_entries)
+
+    def restore_runtime_contracts(self, template_root: Path, project_root: Path) -> tuple[str, ...]:
+        restored: list[str] = []
+        for relative_path in RUNTIME_CONTRACT_RELATIVE_PATHS:
+            source = template_root / relative_path
+            destination = project_root / relative_path
+            if not source.is_file():
+                raise RuntimeError(f"Native runtime contract is missing from BaseProject: {relative_path}")
+            source_bytes = source.read_bytes()
+            if destination.is_file() and destination.read_bytes() == source_bytes:
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            restored.append(relative_path.as_posix())
+        return tuple(restored)
 
     def apply_identity(
         self,

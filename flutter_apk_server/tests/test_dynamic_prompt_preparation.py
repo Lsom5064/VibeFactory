@@ -13,10 +13,38 @@ from flutter_apk_server.server import (
     create_app,
     extract_explicit_app_name,
     materialize_conversation_spec_payload,
+    nonblank_text_or_fallback,
+    sanitize_codex_followup_user_text,
 )
 
 
 class DynamicPromptPreparationTests(unittest.TestCase):
+    def test_followup_answer_preserves_requested_literal_marker(self) -> None:
+        self.assertEqual(
+            "SCROLL_OK",
+            sanitize_codex_followup_user_text(
+                "SCROLL_OK",
+                user_prompt="Reply with exactly SCROLL_OK.",
+            ),
+        )
+        self.assertEqual(
+            "결과는 SCROLL_OK입니다.",
+            sanitize_codex_followup_user_text(
+                "결과는 SCROLL_OK입니다.",
+                user_prompt="SCROLL_OK라고 답해줘",
+            ),
+        )
+
+    def test_followup_answer_still_hides_unrequested_internal_identifier(self) -> None:
+        self.assertEqual(
+            "앱 내부 구현을 확인했어요.",
+            sanitize_codex_followup_user_text("MainActivity를 확인했어요."),
+        )
+
+    def test_nonblank_answer_does_not_require_korean_text(self) -> None:
+        self.assertEqual("Ready", nonblank_text_or_fallback("Ready", "답변 없음"))
+        self.assertEqual("답변 없음", nonblank_text_or_fallback("  ", "답변 없음"))
+
     def test_explicit_app_name_allows_conversation_domain_names(self) -> None:
         self.assertEqual(extract_explicit_app_name("## 앱 이름\n대화 일정"), "대화 일정")
         self.assertEqual(extract_explicit_app_name('\"감성대화\" 앱을 만들어줘'), "감성대화")

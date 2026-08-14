@@ -20,6 +20,7 @@
     <color name="text_secondary">#647067</color>
     <color name="composer_action_icon">#6D766F</color>
     <color name="text_inverse">#FCFEFC</color>
+    <color name="usage_overview_text">#FCFEFC</color>
     <color name="accent_primary">#1F6B4F</color>
     <color name="accent_primary_dark">#174D39</color>
     <color name="assistant_bubble">#FFFFFF</color>

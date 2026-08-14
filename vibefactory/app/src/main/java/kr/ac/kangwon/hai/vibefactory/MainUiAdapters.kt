@@ -132,6 +132,15 @@ class ChatMessageAdapter(
         holder.bind(getItem(position))
     }
 
+    fun refreshConfirmationActions(messageIds: Set<String>) {
+        if (messageIds.isEmpty()) return
+        currentList.forEachIndexed { index, message ->
+            if (message.id in messageIds) {
+                notifyItemChanged(index)
+            }
+        }
+    }
+
     inner class ChatViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         private val dateSeparator: TextView = view.findViewById(R.id.messageDateSeparator)
         private val block: LinearLayout = view.findViewById(R.id.messageBlock)
@@ -616,9 +625,15 @@ class ChatMessageAdapter(
                 return
             }
 
-            val isPromptReview = isPromptReviewMessage(item)
+            val isPromptReview = PromptReviewMessagePolicy.isPromptReview(item)
             val handled = isConfirmationHandled(item.id)
-            confirmationActions.visibility = View.VISIBLE
+            confirmationActions.visibility = if (
+                PromptReviewMessagePolicy.shouldShowConfirmationActions(item, handled)
+            ) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
             btnConfirmationDismiss.visibility = if (isPromptReview) View.GONE else View.VISIBLE
             btnConfirmationAccept.text = itemView.context.getString(
                 if (isPromptReview) R.string.prompt_review_open else R.string.confirmation_accept
@@ -665,11 +680,7 @@ class ChatMessageAdapter(
         }
 
         private fun isPromptReviewMessage(item: ChatMessage): Boolean {
-            return item.kind == MessageKind.CONFIRMATION &&
-                (
-                    item.confirmAction?.trim()?.lowercase() == "submit_initial_prompt" ||
-                        !item.promptReviewText.isNullOrBlank()
-                    )
+            return PromptReviewMessagePolicy.isPromptReview(item)
         }
 
         private fun bindArtifactActions(item: ChatMessage, context: android.content.Context) {

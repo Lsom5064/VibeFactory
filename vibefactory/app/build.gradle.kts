@@ -3,6 +3,15 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+fun configuredServerBaseUrl(): String =
+    providers.environmentVariable("VIBE_SERVER_BASE_URL")
+        .orElse(providers.gradleProperty("VIBE_SERVER_BASE_URL"))
+        .getOrElse("http://KangwonHaiLab.iptime.org:8000")
+        .trimEnd('/')
+
+fun quotedBuildConfigValue(value: String): String =
+    "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
 android {
     namespace = "kr.ac.kangwon.hai.vibefactory"
     compileSdk = 36
@@ -13,6 +22,11 @@ android {
         targetSdk = 35
         versionCode = 6
         versionName = "1.0"
+        buildConfigField(
+            "String",
+            "VIBE_SERVER_BASE_URL",
+            quotedBuildConfigValue(configuredServerBaseUrl())
+        )
     }
 
     buildTypes {
@@ -27,6 +41,9 @@ android {
     }
     kotlinOptions {
         jvmTarget = "1.8"
+    }
+    buildFeatures {
+        buildConfig = true
     }
 }
 

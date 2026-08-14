@@ -42,7 +42,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="@string/token_usage_title"
-                android:textColor="@color/text_inverse"
+                android:textColor="@color/usage_overview_text"
                 android:textSize="26sp"
                 android:textStyle="bold" />
 

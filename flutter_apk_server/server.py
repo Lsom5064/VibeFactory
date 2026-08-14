@@ -67,6 +67,9 @@ REFERENCE_IMAGE_MAX_STORED_BYTES = 2 * 1024 * 1024
 REFERENCE_IMAGE_MAX_DIMENSION = 1600
 REFERENCE_IMAGE_JPEG_QUALITIES = (88, 82, 76, 68, 60, 52, 44)
 REFERENCE_IMAGE_DIMENSION_STEPS = (1600, 1400, 1200, 1024, 800)
+REFERENCE_PDF_MAX_BYTES = 10 * 1024 * 1024
+REFERENCE_TEXT_MAX_BYTES = 2 * 1024 * 1024
+REFERENCE_TEXT_SUFFIXES = {".txt", ".md", ".json", ".csv", ".xml", ".yaml", ".yml"}
 PRIMARY_KEY_INSERT_MAX_ATTEMPTS = 4
 
 
@@ -816,6 +819,87 @@ def save_reference_image_attachment_result(
     }
 
 
+def save_reference_file_attachment_result(
+    workspace_root: Path,
+    *,
+    attachment_type: str,
+    attachment_name: str,
+    attachment_mime_type: str,
+    attachment_base64: str,
+) -> dict[str, Any]:
+    normalized_type = normalize_whitespace(attachment_type).lower()
+    normalized_name = normalize_reference_image_name(attachment_name)
+    normalized_base64 = normalize_reference_image_base64(attachment_base64)
+    if normalized_type not in {"pdf", "text"}:
+        return {"status": "failed", "error_message": "unsupported reference file type"}
+    if not normalized_name or not normalized_base64:
+        return {"status": "failed", "error_message": "missing reference file name or base64 payload"}
+    try:
+        file_bytes = base64.b64decode(normalized_base64, validate=False)
+    except (ValueError, binascii.Error):
+        return {"status": "failed", "error_message": "invalid base64 reference file payload"}
+    if not file_bytes:
+        return {"status": "failed", "error_message": "empty decoded reference file payload"}
+
+    if normalized_type == "pdf":
+        if len(file_bytes) > REFERENCE_PDF_MAX_BYTES:
+            return {
+                "status": "failed",
+                "error_message": f"PDF exceeds size limit ({len(file_bytes)} > {REFERENCE_PDF_MAX_BYTES} bytes)",
+            }
+        if not file_bytes.startswith(b"%PDF-"):
+            return {"status": "failed", "error_message": "invalid PDF payload"}
+        suffix = ".pdf"
+        mime_type = "application/pdf"
+    else:
+        if len(file_bytes) > REFERENCE_TEXT_MAX_BYTES:
+            return {
+                "status": "failed",
+                "error_message": f"text file exceeds size limit ({len(file_bytes)} > {REFERENCE_TEXT_MAX_BYTES} bytes)",
+            }
+        try:
+            file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"status": "failed", "error_message": "text attachment must be UTF-8 encoded"}
+        requested_suffix = Path(normalized_name).suffix.lower()
+        suffix = requested_suffix if requested_suffix in REFERENCE_TEXT_SUFFIXES else ".txt"
+        mime_type = attachment_mime_type if attachment_mime_type.lower().startswith("text/") else "text/plain"
+
+    attachment_dir = workspace_root / "reference_files"
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = sanitize_component(Path(normalized_name).stem or f"reference_{normalized_type}")
+    filename = f"{utc_now_compact()}_{safe_stem}_{uuid.uuid4().hex[:8]}{suffix}"
+    attachment_path = attachment_dir / filename
+    attachment_path.write_bytes(file_bytes)
+    return {
+        "status": "saved",
+        "workspace_path": str(attachment_path.relative_to(workspace_root)),
+        "absolute_path": str(attachment_path),
+        "mime_type": mime_type,
+        "size_bytes": len(file_bytes),
+        "sha256": hashlib.sha256(file_bytes).hexdigest(),
+        "original_size_bytes": len(file_bytes),
+        "original_width": 0,
+        "original_height": 0,
+        "stored_width": 0,
+        "stored_height": 0,
+        "optimized": False,
+    }
+
+
+def classify_reference_attachment_type(attachment_type: str, mime_type: str, name: str) -> str:
+    normalized_type = normalize_whitespace(attachment_type).lower()
+    normalized_mime = normalize_whitespace(mime_type).lower()
+    suffix = Path(name).suffix.lower()
+    if normalized_type == "image" or normalized_mime.startswith("image/"):
+        return "image"
+    if normalized_type == "pdf" or normalized_mime == "application/pdf" or suffix == ".pdf":
+        return "pdf"
+    if normalized_type == "text" or normalized_mime.startswith("text/") or suffix in REFERENCE_TEXT_SUFFIXES:
+        return "text"
+    return ""
+
+
 def normalize_reference_attachments(value: Any) -> list[dict[str, str]]:
     if not isinstance(value, list):
         return []
@@ -832,17 +916,23 @@ def normalize_reference_attachments(value: Any) -> list[dict[str, str]]:
         name = normalize_reference_image_name(raw.get("name") or raw.get("displayName") or raw.get("reference_image_name"))
         base64_value = normalize_reference_image_base64(raw.get("base64") or raw.get("reference_image_base64"))
         workspace_path = normalize_whitespace(str(raw.get("workspace_path") or raw.get("reference_image_workspace_path") or ""))
-        if not name:
-            name = "reference_image"
-        is_image = attachment_type == "image" or mime_type.lower().startswith("image/")
-        if not is_image:
+        normalized_type = classify_reference_attachment_type(attachment_type, mime_type, name)
+        if not normalized_type:
             continue
+        if not name:
+            name = f"reference_{normalized_type}"
         if not base64_value and not workspace_path:
             continue
+        if normalized_type == "image":
+            normalized_mime_type = mime_type or f"image/{infer_reference_image_suffix(name).lstrip('.')}"
+        elif normalized_type == "pdf":
+            normalized_mime_type = "application/pdf"
+        else:
+            normalized_mime_type = mime_type if mime_type.lower().startswith("text/") else "text/plain"
         normalized.append(
             {
-                "type": "image",
-                "mime_type": mime_type or f"image/{infer_reference_image_suffix(name).lstrip('.')}",
+                "type": normalized_type,
+                "mime_type": normalized_mime_type,
                 "name": name,
                 "base64": base64_value,
                 "workspace_path": workspace_path,
@@ -874,8 +964,15 @@ def request_reference_attachments(request: "GenerateRequest") -> list[dict[str, 
     return attachments[:8]
 
 
-def first_reference_attachment(attachments: list[dict[str, str]]) -> dict[str, str]:
-    return next((item for item in attachments if item.get("base64") or item.get("workspace_path")), {})
+def first_reference_image_attachment(attachments: list[dict[str, str]]) -> dict[str, str]:
+    return next(
+        (
+            item
+            for item in attachments
+            if item.get("type") == "image" and (item.get("base64") or item.get("workspace_path"))
+        ),
+        {},
+    )
 
 
 def save_reference_attachments(workspace_root: Path, attachments: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -891,16 +988,25 @@ def save_reference_attachments(workspace_root: Path, attachments: list[dict[str,
             }
         if attachment.get("base64"):
             if not existing_metadata:
-                save_result = save_reference_image_attachment_result(
-                    workspace_root,
-                    reference_image_name=attachment.get("name") or "reference_image",
-                    reference_image_base64=attachment.get("base64") or "",
-                )
+                if attachment.get("type") == "image":
+                    save_result = save_reference_image_attachment_result(
+                        workspace_root,
+                        reference_image_name=attachment.get("name") or "reference_image",
+                        reference_image_base64=attachment.get("base64") or "",
+                    )
+                else:
+                    save_result = save_reference_file_attachment_result(
+                        workspace_root,
+                        attachment_type=attachment.get("type") or "",
+                        attachment_name=attachment.get("name") or "reference_file",
+                        attachment_mime_type=attachment.get("mime_type") or "",
+                        attachment_base64=attachment.get("base64") or "",
+                    )
             workspace_path = str(save_result.get("workspace_path") or workspace_path)
         elif not save_result:
             save_result = {
                 "status": "pending",
-                "error_message": "image payload is referenced by path only or has not been saved yet",
+                "error_message": "attachment payload is referenced by path only or has not been saved yet",
             }
         saved.append(
             {
@@ -926,9 +1032,9 @@ def save_reference_attachments(workspace_root: Path, attachments: list[dict[str,
 
 def reference_attachment_event_payload(attachment: dict[str, Any]) -> dict[str, Any]:
     return {
-        "type": attachment.get("type") or "image",
+        "type": attachment.get("type") or "",
         "mime_type": attachment.get("mime_type") or "",
-        "name": attachment.get("name") or "reference_image",
+        "name": attachment.get("name") or "reference_attachment",
         "workspace_path": attachment.get("workspace_path") or "",
         "absolute_path": attachment.get("absolute_path") or "",
         "size_bytes": int(attachment.get("size_bytes") or 0),
@@ -948,12 +1054,23 @@ def reference_attachments_summary(attachments: list[dict[str, str]]) -> str:
     normalized = normalize_reference_attachments(attachments)
     if not normalized:
         return ""
-    names = [item.get("name") or "reference_image" for item in normalized]
+    names = [item.get("name") or "reference_attachment" for item in normalized]
+    image_count = sum(1 for item in normalized if item.get("type") == "image")
+    file_count = len(normalized) - image_count
+    kind_parts = []
+    if image_count:
+        kind_parts.append(f"이미지 {image_count}개")
+    if file_count:
+        kind_parts.append(f"파일 {file_count}개")
+    kind_summary = ", ".join(kind_parts)
     if len(names) == 1:
-        return build_reference_image_summary(names[0])
+        item = normalized[0]
+        if item.get("type") == "image":
+            return build_reference_image_summary(names[0])
+        return f"참고 파일 `{names[0]}`을 함께 전달받았어요. 파일 내용을 사용자 요청과 함께 확인합니다."
     preview = ", ".join(names[:3])
     suffix = f" 외 {len(names) - 3}개" if len(names) > 3 else ""
-    return f"참고 이미지 {len(names)}개({preview}{suffix})를 함께 전달받았어요. 각 이미지의 UI, 레이아웃, 콘텐츠 맥락을 함께 참고합니다."
+    return f"참고 첨부 {kind_summary}({preview}{suffix})를 함께 전달받았어요. 이미지와 파일 내용을 사용자 요청과 함께 확인합니다."
 
 
 def read_text_if_exists(path: Path, limit: Optional[int] = 20000) -> str:
@@ -1206,6 +1323,11 @@ def contains_korean_text(value: str) -> bool:
 def korean_text_or_fallback(value: str, fallback: str) -> str:
     normalized = normalize_whitespace(value)
     return normalized if contains_korean_text(normalized) else fallback
+
+
+def nonblank_text_or_fallback(value: str, fallback: str) -> str:
+    normalized = normalize_whitespace(value)
+    return normalized if normalized else fallback
 
 
 def serialize_device_info(device_info: Optional[DeviceInfoPayload | dict[str, Any]]) -> dict[str, Any]:
@@ -2946,10 +3068,20 @@ def run_spec_clarification_agent(
     device_info: Optional[dict[str, Any]] = None,
     reference_image_name: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
+    reference_attachments: Optional[list[dict[str, str]]] = None,
     conversation_history: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[dict[str, Any]]:
     normalized_reference_image_name = normalize_reference_image_name(reference_image_name)
     normalized_reference_image_base64 = normalize_reference_image_base64(reference_image_base64)
+    attachment_metadata = [
+        {
+            "type": attachment.get("type") or "attachment",
+            "mime_type": attachment.get("mime_type") or "",
+            "name": attachment.get("name") or "reference_attachment",
+            "workspace_path": attachment.get("workspace_path") or "",
+        }
+        for attachment in normalize_reference_attachments(reference_attachments or [])
+    ]
     context_payload = {
         "task_id": task_id,
         "existing_task": existing_task,
@@ -2961,6 +3093,7 @@ def run_spec_clarification_agent(
         "current_app_context": build_current_app_context(previous_conversation_state),
         "reference_image_attached": bool(normalized_reference_image_base64),
         "reference_image_name": normalized_reference_image_name,
+        "reference_attachments": attachment_metadata,
     }
     schema = {
         "type": "object",
@@ -3086,6 +3219,7 @@ Rules:
 - When the latest message says "그렇게 해줘", "그대로 진행해줘", or otherwise refers back to the conversation, reconstruct the actual agreed app behavior from conversation_history and write those details out explicitly.
 - Never write placeholders such as "이전 대화 맥락의 요청", "위 내용대로", "기존 요청을 그대로 사용", or "앞서 정한 기능" in effective_user_prompt, primary_user_flow, key_screens, core_features, or acceptance_criteria.
 - Preserve every concrete requirement the participant provided. If an earlier assistant explained a technical limitation and proposed a feasible alternative, include only the alternative the participant clearly accepted. Ask one concrete choice question if multiple alternatives remain ambiguous.
+- `reference_attachments` lists images, PDFs, or text files supplied with the latest request. Preserve their names and intended use in the standalone specification. Do not invent file contents that are not present in the text context; tell the downstream builder to inspect the actual saved files.
 - Fill target_users with specific user roles only when they were stated or are strongly implied by the requested workflow, such as 원장, 수강생, 학부모, 의사, or 환자.
 - Do not put generic audiences such as "일반 Android 스마트폰 사용자", "일반 사용자", or "모든 사용자" in target_users. Leave target_users empty when no meaningful audience is known.
 - Fill key_screens with 1-6 concrete user-facing screens or tabs needed by this app. Do not copy whole request sentences into this field.
@@ -3242,6 +3376,7 @@ def decide_intent(
     device_info: Optional[dict[str, Any]] = None,
     reference_image_name: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
+    reference_attachments: Optional[list[dict[str, str]]] = None,
     settings: Optional[Settings] = None,
     db: Optional["Database"] = None,
 ) -> IntentDecision:
@@ -3314,6 +3449,7 @@ def decide_intent(
             device_info=device_info,
             reference_image_name=reference_image_name,
             reference_image_base64=reference_image_base64,
+            reference_attachments=reference_attachments,
             conversation_history=conversation_history,
         )
         if spec_payload:
@@ -3424,7 +3560,7 @@ def decide_intent(
                         str(spec_payload.get("reason") or ""),
                         "질문이나 상담 요청으로 보여서 바로 빌드하지 않고 먼저 대화로 정리합니다.",
                     ),
-                    assistant_message=korean_text_or_fallback(
+                    assistant_message=nonblank_text_or_fallback(
                         str(spec_payload.get("assistant_reply") or ""),
                         build_contextual_app_answer_message(prompt, previous_state) or make_answer_message(prompt),
                     ),
@@ -3572,7 +3708,8 @@ def decide_intent(
                     key_screens=spec_key_screens,
                     storage_mode=spec_storage_mode,
                     stored_data=spec_stored_data,
-                    image_reference_summary=build_reference_image_summary(normalize_reference_image_name(reference_image_name)),
+                    image_reference_summary=reference_attachments_summary(reference_attachments or [])
+                    or build_reference_image_summary(normalize_reference_image_name(reference_image_name)),
                 )
 
     return fallback_decide_intent(
@@ -5001,7 +5138,7 @@ def persist_reference_attachments_for_task(
 
     task_root = task_workspace_root_for(settings, task)
     saved_attachments = save_reference_attachments(task_root, normalized)
-    first_attachment = first_reference_attachment(saved_attachments)
+    first_attachment = first_reference_image_attachment(saved_attachments)
     first_workspace_path = normalize_whitespace(str(first_attachment.get("workspace_path") or ""))
     if saved_attachments:
         task["reference_attachments"] = saved_attachments
@@ -5013,12 +5150,14 @@ def persist_reference_attachments_for_task(
         payload = reference_attachment_event_payload(attachment)
         status = str(payload.get("status") or "unknown")
         error_message = str(payload.get("error_message") or "")
+        attachment_kind = str(payload.get("type") or "attachment")
+        attachment_name = str(payload.get("name") or "reference_attachment")
         attachment_id = db.record_task_attachment(
             task_id=str(task["task_id"]),
             event_id=event_id,
             source=source,
-            kind="image",
-            original_name=str(payload.get("name") or "reference_image"),
+            kind=attachment_kind,
+            original_name=attachment_name,
             mime_type=str(payload.get("mime_type") or ""),
             workspace_path=str(payload.get("workspace_path") or ""),
             absolute_path=str(payload.get("absolute_path") or ""),
@@ -5038,7 +5177,7 @@ def persist_reference_attachments_for_task(
                 str(task["task_id"]),
                 actor="system",
                 event_type="attachment_saved",
-                message_text=f"이미지 첨부 저장됨: {payload.get('name') or 'reference_image'}",
+                message_text=f"첨부 파일 저장됨: {attachment_name}",
                 payload=payload,
             )
         elif status == "pending":
@@ -5046,16 +5185,16 @@ def persist_reference_attachments_for_task(
                 str(task["task_id"]),
                 actor="system",
                 event_type="attachment_received",
-                message_text=f"이미지 첨부 정보 수신됨: {payload.get('name') or 'reference_image'}",
+                message_text=f"첨부 파일 정보 수신됨: {attachment_name}",
                 payload=payload,
             )
         else:
-            failed_messages.append(error_message or f"failed to save {payload.get('name') or 'reference_image'}")
+            failed_messages.append(error_message or f"failed to save {attachment_name}")
             db.log_event(
                 str(task["task_id"]),
                 actor="system",
                 event_type="attachment_save_failed",
-                message_text=f"이미지 첨부 저장 실패: {payload.get('name') or 'reference_image'}",
+                message_text=f"첨부 파일 저장 실패: {attachment_name}",
                 payload=payload,
             )
 
@@ -5077,6 +5216,7 @@ def render_task_agents_md(task_id: str) -> str:
 - 런타임 Task ID는 `BuildConfig.VIBE_TASK_ID`를 사용한다.
 - 런타임 서버 주소는 하드코딩하지 말고 `BuildConfig.VIBE_SERVER_BASE_URL`을 사용한다.
 - 서버 런타임 AI는 `VibeLlmClient`, 공유 데이터는 `VibeDataClient`, 오류 보고는 `VibeCrashReporter`를 우선 재사용한다.
+- `VibeLlmClient` 호출 실패는 `VibeLlmRequestException.userMessage` 또는 예외의 사용자용 message를 화면에 표시한다. HTTP 응답 본문, endpoint, API 키, 내부 경로는 사용자에게 노출하지 않는다.
 - 코드 생성 중에는 `./gradlew :app:lintDebug`로 정적 오류를 검증한다.
 - 최종 signed release APK 빌드는 서버가 수행하므로 `assembleRelease`를 직접 실행하지 않는다.
 - `task_result.json`의 `apk_path`는 `project/app/build/outputs/apk/release/app-release.apk`로 기록한다.
@@ -5211,16 +5351,21 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
     if reference_attachments:
         reference_lines = []
         for index, attachment in enumerate(reference_attachments, start=1):
+            attachment_type = attachment.get("type") or "attachment"
+            type_label = {"image": "이미지", "pdf": "PDF", "text": "텍스트 파일"}.get(
+                attachment_type,
+                "첨부 파일",
+            )
             reference_lines.append(
-                f"- 이미지 {index}: {attachment.get('name') or 'reference_image'} "
+                f"- {type_label} {index}: {attachment.get('name') or 'reference_attachment'} "
                 f"(workspace 경로: {attachment.get('workspace_path') or '(미저장)'})"
             )
         reference_image_section = "\n".join(reference_lines) + (
-            "\n- 이 이미지들은 UI 스타일, 화면 구성, 참고 레이아웃, 대상 사물/장면, 텍스트 맥락을 해석하는 데 사용한다.\n"
-            "- 사용자가 텍스트로 설명한 요구와 이미지가 함께 있으면 둘을 함께 반영하되, 충돌 시에는 사용자 텍스트 요청을 우선하고 차이를 명시한다."
+            "\n- 이미지의 UI·레이아웃·장면과 PDF/텍스트 파일의 실제 내용을 모두 열어 사용자 요청의 맥락으로 사용한다.\n"
+            "- 사용자의 텍스트 설명과 첨부 내용이 함께 있으면 둘을 함께 반영하되, 충돌 시에는 사용자 텍스트 요청을 우선하고 차이를 명시한다."
         )
     else:
-        reference_image_section = "- 첨부된 참고 이미지 없음"
+        reference_image_section = "- 첨부된 참고 자료 없음"
     return f"""# Task Request
 
 - task_id: {task['task_id']}
@@ -5242,7 +5387,7 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - inferred_app_name: {task.get('app_name') or '(미정)'}
 - inferred_package_name: {task.get('package_name') or '(미정)'}
 
-## 첨부 참고 이미지
+## 첨부 참고 자료
 
 {reference_image_section}
 
@@ -5309,6 +5454,7 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - 런타임 AI 호출 시 `package_name`은 runtime_package_name 값을 사용한다.
 - helper client를 사용하지 않고 런타임 endpoint를 직접 조립해야 할 때만 `runtime_endpoint`를 기준으로 하며, `127.0.0.1`, `localhost`, 에뮬레이터 내부 루프백 주소를 하드코딩하지 않는다.
 - 서버 런타임 AI를 쓰는 기능은 네트워크 실패/한도 초과 시 사용자에게 자연스러운 오류 메시지를 보여준다.
+- `VibeLlmClient`가 던지는 `VibeLlmRequestException`은 API 키 미설정, 사용량 한도, 네트워크 오류를 이미 사용자 문구로 정리하므로 `userMessage`를 그대로 표시하고 상태 코드나 원시 응답을 덧붙이지 않는다.
 - 런타임 AI를 쓰는 앱이라면 `task_result.json` 성공 결과에 `app_llm_enabled`, `app_llm_model`, `app_llm_system_prompt`를 함께 넣는다.
 - `app_llm_system_prompt`는 이 앱 목적에 맞는 앱 전용 프롬프트여야 하며, 모든 앱에 공통으로 쓰는 고정 문구를 그대로 복사하지 않는다.
 - 예를 들어 방 정리 조언 앱이라면 사진 속 공간 상태를 관찰하고, 우선순위와 실행 순서를 조언하는 방향이 드러나야 한다.
@@ -5325,6 +5471,7 @@ def append_followup_prompt(
     normalized_prompt: Optional[str] = None,
     reference_image_name: Optional[str] = None,
     reference_image_workspace_path: Optional[str] = None,
+    reference_attachments: Optional[list[dict[str, str]]] = None,
 ) -> None:
     prompt_path = workspace_path / "prompt.md"
     timestamp = utc_now_iso()
@@ -5337,15 +5484,30 @@ def append_followup_prompt(
             handle.write(f"\n### 실제 반영할 요청\n\n{effective_prompt}\n")
         if normalized_prompt:
             handle.write(f"\n### 서버 정리 명세\n\n{normalized_prompt.strip()}\n")
+        normalized_attachments = normalize_reference_attachments(reference_attachments or [])
         normalized_image_name = normalize_reference_image_name(reference_image_name)
         normalized_image_path = normalize_whitespace(str(reference_image_workspace_path or ""))
-        if normalized_image_name:
+        if not normalized_attachments and normalized_image_name:
+            normalized_attachments = [
+                {
+                    "type": "image",
+                    "mime_type": f"image/{infer_reference_image_suffix(normalized_image_name).lstrip('.')}",
+                    "name": normalized_image_name,
+                    "base64": "",
+                    "workspace_path": normalized_image_path,
+                }
+            ]
+        if normalized_attachments:
             handle.write(
-                "\n### 함께 전달된 참고 이미지\n\n"
-                f"- 이름: {normalized_image_name}\n"
-                f"- workspace 경로: {normalized_image_path or '(미저장)'}\n"
-                "- 이 이미지를 UI/레이아웃/콘텐츠 참고 자료로 반영한다.\n"
+                "\n### 함께 전달된 참고 자료\n\n"
             )
+            for attachment in normalized_attachments:
+                handle.write(
+                    f"- 종류: {attachment.get('type') or 'attachment'}, "
+                    f"이름: {attachment.get('name') or 'reference_attachment'}, "
+                    f"workspace 경로: {attachment.get('workspace_path') or '(미저장)'}\n"
+                )
+            handle.write("- 각 이미지 또는 파일의 실제 내용을 열어 사용자 요청과 함께 반영한다.\n")
 
 
 def default_app_llm_config(settings: Settings) -> dict[str, Any]:
@@ -5600,11 +5762,23 @@ def looks_like_technical_reference(value: str) -> bool:
     return bool(re.search(r"[a-z][A-Z]|_", normalized) and re.search(r"[A-Za-z]", normalized))
 
 
-def sanitize_codex_followup_user_text(text: str) -> str:
+def sanitize_codex_followup_user_text(text: str, user_prompt: str = "") -> str:
     if not text:
         return ""
 
     sanitized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if re.fullmatch(r"[A-Z][A-Z0-9_:-]{1,79}", sanitized.strip()):
+        return sanitized.strip()
+
+    protected_literals: dict[str, str] = {}
+    for token in re.findall(r"\b[A-Za-z][A-Za-z0-9_]{1,79}\b", user_prompt):
+        if token not in sanitized:
+            continue
+        if "_" not in token and not re.search(r"[a-z][A-Z]", token):
+            continue
+        placeholder = f"VFLITERALPROTECTED{len(protected_literals)}TOKEN"
+        protected_literals[placeholder] = token
+        sanitized = sanitized.replace(token, placeholder)
 
     def replace_inline_code(match: re.Match[str]) -> str:
         content = match.group(1)
@@ -5633,10 +5807,19 @@ def sanitize_codex_followup_user_text(text: str) -> str:
         "앱 내부 동작",
         sanitized,
     )
+    def replace_code_identifier(match: re.Match[str]) -> str:
+        return f"앱 내부 구현{match.group('particle') or ''}"
+
     sanitized = re.sub(
-        r"(?<![\w가-힣])_?[A-Za-z]+(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)[A-Za-z0-9_]*(?![\w가-힣])",
-        "앱 내부 구현",
+        r"(?<![\w가-힣])(?:[a-z]+[A-Z][A-Za-z0-9]*|[A-Z][a-z]+(?:[A-Z][A-Za-z0-9]*)+|[a-z]+_[a-z0-9_]+)(?P<particle>은|는|이|가|을|를|에서|에|으로|로|와|과)?(?![\w가-힣])",
+        replace_code_identifier,
         sanitized,
+    )
+    sanitized = re.sub(
+        r"((?:변수|상수|클래스|함수|메서드|필드|프로퍼티)\s*(?:이름|명)?\s*(?:은|는|이|가|을|를|에|로)?\s*)[A-Za-z_][A-Za-z0-9_]*",
+        r"\1앱 내부 구현",
+        sanitized,
+        flags=re.IGNORECASE,
     )
     sanitized = re.sub(r"\bline\s*\d+\b", "해당 부분", sanitized, flags=re.IGNORECASE)
     sanitized = re.sub(r"\d+\s*번째\s*줄|\d+\s*번\s*줄|\d+\s*줄", "해당 부분", sanitized)
@@ -5645,6 +5828,8 @@ def sanitize_codex_followup_user_text(text: str) -> str:
     sanitized = sanitized.replace("앱 내부 구현가", "앱 내부 구현이")
     sanitized = sanitized.replace("앱 내부 구현는", "앱 내부 구현은")
     sanitized = sanitized.replace("앱 내부 구현를", "앱 내부 구현을")
+    for placeholder, token in protected_literals.items():
+        sanitized = sanitized.replace(placeholder, token)
     return sanitized
 
 
@@ -5687,9 +5872,9 @@ def run_codex_existing_task_followup_decision(
         safe_previous_conversation_state["reference_image_base64"] = "[omitted]"
     safe_reference_attachments = [
         {
-            "type": attachment.get("type") or "image",
+            "type": attachment.get("type") or "attachment",
             "mime_type": attachment.get("mime_type") or "",
-            "name": attachment.get("name") or "reference_image",
+            "name": attachment.get("name") or "reference_attachment",
             "workspace_path": attachment.get("workspace_path") or "",
         }
         for attachment in normalize_reference_attachments(reference_attachments or [])
@@ -5711,8 +5896,8 @@ def run_codex_existing_task_followup_decision(
 
 The existing app source code is already available in the `project` directory inside this workspace.
 Read the actual code and project files as needed before deciding.
-When `reference_attachments` contains workspace paths, inspect those image files as part of the latest request.
-If `latest_user_prompt` is empty and reference images exist, treat the images themselves as the complete latest user message.
+When `reference_attachments` contains workspace paths, inspect every referenced image, PDF, or text file as part of the latest request.
+If `latest_user_prompt` is empty and reference attachments exist, treat the attachments themselves as the complete latest user message.
 
 User-facing language must be Korean.
 The user is a non-technical end user. User-visible text must explain behavior in plain words.
@@ -5887,7 +6072,10 @@ Context:
         )
         return None
     if mode == "answer_question":
-        parsed["assistant_reply"] = sanitize_codex_followup_user_text(str(parsed.get("assistant_reply") or ""))
+        parsed["assistant_reply"] = sanitize_codex_followup_user_text(
+            str(parsed.get("assistant_reply") or ""),
+            user_prompt=prompt,
+        )
     if mode == "build":
         parsed["change_summary"] = sanitize_codex_followup_user_text(str(parsed.get("change_summary") or ""))
     if mode == "ask_confirmation":
@@ -5917,6 +6105,10 @@ def apply_project_defaults(project_root: Path, task_id: str, app_name: str, pack
         app_name=app_name,
         application_id=package_name,
     )
+
+
+def restore_project_runtime_contracts(project_root: Path, base_project_path: Path) -> tuple[str, ...]:
+    return native_android_project_builder.restore_runtime_contracts(base_project_path, project_root)
 
 
 def project_android_identity_issues(
@@ -5985,6 +6177,7 @@ def create_initial_project_revision(
     revision_root = task_root / "revisions" / revision_label
     project_root = revision_root / "project"
     native_android_project_builder.copy_project(base_project_path, project_root)
+    restore_project_runtime_contracts(project_root, base_project_path)
     ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(task_root, project_root)
     return project_root, revision_label
@@ -5993,6 +6186,7 @@ def create_initial_project_revision(
 def create_followup_project_revision(
     workspace_path: Path,
     source_project_path: Path,
+    base_project_path: Path,
 ) -> tuple[Path, str]:
     revisions_root = workspace_path / "revisions"
     revisions_root.mkdir(parents=True, exist_ok=True)
@@ -6007,6 +6201,7 @@ def create_followup_project_revision(
     revision_root = revisions_root / revision_label
     project_root = revision_root / "project"
     native_android_project_builder.copy_project(source_project_path, project_root)
+    restore_project_runtime_contracts(project_root, base_project_path)
     ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(workspace_path, project_root)
     return project_root, revision_label
@@ -6072,6 +6267,7 @@ def create_branched_task_workspace(
     (task_root / ".codex_result").mkdir(parents=True, exist_ok=True)
 
     native_android_project_builder.copy_project(source_project_path, project_root)
+    restore_project_runtime_contracts(project_root, settings.base_project_path)
     replaced_file_count = replace_project_task_id(project_root, source_task_id, str(task["task_id"]))
     ensure_project_revision_version(project_root, "rev_0001")
     if task.get("app_name") and task.get("package_name"):
@@ -6630,6 +6826,25 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             }
         ],
     }
+
+
+def preserve_existing_task_status_for_answer(
+    task: dict[str, Any],
+    decision: IntentDecision,
+    *,
+    existing_workspace_ready: bool,
+) -> tuple[IntentDecision, str]:
+    if decision.mode != "answer_question" or not existing_workspace_ready:
+        return decision, decision.message
+
+    previous_status = normalize_whitespace(str(task.get("status") or ""))
+    if task.get("apk_path"):
+        previous_status = "Success"
+    if not previous_status or previous_status.lower() in {"queued", "running"}:
+        return decision, decision.message
+
+    previous_message = normalize_whitespace(str(task.get("message") or "")) or decision.message
+    return replace(decision, status=previous_status), previous_message
 
 
 def build_assistant_response_payload(decision: IntentDecision) -> dict[str, Any]:
@@ -7479,6 +7694,9 @@ class CodexTaskRunner:
             )
             if self.settings.mock_codex:
                 self.run_mock(task, workspace_path, stdout_path, stderr_path, result_path)
+                if not self.is_task_cancelled(task_id):
+                    self.enforce_task_project_identity(task_id)
+                    self.attempt_server_side_build(task_id, workspace_path, result_path, None)
             else:
                 self.attempt_server_side_build(task_id, workspace_path, result_path, None)
             self.finalize_task(task_id, workspace_path, result_path, None, False)
@@ -7500,52 +7718,79 @@ class CodexTaskRunner:
             exit_code, timed_out = self.run_mock(task, workspace_path, stdout_path, stderr_path, result_path)
         else:
             exit_code, timed_out = self.run_codex(task, workspace_path, stdout_path, stderr_path)
-            if not self.is_task_cancelled(task_id):
-                codex_elapsed_seconds = time.monotonic() - codex_started_at
-                codex_phase = "failed" if timed_out or (exit_code not in (0, None) and not result_path.exists()) else "succeeded"
-                codex_body = (
-                    "앱 설계와 코드 생성 시간이 제한을 초과했어요."
-                    if timed_out
-                    else "앱 설계와 코드 생성 단계가 완료되었어요."
-                    if codex_phase == "succeeded"
-                    else "앱 설계와 코드 생성 단계에 실패했어요."
-                )
-                log_build_stage_event(
-                    self.db,
-                    task_id,
-                    stage="앱 설계와 코드 생성",
-                    phase=codex_phase,
-                    body=codex_body,
-                    detail=f"종료 코드: {exit_code if exit_code is not None else '-'}, 소요 시간: {codex_elapsed_seconds:.1f}초",
-                )
-            identity_changed = False
-            if not self.is_task_cancelled(task_id):
-                identity_changed = self.enforce_task_project_identity(task_id)
-            result_exists = result_path.exists()
-            if not self.is_task_cancelled(task_id):
-                codex_log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
-                engine_issue = None if result_exists else codex_engine_issue_from_logs(codex_log_text, exit_code)
-                result_status = ""
-                if result_exists:
-                    try:
-                        result_status = normalize_whitespace(
-                            str(json.loads(result_path.read_text(encoding="utf-8")).get("status") or "")
-                        ).lower()
-                    except (json.JSONDecodeError, OSError, AttributeError):
-                        result_status = ""
-                should_build = result_status == "success" or (
-                    not result_exists
-                    and should_attempt_server_side_build(
-                        result_exists=False,
-                        identity_changed=identity_changed,
-                        timed_out=timed_out,
-                        engine_issue=engine_issue,
-                    )
-                )
-                if should_build:
-                    self.attempt_server_side_build(task_id, workspace_path, result_path, exit_code)
+        if not self.is_task_cancelled(task_id):
+            self.complete_generation_stage_and_build(
+                task_id=task_id,
+                workspace_path=workspace_path,
+                result_path=result_path,
+                exit_code=exit_code,
+                timed_out=timed_out,
+                started_at=codex_started_at,
+            )
 
         self.finalize_task(task_id, workspace_path, result_path, exit_code, timed_out)
+
+    def complete_generation_stage_and_build(
+        self,
+        *,
+        task_id: str,
+        workspace_path: Path,
+        result_path: Path,
+        exit_code: Optional[int],
+        timed_out: bool,
+        started_at: float,
+    ) -> None:
+        elapsed_seconds = time.monotonic() - started_at
+        phase = (
+            "failed"
+            if timed_out or (exit_code not in (0, None) and not result_path.exists())
+            else "succeeded"
+        )
+        body = (
+            "앱 설계와 코드 생성 시간이 제한을 초과했어요."
+            if timed_out
+            else "앱 설계와 코드 생성 단계가 완료되었어요."
+            if phase == "succeeded"
+            else "앱 설계와 코드 생성 단계에 실패했어요."
+        )
+        log_build_stage_event(
+            self.db,
+            task_id,
+            stage="앱 설계와 코드 생성",
+            phase=phase,
+            body=body,
+            detail=(
+                f"종료 코드: {exit_code if exit_code is not None else '-'}, "
+                f"소요 시간: {elapsed_seconds:.1f}초"
+            ),
+        )
+        identity_changed = self.enforce_task_project_identity(task_id)
+        result_exists = result_path.exists()
+        codex_log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
+        engine_issue = (
+            None
+            if result_exists
+            else codex_engine_issue_from_logs(codex_log_text, exit_code)
+        )
+        result_status = ""
+        if result_exists:
+            try:
+                result_status = normalize_whitespace(
+                    str(json.loads(result_path.read_text(encoding="utf-8")).get("status") or "")
+                ).lower()
+            except (json.JSONDecodeError, OSError, AttributeError):
+                result_status = ""
+        should_build = result_status == "success" or (
+            not result_exists
+            and should_attempt_server_side_build(
+                result_exists=False,
+                identity_changed=identity_changed,
+                timed_out=timed_out,
+                engine_issue=engine_issue,
+            )
+        )
+        if should_build:
+            self.attempt_server_side_build(task_id, workspace_path, result_path, exit_code)
 
     def run_codex(
         self,
@@ -7730,9 +7975,6 @@ class CodexTaskRunner:
         current_apk_path: Path,
     ) -> Path:
         version_changed = ensure_project_revision_version(project_path)
-        if self.settings.mock_codex:
-            return current_apk_path
-
         env = self.build_task_env(workspace_path, include_signing=True)
         existing_optimized_apk = self.find_existing_optimized_download_apk(
             workspace_path,
@@ -7904,6 +8146,18 @@ class CodexTaskRunner:
                 pass
         task = self.db.get_task(task_id) or {}
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
+        restored_runtime_contracts = restore_project_runtime_contracts(
+            project_path,
+            self.settings.base_project_path,
+        )
+        if restored_runtime_contracts:
+            self.db.log_event(
+                task_id,
+                actor="system",
+                event_type="native_runtime_contracts_restored",
+                message_text="생성 앱의 서버 연동 구성요소를 최신 버전으로 확인했습니다.",
+                payload={"restored_files": list(restored_runtime_contracts)},
+            )
         expected_app_name = current_task_app_name(task)
         expected_package_name = current_task_package_name(task)
         if expected_app_name and expected_package_name:
@@ -8182,9 +8436,6 @@ class CodexTaskRunner:
                     encoding="utf-8",
                 )
             apk_relative = Path("project") / native_android_project_builder.expected_apk_relative
-            apk_path = workspace_path / apk_relative
-            apk_path.parent.mkdir(parents=True, exist_ok=True)
-            apk_path.write_bytes(b"mock-apk")
             result = {
                 "status": "success",
                 "task_id": task["task_id"],
@@ -8395,7 +8646,7 @@ class CodexTaskRunner:
             if current_project_path is not None:
                 try:
                     apk_path = self.ensure_download_apk(task_id, workspace_path, current_project_path, apk_path)
-                    if not self.settings.mock_codex and persisted_package_name:
+                    if persisted_package_name:
                         validate_built_apk_install_contract(
                             current_project_path,
                             apk_path,
@@ -8579,7 +8830,7 @@ def build_task_workspace(settings: Settings, task: dict[str, Any]) -> tuple[Path
             }
         ]
     saved_reference_attachments = save_reference_attachments(task_root, reference_attachments)
-    first_attachment = first_reference_attachment(saved_reference_attachments)
+    first_attachment = first_reference_image_attachment(saved_reference_attachments)
     reference_image_workspace_path = first_attachment.get("workspace_path") or ""
     if saved_reference_attachments:
         task["reference_attachments"] = saved_reference_attachments
@@ -9005,6 +9256,30 @@ def usage_window_payload(label: str, window: Optional[CodexRateLimitWindow]) -> 
     }
 
 
+def classify_rate_limit_windows(
+    limits: Optional[CodexRateLimitSnapshot],
+) -> tuple[Optional[CodexRateLimitWindow], Optional[CodexRateLimitWindow]]:
+    if limits is None:
+        return None, None
+
+    windows = [window for window in (limits.primary, limits.secondary) if window is not None]
+    if not windows:
+        return None, None
+    if len(windows) == 1:
+        window = windows[0]
+        duration = window.window_duration_mins
+        if duration is not None and duration > 24 * 60:
+            return None, window
+        return window, None
+
+    first, second = windows
+    first_duration = first.window_duration_mins
+    second_duration = second.window_duration_mins
+    if first_duration is not None and second_duration is not None:
+        return (first, second) if first_duration <= second_duration else (second, first)
+    return limits.primary, limits.secondary
+
+
 def mock_rate_limit_snapshot() -> CodexRateLimitSnapshot:
     now = int(time.time())
     return CodexRateLimitSnapshot(
@@ -9030,11 +9305,12 @@ def build_token_usage_response(
     task_id: str = "",
 ) -> dict[str, Any]:
     limits, limit_error = load_usage_rate_limits(settings)
+    short_window, weekly_window = classify_rate_limit_windows(limits)
     return {
         "task_id": task_id,
         "limit_name": limits.limit_name if limits and limits.limit_name else "codex",
-        "primary_window": usage_window_payload("5시간 한도", limits.primary if limits else None),
-        "secondary_window": usage_window_payload("주간 한도", limits.secondary if limits else None),
+        "primary_window": usage_window_payload("5시간 한도", short_window),
+        "secondary_window": usage_window_payload("주간 한도", weekly_window),
         "usage": usage,
         "status": "ready" if limit_error is None else "partial",
         "status_message": (
@@ -9175,7 +9451,7 @@ def create_app() -> FastAPI:
         runner: CodexTaskRunner = app.state.runner
         request_device_info = serialize_device_info(request.device_info)
         requested_reference_attachments = request_reference_attachments(request)
-        requested_first_reference = first_reference_attachment(requested_reference_attachments)
+        requested_first_reference = first_reference_image_attachment(requested_reference_attachments)
         requested_reference_image_name = normalize_reference_image_name(
             requested_first_reference.get("name") or request.reference_image_name
         )
@@ -9268,7 +9544,7 @@ def create_app() -> FastAPI:
                 previous_conversation_state.get("reference_attachments") or []
             )
             effective_reference_attachments = requested_reference_attachments or previous_reference_attachments
-            effective_first_reference = first_reference_attachment(effective_reference_attachments)
+            effective_first_reference = first_reference_image_attachment(effective_reference_attachments)
             effective_reference_image_name = requested_reference_image_name or normalize_reference_image_name(
                 effective_first_reference.get("name") or previous_conversation_state.get("reference_image_name")
             )
@@ -9328,7 +9604,7 @@ def create_app() -> FastAPI:
                         request_scope="existing_app_modification",
                     )
                 elif codex_followup_mode == "answer_question":
-                    assistant_reply = korean_text_or_fallback(
+                    assistant_reply = nonblank_text_or_fallback(
                         str((codex_followup_payload or {}).get("assistant_reply") or ""),
                         "기존 앱 코드를 확인했지만 답변을 정리하지 못했어요. 조금 더 구체적으로 물어봐 주세요.",
                     )
@@ -9413,13 +9689,14 @@ def create_app() -> FastAPI:
                     device_info=request_device_info or previous_conversation_state.get("device_info"),
                     reference_image_name=effective_reference_image_name,
                     reference_image_base64=effective_reference_image_base64,
+                    reference_attachments=effective_reference_attachments,
                     settings=settings,
                     db=db,
                 )
             cancelled_task = db.get_task(followup_task_id)
             if cancelled_task and is_cancelled_task_status(str(cancelled_task.get("status") or "")):
                 return serialize_task_for_status(db, cancelled_task, settings.status_log_line_limit)
-            if effective_reference_image_name and not decision.image_reference_summary:
+            if effective_reference_attachments and not decision.image_reference_summary:
                 decision = replace(
                     decision,
                     image_reference_summary=reference_attachments_summary(effective_reference_attachments)
@@ -9444,10 +9721,15 @@ def create_app() -> FastAPI:
                 cancelled_task = db.get_task(followup_task_id)
                 if cancelled_task and is_cancelled_task_status(str(cancelled_task.get("status") or "")):
                     return serialize_task_for_status(db, cancelled_task, settings.status_log_line_limit)
+                persisted_decision, persisted_message = preserve_existing_task_status_for_answer(
+                    task,
+                    decision,
+                    existing_workspace_ready=existing_workspace_ready,
+                )
                 db.update_task(
                     followup_task_id,
-                    status=decision.status,
-                    message=decision.message,
+                    status=persisted_decision.status,
+                    message=persisted_message,
                     device_id=request.device_id,
                     phone_number=request.phone_number,
                     codex_result_json=json.dumps(
@@ -9461,7 +9743,7 @@ def create_app() -> FastAPI:
                                 "reference_attachments": effective_reference_attachments,
                                 "conversation_state_override": previous_conversation_state,
                             },
-                            decision,
+                            persisted_decision,
                             request.prompt,
                         ),
                         ensure_ascii=False,
@@ -9477,7 +9759,7 @@ def create_app() -> FastAPI:
                     message_text=decision.message,
                     payload=build_assistant_response_payload(decision),
                 )
-                return build_decision_response(followup_task_id, decision)
+                return build_decision_response(followup_task_id, persisted_decision)
 
             resolved_app_name = (
                 decision.app_name
@@ -9545,13 +9827,14 @@ def create_app() -> FastAPI:
                 project_path_obj, revision_label = create_followup_project_revision(
                     workspace_path_obj,
                     Path(project_path_value),
+                    settings.base_project_path,
                 )
                 project_path_value = str(project_path_obj)
                 saved_reference_attachments = save_reference_attachments(
                     workspace_path_obj,
                     effective_reference_attachments,
                 )
-                saved_first_reference = first_reference_attachment(saved_reference_attachments)
+                saved_first_reference = first_reference_image_attachment(saved_reference_attachments)
                 reference_image_workspace_path = saved_first_reference.get("workspace_path") or ""
                 apply_project_defaults(project_path_obj, followup_task_id, resolved_app_name, resolved_package_name)
                 append_followup_prompt(
@@ -9561,6 +9844,7 @@ def create_app() -> FastAPI:
                     normalized_prompt=decision.normalized_prompt,
                     reference_image_name=effective_reference_image_name,
                     reference_image_workspace_path=reference_image_workspace_path or previous_conversation_state.get("reference_image_workspace_path"),
+                    reference_attachments=saved_reference_attachments or effective_reference_attachments,
                 )
                 db.record_project_snapshot(
                     task_id=followup_task_id,
@@ -9657,10 +9941,11 @@ def create_app() -> FastAPI:
                 device_info=request_device_info,
                 reference_image_name=requested_reference_image_name,
                 reference_image_base64=requested_reference_image_base64,
+                reference_attachments=requested_reference_attachments,
                 settings=settings,
                 db=db,
             )
-            if requested_reference_image_name and not decision.image_reference_summary:
+            if requested_reference_attachments and not decision.image_reference_summary:
                 decision = replace(
                     decision,
                     image_reference_summary=reference_attachments_summary(requested_reference_attachments)
@@ -9776,7 +10061,7 @@ def create_app() -> FastAPI:
                 db.update_task(
                     task_id,
                     status="Error",
-                    message=f"첨부 이미지 저장 실패: {exc}",
+                    message=f"첨부 파일 저장 실패: {exc}",
                 )
                 failed_task = db.get_task(task_id)
                 if failed_task:
@@ -9785,7 +10070,7 @@ def create_app() -> FastAPI:
             if saved_requested_attachments:
                 requested_reference_attachments = saved_requested_attachments
                 task["reference_attachments"] = saved_requested_attachments
-                first_saved_reference = first_reference_attachment(saved_requested_attachments)
+                first_saved_reference = first_reference_image_attachment(saved_requested_attachments)
                 task["reference_image_workspace_path"] = first_saved_reference.get("workspace_path") or ""
                 task["reference_image_base64"] = ""
                 task["codex_result_json"] = json.dumps(
@@ -10200,7 +10485,7 @@ def create_app() -> FastAPI:
                     "error": str(exc),
                 },
             )
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=503, detail="app llm runtime unavailable") from exc
         except httpx.HTTPStatusError as exc:
             db.record_app_llm_usage(
                 task_id=task_id,
@@ -10728,7 +11013,7 @@ def create_app() -> FastAPI:
             db.list_project_snapshots(task_id),
             apk_path,
         )
-        if project_path is not None and not runner.settings.mock_codex:
+        if project_path is not None:
             try:
                 apk_path = runner.prepare_saved_revision_apk(
                     task,

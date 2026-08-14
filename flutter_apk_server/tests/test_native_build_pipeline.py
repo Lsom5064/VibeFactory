@@ -11,7 +11,10 @@ from flutter_apk_server.server import (
     CodexTaskRunner,
     Database,
     build_task_workspace,
+    build_intent_decision,
     load_settings,
+    preserve_existing_task_status_for_answer,
+    sanitize_codex_followup_user_text,
     utc_now_iso,
 )
 
@@ -20,6 +23,63 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeBuildPipelineTests(unittest.TestCase):
+    def test_followup_sanitizer_preserves_user_marker_but_hides_code_identifiers(self) -> None:
+        self.assertEqual(
+            "VIBE_NATIVE_TEXT_MARKER_20260814_1930",
+            sanitize_codex_followup_user_text("VIBE_NATIVE_TEXT_MARKER_20260814_1930"),
+        )
+        self.assertEqual(
+            "앱 내부 구현을 수정했어요.",
+            sanitize_codex_followup_user_text("MainActivity를 수정했어요."),
+        )
+        self.assertEqual(
+            "변수 앱 내부 구현 확인했어요.",
+            sanitize_codex_followup_user_text("변수 APP_RUNTIME_KEY를 확인했어요."),
+        )
+
+    def test_existing_answer_keeps_completed_apk_task_successful(self) -> None:
+        decision = build_intent_decision(
+            mode="answer_question",
+            task_id="answer-status-task",
+            existing_task=True,
+            existing_workspace_ready=True,
+            user_prompt="현재 앱에 대해 알려줘",
+            assistant_message="현재 앱의 주요 기능을 안내합니다.",
+        )
+
+        persisted, task_message = preserve_existing_task_status_for_answer(
+            {
+                "status": "Pending Decision",
+                "message": "APK 빌드가 완료되었어요.",
+                "apk_path": "/tmp/app-release.apk",
+            },
+            decision,
+            existing_workspace_ready=True,
+        )
+
+        self.assertEqual("Success", persisted.status)
+        self.assertEqual("현재 앱의 주요 기능을 안내합니다.", persisted.message)
+        self.assertEqual("APK 빌드가 완료되었어요.", task_message)
+
+    def test_existing_answer_does_not_override_running_task(self) -> None:
+        decision = build_intent_decision(
+            mode="answer_question",
+            task_id="running-answer-task",
+            existing_task=True,
+            existing_workspace_ready=True,
+            user_prompt="진행 상태를 알려줘",
+            assistant_message="진행 상태를 확인하고 있어요.",
+        )
+
+        persisted, task_message = preserve_existing_task_status_for_answer(
+            {"status": "Running", "message": "앱을 생성하고 있어요.", "apk_path": ""},
+            decision,
+            existing_workspace_ready=True,
+        )
+
+        self.assertEqual("Pending Decision", persisted.status)
+        self.assertEqual(decision.message, task_message)
+
     def test_default_storage_paths_are_isolated_from_flutter_service(self) -> None:
         with patch.dict(
             os.environ,
@@ -118,7 +178,39 @@ class NativeBuildPipelineTests(unittest.TestCase):
             )
 
             runner = CodexTaskRunner(settings, database)
-            runner.process_task(task["task_id"])
+            def write_test_apk(
+                _task_id: str,
+                mock_workspace_path: Path,
+                _result_path: Path,
+                _codex_exit_code: int | None,
+            ) -> None:
+                apk_path = (
+                    mock_workspace_path
+                    / "project/app/build/outputs/apk/release/app-release.apk"
+                )
+                self.assertFalse(
+                    apk_path.exists(),
+                    "Mock code generation must not publish an unsigned placeholder APK",
+                )
+                apk_path.parent.mkdir(parents=True, exist_ok=True)
+                apk_path.write_bytes(b"test-apk-artifact")
+
+            with (
+                patch.object(
+                    runner,
+                    "attempt_server_side_build",
+                    side_effect=write_test_apk,
+                ) as final_build,
+                patch.object(
+                    runner,
+                    "ensure_download_apk",
+                    side_effect=lambda _task_id, _workspace, _project, apk: apk,
+                ),
+                patch("flutter_apk_server.server.validate_built_apk_install_contract"),
+            ):
+                runner.process_task(task["task_id"])
+
+            final_build.assert_called_once()
 
             completed = database.get_task(task["task_id"])
             self.assertIsNotNone(completed)
