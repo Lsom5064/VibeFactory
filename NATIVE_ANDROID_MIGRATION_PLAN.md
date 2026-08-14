@@ -649,7 +649,7 @@ ADB 기기: R5CT60A8H4R (SM-S908N, API 36). 원본 Task 8b69aac6cb7140f098f3101d
 APK 크기: 실제 생성 APK 약 5.1MB, V1과 V6 모두 동일 applicationId 및 고정 signer 확인
 발견된 문제: 처리 완료된 최초 prompt 확인 버튼이 cold relaunch 후 다시 노출됨. PDF 첨부는 회전 후 View 칩만 남고 모델 상태가 유실될 수 있었음. 서버가 image/* 외 PDF·텍스트 첨부를 normalize 단계에서 조용히 제거하여 attachment_count=0으로 기록함. 런타임 LLM 키가 없어 성공 호출은 검증하지 못함
 해결 내용: prompt 확인 action을 message ID 단위로 재바인딩. 첨부 payload를 앱 전용 임시 파일에 보존하고 회전·프로세스 재생성 시 작은 metadata로 복원하며 전송·삭제 시 정리. 서버 첨부 정규화·파일 저장·DB kind·Codex prompt/context를 image/pdf/text 공통으로 일반화하고 PDF/텍스트 크기·형식 검증 및 회귀 테스트 추가
-커밋 SHA: 미커밋
+커밋 SHA: 280efdc13071d3e2fb3091ef548ef462a40a5799
 다음 단계: 사용자가 8000번 서버를 새 코드로 재시작한 뒤 PDF 실기기 attachment_count=1 및 workspace 저장 재검증. APP_RUNTIME_OPENAI_API_KEY 설정 후 런타임 LLM 텍스트·이미지 성공 검증. 다운로드 퍼센트·설치 전환 성능 3회 측정 후 Native AWS canary 배포
 ```
 
@@ -664,7 +664,7 @@ ADB 기기: R5CT60A8H4R (SM-S908N, API 36), 라이트 모드·자동 회전 복�
 APK 크기: v4 5,115,158 bytes
 발견된 문제: secondary usage window null이 주간 남은 용량 0%로 표시되고 API 실패 시 예시 토큰이 실제 값처럼 표시됨. 다크모드 overview 제목 대비 부족. Codex의 정상 마커 응답을 사용자용 보안 필터가 코드 변수로 오인해 '앱 내부 구현'으로 변경함. 완성 Task의 질문 응답 후 status가 Pending Decision으로 퇴행함. 시스템 설치 승인 후 Samsung/Play Protect/생체 인증이 개입해 이번 회차의 자동 실행 시간은 미측정
 해결 내용: 없는 usage window를 null/정보 없음으로 유지하고 가짜 fallback 수치 제거, 설정 요약 동적 구성, dark overview 전용 고대비 색상 추가, 오류 문구에서 내부 endpoint 제거. 후속 응답 필터는 경로·코드 식별자를 계속 가리되 사용자 마커는 보존하고, APK가 있는 Task의 질문은 Success 상태를 유지하도록 수정. 일반 UI 부하 재측정은 603 frame, jank 1.99%, p95 10ms, missed vsync 0
-커밋 SHA: 미커밋
+커밋 SHA: 280efdc13071d3e2fb3091ef548ef462a40a5799
 다음 단계: 현재 server.py는 --reload 없이 실행 중이므로 다음 명시적 재시작 후 text marker 응답·Success status 유지 E2E 재검증. APP_RUNTIME_OPENAI_API_KEY 설정 후 런타임 LLM 텍스트·이미지 검증. 다운로드 중간 퍼센트는 더 큰 APK 또는 제한 네트워크에서 시각 확인. 별도 Native AWS canary 배포
 ```
 
@@ -679,7 +679,7 @@ ADB 기기: R5CT60A8H4R (SM-S908N, API 36), 검증 후 tcp:8000->tcp:8000 및 tc
 APK 크기: v4 5,115,158 bytes
 발견된 문제: 기존 Task의 app_llm_configs에 API 키가 없어 실제 LLM text/image 성공 호출 불가. 생성 앱은 이 상태를 일반 400 서버 실패로만 안내함. 현재 설치된 생성 앱의 AI Advice 버튼 영문 표기와 다크 테마 색 대비가 낮음. 현재 실행 서버는 --reload가 아니어서 앞서 수정한 text marker 보존·Success 상태 유지 코드는 아직 반영되지 않음
 해결 내용: 검증용 저속 프록시는 종료하고 ADB reverse를 원복. 다운로드 진행률과 Task 목록·로그 전환 검증 항목을 완료 처리. API 키가 필요한 실제 모델 성공 검증과 생성 앱 표현 개선은 완료 처리하지 않음
-커밋 SHA: 미커밋
+커밋 SHA: 280efdc13071d3e2fb3091ef548ef462a40a5799
 다음 단계: APP_RUNTIME_OPENAI_API_KEY를 안전하게 설정하고 기존 Task 설정에 적용한 뒤 생성 앱 text/image 실제 성공 응답과 전문 raw_response 로깅 검증. 다음 명시적 서버 재시작 후 text marker/Success 상태 E2E 재검증. 설치 UI 진입 및 자동 실행 시간을 사용자 승인 흐름이 가능한 환경에서 측정하고 별도 Native AWS canary 배포
 ```
 
@@ -694,7 +694,7 @@ ADB 기기: R5CT60A8H4R (SM-S908N, API 36), 호스트 versionCode 6, 검증 후 
 APK 크기: BaseProject signed release 5,095,498 bytes, SHA-256 f280a495b80ee1c14b551aa6bffcd9380e1ce3e705b515639bec278236c315fd
 발견된 문제: Codex가 반환한 7일 창 10080분을 서버가 무조건 5시간 한도로 표기함. 사용자가 전송한 뒤 진행 버블이 최종 답변 자동 스크롤 예약을 취소함. 사용자 요청의 SCROLL_OK 같은 리터럴을 내부 식별자 필터가 앱 내부 구현으로 바꿔 동일 과거 답변과 중복 처리함. 생성 앱 runtime LLM 키는 계속 미설정. AWS 13.124.86.162:22 SSH는 timeout
 해결 내용: 한도 window duration으로 단기/주간 창을 분류하여 7일 창을 주간 카드에 표시. 진행 중에는 사용자 위치를 고정하되 명시적 전송의 최종 스크롤 예약을 유지. 요청에 포함된 리터럴과 전체 마커 응답은 보존하고 영어 답변도 비어 있지 않으면 유지. BaseProject runtime helper를 최초·수정·분기·최종 build 직전에 템플릿 원본으로 복원해 오래된 workspace에도 최신 런타임 계약을 적용. 생성 앱 LLM HTTP/configuration 오류는 endpoint/API key를 노출하지 않는 사용자 문구로 변환
-커밋 SHA: 미커밋
+커밋 SHA: 280efdc13071d3e2fb3091ef548ef462a40a5799
 다음 단계: APP_RUNTIME_OPENAI_API_KEY를 안전하게 설정하고 기존 Task app_llm_config에 적용하여 text/image 실제 모델 성공과 raw_response 전문 로깅 검증. 사용자 승인 가능한 설치 흐름에서 설치 후 자동 실행 시간 측정. AWS SSH 접근 복구 후 별도 Native canary 배포
 ```
 
@@ -709,7 +709,7 @@ ADB 기기: R5CT60A8H4R (SM-S908N, API 36), 호스트 versionCode 6, 검증 후 
 APK 크기: BaseProject signed release 5,095,498 bytes, SHA-256 f280a495b80ee1c14b551aa6bffcd9380e1ce3e705b515639bec278236c315fd
 발견된 문제: 실행 중인 메인 서버는 19:00:45에 시작되었고 server.py 최신 수정은 20:35:09이므로 최신 한도 분류·응답 보존 코드가 메인 프로세스에 미반영. 두 Task의 app_llm_configs.api_key가 비어 실제 text/image 모델 성공 호출은 불가. 473 frame 중 jank 7.40%, p50 5ms, p90 8ms, p95 13ms, p99 105ms이며 ANR·crash·Skipped frames는 없음
 해결 내용: 메인 서버를 종료하지 않고 8012 보조 서버로 최신 소스를 실기기 검증한 뒤 종료하고 ADB reverse를 원복. 실행 중 메인 서버는 PID 77178로 계속 유지
-커밋 SHA: 미커밋
+커밋 SHA: 280efdc13071d3e2fb3091ef548ef462a40a5799
 다음 단계: 사용자가 현재 작업을 멈춘 후 메인 서버를 최신 소스로 명시적 재시작. APP_RUNTIME_OPENAI_API_KEY 설정 후 새 Task에서 runtime LLM text/image 성공·raw_response 전문 로깅 검증. 설치 후 자동 실행 시간 측정과 AWS Native canary 배포
 ```
 
