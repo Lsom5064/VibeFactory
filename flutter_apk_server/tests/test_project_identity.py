@@ -17,6 +17,7 @@ from flutter_apk_server.server import (
     revision_request_summary,
     serialize_project_revision,
     should_attempt_server_side_build,
+    utc_now_iso,
     with_codex_reasoning_effort,
 )
 
@@ -125,6 +126,19 @@ class ProjectIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Database(Path(temp_dir) / "tasks.db")
             database.init_db()
+            now = utc_now_iso()
+            database.create_task(
+                {
+                    "task_id": "task-1",
+                    "user_id": "test-user",
+                    "device_id": "test-device",
+                    "prompt": "test",
+                    "status": "Success",
+                    "message": "ready",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
             database.record_project_snapshot(
                 task_id="task-1",
                 revision_label="rev_0002",

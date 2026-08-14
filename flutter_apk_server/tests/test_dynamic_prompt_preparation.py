@@ -168,6 +168,19 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                         "reason": "가능한 구현 범위를 먼저 설명합니다.",
                         "questions": [],
                         "assistant_reply": "공유하기로 받은 메시지에서 일정 후보를 찾는 방식으로 구현할 수 있어요.",
+                        "__agent_meta": {
+                            "model": "test-intent-model",
+                            "raw_output_text": "full agent output",
+                            "raw_response": {"id": "response-1"},
+                            "usage": {
+                                "input_tokens": 10,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 20,
+                                "cached_output_tokens": 0,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": 30,
+                            },
+                        },
                     }
                 return {
                     "mode": "build",
@@ -215,6 +228,9 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                     self.assertEqual(first.status_code, 200, first.text)
                     task_id = first.json()["task_id"]
                     self.assertEqual(first.json()["request_scope"], "new_app")
+                    usage_records = app.state.db.list_task_usage_records(task_id)
+                    self.assertEqual(1, len(usage_records))
+                    self.assertEqual("spec_clarification_agent", usage_records[0]["source"])
 
                     second = client.post(
                         "/generate",

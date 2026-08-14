@@ -100,6 +100,19 @@ class FullLoggingAndImageStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Database(Path(temp_dir) / "tasks.db")
             database.init_db()
+            now = utc_now_iso()
+            database.create_task(
+                {
+                    "task_id": "task-full-log",
+                    "user_id": "test-user",
+                    "device_id": "test-device",
+                    "prompt": "test",
+                    "status": "Success",
+                    "message": "ready",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
             message = "사용자 입력 " + ("가나다라마바사" * 10_000)
             payload_text = "stdout\n" + ("0123456789" * 20_000)
 

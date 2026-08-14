@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from flutter_apk_server.server import Database, task_event_to_timeline_event
+from flutter_apk_server.server import Database, task_event_to_timeline_event, utc_now_iso
 
 
 class TimelineCursorTests(unittest.TestCase):
@@ -10,6 +10,19 @@ class TimelineCursorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Database(Path(temp_dir) / "tasks.db")
             db.init_db()
+            now = utc_now_iso()
+            db.create_task(
+                {
+                    "task_id": "task-1",
+                    "user_id": "test-user",
+                    "device_id": "test-device",
+                    "prompt": "test",
+                    "status": "Success",
+                    "message": "ready",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
             first_id = db.log_event(
                 "task-1",
                 actor="user",

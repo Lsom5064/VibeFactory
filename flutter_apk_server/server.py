@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -37,6 +37,53 @@ REFERENCE_IMAGE_DIMENSION_STEPS = (1600, 1400, 1200, 1024, 800)
 # Generated APKs are distributed outside an app store. Keeping one high, fixed
 # version code allows any saved revision to replace any other saved revision.
 GENERATED_APK_SIDELOAD_VERSION_CODE = 1_900_000_000
+PRIMARY_KEY_INSERT_MAX_ATTEMPTS = 4
+
+
+def new_database_id() -> str:
+    return uuid.uuid4().hex
+
+
+def is_sqlite_primary_key_collision(
+    error: sqlite3.IntegrityError,
+    *,
+    table_name: str,
+    column_name: str,
+) -> bool:
+    message = " ".join(str(error).split()).lower()
+    prefix = "unique constraint failed:"
+    if not message.startswith(prefix):
+        return False
+    constrained_columns = {
+        column.strip()
+        for column in message[len(prefix):].split(",")
+        if column.strip()
+    }
+    return f"{table_name}.{column_name}".lower() in constrained_columns
+
+
+def insert_with_generated_primary_key(
+    *,
+    table_name: str,
+    column_name: str,
+    insert: Callable[[str], Any],
+) -> str:
+    for attempt in range(PRIMARY_KEY_INSERT_MAX_ATTEMPTS):
+        candidate = new_database_id()
+        try:
+            insert(candidate)
+            return candidate
+        except sqlite3.IntegrityError as exc:
+            if (
+                not is_sqlite_primary_key_collision(
+                    exc,
+                    table_name=table_name,
+                    column_name=column_name,
+                )
+                or attempt + 1 >= PRIMARY_KEY_INSERT_MAX_ATTEMPTS
+            ):
+                raise
+    raise RuntimeError(f"failed to allocate primary key for {table_name}")
 
 
 def utc_now_iso() -> str:
@@ -3671,6 +3718,8 @@ class AppDataDatabase:
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
     def init_db(self) -> None:
@@ -3729,24 +3778,27 @@ class AppDataDatabase:
         data: dict[str, Any],
     ) -> dict[str, Any]:
         now = utc_now_iso()
-        record_id = uuid.uuid4().hex
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO app_data_records (
-                    record_id, task_id, package_name, collection, owner_id,
-                    data_json, created_at, updated_at, deleted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                """,
-                (
-                    record_id,
-                    task_id,
-                    package_name,
-                    collection,
-                    owner_id or None,
-                    json.dumps(data, ensure_ascii=False),
-                    now,
-                    now,
+            record_id = insert_with_generated_primary_key(
+                table_name="app_data_records",
+                column_name="record_id",
+                insert=lambda candidate: connection.execute(
+                    """
+                    INSERT INTO app_data_records (
+                        record_id, task_id, package_name, collection, owner_id,
+                        data_json, created_at, updated_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        candidate,
+                        task_id,
+                        package_name,
+                        collection,
+                        owner_id or None,
+                        json.dumps(data, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
                 ),
             )
             connection.commit()
@@ -3895,6 +3947,120 @@ class AppDataDatabase:
 
 
 class Database:
+    RELATION_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+        "task_events": (
+            "event_id", "task_id", "actor", "event_type", "message_text", "payload_json", "created_at",
+        ),
+        "task_attachments": (
+            "attachment_id", "task_id", "event_id", "source", "kind", "original_name", "mime_type",
+            "workspace_path", "absolute_path", "size_bytes", "sha256", "status", "error_message", "created_at",
+        ),
+        "app_llm_configs": (
+            "task_id", "enabled", "provider", "model", "api_key", "base_url", "system_prompt",
+            "daily_request_limit", "daily_token_limit", "max_output_tokens", "temperature", "created_at", "updated_at",
+        ),
+        "app_llm_usage": (
+            "usage_id", "task_id", "package_name", "input_tokens", "output_tokens", "total_tokens", "status", "created_at",
+        ),
+        "task_usage_records": (
+            "usage_id", "task_id", "source", "model", "input_tokens", "cached_input_tokens", "output_tokens",
+            "cached_output_tokens", "reasoning_output_tokens", "total_tokens", "status", "raw_output_text",
+            "payload_json", "created_at",
+        ),
+        "task_project_snapshots": (
+            "snapshot_id", "task_id", "revision_label", "source", "workspace_path", "project_path",
+            "request_summary", "created_at",
+        ),
+    }
+
+    RELATION_TABLE_DEFINITIONS: dict[str, str] = {
+        "task_events": """
+            event_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            message_text TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(task_id, event_id),
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+        """,
+        "task_attachments": """
+            attachment_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            event_id TEXT,
+            source TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            original_name TEXT,
+            mime_type TEXT,
+            workspace_path TEXT,
+            absolute_path TEXT,
+            size_bytes INTEGER,
+            sha256 TEXT,
+            status TEXT NOT NULL,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+            FOREIGN KEY(task_id, event_id) REFERENCES task_events(task_id, event_id) ON DELETE RESTRICT
+        """,
+        "app_llm_configs": """
+            task_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            api_key TEXT,
+            base_url TEXT,
+            system_prompt TEXT,
+            daily_request_limit INTEGER NOT NULL,
+            daily_token_limit INTEGER NOT NULL,
+            max_output_tokens INTEGER NOT NULL,
+            temperature REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+        """,
+        "app_llm_usage": """
+            usage_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            package_name TEXT NOT NULL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            total_tokens INTEGER,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+        """,
+        "task_usage_records": """
+            usage_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            output_tokens INTEGER,
+            cached_output_tokens INTEGER,
+            reasoning_output_tokens INTEGER,
+            total_tokens INTEGER,
+            status TEXT NOT NULL,
+            raw_output_text TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+        """,
+        "task_project_snapshots": """
+            snapshot_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            revision_label TEXT NOT NULL,
+            source TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            project_path TEXT NOT NULL,
+            request_summary TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(task_id, revision_label),
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+        """,
+    }
+
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
 
@@ -3902,6 +4068,7 @@ class Database:
         connection = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
     def ensure_column(self, connection: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
@@ -3910,6 +4077,258 @@ class Database:
         if column_name in existing_columns:
             return
         connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+    def create_relation_table(
+        self,
+        connection: sqlite3.Connection,
+        logical_name: str,
+        *,
+        actual_name: Optional[str] = None,
+        if_not_exists: bool = False,
+    ) -> None:
+        if logical_name not in self.RELATION_TABLE_DEFINITIONS:
+            raise ValueError(f"unknown relation table: {logical_name}")
+        table_name = actual_name or logical_name
+        if not re.fullmatch(r"[a-z0-9_]+", table_name):
+            raise ValueError(f"invalid internal table name: {table_name}")
+        exists_clause = "IF NOT EXISTS " if if_not_exists else ""
+        connection.execute(
+            f'CREATE TABLE {exists_clause}"{table_name}" ({self.RELATION_TABLE_DEFINITIONS[logical_name]})'
+        )
+
+    @staticmethod
+    def has_unique_columns(
+        connection: sqlite3.Connection,
+        table_name: str,
+        expected_columns: tuple[str, ...],
+    ) -> bool:
+        for index_row in connection.execute(f'PRAGMA index_list("{table_name}")').fetchall():
+            if not bool(index_row["unique"]):
+                continue
+            index_name = str(index_row["name"])
+            columns = tuple(
+                str(row["name"])
+                for row in connection.execute(f'PRAGMA index_info("{index_name}")').fetchall()
+            )
+            if columns == expected_columns:
+                return True
+        return False
+
+    @staticmethod
+    def foreign_key_specs(connection: sqlite3.Connection, table_name: str) -> set[tuple[Any, ...]]:
+        grouped: dict[int, list[sqlite3.Row]] = {}
+        for row in connection.execute(f'PRAGMA foreign_key_list("{table_name}")').fetchall():
+            grouped.setdefault(int(row["id"]), []).append(row)
+        specs: set[tuple[Any, ...]] = set()
+        for rows in grouped.values():
+            ordered = sorted(rows, key=lambda row: int(row["seq"]))
+            specs.add(
+                (
+                    str(ordered[0]["table"]),
+                    tuple(str(row["from"]) for row in ordered),
+                    tuple(str(row["to"]) for row in ordered),
+                    str(ordered[0]["on_delete"]).upper(),
+                )
+            )
+        return specs
+
+    def relation_schema_is_current(self, connection: sqlite3.Connection) -> bool:
+        task_reference = ("tasks", ("task_id",), ("task_id",), "RESTRICT")
+        expected_foreign_keys = {
+            "task_events": {task_reference},
+            "task_attachments": {
+                task_reference,
+                ("task_events", ("task_id", "event_id"), ("task_id", "event_id"), "RESTRICT"),
+            },
+            "app_llm_configs": {task_reference},
+            "app_llm_usage": {task_reference},
+            "task_usage_records": {task_reference},
+            "task_project_snapshots": {task_reference},
+        }
+        if any(
+            not expected.issubset(self.foreign_key_specs(connection, table_name))
+            for table_name, expected in expected_foreign_keys.items()
+        ):
+            return False
+        return self.has_unique_columns(connection, "task_events", ("task_id", "event_id")) and self.has_unique_columns(
+            connection,
+            "task_project_snapshots",
+            ("task_id", "revision_label"),
+        )
+
+    @staticmethod
+    def validate_relation_migration_source(connection: sqlite3.Connection) -> None:
+        for table_name, expected_columns in Database.RELATION_TABLE_COLUMNS.items():
+            actual_columns = tuple(
+                str(row["name"])
+                for row in connection.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+            )
+            if set(actual_columns) != set(expected_columns):
+                raise RuntimeError(
+                    "database integrity migration stopped without changing data; "
+                    f"unexpected columns in {table_name}: "
+                    f"missing={sorted(set(expected_columns) - set(actual_columns))}, "
+                    f"extra={sorted(set(actual_columns) - set(expected_columns))}"
+                )
+        orphan_queries = {
+            "task_events.task_id": """
+                SELECT COUNT(*) FROM task_events child
+                LEFT JOIN tasks parent ON parent.task_id = child.task_id
+                WHERE parent.task_id IS NULL
+            """,
+            "task_attachments.task_id": """
+                SELECT COUNT(*) FROM task_attachments child
+                LEFT JOIN tasks parent ON parent.task_id = child.task_id
+                WHERE parent.task_id IS NULL
+            """,
+            "app_llm_configs.task_id": """
+                SELECT COUNT(*) FROM app_llm_configs child
+                LEFT JOIN tasks parent ON parent.task_id = child.task_id
+                WHERE parent.task_id IS NULL
+            """,
+            "app_llm_usage.task_id": """
+                SELECT COUNT(*) FROM app_llm_usage child
+                LEFT JOIN tasks parent ON parent.task_id = child.task_id
+                WHERE parent.task_id IS NULL
+            """,
+            "task_usage_records.task_id": """
+                SELECT COUNT(*) FROM task_usage_records child
+                LEFT JOIN tasks parent ON parent.task_id = child.task_id
+                WHERE parent.task_id IS NULL
+            """,
+            "task_project_snapshots.task_id": """
+                SELECT COUNT(*) FROM task_project_snapshots child
+                LEFT JOIN tasks parent ON parent.task_id = child.task_id
+                WHERE parent.task_id IS NULL
+            """,
+            "task_attachments.(task_id,event_id)": """
+                SELECT COUNT(*) FROM task_attachments child
+                LEFT JOIN task_events parent
+                  ON parent.task_id = child.task_id AND parent.event_id = child.event_id
+                WHERE child.event_id IS NOT NULL AND parent.event_id IS NULL
+            """,
+        }
+        violations: dict[str, int] = {}
+        for label, query in orphan_queries.items():
+            count = int(connection.execute(query).fetchone()[0])
+            if count > 0:
+                violations[label] = count
+        duplicate_snapshots = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT task_id, revision_label
+                    FROM task_project_snapshots
+                    GROUP BY task_id, revision_label
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()[0]
+        )
+        if duplicate_snapshots:
+            violations["task_project_snapshots.(task_id,revision_label)"] = duplicate_snapshots
+        if violations:
+            details = ", ".join(f"{label}={count}" for label, count in sorted(violations.items()))
+            raise RuntimeError(
+                "database integrity migration stopped without changing data; "
+                f"resolve legacy relation violations first: {details}"
+            )
+
+    def migrate_relation_schema(self, connection: sqlite3.Connection) -> None:
+        if self.relation_schema_is_current(connection):
+            return
+        self.validate_relation_migration_source(connection)
+        connection.commit()
+        self.back_up_before_relation_migration(connection)
+        connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for logical_name, columns in self.RELATION_TABLE_COLUMNS.items():
+                replacement_name = f"{logical_name}__integrity_new"
+                self.create_relation_table(
+                    connection,
+                    logical_name,
+                    actual_name=replacement_name,
+                )
+                column_list = ", ".join(f'"{column}"' for column in columns)
+                connection.execute(
+                    f'INSERT INTO "{replacement_name}" ({column_list}) '
+                    f'SELECT {column_list} FROM "{logical_name}" ORDER BY rowid ASC'
+                )
+                source_count = int(connection.execute(f'SELECT COUNT(*) FROM "{logical_name}"').fetchone()[0])
+                replacement_count = int(
+                    connection.execute(f'SELECT COUNT(*) FROM "{replacement_name}"').fetchone()[0]
+                )
+                if replacement_count != source_count:
+                    raise RuntimeError(
+                        f"database migration row count mismatch for {logical_name}: "
+                        f"source={source_count}, replacement={replacement_count}"
+                    )
+
+            for table_name in (
+                "task_attachments",
+                "app_llm_configs",
+                "app_llm_usage",
+                "task_usage_records",
+                "task_project_snapshots",
+                "task_events",
+            ):
+                connection.execute(f'DROP TABLE "{table_name}"')
+            for table_name in self.RELATION_TABLE_COLUMNS:
+                connection.execute(
+                    f'ALTER TABLE "{table_name}__integrity_new" RENAME TO "{table_name}"'
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys=ON")
+
+    def back_up_before_relation_migration(self, connection: sqlite3.Connection) -> Path:
+        backup_path = self.db_path.with_name(f"{self.db_path.name}.pre_relation_fk_v1.bak")
+        if backup_path.exists():
+            with sqlite3.connect(backup_path) as backup_connection:
+                integrity = str(backup_connection.execute("PRAGMA integrity_check").fetchone()[0])
+            if integrity != "ok":
+                raise RuntimeError(f"existing database migration backup is invalid: {backup_path}")
+            return backup_path
+
+        with sqlite3.connect(backup_path) as backup_connection:
+            connection.backup(backup_connection)
+            integrity = str(backup_connection.execute("PRAGMA integrity_check").fetchone()[0])
+        if integrity != "ok":
+            raise RuntimeError(f"database migration backup failed integrity check: {backup_path}")
+        return backup_path
+
+    @staticmethod
+    def ensure_relation_indexes(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_events_task_id_created_at ON task_events(task_id, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_attachments_task_id_created_at ON task_attachments(task_id, created_at)"
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_task_attachments_sha256 ON task_attachments(sha256)")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_app_llm_usage_task_id_created_at ON app_llm_usage(task_id, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_usage_records_task_id_created_at ON task_usage_records(task_id, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_project_snapshots_task_id_created_at ON task_project_snapshots(task_id, created_at)"
+        )
+
+    @staticmethod
+    def validate_foreign_keys(connection: sqlite3.Connection) -> None:
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            first = violations[0]
+            raise RuntimeError(
+                "database foreign key check failed: "
+                f"table={first['table']}, rowid={first['rowid']}, parent={first['parent']}"
+            )
 
     def init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3962,117 +4381,9 @@ class Database:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_phone_number_created_at ON tasks(phone_number, created_at DESC)"
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_events (
-                    event_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    message_text TEXT,
-                    payload_json TEXT,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_task_events_task_id_created_at ON task_events(task_id, created_at)")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_attachments (
-                    attachment_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    event_id TEXT,
-                    source TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    original_name TEXT,
-                    mime_type TEXT,
-                    workspace_path TEXT,
-                    absolute_path TEXT,
-                    size_bytes INTEGER,
-                    sha256 TEXT,
-                    status TEXT NOT NULL,
-                    error_message TEXT,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_task_attachments_task_id_created_at ON task_attachments(task_id, created_at)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_task_attachments_sha256 ON task_attachments(sha256)"
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS app_llm_configs (
-                    task_id TEXT PRIMARY KEY,
-                    enabled INTEGER NOT NULL,
-                    provider TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    api_key TEXT,
-                    base_url TEXT,
-                    system_prompt TEXT,
-                    daily_request_limit INTEGER NOT NULL,
-                    daily_token_limit INTEGER NOT NULL,
-                    max_output_tokens INTEGER NOT NULL,
-                    temperature REAL NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS app_llm_usage (
-                    usage_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    package_name TEXT NOT NULL,
-                    input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    total_tokens INTEGER,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_app_llm_usage_task_id_created_at ON app_llm_usage(task_id, created_at)")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_usage_records (
-                    usage_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    input_tokens INTEGER,
-                    cached_input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    cached_output_tokens INTEGER,
-                    reasoning_output_tokens INTEGER,
-                    total_tokens INTEGER,
-                    status TEXT NOT NULL,
-                    raw_output_text TEXT,
-                    payload_json TEXT,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_task_usage_records_task_id_created_at ON task_usage_records(task_id, created_at)")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_project_snapshots (
-                    snapshot_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    revision_label TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    workspace_path TEXT NOT NULL,
-                    project_path TEXT NOT NULL,
-                    request_summary TEXT,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
+            for table_name in self.RELATION_TABLE_DEFINITIONS:
+                self.create_relation_table(connection, table_name, if_not_exists=True)
             self.ensure_column(connection, "task_project_snapshots", "request_summary", "TEXT")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_task_project_snapshots_task_id_created_at ON task_project_snapshots(task_id, created_at)")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS server_settings (
@@ -4082,6 +4393,10 @@ class Database:
                 )
                 """
             )
+            connection.commit()
+            self.migrate_relation_schema(connection)
+            self.ensure_relation_indexes(connection)
+            self.validate_foreign_keys(connection)
             connection.commit()
 
     def create_task(self, task: dict[str, Any]) -> None:
@@ -4125,6 +4440,26 @@ class Database:
             )
             connection.commit()
 
+    def create_task_with_generated_id(
+        self,
+        task_builder: Callable[[str], dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        final_task: Optional[dict[str, Any]] = None
+
+        def insert(candidate: str) -> None:
+            nonlocal final_task
+            final_task = task_builder(candidate)
+            self.create_task(final_task)
+
+        task_id = insert_with_generated_primary_key(
+            table_name="tasks",
+            column_name="task_id",
+            insert=insert,
+        )
+        if final_task is None:
+            raise RuntimeError("task builder did not produce a task")
+        return task_id, final_task
+
     def update_task(self, task_id: str, **fields: Any) -> None:
         if not fields:
             return
@@ -4161,23 +4496,26 @@ class Database:
         payload: Optional[dict[str, Any]] = None,
     ) -> str:
         created_at = utc_now_iso()
-        event_id = uuid.uuid4().hex
         payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO task_events (
-                    event_id, task_id, actor, event_type, message_text, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    task_id,
-                    actor,
-                    event_type,
-                    message_text,
-                    payload_json,
-                    created_at,
+            event_id = insert_with_generated_primary_key(
+                table_name="task_events",
+                column_name="event_id",
+                insert=lambda candidate: connection.execute(
+                    """
+                    INSERT INTO task_events (
+                        event_id, task_id, actor, event_type, message_text, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate,
+                        task_id,
+                        actor,
+                        event_type,
+                        message_text,
+                        payload_json,
+                        created_at,
+                    ),
                 ),
             )
             connection.commit()
@@ -4199,30 +4537,33 @@ class Database:
         status: str,
         error_message: str = "",
     ) -> str:
-        attachment_id = uuid.uuid4().hex
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO task_attachments (
-                    attachment_id, task_id, event_id, source, kind, original_name, mime_type,
-                    workspace_path, absolute_path, size_bytes, sha256, status, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    attachment_id,
-                    task_id,
-                    event_id,
-                    source,
-                    kind,
-                    original_name,
-                    mime_type,
-                    workspace_path,
-                    absolute_path,
-                    size_bytes,
-                    sha256,
-                    status,
-                    error_message,
-                    utc_now_iso(),
+            attachment_id = insert_with_generated_primary_key(
+                table_name="task_attachments",
+                column_name="attachment_id",
+                insert=lambda candidate: connection.execute(
+                    """
+                    INSERT INTO task_attachments (
+                        attachment_id, task_id, event_id, source, kind, original_name, mime_type,
+                        workspace_path, absolute_path, size_bytes, sha256, status, error_message, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate,
+                        task_id,
+                        event_id,
+                        source,
+                        kind,
+                        original_name,
+                        mime_type,
+                        workspace_path,
+                        absolute_path,
+                        size_bytes,
+                        sha256,
+                        status,
+                        error_message,
+                        utc_now_iso(),
+                    ),
                 ),
             )
             connection.commit()
@@ -4439,21 +4780,25 @@ class Database:
         status: str,
     ) -> None:
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO app_llm_usage (
-                    usage_id, task_id, package_name, input_tokens, output_tokens, total_tokens, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid.uuid4().hex,
-                    task_id,
-                    package_name,
-                    input_tokens,
-                    output_tokens,
-                    total_tokens,
-                    status,
-                    utc_now_iso(),
+            insert_with_generated_primary_key(
+                table_name="app_llm_usage",
+                column_name="usage_id",
+                insert=lambda candidate: connection.execute(
+                    """
+                    INSERT INTO app_llm_usage (
+                        usage_id, task_id, package_name, input_tokens, output_tokens, total_tokens, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate,
+                        task_id,
+                        package_name,
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        status,
+                        utc_now_iso(),
+                    ),
                 ),
             )
             connection.commit()
@@ -4476,29 +4821,33 @@ class Database:
     def record_task_usage(self, task_id: str, usage: TaskUsageRecord) -> None:
         payload_json = json.dumps(usage.payload, ensure_ascii=False) if usage.payload is not None else None
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO task_usage_records (
-                    usage_id, task_id, source, model,
-                    input_tokens, cached_input_tokens, output_tokens, cached_output_tokens,
-                    reasoning_output_tokens, total_tokens, status, raw_output_text, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid.uuid4().hex,
-                    task_id,
-                    usage.source,
-                    usage.model,
-                    usage.input_tokens,
-                    usage.cached_input_tokens,
-                    usage.output_tokens,
-                    usage.cached_output_tokens,
-                    usage.reasoning_output_tokens,
-                    usage.total_tokens,
-                    usage.status,
-                    usage.raw_output_text,
-                    payload_json,
-                    utc_now_iso(),
+            insert_with_generated_primary_key(
+                table_name="task_usage_records",
+                column_name="usage_id",
+                insert=lambda candidate: connection.execute(
+                    """
+                    INSERT INTO task_usage_records (
+                        usage_id, task_id, source, model,
+                        input_tokens, cached_input_tokens, output_tokens, cached_output_tokens,
+                        reasoning_output_tokens, total_tokens, status, raw_output_text, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate,
+                        task_id,
+                        usage.source,
+                        usage.model,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.output_tokens,
+                        usage.cached_output_tokens,
+                        usage.reasoning_output_tokens,
+                        usage.total_tokens,
+                        usage.status,
+                        usage.raw_output_text,
+                        payload_json,
+                        utc_now_iso(),
+                    ),
                 ),
             )
             connection.commit()
@@ -4529,22 +4878,32 @@ class Database:
         request_summary: str = "",
     ) -> None:
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO task_project_snapshots (
-                    snapshot_id, task_id, revision_label, source, workspace_path, project_path,
-                    request_summary, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid.uuid4().hex,
-                    task_id,
-                    revision_label,
-                    source,
-                    workspace_path,
-                    project_path,
-                    compact_revision_request_summary(request_summary) if request_summary else "",
-                    utc_now_iso(),
+            insert_with_generated_primary_key(
+                table_name="task_project_snapshots",
+                column_name="snapshot_id",
+                insert=lambda candidate: connection.execute(
+                    """
+                    INSERT INTO task_project_snapshots (
+                        snapshot_id, task_id, revision_label, source, workspace_path, project_path,
+                        request_summary, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(task_id, revision_label) DO UPDATE SET
+                        source = excluded.source,
+                        workspace_path = excluded.workspace_path,
+                        project_path = excluded.project_path,
+                        request_summary = excluded.request_summary,
+                        created_at = excluded.created_at
+                    """,
+                    (
+                        candidate,
+                        task_id,
+                        revision_label,
+                        source,
+                        workspace_path,
+                        project_path,
+                        compact_revision_request_summary(request_summary) if request_summary else "",
+                        utc_now_iso(),
+                    ),
                 ),
             )
             connection.commit()
@@ -9651,34 +10010,53 @@ def create_app() -> FastAPI:
             runner.enqueue(followup_task_id)
             return build_decision_response(followup_task_id, decision)
 
-        task_id = uuid.uuid4().hex
-        now = utc_now_iso()
         resolved_user_id = effective_owner_id(request.device_id, request.phone_number)
-        decision = decide_intent(
-            request.prompt,
-            task_id,
-            existing_task=False,
-            existing_workspace_ready=False,
-            previous_conversation_state=None,
-            device_info=request_device_info,
-            reference_image_name=requested_reference_image_name,
-            reference_image_base64=requested_reference_image_base64,
-            settings=settings,
-            db=db,
-        )
-        if requested_reference_image_name and not decision.image_reference_summary:
-            decision = replace(
-                decision,
-                image_reference_summary=reference_attachments_summary(requested_reference_attachments)
-                or build_reference_image_summary(requested_reference_image_name),
+        initial_created_at = utc_now_iso()
+
+        def build_initial_task_placeholder(candidate_task_id: str) -> dict[str, Any]:
+            return {
+                "task_id": candidate_task_id,
+                "user_id": resolved_user_id,
+                "device_id": request.device_id,
+                "phone_number": request.phone_number,
+                "prompt": request.prompt,
+                "status": "Pending Decision",
+                "message": "요청을 검토하고 있어요.",
+                "created_at": initial_created_at,
+                "updated_at": initial_created_at,
+            }
+
+        task_id, task_placeholder = db.create_task_with_generated_id(build_initial_task_placeholder)
+        try:
+            decision = decide_intent(
+                request.prompt,
+                task_id,
+                existing_task=False,
+                existing_workspace_ready=False,
+                previous_conversation_state=None,
+                device_info=request_device_info,
+                reference_image_name=requested_reference_image_name,
+                reference_image_base64=requested_reference_image_base64,
+                settings=settings,
+                db=db,
             )
-        decision = build_initial_prompt_review_decision(decision)
+            if requested_reference_image_name and not decision.image_reference_summary:
+                decision = replace(
+                    decision,
+                    image_reference_summary=reference_attachments_summary(requested_reference_attachments)
+                    or build_reference_image_summary(requested_reference_image_name),
+                )
+            decision = build_initial_prompt_review_decision(decision)
+        except Exception:
+            db.update_task(
+                task_id,
+                status="Error",
+                message="초기 요청을 분석하는 중 서버 오류가 발생했어요.",
+            )
+            raise
+
         task = {
-            "task_id": task_id,
-            "user_id": resolved_user_id,
-            "device_id": request.device_id,
-            "phone_number": request.phone_number,
-            "prompt": request.prompt,
+            **task_placeholder,
             "device_info": request_device_info,
             "reference_image_name": requested_reference_image_name,
             "reference_image_base64": requested_reference_image_base64,
@@ -9713,13 +10091,19 @@ def create_app() -> FastAPI:
                 ensure_ascii=False,
             ),
             "log": None,
-            "created_at": now,
-            "updated_at": now,
             "normalized_prompt": decision.normalized_prompt,
             "build_request_prompt": decision.effective_user_prompt,
         }
-
-        db.create_task(task)
+        db.update_task(
+            task_id,
+            status=decision.status,
+            message=decision.message,
+            app_name=decision.app_name or None,
+            package_name=decision.package_name or None,
+            normalized_prompt=decision.normalized_prompt,
+            build_request_prompt=decision.effective_user_prompt,
+            codex_result_json=task["codex_result_json"],
+        )
         ensure_default_app_llm_config(db, settings, task_id)
         db.log_event(
             task_id,
@@ -10520,7 +10904,6 @@ def create_app() -> FastAPI:
             if is_generate_blocked_task_status(str(source_task.get("status") or "")):
                 raise HTTPException(status_code=409, detail="current revision is still being updated")
 
-        branched_task_id = uuid.uuid4().hex
         now = utc_now_iso()
         app_name = current_task_app_name(source_task) or infer_project_app_name(source_project_path)
         package_name = current_task_package_name(source_task) or infer_project_package_name(source_project_path)
@@ -10557,34 +10940,36 @@ def create_app() -> FastAPI:
             },
             "recent_messages": [],
         }
-        branched_task = {
-            "task_id": branched_task_id,
-            "user_id": str(source_task.get("user_id") or effective_owner_id(device_id or "", phone_number)),
-            "device_id": normalize_whitespace(device_id or str(source_task.get("device_id") or "")),
-            "phone_number": normalize_whitespace(phone_number or str(source_task.get("phone_number") or "")) or None,
-            "prompt": branch_prompt,
-            "status": "Queued",
-            "message": branch_message,
-            "workspace_path": None,
-            "project_path": None,
-            "apk_path": None,
-            "apk_url": None,
-            "app_name": app_name,
-            "package_name": package_name,
-            "normalized_prompt": branch_prompt,
-            "build_request_prompt": branch_prompt,
-            "input_tokens": None,
-            "cached_input_tokens": None,
-            "output_tokens": None,
-            "reasoning_output_tokens": None,
-            "total_tokens": None,
-            "codex_result_json": json.dumps(branch_state, ensure_ascii=False),
-            "log": None,
-            "created_at": now,
-            "updated_at": now,
-        }
 
-        db.create_task(branched_task)
+        def build_branched_task(candidate_task_id: str) -> dict[str, Any]:
+            return {
+                "task_id": candidate_task_id,
+                "user_id": str(source_task.get("user_id") or effective_owner_id(device_id or "", phone_number)),
+                "device_id": normalize_whitespace(device_id or str(source_task.get("device_id") or "")),
+                "phone_number": normalize_whitespace(phone_number or str(source_task.get("phone_number") or "")) or None,
+                "prompt": branch_prompt,
+                "status": "Queued",
+                "message": branch_message,
+                "workspace_path": None,
+                "project_path": None,
+                "apk_path": None,
+                "apk_url": None,
+                "app_name": app_name,
+                "package_name": package_name,
+                "normalized_prompt": branch_prompt,
+                "build_request_prompt": branch_prompt,
+                "input_tokens": None,
+                "cached_input_tokens": None,
+                "output_tokens": None,
+                "reasoning_output_tokens": None,
+                "total_tokens": None,
+                "codex_result_json": json.dumps(branch_state, ensure_ascii=False),
+                "log": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+        branched_task_id, branched_task = db.create_task_with_generated_id(build_branched_task)
         source_llm_config = db.get_app_llm_config(task_id)
         if source_llm_config:
             db.upsert_app_llm_config(branched_task_id, source_llm_config)
