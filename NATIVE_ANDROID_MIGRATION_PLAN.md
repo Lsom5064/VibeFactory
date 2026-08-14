@@ -435,8 +435,8 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 - [x] 리비전 목록과 과거 APK 설치 확인
 - [x] 특정 리비전에서 새 Task 분기
 - [x] 분기 후 package와 서명 동작 확인
-- [ ] 생성 앱에서 런타임 LLM 텍스트 요청
-- [ ] 생성 앱에서 런타임 LLM 이미지 요청
+- [x] 생성 앱에서 런타임 LLM 텍스트 요청
+- [x] 생성 앱에서 런타임 LLM 이미지 요청
 - [x] 생성 앱 데이터 생성·조회·수정·삭제
 - [x] 생성 앱 오류를 발생시켜 호스트 앱 보고 확인
 - [x] 자동 복구 요청과 후속 APK 설치 확인
@@ -546,7 +546,7 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 - [x] APK가 고정 키로 정상 서명된다.
 - [x] 최초 생성, 수정, revision, branch, cancel이 동작한다.
 - [x] 다운로드, 설치, 자동 실행이 동작한다.
-- [ ] 런타임 LLM, 첨부 이미지, 전체 로깅이 동작한다.
+- [x] 런타임 LLM, 첨부 이미지, 전체 로깅이 동작한다.
 - [x] app data CRUD가 동작한다.
 - [x] 런타임 오류 보고가 동작한다.
 - [ ] 자동 테스트와 ADB 실기기 테스트가 통과한다.
@@ -711,6 +711,21 @@ APK 크기: BaseProject signed release 5,095,498 bytes, SHA-256 f280a495b80ee1c1
 해결 내용: 메인 서버를 종료하지 않고 8012 보조 서버로 최신 소스를 실기기 검증한 뒤 종료하고 ADB reverse를 원복. 실행 중 메인 서버는 PID 77178로 계속 유지
 커밋 SHA: 280efdc13071d3e2fb3091ef548ef462a40a5799
 다음 단계: 사용자가 현재 작업을 멈춘 후 메인 서버를 최신 소스로 명시적 재시작. APP_RUNTIME_OPENAI_API_KEY 설정 후 새 Task에서 runtime LLM text/image 성공·raw_response 전문 로깅 검증. 설치 후 자동 실행 시간 측정과 AWS Native canary 배포
+```
+
+```text
+일시: 2026-08-14 20:53-21:13 KST
+Phase: 4, 8-10 런타임 LLM 실제 모델·이미지·전문 로깅 및 남은 배포 게이트 검증
+변경 파일: flutter_apk_server/server.py, tests/test_app_runtime_environment_key.py, run-local-server.sh, NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: server unittest discover/py_compile, bash -n, latest-source 8012 server, ADB generated app install/launch/input/tap, OpenAI Responses text/image 실제 호출, SQLite task_events/task_attachments/app_llm_usage 대조, sips/file/shasum, PackageInstaller 자동 실행 측정 시도, AWS SSH 43.200.231.104
+테스트 결과: 서버 66개 통과. 실제 생성 앱의 VibeLlmClient로 text 요청 200 및 화면 응답 표시 성공. 실기기 임시 복사본에 실제 PNG를 포함해 image 요청 200 및 화면 응답 표시 성공. request/response JSON은 모두 json_valid=1이고 raw_response object 1,735자가 전문 저장됨. 이미지는 요청 event_id와 FK 연결되고 usage는 text 212, image 2,466 total token으로 성공 기록
+ADB 기기: R5CT60A8H4R (SM-S908N, API 36). 임시 테스트 APK 검증 후 서버 rev4 원본 APK를 같은 package/version/signer로 재설치. tcp:8000->tcp:8000 원복, 8012 보조 서버 종료, crash 없음
+빌드 시간: 임시 텍스트 APK warm build 1초, 이미지 포함 APK 증분 build 17초. 실제 런타임 text/image 응답은 각각 약 3초/2초
+APK 크기: 원본 rev4 약 4.9MB로 재설치. 런타임 이미지는 저장 정책에 따라 JPEG 746x1600, 108,781 bytes로 저장되고 DB SHA-256과 실제 파일이 일치
+발견된 문제: 환경 API key를 기본 Task 설정에 복사하면 SQLite에 secret이 영구 저장될 수 있음. 호스트 설치 후 자동 실행 측정은 Samsung UnknownSourceConfirmActivity의 '앱 설치가 권장되지 않음' 보안 승인에서 중단. AWS 최신 기록 IP 43.200.231.104:22도 timeout이며 로컬 AWS CLI는 미설치
+해결 내용: 환경 키는 요청 처리 시에만 메모리에서 Task config와 결합하고 default/Task DB·event에 저장하지 않도록 수정·테스트. run-local-server.sh는 APP_RUNTIME_OPENAI_API_KEY가 없을 때만 OPENAI_API_KEY를 process-only fallback으로 사용. 실제 DB api_key length=0, API api_key_configured=true 검증. 보안 경고에서 '설치 안 함'을 선택하고 우회하지 않음
+커밋 SHA: 미커밋
+다음 단계: 사용자가 Samsung '무시하고 설치' 흐름을 직접 승인할 수 있는 회차에 설치 후 자동 실행 시간 3회 측정. EC2 security group·공인 IP·instance 상태 복구 후 AWS Native canary 배포·smoke test. 메인 8000 서버는 사용자가 작업을 멈춘 뒤 최신 소스로 재시작
 ```
 
 각 작업 단계가 끝날 때 아래 형식으로 기록한다.

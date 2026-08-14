@@ -5515,7 +5515,9 @@ def default_app_llm_config(settings: Settings) -> dict[str, Any]:
         "enabled": settings.app_runtime_enabled_by_default and bool(settings.app_runtime_api_key),
         "provider": settings.app_runtime_provider,
         "model": settings.app_runtime_model,
-        "api_key": settings.app_runtime_api_key,
+        # Environment secrets are resolved only while handling a request. They
+        # must not be copied into SQLite task/default configuration records.
+        "api_key": "",
         "base_url": settings.app_runtime_base_url,
         "system_prompt": settings.app_runtime_system_prompt,
         "daily_request_limit": settings.app_runtime_daily_request_limit,
@@ -5523,6 +5525,16 @@ def default_app_llm_config(settings: Settings) -> dict[str, Any]:
         "max_output_tokens": settings.app_runtime_max_output_tokens,
         "temperature": settings.app_runtime_temperature,
     }
+
+
+def app_llm_config_with_environment_key(
+    config: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    effective = dict(config)
+    if not str(effective.get("api_key") or "").strip() and settings.app_runtime_api_key:
+        effective["api_key"] = settings.app_runtime_api_key
+    return effective
 
 
 def resolve_default_app_llm_config(db: Database, settings: Settings) -> dict[str, Any]:
@@ -9376,9 +9388,10 @@ def create_app() -> FastAPI:
         db: Database = app.state.db
         require_admin_token(settings, x_admin_token)
         config = resolve_default_app_llm_config(db, settings)
+        effective_config = app_llm_config_with_environment_key(config, settings)
         return {
             "source": "server_settings" if db.get_server_setting("app_llm_defaults") else "environment",
-            **app_llm_config_response_payload(config),
+            **app_llm_config_response_payload(effective_config),
         }
 
     @app.post("/admin/app-llm-defaults")
@@ -9441,7 +9454,9 @@ def create_app() -> FastAPI:
             "source": "server_settings",
             "apply_to_existing_tasks": request.apply_to_existing_tasks,
             "updated_task_count": updated_task_count,
-            **app_llm_config_response_payload(config),
+            **app_llm_config_response_payload(
+                app_llm_config_with_environment_key(config, settings)
+            ),
         }
 
     @app.post("/generate")
@@ -10304,6 +10319,7 @@ def create_app() -> FastAPI:
             config = db.get_app_llm_config(task_id)
         if not config:
             raise HTTPException(status_code=404, detail="llm config not found")
+        effective_config = app_llm_config_with_environment_key(config, settings)
         return {
             "task_id": task_id,
             "enabled": bool(config.get("enabled")),
@@ -10315,7 +10331,7 @@ def create_app() -> FastAPI:
             "daily_token_limit": int(config.get("daily_token_limit") or 0),
             "max_output_tokens": int(config.get("max_output_tokens") or 0),
             "temperature": float(config.get("temperature") or 0.0),
-            "api_key_configured": bool(str(config.get("api_key") or "").strip()),
+            "api_key_configured": bool(str(effective_config.get("api_key") or "").strip()),
         }
 
     @app.post("/apps/{task_id}/llm-config")
@@ -10372,6 +10388,7 @@ def create_app() -> FastAPI:
             config = db.get_app_llm_config(task_id)
         if not config or not bool(config.get("enabled")):
             raise HTTPException(status_code=403, detail="app llm runtime disabled")
+        config = app_llm_config_with_environment_key(config, settings)
 
         expected_package_name = str(task.get("package_name") or "").strip()
         if expected_package_name and request.package_name.strip() != expected_package_name:
