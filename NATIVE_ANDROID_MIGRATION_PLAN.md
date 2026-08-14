@@ -531,21 +531,21 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 
 다음을 모두 만족해야 migration을 완료로 본다.
 
-- [ ] 현재 로컬 원본이 GitHub 복구 브랜치와 태그에 존재한다.
-- [ ] Flutter와 Dart 빌드 의존성이 새 서비스 코드에서 제거됐다.
-- [ ] BaseProject가 정상적인 Native Android 프로젝트다.
-- [ ] 생성 앱에 `MainActivity.kt`와 `activity_main.xml`이 존재한다.
-- [ ] 서버 빌드 로직이 route에서 분리됐다.
-- [ ] 기존 호스트 앱 API DTO를 깨는 변경이 없다.
-- [ ] APK가 고정 키로 정상 서명된다.
+- [x] 현재 로컬 원본이 GitHub 복구 브랜치와 태그에 존재한다.
+- [x] Flutter와 Dart 빌드 의존성이 새 서비스 코드에서 제거됐다.
+- [x] BaseProject가 정상적인 Native Android 프로젝트다.
+- [x] 생성 앱에 `MainActivity.kt`와 `activity_main.xml`이 존재한다.
+- [x] 서버 빌드 로직이 route에서 분리됐다.
+- [x] 기존 호스트 앱 API DTO를 깨는 변경이 없다.
+- [x] APK가 고정 키로 정상 서명된다.
 - [ ] 최초 생성, 수정, revision, branch, cancel이 동작한다.
 - [ ] 다운로드, 설치, 자동 실행이 동작한다.
 - [ ] 런타임 LLM, 첨부 이미지, 전체 로깅이 동작한다.
 - [ ] app data CRUD가 동작한다.
 - [ ] 런타임 오류 보고가 동작한다.
 - [ ] 자동 테스트와 ADB 실기기 테스트가 통과한다.
-- [ ] APK 크기와 build delay 측정 결과가 기록됐다.
-- [ ] 기존 DB와 workspace가 삭제되지 않았다.
+- [x] APK 크기와 build delay 측정 결과가 기록됐다.
+- [x] 기존 DB와 workspace가 삭제되지 않았다.
 - [ ] 새 서비스 배포와 smoke test가 통과했다.
 
 ## 15. 롤백
@@ -615,6 +615,21 @@ APK 크기: 5,094,598 bytes
 해결 내용: 환경변수 미설정 시 native_tasks.db, native_app_data.db, native_workspaces, .native_tooling만 선택하는 테스트를 추가
 커밋 SHA: f76cfda55
 다음 단계: 소스 감사와 feature branch push 후 ADB 실기기 및 별도 Native AWS canary 검증
+```
+
+```text
+일시: 2026-08-14 KST
+Phase: 완료 조건 증거 감사
+변경 파일: NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: git ls-remote/show-ref/rev-parse, SQLite PRAGMA quick_check, 소스 의존성 검색, ADB devices
+테스트 결과: GitHub 복구 branch/tag와 Native feature branch 확인, 기존 tasks.db quick_check=ok, 기존 workspace 보존 확인, Native APK 설치 경로가 artifact URL과 APK package identity를 사용함을 확인
+ADB 기기: 연결 기기 없음. 설치·자동 실행·runtime 기능 관련 완료 조건은 체크하지 않음
+빌드 시간: 기존 Phase 9 측정값 유지
+APK 크기: 5,094,598 bytes
+발견된 문제: 없음. 호스트 앱 설치 흐름은 Native/Flutter 파일 구조를 직접 참조하지 않지만 실제 installer 결과와 자동 실행은 정적 검사만으로 증명할 수 없음
+해결 내용: 직접 증명된 완료 조건만 체크하고 실기기·배포 조건은 미완료로 유지
+커밋 SHA: 92997e417 상태 기준
+다음 단계: ADB 기기 연결 후 Phase 8 전체 시나리오, 이후 별도 Native AWS canary 배포
 ```
 
 각 작업 단계가 끝날 때 아래 형식으로 기록한다.
