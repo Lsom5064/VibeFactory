@@ -582,7 +582,7 @@ APK 크기: 5,094,722 bytes
 발견된 문제: Codex 성공 JSON 존재 시 서버 final build를 건너뛸 수 있었고, OkHttp coroutine 취소가 실제 Call을 취소하지 않았음. --no-daemon 사용 시 up-to-date build도 median 18.42초 소요
 해결 내용: 성공 JSON이면 서버가 항상 lint+signed release를 수행하고 기존 결과 필드를 보존. suspendCancellableCoroutine으로 OkHttp Call 취소 연결. 공유 Gradle daemon을 재사용해 warm release median 1.85초, clean lint+release fixture median 6.69초로 단축
 서명 fingerprint: SHA-256 6661f6b196932fbeabf06e955bc8820fe2ca438dcc8f9c270e9d32528560f277
-커밋 SHA: 미커밋
+커밋 SHA: f76cfda55
 다음 단계: ADB 실기기, 실제 Codex 생성·수정·리비전·분기, 성능 3회 측정, canary 배포
 ```
 
@@ -598,7 +598,7 @@ APK 크기: V1 5,135,235 bytes, V2 5,138,951 bytes
 발견된 문제: 분기 worker에서 정의되지 않은 source_root를 참조해 Error 발생. 분기 시 이전 project 내부 logs/.codex_result가 함께 복사됨. Codex subprocess에 signing/runtime/admin 비밀 환경변수가 전달될 수 있었고 AWS secrets 디렉터리는 서비스 사용자가 keystore를 읽을 수 없는 권한이었음. 최종 prompt의 명시적 앱 이름보다 최초 임시 이름이 우선됨
 해결 내용: source_project_path 검증으로 수정하고 worker 회귀 테스트 추가. project root runner 산출물은 revision/branch 복사 및 성공 후 cache prune에서 제외·제거. Codex 환경에서 비밀값을 제거하고 signing 값은 Gradle release 단계에만 주입. AWS secrets를 root:ubuntu 750, keystore root:ubuntu 640 정책으로 수정. 최종 prompt의 명시적 앱 이름을 최초 빌드 Task label에 반영하고 package는 유지
 서명 fingerprint: SHA-256 6661f6b196932fbeabf06e955bc8820fe2ca438dcc8f9c270e9d32528560f277
-커밋 SHA: 미커밋
+커밋 SHA: f76cfda55
 다음 단계: ADB 실기기 검증, 별도 Native AWS canary 배포, 최종 감사와 feature branch push
 ```
 
@@ -613,7 +613,7 @@ ADB 기기: 연결 기기 없음. 설치·덮어쓰기·자동 실행과 실기�
 APK 크기: 5,094,598 bytes
 발견된 문제: 기본 데이터 경로 분리를 직접 고정하는 회귀 테스트가 없었음
 해결 내용: 환경변수 미설정 시 native_tasks.db, native_app_data.db, native_workspaces, .native_tooling만 선택하는 테스트를 추가
-커밋 SHA: 미커밋
+커밋 SHA: f76cfda55
 다음 단계: 소스 감사와 feature branch push 후 ADB 실기기 및 별도 Native AWS canary 검증
 ```
 
