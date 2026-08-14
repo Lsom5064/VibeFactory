@@ -28,12 +28,16 @@ aws/downloads/
 # Server runtime data. Keep these on the server/data volume, not in Git.
 flutter_apk_server/tasks.db*
 flutter_apk_server/app_data.db*
+flutter_apk_server/native_tasks.db*
+flutter_apk_server/native_app_data.db*
 flutter_apk_server/*.sqlite*
 flutter_apk_server/workspaces/
+flutter_apk_server/native_workspaces/
 flutter_apk_server/profiles/
 flutter_apk_server/logs/
 flutter_apk_server/uploads/
 flutter_apk_server/.tooling/
+flutter_apk_server/.native_tooling/
 flutter_apk_server/.venv/
 flutter_apk_server/venv/
 

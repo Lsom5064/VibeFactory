@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Mapping, Optional, cast
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -28,15 +28,45 @@ from fastapi.responses import FileResponse
 from PIL import Image, ImageOps, UnidentifiedImageError  # type: ignore[import-untyped]
 from pydantic import BaseModel, Field
 
+try:
+    from .project_builder import (
+        GENERATED_APK_SIDELOAD_VERSION_CODE,
+        native_android_project_builder,
+    )
+except ImportError:
+    from project_builder import (  # type: ignore[no-redef]
+        GENERATED_APK_SIDELOAD_VERSION_CODE,
+        native_android_project_builder,
+    )
+
+
+GENERATED_APP_SIGNING_ENV_KEYS = (
+    "GENERATED_APP_KEYSTORE_PATH",
+    "GENERATED_APP_KEYSTORE_PASSWORD",
+    "GENERATED_APP_KEY_ALIAS",
+    "GENERATED_APP_KEY_PASSWORD",
+)
+SUBPROCESS_SECRET_ENV_KEYS = (
+    *GENERATED_APP_SIGNING_ENV_KEYS,
+    "APP_RUNTIME_OPENAI_API_KEY",
+    "ADMIN_API_TOKEN",
+)
+
+
+def build_subprocess_environment(
+    source: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
+    env = dict(os.environ if source is None else source)
+    for key in SUBPROCESS_SECRET_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
 
 REFERENCE_IMAGE_MAX_SOURCE_BYTES = 20 * 1024 * 1024
 REFERENCE_IMAGE_MAX_STORED_BYTES = 2 * 1024 * 1024
 REFERENCE_IMAGE_MAX_DIMENSION = 1600
 REFERENCE_IMAGE_JPEG_QUALITIES = (88, 82, 76, 68, 60, 52, 44)
 REFERENCE_IMAGE_DIMENSION_STEPS = (1600, 1400, 1200, 1024, 800)
-# Generated APKs are distributed outside an app store. Keeping one high, fixed
-# version code allows any saved revision to replace any other saved revision.
-GENERATED_APK_SIDELOAD_VERSION_CODE = 1_900_000_000
 PRIMARY_KEY_INSERT_MAX_ATTEMPTS = 4
 
 
@@ -102,7 +132,7 @@ def resolve_path(value: str, default: Path, root: Path) -> Path:
 
 
 def default_base_project_path(root: Path) -> Path:
-    local_default = root / "base_flutter_project"
+    local_default = root / "base_android_project"
     sibling_default = root.parent / "BaseProject"
     if local_default.exists():
         return local_default
@@ -132,19 +162,6 @@ def detect_codex_binary() -> str:
     return "codex"
 
 
-def parse_local_properties(path: Path) -> dict[str, str]:
-    if not path.exists() or not path.is_file():
-        return {}
-    properties: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        properties[key.strip()] = value.strip()
-    return properties
-
-
 def env_flag(name: str, default: bool) -> bool:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -157,35 +174,8 @@ def env_flag(name: str, default: bool) -> bool:
     return default
 
 
-def default_codex_add_dirs(root: Path) -> list[Path]:
-    add_dirs: list[Path] = []
-    seen: set[Path] = set()
-
-    def add_path(candidate: Optional[Path]) -> None:
-        if candidate is None:
-            return
-        resolved = candidate.expanduser().resolve()
-        if resolved.exists() and resolved not in seen:
-            seen.add(resolved)
-            add_dirs.append(resolved)
-
-    flutter_root_env = os.environ.get("FLUTTER_ROOT") or os.environ.get("FLUTTER_HOME")
-    if flutter_root_env:
-        add_path(Path(flutter_root_env) / "bin" / "cache")
-
-    for properties_path in (
-        root / "base_flutter_project" / "android" / "local.properties",
-        root.parent / "BaseProject" / "android" / "local.properties",
-    ):
-        flutter_sdk = parse_local_properties(properties_path).get("flutter.sdk")
-        if flutter_sdk:
-            add_path(Path(flutter_sdk) / "bin" / "cache")
-
-    add_path(Path.home() / "Desktop" / "flutter" / "bin" / "cache")
-    return add_dirs
-
-
 def default_codex_command(root: Path) -> str:
+    _ = root
     args = [
         shlex.quote(detect_codex_binary()),
         "exec",
@@ -211,8 +201,6 @@ def default_codex_command(root: Path) -> str:
                 shlex.quote(os.getenv("CODEX_SANDBOX_MODE", "danger-full-access").strip() or "danger-full-access"),
             ]
         )
-    for add_dir in default_codex_add_dirs(root):
-        args.extend(["--add-dir", shlex.quote(str(add_dir))])
     return f'{" ".join(args)} "{{prompt}}"'
 
 
@@ -236,33 +224,6 @@ def with_codex_reasoning_effort(args: list[str], reasoning_effort: str) -> list[
     insert_at = max(0, len(updated) - 1)
     updated[insert_at:insert_at] = ["-c", config_value]
     return updated
-
-
-def default_flutter_command(root: Path) -> str:
-    flutter_command = os.getenv("FLUTTER_COMMAND", "").strip()
-    if flutter_command:
-        return flutter_command
-
-    flutter_root_env = os.environ.get("FLUTTER_ROOT") or os.environ.get("FLUTTER_HOME")
-    if flutter_root_env:
-        flutter_bin = Path(flutter_root_env).expanduser() / "bin" / "flutter"
-        if flutter_bin.exists():
-            return str(flutter_bin)
-
-    for properties_path in (
-        root / "base_flutter_project" / "android" / "local.properties",
-        root.parent / "BaseProject" / "android" / "local.properties",
-    ):
-        flutter_sdk = parse_local_properties(properties_path).get("flutter.sdk")
-        if flutter_sdk:
-            flutter_bin = Path(flutter_sdk).expanduser() / "bin" / "flutter"
-            if flutter_bin.exists():
-                return str(flutter_bin)
-
-    fallback_flutter = Path.home() / "Desktop" / "flutter" / "bin" / "flutter"
-    if fallback_flutter.exists():
-        return str(fallback_flutter)
-    return "flutter"
 
 
 def sanitize_component(value: str) -> str:
@@ -491,6 +452,7 @@ def fetch_codex_rate_limits_via_app_server(
     *,
     env: Optional[dict[str, str]] = None,
 ) -> "CodexRateLimitSnapshot":
+    process_env = build_subprocess_environment(env)
     process = subprocess.Popen(
         [codex_binary, "app-server", "--listen", "stdio://"],
         stdin=subprocess.PIPE,
@@ -498,7 +460,7 @@ def fetch_codex_rate_limits_via_app_server(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=env,
+        env=process_env,
     )
     try:
         if process.stdin is None:
@@ -1050,7 +1012,6 @@ class Settings:
     workspaces_root: Path
     build_cache_root: Path
     codex_command: str
-    flutter_command: str
     codex_timeout_seconds: Optional[int]
     server_base_url: str
     max_concurrent_codex_runs: int
@@ -1074,9 +1035,11 @@ class Settings:
     app_runtime_daily_token_limit: int
     app_runtime_max_output_tokens: int
     app_runtime_temperature: float
+    generated_app_keystore_path: str
+    generated_app_keystore_password: str
+    generated_app_key_alias: str
+    generated_app_key_password: str
     shared_build_cache_enabled: bool
-    optimized_download_apk_enabled: bool
-    android_only_workspace_enabled: bool
     admin_api_token: str
 
 
@@ -1095,27 +1058,26 @@ def load_settings() -> Settings:
         ),
         workspaces_root=resolve_path(
             os.getenv("WORKSPACES_ROOT", ""),
-            root / "workspaces",
+            root / "native_workspaces",
             root,
         ),
         build_cache_root=resolve_path(
             os.getenv("BUILD_CACHE_ROOT", ""),
-            root / ".tooling",
+            root / ".native_tooling",
             root,
         ),
         codex_command=os.getenv("CODEX_COMMAND", default_codex_command(root)),
-        flutter_command=default_flutter_command(root),
         codex_timeout_seconds=codex_timeout_seconds,
         server_base_url=os.getenv("SERVER_BASE_URL", "http://127.0.0.1:8000").rstrip("/"),
         max_concurrent_codex_runs=max(1, int(os.getenv("MAX_CONCURRENT_CODEX_RUNS", "1"))),
         db_path=resolve_path(
             os.getenv("DB_PATH", ""),
-            root / "tasks.db",
+            root / "native_tasks.db",
             root,
         ),
         app_data_db_path=resolve_path(
             os.getenv("APP_DATA_DB_PATH", ""),
-            root / "app_data.db",
+            root / "native_app_data.db",
             root,
         ),
         mock_codex=mock_codex,
@@ -1142,9 +1104,11 @@ def load_settings() -> Settings:
         app_runtime_daily_token_limit=max(1, int(os.getenv("APP_RUNTIME_DAILY_TOKEN_LIMIT", "50000"))),
         app_runtime_max_output_tokens=max(0, int(os.getenv("APP_RUNTIME_MAX_OUTPUT_TOKENS", "0"))),
         app_runtime_temperature=float(os.getenv("APP_RUNTIME_TEMPERATURE", "0.4")),
+        generated_app_keystore_path=os.getenv("GENERATED_APP_KEYSTORE_PATH", "").strip(),
+        generated_app_keystore_password=os.getenv("GENERATED_APP_KEYSTORE_PASSWORD", "").strip(),
+        generated_app_key_alias=os.getenv("GENERATED_APP_KEY_ALIAS", "").strip(),
+        generated_app_key_password=os.getenv("GENERATED_APP_KEY_PASSWORD", "").strip(),
         shared_build_cache_enabled=env_flag("SHARED_BUILD_CACHE_ENABLED", True),
-        optimized_download_apk_enabled=env_flag("OPTIMIZED_DOWNLOAD_APK_ENABLED", True),
-        android_only_workspace_enabled=env_flag("ANDROID_ONLY_WORKSPACE_ENABLED", True),
         admin_api_token=os.getenv("ADMIN_API_TOKEN", "").strip(),
     )
 
@@ -1358,16 +1322,19 @@ def slugify_package_segment(value: str) -> str:
 
 def extract_explicit_app_name(prompt: str) -> str:
     patterns = (
-        r'[\"“”\'"]([^"\n]{2,40}?)[\"“”\'"]\s*(?:앱|어플|application)',
-        r'(?:앱 이름|애플리케이션 이름|서비스 이름)[은는:\s]+([A-Za-z0-9가-힣 _-]{2,40})',
-        r'([A-Za-z0-9가-힣 _-]{2,30})\s*(?:앱|어플)(?:을|를|으로|로)?',
+        (r'[\"“”\'"]([^"\n]{2,40}?)[\"“”\'"]\s*(?:앱|어플|application)', True),
+        (r'(?:앱 이름|애플리케이션 이름|서비스 이름)[은는:\s]+([A-Za-z0-9가-힣 _-]{2,40})', True),
+        (r'([A-Za-z0-9가-힣 _-]{2,30})\s*(?:앱|어플)(?:을|를|으로|로)?', False),
     )
-    for pattern in patterns:
+    for pattern, is_explicit_label in patterns:
         match = re.search(pattern, prompt, re.IGNORECASE)
         if not match:
             continue
-        candidate = normalize_whitespace(match.group(1))
-        if any(token in candidate for token in ("만들", "정리", "대화", "수 있는", "기능", "화면", "추가", "변경")):
+        candidate = normalize_whitespace(match.group(1)).strip(" -")
+        if not is_explicit_label and any(
+            token in candidate
+            for token in ("만들", "정리", "수 있는", "기능", "화면", "추가", "변경", "해당 정보")
+        ):
             continue
         if candidate and len(candidate) <= 24:
             return candidate
@@ -1605,7 +1572,7 @@ def questions_accept_generic_confirmation(questions: list[str]) -> bool:
 def make_answer_message(prompt: str) -> str:
     normalized = normalize_whitespace(prompt)
     if "무엇을 할 수" in normalized or "뭐가 가능" in normalized:
-        return "이 서버는 Flutter Android 앱 생성을 위한 작업을 처리해요. 원하는 화면, 기능, 앱 분위기를 말해주면 실제 APK 빌드까지 이어갈 수 있어요."
+        return "이 서버는 네이티브 Android 앱 생성을 위한 작업을 처리해요. 원하는 화면, 기능, 앱 분위기를 말해주면 실제 APK 빌드까지 이어갈 수 있어요."
     return "이 메시지는 바로 앱 빌드로 보내기보다 먼저 대화로 정리하는 편이 좋아 보여요. 원하는 앱의 목적, 핵심 화면, 꼭 필요한 기능을 조금 더 구체적으로 알려주세요."
 
 
@@ -1616,7 +1583,7 @@ def detect_unsupported_android_request(prompt: str) -> Optional[str]:
         (
             any(token in normalized for token in ("빅스비", "Bixby", "bixby"))
             and any(token in normalized for token in ("연동", "제어", "호출", "자동화", "실행", "트리거")),
-            "이 요청은 일반 안드로이드 앱으로 바로 제공하기 어려워요. 빅스비와의 깊은 연동이나 자동 제어는 삼성 전용 공개 범위와 기기별 정책 영향을 크게 받아서, 일반 Flutter 앱만으로 안정적으로 구현된다고 약속하기 어렵습니다. 대신 앱 내부 음성 명령이나 자체 AI 비서 흐름처럼 안드로이드에서 확실히 동작하는 방향으로 바꾸는 게 좋습니다.",
+            "이 요청은 일반 안드로이드 앱으로 바로 제공하기 어려워요. 빅스비와의 깊은 연동이나 자동 제어는 삼성 전용 공개 범위와 기기별 정책 영향을 크게 받아서, 일반 Android 앱만으로 안정적으로 구현된다고 약속하기 어렵습니다. 대신 앱 내부 음성 명령이나 자체 AI 비서 흐름처럼 안드로이드에서 확실히 동작하는 방향으로 바꾸는 게 좋습니다.",
         ),
         (
             any(token in lowered for token in ("private api", "비공개 api", "숨겨진 api", "hidden api")),
@@ -1965,7 +1932,7 @@ def build_normalized_prompt(
     lines = [
         f"- 목표 앱 이름: {app_name}",
         f"- Android package name: {package_name}",
-        "- 구현 대상: Flutter Android 앱",
+        "- 구현 대상: Kotlin과 XML 기반 네이티브 Android 앱",
         f"- 1차 핵심 흐름: {normalize_whitespace(primary_user_flow) or '(미정)'}",
         "- 2차 고도화 요구:",
     ]
@@ -2400,7 +2367,7 @@ def build_intent_decision(
 
 def build_prepared_generation_prompt(decision: IntentDecision) -> str:
     app_name = normalize_whitespace(decision.app_name) or infer_app_name(decision.effective_user_prompt)
-    purpose = normalize_whitespace(decision.primary_user_flow) or "사용자가 요청한 목적을 중심으로 Flutter Android 앱을 만든다."
+    purpose = normalize_whitespace(decision.primary_user_flow) or "사용자가 요청한 목적을 중심으로 네이티브 Android 앱을 만든다."
     feature_points = normalize_prompt_items(decision.feature_points, max_items=8) or extract_feature_points(
         decision.effective_user_prompt
     )
@@ -2492,7 +2459,7 @@ def build_initial_prompt_submission_decision(
     previous_conversation_state: dict[str, Any],
 ) -> IntentDecision:
     submitted_prompt = final_prompt.strip()
-    app_name = normalize_whitespace(
+    app_name = extract_explicit_app_name(submitted_prompt) or normalize_whitespace(
         str(
             previous_conversation_state.get("pending_app_name")
             or previous_conversation_state.get("app_name")
@@ -3076,7 +3043,7 @@ def run_spec_clarification_agent(
             },
         },
     }
-    agent_prompt = f"""You are the dedicated pre-build spec clarification agent for a Flutter Android APK build server.
+    agent_prompt = f"""You are the dedicated pre-build spec clarification agent for a native Android APK build server using Kotlin and XML Views.
 You are not a general chat assistant and you are not a downstream formatting assistant.
 Your only job is to turn the latest user message into one of these outcomes:
 - ordinary non-build question -> answer_question
@@ -5100,16 +5067,19 @@ def persist_reference_attachments_for_task(
 def render_task_agents_md(task_id: str) -> str:
     return f"""# Task Workspace Instructions
 
-- Flutter Android 앱만 빌드한다.
-- iOS/Xcode는 사용하지 않는다.
-- 사용자의 명세를 반영해 `project` 폴더의 Flutter 앱을 수정한다.
-- 가급적 `project/lib/main.dart`, `project/pubspec.yaml`, `project/android/app/` 아래만 집중해서 수정한다.
-- `prompt.md`에 지정된 Task ID, 앱 이름, Android package name, `applicationId`, `namespace`, Kotlin package 선언과 `MainActivity` 경로는 서버가 관리하는 불변 식별자다. 새 앱 생성과 모든 수정에서 이 값을 바꾸거나 새 패키지를 만들지 않는다.
-- 런타임 API의 `taskId`, `packageName`, endpoint 경로도 `prompt.md`의 값과 정확히 일치시킨다. `task_result.json`에는 실제 프로젝트와 동일한 `task_id` 및 `package_name`을 기록한다.
-- 기존 Android release debug signing 설정과 `CrashHandler.initialize(...)`의 Task ID 및 package name을 유지한다.
-- 코드 생성 중에는 `flutter pub get`과 `flutter analyze`로 의존성과 정적 오류를 검증한다.
-- 최종 APK 빌드는 Task 식별자 보정 뒤 서버가 한 번만 수행하므로 `flutter build apk`를 직접 실행하지 않는다.
-- `task_result.json`의 `apk_path`에는 서버가 생성할 예상 release APK 경로인 `project/build/app/outputs/flutter-apk/app-release.apk`를 기록한다.
+- Android 전용 네이티브 앱만 만든다. Flutter, Dart, iOS, Xcode, Jetpack Compose는 사용하지 않는다.
+- Kotlin과 Android Views/XML을 사용해 `project` 폴더의 앱을 수정한다.
+- `app/src/main/kotlin/kr/ac/kangwon/hai/generated/MainActivity.kt`와 `app/src/main/res/layout/activity_main.xml`을 유지한다.
+- 서버가 관리하는 `gradle.properties`의 Task ID, application ID, version code와 `app/build.gradle.kts`의 namespace·BuildConfig·release signing 설정을 변경하지 않는다.
+- `GeneratedApplication.kt`, `VibeCrashReporter.kt`, `VibeHttpClient.kt`, `VibeLlmClient.kt`, `VibeDataClient.kt`의 런타임 계약을 제거하거나 바꾸지 않는다.
+- 앱 이름을 바꿔야 하면 서버가 관리하는 metadata를 임의 변경하지 말고 구현 결과의 `app_name`에 제안값을 기록한다.
+- 런타임 package name은 하드코딩하지 말고 `applicationContext.packageName`을 사용한다.
+- 런타임 Task ID는 `BuildConfig.VIBE_TASK_ID`를 사용한다.
+- 런타임 서버 주소는 하드코딩하지 말고 `BuildConfig.VIBE_SERVER_BASE_URL`을 사용한다.
+- 서버 런타임 AI는 `VibeLlmClient`, 공유 데이터는 `VibeDataClient`, 오류 보고는 `VibeCrashReporter`를 우선 재사용한다.
+- 코드 생성 중에는 `./gradlew :app:lintDebug`로 정적 오류를 검증한다.
+- 최종 signed release APK 빌드는 서버가 수행하므로 `assembleRelease`를 직접 실행하지 않는다.
+- `task_result.json`의 `apk_path`는 `project/app/build/outputs/apk/release/app-release.apk`로 기록한다.
 - 사용자가 요청한 핵심 기능을 더 쉬운 대체 구현으로 바꾸지 않는다.
 - `prompt.md`에 적힌 `1차 핵심 흐름`을 이번 빌드의 최우선 범위로 본다.
 - `2차 고도화 요구`는 1차가 안정적으로 성립한 뒤에 반영한다. 시간이 부족하거나 충돌하면 1차를 우선하고, 못 넣은 2차 요구는 `known_limitations`에 남긴다.
@@ -5121,9 +5091,9 @@ def render_task_agents_md(task_id: str) -> str:
 - 여러 사용자나 여러 기기가 같은 데이터를 봐야 하는 공유형 앱은 `prompt.md`의 서버 데이터 API를 사용한다.
 - 단일 사용자 로컬 저장만 필요한 앱은 서버 데이터 API를 쓰지 말고 기기 내부 저장을 우선한다.
 - 더미 데이터나 예시 문구는 UI 스켈레톤 확인용 보조로만 허용된다. 핵심 사용자 흐름을 더미 데이터만으로 완성 처리하면 안 된다.
-- Flutter UI는 모든 화면 크기와 키보드/시스템 inset에서 `RenderFlex overflowed by ... pixels` 및 top/bottom/right/left overflow가 나지 않게 만든다.
-- 세로로 내용이 늘어나는 화면은 `SafeArea`와 `SingleChildScrollView`, `ListView`, `CustomScrollView` 중 적절한 스크롤 컨테이너를 사용한다. 고정 높이 `Column`에 긴 콘텐츠를 그대로 넣지 않는다.
-- `Column`/`Row` 안의 긴 텍스트, 버튼, 입력창, 카드 목록은 `Flexible`/`Expanded`, `Wrap`, `ConstrainedBox`, `LayoutBuilder`, `maxLines`/`overflow` 등을 사용해 작은 화면에서도 넘치지 않게 한다.
+- 모든 화면 크기와 키보드·system inset·화면 회전 상태에서 UI가 잘리거나 겹치지 않게 만든다.
+- 긴 화면은 `NestedScrollView` 또는 `RecyclerView`를 사용하고, 큰 목록을 `ScrollView` 안에 중첩하지 않는다.
+- `ConstraintLayout`의 양쪽 constraint와 `0dp` match constraint를 사용해 긴 제목과 버튼이 화면 밖으로 넘치지 않게 한다.
 - 빌드 전에 작은 화면 기준으로 레이아웃을 점검하고, overflow 가능성이 있으면 성공으로 보고하지 않는다.
 - 구현이 어려워 일부 요구사항을 못 지켰다면 숨기지 말고 실패 처리하거나 `known_limitations`에 명시한다.
 - 빌드 성공 시 반드시 `.codex_result/task_result.json`을 valid JSON으로 작성한다.
@@ -5138,7 +5108,7 @@ def render_task_agents_md(task_id: str) -> str:
   "task_id": "{task_id}",
   "app_name": "...",
   "package_name": "...",
-  "apk_path": "project/build/app/outputs/flutter-apk/app-release.apk",
+  "apk_path": "project/app/build/outputs/apk/release/app-release.apk",
   "implemented_requirements": ["실제로 동작하는 핵심 요구사항 1", "실제로 동작하는 핵심 요구사항 2"],
   "verification_notes": ["직접 확인한 동작이나 점검 내용"],
   "known_limitations": [],
@@ -5321,12 +5291,13 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - `GET /apps/{{task_id}}/data/{{collection}}?package_name=...&owner_id=...`: 컬렉션 목록 조회
 - `PATCH /apps/{{task_id}}/data/{{collection}}/{{record_id}}`: body `{{"package_name": "...", "owner_id": "...", "data": {{...}}, "replace": false}}`
 - `DELETE /apps/{{task_id}}/data/{{collection}}/{{record_id}}?package_name=...`: 레코드 삭제
-- BaseProject에 `lib/vibe_data_client.dart`가 있으면 이를 우선 사용한다.
+- BaseProject의 `VibeDataClient.kt`를 우선 사용한다.
+- `VibeDataClient`와 `VibeLlmClient`는 `BuildConfig.VIBE_SERVER_BASE_URL`을 기본 서버 주소로 사용하므로 URL 문자열을 소스에 다시 하드코딩하지 않는다.
 
 ## 작업 규칙
 
 - `AGENTS.md` 지침을 반드시 따른다.
-- `project` 폴더 안의 Flutter 앱만 수정한다.
+- `project` 폴더 안의 Kotlin/XML 네이티브 Android 앱만 수정한다.
 - 결과는 반드시 `.codex_result/task_result.json`에 기록한다.
 - 성공 시 Android APK 경로를 넣고, 실패 시 짧은 한국어 오류 요약을 넣는다.
 - `1차 핵심 흐름`은 이번 빌드에서 반드시 완성되어야 하는 첫 출시 범위다.
@@ -5336,12 +5307,12 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - 카메라 요구를 수동 텍스트 입력으로, OCR 요구를 붙여넣기 전용 입력으로, 외부 정보 조회를 하드코딩 목록으로, 저장 기능을 메모리 상태만으로 대체하지 않는다.
 - 사용자가 사진 분석, 조언, 분류, 요약, 상담처럼 실제 AI 추론이 필요한 기능을 요청했다면, 예시 문구나 규칙 기반 하드코딩으로 끝내지 말고 서버 런타임 AI endpoint를 호출하는 실제 동작을 구현한다.
 - 런타임 AI 호출 시 `package_name`은 runtime_package_name 값을 사용한다.
-- 런타임 endpoint를 앱 코드에 넣을 때 `127.0.0.1`, `localhost`, 에뮬레이터 내부 루프백 주소를 사용하지 말고 `runtime_endpoint` 값을 그대로 사용한다.
+- helper client를 사용하지 않고 런타임 endpoint를 직접 조립해야 할 때만 `runtime_endpoint`를 기준으로 하며, `127.0.0.1`, `localhost`, 에뮬레이터 내부 루프백 주소를 하드코딩하지 않는다.
 - 서버 런타임 AI를 쓰는 기능은 네트워크 실패/한도 초과 시 사용자에게 자연스러운 오류 메시지를 보여준다.
 - 런타임 AI를 쓰는 앱이라면 `task_result.json` 성공 결과에 `app_llm_enabled`, `app_llm_model`, `app_llm_system_prompt`를 함께 넣는다.
 - `app_llm_system_prompt`는 이 앱 목적에 맞는 앱 전용 프롬프트여야 하며, 모든 앱에 공통으로 쓰는 고정 문구를 그대로 복사하지 않는다.
 - 예를 들어 방 정리 조언 앱이라면 사진 속 공간 상태를 관찰하고, 우선순위와 실행 순서를 조언하는 방향이 드러나야 한다.
-- 화면 레이아웃은 작은 Android 화면, 화면 회전, 키보드 표시 상태에서도 top/bottom/right/left overflow가 나지 않게 구현한다. 긴 콘텐츠는 `SafeArea`와 스크롤 가능한 컨테이너로 감싸고, `Row`/`Column`의 긴 자식은 `Flexible`/`Expanded`/`Wrap`/`overflow` 처리를 한다.
+- 화면 레이아웃은 작은 Android 화면, 화면 회전, 키보드 표시 상태에서도 잘리거나 겹치지 않게 구현한다. 긴 콘텐츠는 `NestedScrollView` 또는 `RecyclerView`를 사용하고, 긴 자식은 양쪽 constraint와 `0dp` match constraint를 사용한다.
 - 현재 사용자 기기 정보가 제공되면, UI 크기·Android 버전·센서/웨어러블 가능성 같은 구현 판단에 실제로 반영한다.
 """
 
@@ -5736,7 +5707,7 @@ def run_codex_existing_task_followup_decision(
         "project_path": str(project_path),
     }
     context_json = json.dumps(context_payload, ensure_ascii=False, indent=2)
-    codex_prompt = f"""You are the VibeFactory Codex follow-up decision agent for an existing Flutter Android app.
+    codex_prompt = f"""You are the VibeFactory Codex follow-up decision agent for an existing native Android app built with Kotlin and XML Views.
 
 The existing app source code is already available in the `project` directory inside this workspace.
 Read the actual code and project files as needed before deciding.
@@ -5801,7 +5772,7 @@ Context:
     args = shlex.split(command_text)
     args = [part.replace(placeholder, codex_prompt) for part in args]
     args = with_codex_reasoning_effort(args, settings.codex_followup_reasoning_effort)
-    env = os.environ.copy()
+    env = build_subprocess_environment()
     env["CI"] = "1"
 
     exit_code: Optional[int] = None
@@ -5939,239 +5910,25 @@ Context:
     return parsed
 
 
-def normalize_dart_project_identity(
-    dart_text: str,
-    *,
-    task_id: str,
-    package_name: str,
-    previous_package_names: set[str],
-) -> str:
-    updated = dart_text
-    for previous_package_name in previous_package_names:
-        if previous_package_name and previous_package_name != package_name:
-            updated = updated.replace(previous_package_name, package_name)
-
-    string_declaration = (
-        r"(?:(?:static\s+)?(?:const|final)\s+(?:String\s+)?|(?:static\s+)?String\s+)"
-    )
-    package_assignment = re.compile(
-        rf"(?P<prefix>\b{string_declaration}"
-        r"[A-Za-z_][A-Za-z0-9_]*package[A-Za-z0-9_]*\s*=\s*)"
-        r"(?P<quote>['\"])[^'\"]*(?P=quote)",
-        flags=re.IGNORECASE,
-    )
-    task_id_assignment = re.compile(
-        rf"(?P<prefix>\b{string_declaration}"
-        r"[A-Za-z_][A-Za-z0-9_]*task[A-Za-z0-9_]*id[A-Za-z0-9_]*\s*=\s*)"
-        r"(?P<quote>['\"])[^'\"]*(?P=quote)",
-        flags=re.IGNORECASE,
-    )
-    literal_package_argument = re.compile(
-        r"(?P<prefix>\bpackageName\s*:\s*)(?P<quote>['\"])[^'\"]*(?P=quote)"
-    )
-    literal_task_argument = re.compile(
-        r"(?P<prefix>\btaskId\s*:\s*)(?P<quote>['\"])[^'\"]*(?P=quote)"
-    )
-
-    def replace_string(match: re.Match[str], value: str) -> str:
-        return f"{match.group('prefix')}{match.group('quote')}{value}{match.group('quote')}"
-
-    updated = package_assignment.sub(lambda match: replace_string(match, package_name), updated)
-    updated = task_id_assignment.sub(lambda match: replace_string(match, task_id), updated)
-    updated = literal_package_argument.sub(lambda match: replace_string(match, package_name), updated)
-    updated = literal_task_argument.sub(lambda match: replace_string(match, task_id), updated)
-    updated = re.sub(
-        r"(?P<prefix>/apps/)[0-9a-fA-F]{32}(?P<suffix>/(?:llm/respond|data)(?=[/'\"?]))",
-        rf"\g<prefix>{task_id}\g<suffix>",
-        updated,
-    )
-    return updated
-
-
 def apply_project_defaults(project_root: Path, task_id: str, app_name: str, package_name: str) -> bool:
-    changed = False
-    previous_package_names: set[str] = set()
-    manifest_path = project_root / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
-    manifest_text = read_text_if_exists(manifest_path, limit=None)
-    if manifest_text:
-        next_manifest_text = re.sub(
-            r'android:label="[^"]*"',
-            f'android:label="{app_name}"',
-            manifest_text,
-            count=1,
-        )
-        if next_manifest_text != manifest_text:
-            manifest_path.write_text(next_manifest_text, encoding="utf-8")
-            changed = True
-
-    gradle_path = project_root / "android" / "app" / "build.gradle.kts"
-    gradle_text = read_text_if_exists(gradle_path, limit=None)
-    if gradle_text:
-        previous_package_names.update(
-            match.strip()
-            for match in re.findall(
-                r'(?:namespace|applicationId)\s*=\s*"([^"]+)"',
-                gradle_text,
-            )
-            if match.strip()
-        )
-        next_gradle_text = re.sub(
-            r'namespace\s*=\s*"[^"]+"',
-            f'namespace = "{package_name}"',
-            gradle_text,
-        )
-        next_gradle_text = re.sub(
-            r'applicationId\s*=\s*"[^"]+"',
-            f'applicationId = "{package_name}"',
-            next_gradle_text,
-        )
-        next_gradle_text = re.sub(
-            r"(?m)^[ \t]*applicationIdSuffix\s*=\s*[^\n]+\n?",
-            "",
-            next_gradle_text,
-        )
-        if next_gradle_text != gradle_text:
-            gradle_path.write_text(next_gradle_text, encoding="utf-8")
-            changed = True
-
-    kotlin_root = project_root / "android" / "app" / "src" / "main" / "kotlin"
-    kotlin_files = sorted(kotlin_root.rglob("*.kt")) if kotlin_root.exists() else []
-    kotlin_sources: dict[Path, str] = {}
-    generated_package_pattern = re.compile(
-        r"\bkr\.ac\.kangwon\.hai\.generated\.customapp[A-Za-z0-9_]+\b"
+    return native_android_project_builder.apply_identity(
+        project_root,
+        task_id=task_id,
+        app_name=app_name,
+        application_id=package_name,
     )
-    stale_package_roots = {
-        candidate
-        for candidate in previous_package_names
-        if candidate and candidate != package_name
-    }
-    stale_package_roots.add("kr.ac.kangwon.hai.baseproject")
-
-    for kotlin_file in kotlin_files:
-        kotlin_text = read_text_if_exists(kotlin_file, limit=None)
-        if not kotlin_text:
-            continue
-        kotlin_sources[kotlin_file] = kotlin_text
-        package_match = re.search(r"^package\s+([A-Za-z0-9_.]+)", kotlin_text, flags=re.MULTILINE)
-        if not package_match:
-            continue
-        declared_package = package_match.group(1)
-        generated_match = generated_package_pattern.match(declared_package)
-        if generated_match and generated_match.group(0) != package_name:
-            stale_package_roots.add(generated_match.group(0))
-        elif declared_package != package_name and not declared_package.startswith(f"{package_name}."):
-            matching_previous_root = next(
-                (
-                    previous
-                    for previous in previous_package_names
-                    if declared_package == previous or declared_package.startswith(f"{previous}.")
-                ),
-                None,
-            )
-            if matching_previous_root is None:
-                stale_package_roots.add(declared_package)
-
-    for kotlin_file, kotlin_text in kotlin_sources.items():
-        next_kotlin_text = kotlin_text
-        for stale_package in sorted(stale_package_roots, key=len, reverse=True):
-            if stale_package == package_name:
-                continue
-            next_kotlin_text = re.sub(
-                rf"(?<![A-Za-z0-9_]){re.escape(stale_package)}(?=\.|[^A-Za-z0-9_]|$)",
-                package_name,
-                next_kotlin_text,
-            )
-        if next_kotlin_text != kotlin_text:
-            kotlin_file.write_text(next_kotlin_text, encoding="utf-8")
-            changed = True
-
-    lib_root = project_root / "lib"
-    for dart_path in lib_root.rglob("*.dart"):
-        dart_text = read_text_if_exists(dart_path, limit=None)
-        if not dart_text:
-            continue
-        next_dart_text = normalize_dart_project_identity(
-            dart_text,
-            task_id=task_id,
-            package_name=package_name,
-            previous_package_names=previous_package_names,
-        )
-        if dart_path.name == "main.dart":
-            next_dart_text = re.sub(
-                r'CrashHandler\.initialize\(\s*.*?\s*\);\s*',
-                f'CrashHandler.initialize("{task_id}", "{package_name}");\n',
-                next_dart_text,
-                count=1,
-                flags=re.DOTALL,
-            )
-            next_dart_text = next_dart_text.replace("title: 'Generated App'", f"title: '{app_name}'")
-            next_dart_text = next_dart_text.replace(
-                'Text("Generated App Running")',
-                f'Text("{app_name} 실행 중")',
-            )
-        if next_dart_text != dart_text:
-            dart_path.write_text(next_dart_text, encoding="utf-8")
-            changed = True
-
-    if ensure_release_uses_debug_signing(project_root):
-        changed = True
-    return changed
 
 
-def project_android_identity_issues(project_root: Path, package_name: str) -> list[str]:
-    issues: list[str] = []
-    gradle_path = project_root / "android" / "app" / "build.gradle.kts"
-    gradle_text = read_text_if_exists(gradle_path, limit=None)
-    for key, configured_package in re.findall(
-        r"(namespace|applicationId)\s*=\s*\"([^\"]+)\"",
-        gradle_text,
-    ):
-        if configured_package != package_name:
-            issues.append(f"{key}={configured_package}")
-
-    kotlin_root = project_root / "android" / "app" / "src" / "main" / "kotlin"
-    if kotlin_root.exists():
-        for kotlin_file in sorted(kotlin_root.rglob("*.kt")):
-            kotlin_text = read_text_if_exists(kotlin_file, limit=None)
-            if not kotlin_text:
-                continue
-            package_match = re.search(r"^package\s+([A-Za-z0-9_.]+)", kotlin_text, flags=re.MULTILINE)
-            if package_match is None:
-                issues.append(f"{kotlin_file.relative_to(project_root)}:missing-package")
-                continue
-            declared_package = package_match.group(1)
-            if declared_package != package_name and not declared_package.startswith(f"{package_name}."):
-                issues.append(f"{kotlin_file.relative_to(project_root)}:{declared_package}")
-    return issues
-
-
-def ensure_release_uses_debug_signing(project_root: Path) -> bool:
-    gradle_path = project_root / "android" / "app" / "build.gradle.kts"
-    gradle_text = read_text_if_exists(gradle_path, limit=100_000)
-    if not gradle_text:
-        return False
-    if "signingConfigs.getByName(\"debug\")" in gradle_text or "signingConfigs.debug" in gradle_text:
-        return False
-
-    flutter_block_match = re.search(r"(?m)^flutter\s*\{", gradle_text)
-    search_end = flutter_block_match.start() if flutter_block_match else len(gradle_text)
-    android_end_index = gradle_text.rfind("}", 0, search_end)
-    if android_end_index < 0:
-        return False
-
-    build_types_block = """
-
-    buildTypes {
-        getByName("release") {
-            signingConfig = signingConfigs.getByName("debug")
-        }
-    }
-"""
-    next_text = gradle_text[:android_end_index] + build_types_block + gradle_text[android_end_index:]
-    if next_text == gradle_text:
-        return False
-    gradle_path.write_text(next_text, encoding="utf-8")
-    return True
+def project_android_identity_issues(
+    project_root: Path,
+    package_name: str,
+    task_id: str,
+) -> list[str]:
+    return native_android_project_builder.identity_issues(
+        project_root,
+        task_id=task_id,
+        application_id=package_name,
+    )
 
 
 def ensure_workspace_project_link(workspace_path: Path, project_root: Path) -> Path:
@@ -6201,146 +5958,41 @@ def revision_number_from_label(revision_label: str) -> int:
 
 
 def ensure_project_revision_version(project_root: Path, revision_label: Optional[str] = None) -> bool:
-    _ = revision_label or current_revision_label(project_root)
-    pubspec_path = project_root / "pubspec.yaml"
-    pubspec_text = read_text_if_exists(pubspec_path, limit=100_000)
-    if not pubspec_text:
-        return False
-
-    version_match = re.search(r"^version:\s*([^\s#]+)(.*)$", pubspec_text, re.MULTILINE)
-    if version_match:
-        current_value = version_match.group(1).strip()
-        suffix = version_match.group(2)
-        version_name, _, _ = current_value.partition("+")
-        version_name = version_name.strip() or "1.0.0"
-        next_line = f"version: {version_name}+{GENERATED_APK_SIDELOAD_VERSION_CODE}{suffix}"
-        next_text = (
-            pubspec_text[: version_match.start()]
-            + next_line
-            + pubspec_text[version_match.end() :]
-        )
-    else:
-        separator = "" if pubspec_text.endswith("\n") else "\n"
-        next_text = (
-            f"{pubspec_text}{separator}"
-            f"version: 1.0.0+{GENERATED_APK_SIDELOAD_VERSION_CODE}\n"
-        )
-
-    if next_text == pubspec_text:
-        return False
-    pubspec_path.write_text(next_text, encoding="utf-8")
-    return True
-
-
-def built_apk_identity(project_root: Path, apk_path: Path) -> tuple[str, Optional[int]]:
-    metadata_candidates = (
-        project_root / "build" / "app" / "outputs" / "apk" / "release" / "output-metadata.json",
-        project_root / "build" / "app" / "outputs" / "apk" / "debug" / "output-metadata.json",
-    )
-    for metadata_path in metadata_candidates:
-        if not metadata_path.is_file():
-            continue
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        if not isinstance(metadata, dict):
-            continue
-        application_id = normalize_whitespace(str(metadata.get("applicationId") or ""))
-        elements = metadata.get("elements")
-        if not application_id or not isinstance(elements, list):
-            continue
-        matching_element: Optional[dict[str, Any]] = None
-        fallback_element: Optional[dict[str, Any]] = None
-        for element in elements:
-            if not isinstance(element, dict):
-                continue
-            fallback_element = fallback_element or element
-            if str(element.get("outputFile") or "") == apk_path.name:
-                matching_element = element
-                break
-        selected_element = matching_element or fallback_element
-        if selected_element is None:
-            continue
-        version_code = optional_int_value(selected_element.get("versionCode"))
-        return application_id, version_code
-    return "", None
+    _ = revision_label
+    return native_android_project_builder.ensure_version(project_root)
 
 
 def validate_built_apk_install_contract(
     project_root: Path,
     apk_path: Path,
     expected_package_name: str,
+    *,
+    env: Optional[dict[str, str]] = None,
 ) -> None:
-    application_id, version_code = built_apk_identity(project_root, apk_path)
-    if not application_id:
-        raise RuntimeError("APK 빌드 메타데이터에서 패키지 이름을 확인할 수 없습니다.")
-    if application_id != expected_package_name:
-        raise RuntimeError(
-            "APK 패키지 이름이 Task 식별자와 일치하지 않습니다: "
-            f"{application_id} != {expected_package_name}"
-        )
-    if version_code != GENERATED_APK_SIDELOAD_VERSION_CODE:
-        raise RuntimeError(
-            "APK 설치 버전 코드가 사이드로드 정책과 일치하지 않습니다: "
-            f"{version_code} != {GENERATED_APK_SIDELOAD_VERSION_CODE}"
-        )
-
-
-def flutter_no_pub_args(project_root: Path) -> list[str]:
-    package_config = project_root / ".dart_tool" / "package_config.json"
-    return ["--no-pub"] if package_config.is_file() else []
-
-
-ANDROID_ONLY_WORKSPACE_ROOT_IGNORES = {
-    "ios",
-    "macos",
-    "windows",
-    "linux",
-    "web",
-    "test",
-}
+    native_android_project_builder.validate_apk(
+        project_root,
+        apk_path,
+        expected_application_id=expected_package_name,
+        env=env,
+    )
 
 
 def create_initial_project_revision(
     task_root: Path,
     base_project_path: Path,
-    *,
-    android_only: bool = True,
 ) -> tuple[Path, str]:
     revision_label = "rev_0001"
     revision_root = task_root / "revisions" / revision_label
     project_root = revision_root / "project"
-    source_root = base_project_path.resolve()
-
-    def ignore_initial_project_dirs(path: str, names: list[str]) -> set[str]:
-        ignored = ignore_project_revision_cache_dirs(path, names)
-        if android_only and Path(path).resolve() == source_root:
-            ignored.update(name for name in names if name in ANDROID_ONLY_WORKSPACE_ROOT_IGNORES)
-        return ignored
-
-    shutil.copytree(base_project_path, project_root, ignore=ignore_initial_project_dirs)
+    native_android_project_builder.copy_project(base_project_path, project_root)
     ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(task_root, project_root)
     return project_root, revision_label
 
 
-def ignore_project_revision_cache_dirs(path: str, names: list[str]) -> set[str]:
-    _ = path
-    cache_names = {
-        "build",
-        ".dart_tool",
-        ".gradle",
-        ".tooling",
-    }
-    return {name for name in names if name in cache_names}
-
-
 def create_followup_project_revision(
     workspace_path: Path,
     source_project_path: Path,
-    *,
-    android_only: bool = True,
 ) -> tuple[Path, str]:
     revisions_root = workspace_path / "revisions"
     revisions_root.mkdir(parents=True, exist_ok=True)
@@ -6354,15 +6006,7 @@ def create_followup_project_revision(
     revision_label = f"rev_{highest_index + 1:04d}"
     revision_root = revisions_root / revision_label
     project_root = revision_root / "project"
-    source_root = source_project_path.resolve()
-
-    def ignore_followup_project_dirs(path: str, names: list[str]) -> set[str]:
-        ignored = ignore_project_revision_cache_dirs(path, names)
-        if android_only and Path(path).resolve() == source_root:
-            ignored.update(name for name in names if name in ANDROID_ONLY_WORKSPACE_ROOT_IGNORES)
-        return ignored
-
-    shutil.copytree(source_project_path, project_root, ignore=ignore_followup_project_dirs)
+    native_android_project_builder.copy_project(source_project_path, project_root)
     ensure_project_revision_version(project_root, revision_label)
     ensure_workspace_project_link(workspace_path, project_root)
     return project_root, revision_label
@@ -6417,11 +6061,9 @@ def create_branched_task_workspace(
 ) -> tuple[Path, Path, int]:
     task_root = task_workspace_root_for(settings, task)
     project_root = task_root / "revisions" / "rev_0001" / "project"
-    source_root = source_project_path.resolve()
-
     if task_root.exists() and ((task_root / "project").exists() or (task_root / "revisions").exists()):
         raise RuntimeError(f"task workspace already exists: {task_root}")
-    if not source_root.exists() or not source_root.is_dir():
+    if not source_project_path.exists() or not source_project_path.is_dir():
         raise RuntimeError("source revision project does not exist")
 
     settings.workspaces_root.mkdir(parents=True, exist_ok=True)
@@ -6429,13 +6071,7 @@ def create_branched_task_workspace(
     (task_root / "logs").mkdir(parents=True, exist_ok=True)
     (task_root / ".codex_result").mkdir(parents=True, exist_ok=True)
 
-    def ignore_branched_project_dirs(path: str, names: list[str]) -> set[str]:
-        ignored = ignore_project_revision_cache_dirs(path, names)
-        if settings.android_only_workspace_enabled and Path(path).resolve() == source_root:
-            ignored.update(name for name in names if name in ANDROID_ONLY_WORKSPACE_ROOT_IGNORES)
-        return ignored
-
-    shutil.copytree(source_root, project_root, ignore=ignore_branched_project_dirs)
+    native_android_project_builder.copy_project(source_project_path, project_root)
     replaced_file_count = replace_project_task_id(project_root, source_task_id, str(task["task_id"]))
     ensure_project_revision_version(project_root, "rev_0001")
     if task.get("app_name") and task.get("package_name"):
@@ -6452,9 +6088,6 @@ def clear_previous_run_artifacts(workspace_path: Path) -> None:
         workspace_path / "logs" / "codex_stdout.log",
         workspace_path / "logs" / "codex_stderr.log",
         workspace_path / "logs" / "build.log",
-        workspace_path / "project" / "build" / "app" / "outputs" / "flutter-apk" / "app-release.apk",
-        workspace_path / "project" / "build" / "app" / "outputs" / "flutter-apk" / "app-arm64-v8a-release.apk",
-        workspace_path / "project" / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk",
     )
     for artifact_path in artifact_paths:
         try:
@@ -6462,6 +6095,11 @@ def clear_previous_run_artifacts(workspace_path: Path) -> None:
                 artifact_path.unlink()
         except FileNotFoundError:
             continue
+    project_link = workspace_path / "project"
+    if project_link.is_dir():
+        project_root = project_link.resolve()
+        if ensure_within_root(project_root, workspace_path):
+            native_android_project_builder.clear_artifacts(project_root)
 
 
 def effective_owner_id(device_id: str, phone_number: Optional[str]) -> str:
@@ -7345,45 +6983,18 @@ def write_result_json(result_path: Path, payload: dict[str, Any]) -> None:
 
 
 def infer_project_app_name(project_root: Path) -> str:
-    manifest_path = project_root / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
-    manifest_text = read_text_if_exists(manifest_path, limit=100_000)
-    label_match = re.search(r'android:label="([^"]+)"', manifest_text)
-    if label_match and label_match.group(1).strip():
-        return label_match.group(1).strip()
-
-    pubspec_path = project_root / "pubspec.yaml"
-    pubspec_text = read_text_if_exists(pubspec_path, limit=50_000)
-    name_match = re.search(r"^name:\s*([A-Za-z0-9_.-]+)\s*$", pubspec_text, re.MULTILINE)
-    if name_match and name_match.group(1).strip():
-        return name_match.group(1).strip()
-    return "Generated App"
+    return native_android_project_builder.infer_app_name(project_root) or "Generated App"
 
 
 def infer_project_package_name(project_root: Path) -> str:
-    gradle_path = project_root / "android" / "app" / "build.gradle.kts"
-    gradle_text = read_text_if_exists(gradle_path, limit=100_000)
-    app_id_match = re.search(r'applicationId\s*=\s*"([^"]+)"', gradle_text)
-    if app_id_match and app_id_match.group(1).strip():
-        return app_id_match.group(1).strip()
-    namespace_match = re.search(r'namespace\s*=\s*"([^"]+)"', gradle_text)
-    if namespace_match and namespace_match.group(1).strip():
-        return namespace_match.group(1).strip()
-    return "com.example.generatedapp"
+    return (
+        native_android_project_builder.infer_application_id(project_root)
+        or "com.example.generatedapp"
+    )
 
 
 def project_looks_like_placeholder_app(project_root: Path) -> bool:
-    main_dart_path = project_root / "lib" / "main.dart"
-    main_dart_text = read_text_if_exists(main_dart_path, limit=200_000)
-    if not main_dart_text:
-        return False
-    normalized = re.sub(r"\s+", " ", main_dart_text)
-    placeholder_markers = (
-        'Text("Generated App")',
-        "Text('Generated App')",
-        'title: "Generated App"',
-        "title: 'Generated App'",
-    )
-    return any(marker in normalized for marker in placeholder_markers)
+    return native_android_project_builder.looks_like_placeholder(project_root)
 
 
 def make_error_result(task_id: str, message: str, build_log_path: str = "logs/build.log") -> dict[str, Any]:
@@ -7914,12 +7525,24 @@ class CodexTaskRunner:
             if not self.is_task_cancelled(task_id):
                 codex_log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
                 engine_issue = None if result_exists else codex_engine_issue_from_logs(codex_log_text, exit_code)
-                if should_attempt_server_side_build(
-                    result_exists=result_exists,
-                    identity_changed=identity_changed,
-                    timed_out=timed_out,
-                    engine_issue=engine_issue,
-                ):
+                result_status = ""
+                if result_exists:
+                    try:
+                        result_status = normalize_whitespace(
+                            str(json.loads(result_path.read_text(encoding="utf-8")).get("status") or "")
+                        ).lower()
+                    except (json.JSONDecodeError, OSError, AttributeError):
+                        result_status = ""
+                should_build = result_status == "success" or (
+                    not result_exists
+                    and should_attempt_server_side_build(
+                        result_exists=False,
+                        identity_changed=identity_changed,
+                        timed_out=timed_out,
+                        engine_issue=engine_issue,
+                    )
+                )
+                if should_build:
                     self.attempt_server_side_build(task_id, workspace_path, result_path, exit_code)
 
         self.finalize_task(task_id, workspace_path, result_path, exit_code, timed_out)
@@ -7978,21 +7601,48 @@ class CodexTaskRunner:
             return process.wait()
         return process.wait(timeout=timeout_seconds)
 
-    def build_task_env(self, workspace_path: Path) -> dict[str, str]:
+    def build_task_env(
+        self,
+        workspace_path: Path,
+        *,
+        include_signing: bool = False,
+    ) -> dict[str, str]:
         tool_cache_root = self.settings.build_cache_root if self.settings.shared_build_cache_enabled else workspace_path / ".tooling"
-        pub_cache_path = tool_cache_root / "pub-cache"
         gradle_home_path = tool_cache_root / "gradle"
         temp_path = workspace_path / ".tooling" / "tmp"
-        pub_cache_path.mkdir(parents=True, exist_ok=True)
         gradle_home_path.mkdir(parents=True, exist_ok=True)
         temp_path.mkdir(parents=True, exist_ok=True)
-        env = os.environ.copy()
-        env["PUB_CACHE"] = str(pub_cache_path)
+        env = build_subprocess_environment()
         env["GRADLE_USER_HOME"] = str(gradle_home_path)
         env["TMPDIR"] = str(temp_path)
-        env["FLUTTER_SUPPRESS_ANALYTICS"] = "true"
         env["CI"] = "1"
+        signing_values = {
+            "GENERATED_APP_KEYSTORE_PATH": self.settings.generated_app_keystore_path,
+            "GENERATED_APP_KEYSTORE_PASSWORD": self.settings.generated_app_keystore_password,
+            "GENERATED_APP_KEY_ALIAS": self.settings.generated_app_key_alias,
+            "GENERATED_APP_KEY_PASSWORD": self.settings.generated_app_key_password,
+        }
+        if include_signing:
+            for key, value in signing_values.items():
+                if value:
+                    env[key] = value
         return env
+
+    def require_release_signing(self) -> None:
+        signing_values = {
+            "GENERATED_APP_KEYSTORE_PATH": self.settings.generated_app_keystore_path,
+            "GENERATED_APP_KEYSTORE_PASSWORD": self.settings.generated_app_keystore_password,
+            "GENERATED_APP_KEY_ALIAS": self.settings.generated_app_key_alias,
+            "GENERATED_APP_KEY_PASSWORD": self.settings.generated_app_key_password,
+        }
+        missing = [key for key, value in signing_values.items() if not value]
+        if missing:
+            raise RuntimeError(
+                "생성 앱 release 서명 설정이 없습니다: " + ", ".join(missing)
+            )
+        keystore_path = Path(self.settings.generated_app_keystore_path).expanduser()
+        if not keystore_path.is_file():
+            raise RuntimeError(f"생성 앱 release keystore를 찾을 수 없습니다: {keystore_path}")
 
     def run_logged_command(
         self,
@@ -8043,94 +7693,11 @@ class CodexTaskRunner:
             finally:
                 self.unregister_process(process)
 
-    def ensure_debug_apk(
-        self,
-        task_id: str,
-        workspace_path: Path,
-        project_path: Path,
-        current_apk_path: Path,
-    ) -> Path:
-        version_changed = ensure_project_revision_version(project_path)
-        if current_apk_path.name == "app-debug.apk" and current_apk_path.exists() and not version_changed:
-            return current_apk_path
-
-        candidate_paths: list[Path] = []
-        sibling_debug = current_apk_path.with_name("app-debug.apk")
-        candidate_paths.append(sibling_debug)
-        candidate_paths.append(
-            workspace_path / "project" / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk"
-        )
-
-        seen: set[Path] = set()
-        for candidate in candidate_paths:
-            resolved = candidate.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            if ensure_within_root(resolved, workspace_path) and resolved.exists() and resolved.stat().st_size > 0:
-                return resolved
-
-        build_log_path = workspace_path / "logs" / "build.log"
-        env = self.build_task_env(workspace_path)
-        flutter_args = shlex.split(self.settings.flutter_command)
-        debug_apk = (project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk").resolve()
-        status_message = "설치 가능한 디버그 APK를 준비하고 있어요."
-        did_update = self.db.update_task_if_status(
-            task_id,
-            {"running"},
-            status="Running",
-            message=status_message,
-        )
-        if not did_update:
-            raise RuntimeError("앱 생성이 중단되었습니다.")
-        running_task = self.db.get_task(task_id)
-        if running_task:
-            log_task_status_event(self.db, running_task, event_type="build_stage_debug_prepare")
-        log_build_stage_event(
-            self.db,
-            task_id,
-            stage="debug apk",
-            phase="started",
-            body=status_message,
-            detail="최적화 APK 준비에 실패했거나 비활성화되어 debug APK를 준비합니다.",
-        )
-        exit_code, timed_out, elapsed_seconds = self.run_logged_command(
-            flutter_args + ["build", "apk", "--debug"] + flutter_no_pub_args(project_path),
-            cwd=project_path,
-            env=env,
-            log_path=build_log_path,
-            task_id=task_id,
-        )
-        if self.is_task_cancelled(task_id):
-            raise RuntimeError("앱 생성이 중단되었습니다.")
-        if timed_out and not debug_apk.exists():
-            raise RuntimeError("debug APK 빌드가 시간 제한을 초과했습니다.")
-        if exit_code != 0 and not debug_apk.exists():
-            raise RuntimeError(f"debug APK 빌드에 실패했습니다. exit code: {exit_code}")
-
-        if not ensure_within_root(debug_apk, workspace_path) or not debug_apk.exists() or debug_apk.stat().st_size <= 0:
-            raise RuntimeError("debug APK 산출물을 찾을 수 없습니다.")
-
-        log_build_stage_event(
-            self.db,
-            task_id,
-            stage="debug apk",
-            phase="succeeded",
-            body="설치 가능한 디버그 APK를 준비했어요.",
-            detail=f"소요 시간: {elapsed_seconds:.1f}초",
-        )
-        return debug_apk
-
     def optimized_download_apk_candidates(self, project_path: Path, current_apk_path: Path) -> list[Path]:
-        flutter_apk_root = project_path / "build" / "app" / "outputs" / "flutter-apk"
         candidates = [
             current_apk_path,
-            flutter_apk_root / "app-release.apk",
-            flutter_apk_root / "app-arm64-v8a-release.apk",
+            project_path / native_android_project_builder.expected_apk_relative,
         ]
-        if flutter_apk_root.exists():
-            candidates.extend(sorted(flutter_apk_root.glob("*arm64*v8a*release*.apk")))
-            candidates.extend(sorted(flutter_apk_root.glob("*release*.apk")))
 
         seen: set[Path] = set()
         ordered: list[Path] = []
@@ -8163,22 +7730,31 @@ class CodexTaskRunner:
         current_apk_path: Path,
     ) -> Path:
         version_changed = ensure_project_revision_version(project_path)
-        if not self.settings.optimized_download_apk_enabled or self.settings.mock_codex:
-            return self.ensure_debug_apk(task_id, workspace_path, project_path, current_apk_path)
+        if self.settings.mock_codex:
+            return current_apk_path
 
+        env = self.build_task_env(workspace_path, include_signing=True)
         existing_optimized_apk = self.find_existing_optimized_download_apk(
             workspace_path,
             project_path,
             current_apk_path,
         )
         if existing_optimized_apk is not None and not version_changed:
-            return existing_optimized_apk
+            try:
+                task = self.db.get_task(task_id) or {}
+                validate_built_apk_install_contract(
+                    project_path,
+                    existing_optimized_apk,
+                    current_task_package_name(task),
+                    env=env,
+                )
+                return existing_optimized_apk
+            except RuntimeError:
+                pass
 
         build_log_path = workspace_path / "logs" / "build.log"
-        env = self.build_task_env(workspace_path)
-        flutter_args = shlex.split(self.settings.flutter_command)
-        ensure_release_uses_debug_signing(project_path)
-        status_message = "다운로드용 APK를 최적화하고 있어요."
+        self.require_release_signing()
+        status_message = "서명된 다운로드용 APK를 준비하고 있어요."
         did_update = self.db.update_task_if_status(
             task_id,
             {"running"},
@@ -8193,15 +7769,14 @@ class CodexTaskRunner:
         log_build_stage_event(
             self.db,
             task_id,
-            stage="다운로드용 APK 최적화",
+            stage="다운로드용 APK 빌드",
             phase="started",
             body=status_message,
-            detail="arm64 release APK를 생성합니다.",
+            detail="Android release APK를 생성하고 서명합니다.",
         )
+        release_step = native_android_project_builder.build_steps(project_path)[-1]
         exit_code, timed_out, elapsed_seconds = self.run_logged_command(
-            flutter_args
-            + ["build", "apk", "--release", "--target-platform", "android-arm64"]
-            + flutter_no_pub_args(project_path),
+            list(release_step.command),
             cwd=project_path,
             env=env,
             log_path=build_log_path,
@@ -8210,19 +7785,22 @@ class CodexTaskRunner:
         if self.is_task_cancelled(task_id):
             raise RuntimeError("앱 생성이 중단되었습니다.")
 
-        optimized_apk = self.find_existing_optimized_download_apk(
-            workspace_path,
-            project_path,
-            current_apk_path,
-        )
+        optimized_apk = native_android_project_builder.resolve_apk(project_path)
         if not timed_out and exit_code == 0 and optimized_apk is not None:
+            task = self.db.get_task(task_id) or {}
+            validate_built_apk_install_contract(
+                project_path,
+                optimized_apk,
+                current_task_package_name(task),
+                env=env,
+            )
             size_mb = optimized_apk.stat().st_size / (1024 * 1024)
             log_build_stage_event(
                 self.db,
                 task_id,
-                stage="다운로드용 APK 최적화",
+                stage="다운로드용 APK 빌드",
                 phase="succeeded",
-                body="다운로드용 APK를 작게 준비했어요.",
+                body="서명된 다운로드용 APK를 준비했어요.",
                 detail=f"{optimized_apk.name}, {size_mb:.1f}MB, 소요 시간: {elapsed_seconds:.1f}초",
             )
             return optimized_apk
@@ -8231,12 +7809,12 @@ class CodexTaskRunner:
         log_build_stage_event(
             self.db,
             task_id,
-            stage="다운로드용 APK 최적화",
+            stage="다운로드용 APK 빌드",
             phase="failed",
-            body="다운로드용 APK 최적화에 실패해 debug APK로 대체합니다.",
+            body="서명된 다운로드용 APK를 준비하지 못했어요.",
             detail=f"{reason}, 소요 시간: {elapsed_seconds:.1f}초",
         )
-        return self.ensure_debug_apk(task_id, workspace_path, project_path, current_apk_path)
+        raise RuntimeError(f"다운로드용 APK 빌드에 실패했습니다. {reason}")
 
     def prepare_saved_revision_apk(
         self,
@@ -8256,7 +7834,11 @@ class CodexTaskRunner:
                 app_name,
                 expected_package_name,
             )
-            identity_issues = project_android_identity_issues(project_path, expected_package_name)
+            identity_issues = project_android_identity_issues(
+                project_path,
+                expected_package_name,
+                str(task["task_id"]),
+            )
             if identity_issues:
                 raise RuntimeError("Android 앱 식별 정보를 복원하지 못했습니다.")
             version_changed = ensure_project_revision_version(project_path)
@@ -8271,35 +7853,18 @@ class CodexTaskRunner:
                         project_path,
                         existing_apk,
                         expected_package_name,
+                        env=self.build_task_env(workspace_path, include_signing=True),
                     )
                     return existing_apk
                 except RuntimeError:
                     pass
 
-            ensure_release_uses_debug_signing(project_path)
             build_log_path = workspace_path / "logs" / "revision_download_build.log"
-            env = self.build_task_env(workspace_path)
-            flutter_args = shlex.split(self.settings.flutter_command)
-            commands: list[list[str]] = []
-            if not flutter_no_pub_args(project_path):
-                commands.append(flutter_args + ["pub", "get"])
-            commands.append(
-                flutter_args
-                + [
-                    "build",
-                    "apk",
-                    "--release",
-                    "--target-platform",
-                    "android-arm64",
-                    "--build-number",
-                    str(GENERATED_APK_SIDELOAD_VERSION_CODE),
-                ]
-                + flutter_no_pub_args(project_path)
-            )
-
-            for args in commands:
+            self.require_release_signing()
+            env = self.build_task_env(workspace_path, include_signing=True)
+            for build_step in native_android_project_builder.build_steps(project_path):
                 exit_code, timed_out, _ = self.run_logged_command(
-                    args,
+                    list(build_step.command),
                     cwd=project_path,
                     env=env,
                     log_path=build_log_path,
@@ -8318,6 +7883,7 @@ class CodexTaskRunner:
                 project_path,
                 prepared_apk,
                 expected_package_name,
+                env=env,
             )
             return prepared_apk
 
@@ -8328,6 +7894,14 @@ class CodexTaskRunner:
         result_path: Path,
         codex_exit_code: Optional[int],
     ) -> None:
+        prior_result: dict[str, Any] = {}
+        if result_path.is_file():
+            try:
+                parsed_result = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(parsed_result, dict):
+                    prior_result = parsed_result
+            except (json.JSONDecodeError, OSError):
+                pass
         task = self.db.get_task(task_id) or {}
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
         expected_app_name = current_task_app_name(task)
@@ -8339,7 +7913,11 @@ class CodexTaskRunner:
                 expected_app_name,
                 expected_package_name,
             )
-            identity_issues = project_android_identity_issues(project_path, expected_package_name)
+            identity_issues = project_android_identity_issues(
+                project_path,
+                expected_package_name,
+                task_id,
+            )
             if identity_issues:
                 build_log_path = workspace_path / "logs" / "build.log"
                 build_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8373,27 +7951,26 @@ class CodexTaskRunner:
                 )
                 return
         ensure_project_revision_version(project_path)
-        ensure_release_uses_debug_signing(project_path)
         build_log_path = workspace_path / "logs" / "build.log"
-        env = self.build_task_env(workspace_path)
-        flutter_args = shlex.split(self.settings.flutter_command)
-        stages = [
-            ("pub_get", "Flutter 의존성을 설치하고 있어요.", flutter_args + ["pub", "get"]),
-            (
-                "analyze",
-                "Flutter 코드를 분석하고 있어요.",
-                flutter_args + ["analyze", "--no-pub", "--no-fatal-warnings", "--no-fatal-infos"],
-            ),
-            (
-                "build",
-                "Android APK를 빌드하고 있어요.",
-                flutter_args
-                + ["build", "apk", "--release", "--target-platform", "android-arm64", "--no-pub"],
-            ),
-        ]
+        env = self.build_task_env(workspace_path, include_signing=True)
+        try:
+            self.require_release_signing()
+        except RuntimeError as exc:
+            write_result_json(
+                result_path,
+                {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error_stage": "build",
+                    "message": str(exc),
+                    "build_log_path": "logs/build.log",
+                },
+            )
+            return
+        build_steps = native_android_project_builder.build_steps(project_path)
 
         build_log_path.write_text(
-            f"[server] 결과 파일이 없어 서버가 직접 Flutter 검증을 이어갑니다. worker_exit_code={codex_exit_code}\n",
+            f"[server] 결과 파일이 없어 서버가 직접 Android 검증을 이어갑니다. worker_exit_code={codex_exit_code}\n",
             encoding="utf-8",
         )
         log_build_stage_event(
@@ -8401,16 +7978,13 @@ class CodexTaskRunner:
             task_id,
             stage="서버 검증 빌드",
             phase="started",
-            body="서버가 직접 Flutter 검증 빌드를 이어가고 있어요.",
+            body="서버가 직접 Android 검증 빌드를 이어가고 있어요.",
         )
 
-        stage_labels = {
-            "pub_get": "pub get",
-            "analyze": "analyze",
-            "build": "build",
-        }
-
-        for stage_key, status_message, args in stages:
+        for build_step in build_steps:
+            stage_key = build_step.key
+            stage_label = build_step.label
+            status_message = f"{stage_label} 단계를 진행하고 있어요."
             if self.is_task_cancelled(task_id):
                 return
             did_update = self.db.update_task_if_status(
@@ -8427,13 +8001,13 @@ class CodexTaskRunner:
             log_build_stage_event(
                 self.db,
                 task_id,
-                stage=stage_labels[stage_key],
+                stage=stage_label,
                 phase="started",
                 body=status_message,
                 detail="명령을 실행하고 있어요.",
             )
             exit_code, timed_out, elapsed_seconds = self.run_logged_command(
-                args,
+                list(build_step.command),
                 cwd=project_path,
                 env=env,
                 log_path=build_log_path,
@@ -8445,9 +8019,9 @@ class CodexTaskRunner:
                 log_build_stage_event(
                     self.db,
                     task_id,
-                    stage=stage_labels[stage_key],
+                    stage=stage_label,
                     phase="failed",
-                    body=f"Flutter {stage_labels[stage_key]} 단계가 시간 제한을 초과했어요.",
+                    body=f"{stage_label} 단계가 시간 제한을 초과했어요.",
                     detail=f"소요 시간: {elapsed_seconds:.1f}초",
                 )
                 write_result_json(
@@ -8455,8 +8029,8 @@ class CodexTaskRunner:
                     {
                         "status": "failed",
                         "task_id": task_id,
-                        "error_stage": stage_key if stage_key != "pub_get" else "unknown",
-                        "message": f"Flutter {stage_labels[stage_key]} 단계가 시간 제한을 초과했어요.",
+                        "error_stage": stage_key,
+                        "message": f"{stage_label} 단계가 시간 제한을 초과했어요.",
                         "build_log_path": "logs/build.log",
                     },
                 )
@@ -8465,9 +8039,9 @@ class CodexTaskRunner:
                 log_build_stage_event(
                     self.db,
                     task_id,
-                    stage=stage_labels[stage_key],
+                    stage=stage_label,
                     phase="failed",
-                    body=f"Flutter {stage_labels[stage_key]} 단계에 실패했어요.",
+                    body=f"{stage_label} 단계에 실패했어요.",
                     detail=f"종료 코드: {exit_code}, 소요 시간: {elapsed_seconds:.1f}초",
                 )
                 write_result_json(
@@ -8475,8 +8049,8 @@ class CodexTaskRunner:
                     {
                         "status": "failed",
                         "task_id": task_id,
-                        "error_stage": stage_key if stage_key != "pub_get" else "unknown",
-                        "message": f"Flutter {stage_labels[stage_key]} 단계에 실패했어요.",
+                        "error_stage": stage_key,
+                        "message": f"{stage_label} 단계에 실패했어요.",
                         "build_log_path": "logs/build.log",
                     },
                 )
@@ -8484,9 +8058,9 @@ class CodexTaskRunner:
             log_build_stage_event(
                 self.db,
                 task_id,
-                stage=stage_labels[stage_key],
+                stage=stage_label,
                 phase="succeeded",
-                body=f"Flutter {stage_labels[stage_key]} 단계가 완료되었어요.",
+                body=f"{stage_label} 단계가 완료되었어요.",
                 detail=f"소요 시간: {elapsed_seconds:.1f}초",
             )
 
@@ -8503,10 +8077,44 @@ class CodexTaskRunner:
             )
             return
 
-        apk_relative = Path("project/build/app/outputs/flutter-apk/app-release.apk")
+        built_apk = native_android_project_builder.resolve_apk(project_path)
+        if built_apk is None or not expected_package_name:
+            write_result_json(
+                result_path,
+                {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error_stage": "build",
+                    "message": "서명된 Android APK 산출물을 확인할 수 없습니다.",
+                    "build_log_path": "logs/build.log",
+                },
+            )
+            return
+        try:
+            validate_built_apk_install_contract(
+                project_path,
+                built_apk,
+                expected_package_name,
+                env=env,
+            )
+        except RuntimeError as exc:
+            write_result_json(
+                result_path,
+                {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error_stage": "build",
+                    "message": f"APK 설치 계약 검증에 실패했습니다: {exc}",
+                    "build_log_path": "logs/build.log",
+                },
+            )
+            return
+
+        apk_relative = Path("project") / native_android_project_builder.expected_apk_relative
         write_result_json(
             result_path,
             {
+                **prior_result,
                 "status": "success",
                 "task_id": task_id,
                 "app_name": infer_project_app_name(project_path),
@@ -8565,15 +8173,23 @@ class CodexTaskRunner:
                 "build_log_path": "logs/build.log",
             }
         else:
-            apk_relative = Path("project/build/app/outputs/flutter-apk/app-debug.apk")
+            project_path = Path(str(task.get("project_path") or workspace_path / "project"))
+            layout_path = project_path / "app" / "src" / "main" / "res" / "layout" / "activity_main.xml"
+            if layout_path.is_file():
+                layout_text = layout_path.read_text(encoding="utf-8")
+                layout_path.write_text(
+                    layout_text.replace("@string/template_title", "@string/app_name"),
+                    encoding="utf-8",
+                )
+            apk_relative = Path("project") / native_android_project_builder.expected_apk_relative
             apk_path = workspace_path / apk_relative
             apk_path.parent.mkdir(parents=True, exist_ok=True)
             apk_path.write_bytes(b"mock-apk")
             result = {
                 "status": "success",
                 "task_id": task["task_id"],
-                "app_name": "Mock App",
-                "package_name": "com.example.mockapp",
+                "app_name": current_task_app_name(task) or "Mock App",
+                "package_name": current_task_package_name(task) or "com.example.mockapp",
                 "apk_path": apk_relative.as_posix(),
                 "app_llm_enabled": True,
                 "app_llm_system_prompt": "사용자가 보낸 상황과 사진을 바탕으로 한국어로 실용적인 조언을 제공하세요. 우선순위와 실행 순서를 분명하게 제안하세요.",
@@ -8891,6 +8507,10 @@ class CodexTaskRunner:
                 body="APK 생성이 완료되었어요.",
                 detail=str(apk_path),
             )
+            if current_project_path is not None:
+                native_android_project_builder.prune_caches_preserving_release(
+                    current_project_path
+                )
             return
 
         if result.get("status") == "failed":
@@ -8946,7 +8566,6 @@ def build_task_workspace(settings: Settings, task: dict[str, Any]) -> tuple[Path
     project_root, _ = create_initial_project_revision(
         task_root,
         settings.base_project_path,
-        android_only=settings.android_only_workspace_enabled,
     )
     reference_attachments = normalize_reference_attachments(task.get("reference_attachments") or [])
     if not reference_attachments:
@@ -9174,16 +8793,10 @@ def find_revision_apk(workspace_path: Path, project_path: Path, task: dict[str, 
         candidates.append(Path(task_apk_path))
     candidates.extend(
         [
-            project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-release.apk",
-            project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-arm64-v8a-release.apk",
-            project_path / "build" / "app" / "outputs" / "flutter-apk" / "app-debug.apk",
-            project_path / "build" / "app" / "outputs" / "apk" / "debug" / "app-debug.apk",
+            project_path / native_android_project_builder.expected_apk_relative,
+            project_path / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk",
         ]
     )
-    flutter_apk_root = project_path / "build" / "app" / "outputs" / "flutter-apk"
-    if flutter_apk_root.exists():
-        candidates.extend(sorted(flutter_apk_root.glob("*release*.apk")))
-        candidates.extend(sorted(flutter_apk_root.glob("*.apk")))
     for candidate in candidates:
         apk_path = candidate if candidate.is_absolute() else workspace_path / candidate
         apk_path = apk_path.resolve()
@@ -9216,7 +8829,8 @@ def project_path_for_apk_artifact(
         if (
             ensure_within_root(project_path, workspace_path)
             and ensure_within_root(apk_path, project_path)
-            and (project_path / "pubspec.yaml").is_file()
+            and (project_path / "settings.gradle.kts").is_file()
+            and (project_path / "app" / "build.gradle.kts").is_file()
         ):
             return project_path
     return None
@@ -9465,7 +9079,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Flutter APK Builder Server", lifespan=lifespan)
+    app = FastAPI(title="Native Android APK Builder Server", lifespan=lifespan)
     dashboard_module_name = (
         f"{__package__}.admin_dashboard"
         if __package__
@@ -9680,6 +9294,9 @@ def create_app() -> FastAPI:
                     "awaiting_confirmation": False,
                     "final_generation_prompt": request.prompt,
                     "latest_effective_user_prompt": request.prompt,
+                    "app_name": decision.app_name,
+                    "generated_app_name": decision.app_name,
+                    "pending_app_name": decision.app_name,
                     "pending_user_prompt": "",
                     "pending_normalized_prompt": "",
                     "confirmation_action": "",
@@ -9862,7 +9479,11 @@ def create_app() -> FastAPI:
                 )
                 return build_decision_response(followup_task_id, decision)
 
-            resolved_app_name = current_task_app_name(task, previous_conversation_state) or decision.app_name
+            resolved_app_name = (
+                decision.app_name
+                if is_initial_prompt_submission and decision.app_name
+                else current_task_app_name(task, previous_conversation_state) or decision.app_name
+            )
             resolved_package_name = current_task_package_name(task, previous_conversation_state) or decision.package_name
             if not resolved_package_name and resolved_app_name:
                 resolved_package_name = infer_package_name(resolved_app_name, followup_task_id)
@@ -9924,7 +9545,6 @@ def create_app() -> FastAPI:
                 project_path_obj, revision_label = create_followup_project_revision(
                     workspace_path_obj,
                     Path(project_path_value),
-                    android_only=settings.android_only_workspace_enabled,
                 )
                 project_path_value = str(project_path_obj)
                 saved_reference_attachments = save_reference_attachments(

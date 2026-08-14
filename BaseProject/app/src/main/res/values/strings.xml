@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Generated App</string>
+    <string name="template_title">Generated App</string>
+    <string name="template_body">Native Android template ready</string>
+</resources>

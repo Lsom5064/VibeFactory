@@ -1,17 +1,18 @@
+import shutil
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+from flutter_apk_server.project_builder import native_android_project_builder
 from flutter_apk_server.server import (
     Database,
     GENERATED_APK_SIDELOAD_VERSION_CODE,
     apply_project_defaults,
+    build_subprocess_environment,
     build_codex_followup_build_summary,
     build_intent_decision,
-    built_apk_identity,
     ensure_project_revision_version,
-    flutter_no_pub_args,
     project_android_identity_issues,
     render_task_agents_md,
     revision_request_summary,
@@ -22,16 +23,31 @@ from flutter_apk_server.server import (
 )
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+BASE_PROJECT = REPOSITORY_ROOT / "BaseProject"
+
+
 class ProjectIdentityTests(unittest.TestCase):
+    def test_codex_subprocess_environment_removes_server_secrets(self) -> None:
+        source = {
+            "PATH": "/usr/bin",
+            "GENERATED_APP_KEYSTORE_PATH": "/secret/generated-app.jks",
+            "GENERATED_APP_KEYSTORE_PASSWORD": "store-secret",
+            "GENERATED_APP_KEY_ALIAS": "generated",
+            "GENERATED_APP_KEY_PASSWORD": "key-secret",
+            "APP_RUNTIME_OPENAI_API_KEY": "runtime-secret",
+            "ADMIN_API_TOKEN": "admin-secret",
+        }
+
+        self.assertEqual({"PATH": "/usr/bin"}, build_subprocess_environment(source))
+
     def test_codex_followup_summary_does_not_echo_raw_user_request(self) -> None:
         user_prompt = "첫 번째 카드 제목을 더 크게 바꾸고 오른쪽 버튼을 초록색으로 바꿔줘"
-
         summary = build_codex_followup_build_summary(
             "컬러카드",
             f"기존 컬러카드를 수정할게요. 이번 수정은 {user_prompt}를 반영해요.",
             user_prompt,
         )
-
         self.assertEqual(
             summary,
             "기존 컬러카드를 수정할게요. 요청한 변경 내용을 현재 앱의 구성에 맞게 반영해요.",
@@ -39,7 +55,6 @@ class ProjectIdentityTests(unittest.TestCase):
 
     def test_build_intent_uses_explicit_codex_user_visible_summary(self) -> None:
         summary = "기존 컬러카드를 수정할게요. 카드 제목의 강조를 높이고 동작 버튼을 더 잘 보이게 정돈해요."
-
         decision = build_intent_decision(
             mode="build",
             task_id="task-1",
@@ -49,7 +64,6 @@ class ProjectIdentityTests(unittest.TestCase):
             suggested_app_name="컬러카드",
             user_visible_summary=summary,
         )
-
         self.assertEqual(decision.summary, summary)
 
     def test_followup_reasoning_override_only_replaces_reasoning_config(self) -> None:
@@ -64,9 +78,7 @@ class ProjectIdentityTests(unittest.TestCase):
             'service_tier="default"',
             "prompt",
         ]
-
         updated = with_codex_reasoning_effort(original, "low")
-
         self.assertEqual(original[5], 'model_reasoning_effort="medium"')
         self.assertEqual(updated[5], 'model_reasoning_effort="low"')
         self.assertEqual(updated[7], 'service_tier="default"')
@@ -78,38 +90,29 @@ class ProjectIdentityTests(unittest.TestCase):
             ["codex", "exec", "-c", 'model_reasoning_effort="high"', "prompt"],
         )
 
-    def test_task_agent_contract_keeps_server_managed_identity(self) -> None:
+    def test_task_agent_contract_is_native_android_and_server_managed(self) -> None:
         instructions = render_task_agents_md("test-task")
-
-        for immutable_identity in (
-            "Task ID",
-            "Android package name",
-            "`applicationId`",
-            "`namespace`",
-            "Kotlin package",
-            "`MainActivity`",
-            "release debug signing",
-            "`CrashHandler.initialize(...)`",
+        for required_text in (
+            "Android 전용 네이티브 앱",
+            "Kotlin과 Android Views/XML",
+            "`gradle.properties`",
+            "MainActivity.kt",
+            "activity_main.xml",
+            "`BuildConfig.VIBE_TASK_ID`",
+            "`BuildConfig.VIBE_SERVER_BASE_URL`",
+            "release signing",
+            "`./gradlew :app:lintDebug`",
+            "`assembleRelease`를 직접 실행하지 않는다",
+            "project/app/build/outputs/apk/release/app-release.apk",
+            '"task_id": "test-task"',
         ):
-            self.assertIn(immutable_identity, instructions)
-        self.assertIn('"task_id": "test-task"', instructions)
-        self.assertIn("app-release.apk", instructions)
-
-    def test_task_agent_contract_delegates_final_apk_build_to_server(self) -> None:
-        instructions = render_task_agents_md("test-task")
-
-        self.assertIn("`flutter build apk`를 직접 실행하지 않는다", instructions)
-        self.assertIn("`flutter pub get`과 `flutter analyze`", instructions)
-        self.assertIn(
-            "project/build/app/outputs/flutter-apk/app-release.apk",
-            instructions,
-        )
+            self.assertIn(required_text, instructions)
+        self.assertNotIn("flutter build apk", instructions.lower())
 
     def test_database_has_owner_list_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Database(Path(temp_dir) / "tasks.db")
             database.init_db()
-
             with sqlite3.connect(database.db_path) as connection:
                 index_names = {
                     str(row[0])
@@ -117,10 +120,9 @@ class ProjectIdentityTests(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type = 'index'"
                     )
                 }
-
-            self.assertIn("idx_tasks_user_id_created_at", index_names)
-            self.assertIn("idx_tasks_device_id_created_at", index_names)
-            self.assertIn("idx_tasks_phone_number_created_at", index_names)
+        self.assertIn("idx_tasks_user_id_created_at", index_names)
+        self.assertIn("idx_tasks_device_id_created_at", index_names)
+        self.assertIn("idx_tasks_phone_number_created_at", index_names)
 
     def test_project_snapshot_persists_its_own_revision_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -147,13 +149,11 @@ class ProjectIdentityTests(unittest.TestCase):
                 project_path="/tmp/workspace/revisions/rev_0002/project",
                 request_summary="두 번째 카드의 제목을 굵게 표시해줘",
             )
-
             snapshot = database.list_project_snapshots("task-1")[0]
-
-            self.assertEqual(
-                revision_request_summary({}, snapshot, []),
-                "두 번째 카드의 제목을 굵게 표시해줘",
-            )
+        self.assertEqual(
+            revision_request_summary({}, snapshot, []),
+            "두 번째 카드의 제목을 굵게 표시해줘",
+        )
 
     def test_current_revision_compares_resolved_project_paths(self) -> None:
         revision = serialize_project_revision(
@@ -171,24 +171,94 @@ class ProjectIdentityTests(unittest.TestCase):
                 "created_at": "2026-07-30T00:00:00+00:00",
             },
         )
-
         self.assertTrue(revision["is_current"])
 
-    def test_flutter_no_pub_is_used_only_with_resolved_dependencies(self) -> None:
+    def test_native_project_copy_excludes_build_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source"
+            destination = Path(temp_dir) / "destination"
+            (source / "app/src").mkdir(parents=True)
+            (source / "app/src/source.kt").write_text("class Source", encoding="utf-8")
+            for cache_name in ("build", ".gradle", ".tooling", ".kotlin"):
+                cache_path = source / cache_name
+                cache_path.mkdir()
+                (cache_path / "cached.bin").write_bytes(b"cache")
+            for runner_name in ("logs", ".codex_result"):
+                runner_path = source / runner_name
+                runner_path.mkdir()
+                (runner_path / "internal.txt").write_text("internal", encoding="utf-8")
+            (source / "app/src/logs").mkdir()
+            (source / "app/src/logs/AppLog.kt").write_text("class AppLog", encoding="utf-8")
+            native_android_project_builder.copy_project(source, destination)
+            self.assertTrue((destination / "app/src/source.kt").is_file())
+            self.assertTrue((destination / "app/src/logs/AppLog.kt").is_file())
+            for cache_name in ("build", ".gradle", ".tooling", ".kotlin"):
+                self.assertFalse((destination / cache_name).exists())
+            for runner_name in ("logs", ".codex_result"):
+                self.assertFalse((destination / runner_name).exists())
+
+    def test_native_identity_collapses_duplicate_managed_properties(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir) / "project"
+            native_android_project_builder.copy_project(BASE_PROJECT, project_root)
+            properties_path = project_root / "gradle.properties"
+            properties_path.write_text(
+                properties_path.read_text(encoding="utf-8")
+                + "GENERATED_APP_TASK_ID=stale-task\n"
+                + "GENERATED_APP_APPLICATION_ID=kr.ac.kangwon.hai.generated.stale\n",
+                encoding="utf-8",
+            )
+
+            native_android_project_builder.apply_identity(
+                project_root,
+                task_id="current-task",
+                app_name="현재 앱",
+                application_id="kr.ac.kangwon.hai.generated.current",
+            )
+
+            managed_lines = [
+                line
+                for line in properties_path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("GENERATED_APP_TASK_ID=")
+                or line.startswith("GENERATED_APP_APPLICATION_ID=")
+            ]
+            self.assertEqual(
+                [
+                    "GENERATED_APP_APPLICATION_ID=kr.ac.kangwon.hai.generated.current",
+                    "GENERATED_APP_TASK_ID=current-task",
+                ],
+                managed_lines,
+            )
+
+    def test_native_cache_pruning_preserves_release_apk_and_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
+            release_root = project_root / "app/build/outputs/apk/release"
+            release_root.mkdir(parents=True)
+            (release_root / "app-release.apk").write_bytes(b"apk")
+            (release_root / "output-metadata.json").write_text("{}", encoding="utf-8")
+            (project_root / "app/build/intermediates/files").mkdir(parents=True)
+            (project_root / "app/build/intermediates/files/cache.bin").write_bytes(b"cache")
+            (project_root / "app/build/outputs/logs").mkdir(parents=True)
+            (project_root / ".gradle").mkdir()
+            (project_root / ".gradle/state.bin").write_bytes(b"cache")
+            (project_root / "logs").mkdir()
+            (project_root / "logs/build.log").write_text("duplicate", encoding="utf-8")
+            (project_root / ".codex_result").mkdir()
+            (project_root / ".codex_result/result.json").write_text("{}", encoding="utf-8")
 
-            self.assertEqual(flutter_no_pub_args(project_root), [])
+            native_android_project_builder.prune_caches_preserving_release(project_root)
 
-            package_config = project_root / ".dart_tool/package_config.json"
-            package_config.parent.mkdir(parents=True)
-            package_config.write_text("{}", encoding="utf-8")
-
-            self.assertEqual(flutter_no_pub_args(project_root), ["--no-pub"])
+            self.assertTrue((release_root / "app-release.apk").is_file())
+            self.assertTrue((release_root / "output-metadata.json").is_file())
+            self.assertFalse((project_root / "app/build/intermediates").exists())
+            self.assertFalse((project_root / "app/build/outputs/logs").exists())
+            self.assertFalse((project_root / ".gradle").exists())
+            self.assertFalse((project_root / "logs").exists())
+            self.assertFalse((project_root / ".codex_result").exists())
 
     def test_server_rebuild_decision_prioritizes_valid_results_and_engine_errors(self) -> None:
         auth_issue = ("Error", "auth failed", "codex_auth_error", "engine")
-
         self.assertTrue(
             should_attempt_server_side_build(
                 result_exists=True,
@@ -213,14 +283,6 @@ class ProjectIdentityTests(unittest.TestCase):
                 engine_issue=auth_issue,
             )
         )
-        self.assertFalse(
-            should_attempt_server_side_build(
-                result_exists=False,
-                identity_changed=True,
-                timed_out=True,
-                engine_issue=None,
-            )
-        )
         self.assertTrue(
             should_attempt_server_side_build(
                 result_exists=False,
@@ -230,304 +292,69 @@ class ProjectIdentityTests(unittest.TestCase):
             )
         )
 
-    def test_apply_project_defaults_restores_branch_identity(self) -> None:
+    def test_native_identity_is_structural_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            project_root = Path(temp_dir)
-            manifest_path = project_root / "android/app/src/main/AndroidManifest.xml"
-            gradle_path = project_root / "android/app/build.gradle.kts"
-            kotlin_path = project_root / "android/app/src/main/kotlin/example/MainActivity.kt"
-            dart_path = project_root / "lib/main.dart"
-
-            manifest_path.parent.mkdir(parents=True)
-            gradle_path.parent.mkdir(parents=True, exist_ok=True)
-            kotlin_path.parent.mkdir(parents=True)
-            dart_path.parent.mkdir(parents=True)
-
-            manifest_path.write_text(
-                '<application android:label="Wrong App" />\n',
-                encoding="utf-8",
-            )
-            gradle_path.write_text(
-                """
-android {
-    namespace = "example.wrong"
-    defaultConfig {
-        applicationId = "example.wrong"
-    }
-}
-
-flutter {
-    source = "../.."
-}
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            kotlin_path.write_text(
-                "package example.wrong\n\nclass MainActivity\n",
-                encoding="utf-8",
-            )
-            dart_path.write_text(
-                """
-const String _packageName = 'example.branch';
-const String _taskId = 'wrong-task-id';
-const String _runtimeEndpoint =
-    'http://server.example/apps/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/llm/respond';
-
-void main() {
-  CrashHandler.initialize("source-task", "example.wrong");
-  final client = Client(
-    taskId: 'source-task',
-    packageName: 'example.branch',
-  );
-  runApp(const App());
-}
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-
-            expected_package = "kr.ac.kangwon.hai.generated.original"
-            changed = apply_project_defaults(
-                project_root,
-                "branched-task",
-                "Branch App",
-                expected_package,
-            )
-
-            self.assertTrue(changed)
-            self.assertIn('android:label="Branch App"', manifest_path.read_text(encoding="utf-8"))
-            self.assertIn(f'namespace = "{expected_package}"', gradle_path.read_text(encoding="utf-8"))
-            self.assertIn(f'applicationId = "{expected_package}"', gradle_path.read_text(encoding="utf-8"))
-            self.assertIn("signingConfigs.getByName(\"debug\")", gradle_path.read_text(encoding="utf-8"))
-            self.assertIn(f"package {expected_package}", kotlin_path.read_text(encoding="utf-8"))
-            self.assertIn(
-                f'CrashHandler.initialize("branched-task", "{expected_package}");',
-                dart_path.read_text(encoding="utf-8"),
-            )
-            self.assertIn(
-                f"const String _packageName = '{expected_package}';",
-                dart_path.read_text(encoding="utf-8"),
-            )
-            self.assertIn(
-                "const String _taskId = 'branched-task';",
-                dart_path.read_text(encoding="utf-8"),
-            )
-            self.assertIn(
-                "/apps/branched-task/llm/respond",
-                dart_path.read_text(encoding="utf-8"),
-            )
-            self.assertIn(
-                "packageName: 'kr.ac.kangwon.hai.generated.original'",
-                dart_path.read_text(encoding="utf-8"),
-            )
-            self.assertIn(
-                "taskId: 'branched-task'",
-                dart_path.read_text(encoding="utf-8"),
-            )
-            self.assertFalse(
-                apply_project_defaults(
-                    project_root,
-                    "branched-task",
-                    "Branch App",
-                    expected_package,
-                )
-            )
-
-    def test_apply_project_defaults_restores_all_kotlin_package_references(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_root = Path(temp_dir)
-            gradle_path = project_root / "android/app/build.gradle.kts"
-            kotlin_root = project_root / "android/app/src/main/kotlin/example"
-            main_activity_path = kotlin_root / "MainActivity.kt"
-            service_path = kotlin_root / "NotificationCaptureService.kt"
-            store_path = kotlin_root / "NotificationInboxStore.kt"
-
-            gradle_path.parent.mkdir(parents=True)
-            kotlin_root.mkdir(parents=True)
-            gradle_path.write_text(
-                """
-android {
-    namespace = "kr.ac.kangwon.hai.generated.customappsource01"
-    defaultConfig {
-        applicationId = "kr.ac.kangwon.hai.generated.customappsource01"
-    }
-}
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            main_activity_path.write_text(
-                """
-package kr.ac.kangwon.hai.generated.customappsource01
-
-import kr.ac.kangwon.hai.generated.customappbranch02.NotificationInboxStore
-
-class MainActivity {
-    val store = NotificationInboxStore()
-}
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            service_path.write_text(
-                """
-package kr.ac.kangwon.hai.generated.customappbranch02
-
-class NotificationCaptureService
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            store_path.write_text(
-                """
-package kr.ac.kangwon.hai.generated.customappbranch02
-
-class NotificationInboxStore
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-
-            expected_package = "kr.ac.kangwon.hai.generated.customappsource01"
+            project_root = Path(temp_dir) / "project"
+            shutil.copytree(BASE_PROJECT, project_root)
+            package_name = "kr.ac.kangwon.hai.generated.sample"
             self.assertTrue(
-                apply_project_defaults(
-                    project_root,
-                    "branched-task",
-                    "Branch App",
-                    expected_package,
-                )
+                apply_project_defaults(project_root, "task-123", "샘플 앱", package_name)
             )
-
-            for kotlin_path in (main_activity_path, service_path, store_path):
-                kotlin_text = kotlin_path.read_text(encoding="utf-8")
-                self.assertIn(f"package {expected_package}", kotlin_text)
-                self.assertNotIn("customappbranch02", kotlin_text)
-            self.assertEqual(project_android_identity_issues(project_root, expected_package), [])
+            self.assertEqual(
+                project_android_identity_issues(project_root, package_name, "task-123"),
+                [],
+            )
+            properties = (project_root / "gradle.properties").read_text(encoding="utf-8")
+            self.assertIn(f"GENERATED_APP_APPLICATION_ID={package_name}", properties)
+            self.assertIn("GENERATED_APP_TASK_ID=task-123", properties)
+            self.assertIn(
+                f"GENERATED_APP_VERSION_CODE={GENERATED_APK_SIDELOAD_VERSION_CODE}",
+                properties,
+            )
+            strings = (
+                project_root / "app/src/main/res/values/strings.xml"
+            ).read_text(encoding="utf-8")
+            self.assertIn("샘플 앱", strings)
             self.assertFalse(
-                apply_project_defaults(
-                    project_root,
-                    "branched-task",
-                    "Branch App",
-                    expected_package,
-                )
+                apply_project_defaults(project_root, "task-123", "샘플 앱", package_name)
             )
-
-    def test_project_android_identity_issues_reports_unmanaged_kotlin_package(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_root = Path(temp_dir)
-            gradle_path = project_root / "android/app/build.gradle.kts"
-            kotlin_path = project_root / "android/app/src/main/kotlin/example/Service.kt"
-            gradle_path.parent.mkdir(parents=True)
-            kotlin_path.parent.mkdir(parents=True)
-            gradle_path.write_text(
-                """
-android {
-    namespace = "example.expected"
-    defaultConfig {
-        applicationId = "example.expected"
-    }
-}
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            kotlin_path.write_text("package example.unexpected\n", encoding="utf-8")
-
-            issues = project_android_identity_issues(project_root, "example.expected")
-
-            self.assertEqual(len(issues), 1)
-            self.assertIn("example.unexpected", issues[0])
-
-    def test_project_defaults_remove_package_suffixes_and_override_all_application_ids(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_root = Path(temp_dir)
-            gradle_path = project_root / "android/app/build.gradle.kts"
-            gradle_path.parent.mkdir(parents=True)
-            gradle_path.write_text(
-                """
-android {
-    namespace = "example.wrong"
-    defaultConfig {
-        applicationId = "example.wrong"
-        applicationIdSuffix = ".revision"
-    }
-    productFlavors {
-        create("demo") {
-            applicationId = "example.demo"
-        }
-    }
-}
-
-flutter {
-    source = "../.."
-}
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-
-            expected_package = "kr.ac.kangwon.hai.generated.stable"
-            self.assertTrue(
-                apply_project_defaults(
-                    project_root,
-                    "task-1",
-                    "Stable App",
-                    expected_package,
-                )
-            )
-
-            gradle_text = gradle_path.read_text(encoding="utf-8")
-            self.assertEqual(gradle_text.count(f'applicationId = "{expected_package}"'), 2)
-            self.assertNotIn("applicationIdSuffix", gradle_text)
 
     def test_all_revisions_use_one_sideload_version_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
-            pubspec_path = project_root / "pubspec.yaml"
-            pubspec_path.write_text("name: sample\nversion: 1.2.3+4\n", encoding="utf-8")
-
+            (project_root / "gradle.properties").write_text(
+                "GENERATED_APP_VERSION_CODE=4\nGENERATED_APP_VERSION_NAME=1.2.3\n",
+                encoding="utf-8",
+            )
             self.assertTrue(ensure_project_revision_version(project_root, "rev_0009"))
+            properties = (project_root / "gradle.properties").read_text(encoding="utf-8")
             self.assertIn(
-                f"version: 1.2.3+{GENERATED_APK_SIDELOAD_VERSION_CODE}",
-                pubspec_path.read_text(encoding="utf-8"),
+                f"GENERATED_APP_VERSION_CODE={GENERATED_APK_SIDELOAD_VERSION_CODE}",
+                properties,
             )
             self.assertFalse(ensure_project_revision_version(project_root, "rev_0001"))
 
-    def test_built_apk_identity_reads_gradle_output_metadata(self) -> None:
+    def test_native_validation_rejects_flutter_and_compose(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            project_root = Path(temp_dir)
-            apk_path = (
-                project_root
-                / "build/app/outputs/flutter-apk/app-release.apk"
+            flutter_project = Path(temp_dir) / "flutter-project"
+            shutil.copytree(BASE_PROJECT, flutter_project)
+            (flutter_project / "pubspec.yaml").write_text("name: forbidden\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Flutter/Dart"):
+                native_android_project_builder.validate_project_structure(flutter_project)
+
+            compose_project = Path(temp_dir) / "compose-project"
+            shutil.copytree(BASE_PROJECT, compose_project)
+            main_activity = (
+                compose_project
+                / "app/src/main/kotlin/kr/ac/kangwon/hai/generated/MainActivity.kt"
             )
-            apk_path.parent.mkdir(parents=True)
-            apk_path.write_bytes(b"apk")
-            metadata_path = (
-                project_root
-                / "build/app/outputs/apk/release/output-metadata.json"
-            )
-            metadata_path.parent.mkdir(parents=True)
-            metadata_path.write_text(
-                """
-{
-  "applicationId": "kr.ac.kangwon.hai.generated.sample",
-  "elements": [
-    {
-      "versionCode": 1900000000,
-      "outputFile": "app-release.apk"
-    }
-  ]
-}
-""".strip(),
+            main_activity.write_text(
+                main_activity.read_text(encoding="utf-8")
+                + "\nimport androidx.compose.runtime.Composable\n",
                 encoding="utf-8",
             )
-
-            self.assertEqual(
-                built_apk_identity(project_root, apk_path),
-                ("kr.ac.kangwon.hai.generated.sample", 1_900_000_000),
-            )
-
+            with self.assertRaisesRegex(RuntimeError, "Compose"):
+                native_android_project_builder.validate_project_structure(compose_project)
 
 if __name__ == "__main__":
     unittest.main()

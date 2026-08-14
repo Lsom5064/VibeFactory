@@ -11,11 +11,16 @@ from flutter_apk_server.server import (
     build_prepared_generation_prompt,
     contains_conversation_placeholder,
     create_app,
+    extract_explicit_app_name,
     materialize_conversation_spec_payload,
 )
 
 
 class DynamicPromptPreparationTests(unittest.TestCase):
+    def test_explicit_app_name_allows_conversation_domain_names(self) -> None:
+        self.assertEqual(extract_explicit_app_name("## 앱 이름\n대화 일정"), "대화 일정")
+        self.assertEqual(extract_explicit_app_name('\"감성대화\" 앱을 만들어줘'), "감성대화")
+
     def test_prompt_omits_generic_audience_and_irrelevant_storage_sections(self) -> None:
         decision = build_intent_decision(
             mode="build",
@@ -247,16 +252,25 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                     self.assertEqual(result["interaction_type"], "needs_initial_prompt_review")
                     self.assertIn("공유하기로 전달받은 메시지", result["prepared_prompt"])
                     self.assertNotIn("이전 대화 맥락", result["prepared_prompt"])
+                    self.assertIn(
+                        "## 앱 이름\n일정 모아보기",
+                        result["prepared_prompt"],
+                        result["prepared_prompt"],
+                    )
                     history = agent_calls[1]["conversation_history"]
                     self.assertEqual([entry["role"] for entry in history], ["user", "assistant", "user"])
                     self.assertIn("구현할 수 있어요", history[1]["content"])
 
+                    edited_prompt = result["prepared_prompt"].replace(
+                        "## 앱 이름\n일정 모아보기",
+                        "## 앱 이름\n대화 일정",
+                    )
                     submitted = client.post(
                         "/generate",
                         json={
                             "task_id": task_id,
                             "device_id": "conversation-device",
-                            "prompt": result["prepared_prompt"],
+                            "prompt": edited_prompt,
                             "display_prompt": "만들어진 프롬프트대로 생성요청 문구를 보냈어요",
                             "request_action": "submit_initial_prompt",
                         },
@@ -267,6 +281,8 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                     self.assertEqual(submitted_result["task_id"], task_id)
                     self.assertEqual(submitted_result["interaction_type"], "build_started")
                     self.assertEqual(submitted_result["tool"], "codex")
+                    self.assertEqual(submitted_result["app_name"], "대화 일정")
+                    self.assertEqual(app.state.db.get_task(task_id)["app_name"], "대화 일정")
                     self.assertNotEqual(submitted_result.get("confirmation_action"), "submit_initial_prompt")
 
 

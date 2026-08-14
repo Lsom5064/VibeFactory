@@ -1,7 +1,7 @@
 # VibeFactory Native Android Migration Plan
 
 - 작성일: 2026-08-14
-- 문서 상태: 구현 승인 대기
+- 문서 상태: 구현 진행 중
 - 기준 저장소: `/Users/hai/Desktop/buildingAppswithCodex`
 - 원본 기준: GitHub가 아니라 현재 로컬 작업 트리
 
@@ -77,8 +77,10 @@ BaseProject/
         ├── AndroidManifest.xml
         ├── kotlin/kr/ac/kangwon/hai/generated/
         │   ├── MainActivity.kt
+        │   ├── GeneratedApplication.kt
         │   ├── VibeCrashReporter.kt
         │   ├── VibeDataClient.kt
+        │   ├── VibeHttpClient.kt
         │   └── VibeLlmClient.kt
         └── res/
             ├── layout/activity_main.xml
@@ -123,6 +125,19 @@ NativeAndroidProjectBuilder(ProjectBuilder)
 
 정확한 버전은 구현 시작 시 현재 설치된 Android SDK와 호스트 앱 구성을 확인한 뒤 문서에 기록한다.
 
+구현 고정값:
+
+```text
+JDK: Temurin 17.0.16 (AWS는 OpenJDK 17)
+Gradle Wrapper: 8.13
+Android Gradle Plugin: 8.13.2
+Kotlin Android Plugin: 2.0.21
+compileSdk: 36
+targetSdk: 35
+minSdk: 26
+JVM target: 17
+```
+
 ### 6.2 앱 식별자
 
 - `applicationId`가 설치 앱의 실제 package identity다.
@@ -132,6 +147,7 @@ NativeAndroidProjectBuilder(ProjectBuilder)
 - 앱 이름 변경은 label만 바꾸고 `applicationId`는 바꾸지 않는다.
 - 런타임 요청의 package name은 하드코딩 대신 `applicationContext.packageName`에서 얻는다.
 - Task ID는 서버가 생성한 BuildConfig 또는 resource 값에서 읽는다.
+- 서버 base URL은 빌드 환경의 `SERVER_BASE_URL`을 `BuildConfig.VIBE_SERVER_BASE_URL`로 주입해 사용한다.
 
 ### 6.3 버전 코드
 
@@ -291,108 +307,117 @@ project/app/build/outputs/apk/release/app-release.apk
 
 ### Phase 0. 현재 로컬 소스 복구 지점 생성
 
-- [ ] `git status`, 현재 브랜치, remote, HEAD SHA를 기록한다.
-- [ ] 추적된 수정·삭제 파일을 검토한다.
-- [ ] 미추적 파일을 소스와 런타임 산출물로 분류한다.
-- [ ] 서버 테스트를 실행한다.
-- [ ] 호스트 앱 unit test와 compile을 실행한다.
-- [ ] 현재 로컬 소스만 포함한 복구 커밋을 만든다.
-- [ ] `backup/pre-native-android-20260814` 브랜치를 GitHub에 push한다.
-- [ ] `pre-native-android-20260814` annotated tag를 push한다.
-- [ ] 복구 커밋 SHA를 이 문서에 기록한다.
-- [ ] 기존 DB와 workspace 백업 위치를 기록한다.
+- [x] `git status`, 현재 브랜치, remote, HEAD SHA를 기록한다.
+- [x] 추적된 수정·삭제 파일을 검토한다.
+- [x] 미추적 파일을 소스와 런타임 산출물로 분류한다.
+- [x] 서버 테스트를 실행한다.
+- [x] 호스트 앱 unit test와 compile을 실행한다.
+- [x] 현재 로컬 소스만 포함한 복구 커밋을 만든다.
+- [x] `backup/pre-native-android-20260814` 브랜치를 GitHub에 push한다.
+- [x] `pre-native-android-20260814` annotated tag를 push한다.
+- [x] 복구 커밋 SHA를 이 문서에 기록한다.
+- [x] 기존 DB와 workspace 백업 위치를 기록한다.
 
 기록:
 
 ```text
-복구 브랜치:
-복구 태그:
-복구 커밋 SHA:
-DB 백업 위치:
-workspace 백업 위치:
-검증 일시:
+복구 브랜치: backup/pre-native-android-20260814
+복구 태그: pre-native-android-20260814
+복구 커밋 SHA: 8ab2bbdd8c8735d384584a1dc5ea6f1cce399a85
+DB 백업 위치: /volume1/vibefactory-archive/pre-native-android-20260814/local/databases
+workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-20260814/local/workspaces
+검증 일시: 2026-08-14 14:42:52 KST
 ```
+
+검증 결과:
+
+- 서버 `unittest` 37개 통과
+- 호스트 앱 `testDebugUnitTest`, `compileDebugKotlin` 통과 (`BUILD SUCCESSFUL`, 21초)
+- NAS DB SHA-256이 로컬 SQLite online backup과 일치
+- NAS에 실제 Task workspace 디렉터리 10개 확인
+- 캐시 및 독립 ZIP 아카이브를 제외한 workspace `rsync --dry-run` 파일 차이 없음
+- 기존 24.6GB 독립 ZIP 아카이브 4개는 workspace 디렉터리가 아니므로 NAS 동기화 대상에서 제외하고 로컬 원본을 그대로 보존
 
 ### Phase 1. 마이그레이션 브랜치와 계약 테스트
 
-- [ ] 복구 커밋에서 `feature/native-android-generation` 브랜치를 만든다.
-- [ ] 서버 API 응답 fixture 또는 contract test를 작성한다.
-- [ ] 호스트 앱 DTO와 서버 응답 필드를 대조한다.
-- [ ] 생성, 상태, 취소, 리비전, 분기, 다운로드 계약 테스트를 만든다.
-- [ ] 기존 테스트가 모두 통과하는 기준점을 기록한다.
+- [x] 복구 커밋에서 `feature/native-android-generation` 브랜치를 만든다.
+- [x] 서버 API 응답 fixture 또는 contract test를 작성한다.
+- [x] 호스트 앱 DTO와 서버 응답 필드를 대조한다.
+- [x] 생성, 상태, 취소, 리비전, 분기, 다운로드 계약 테스트를 만든다.
+- [x] 기존 테스트가 모두 통과하는 기준점을 기록한다.
 
 ### Phase 2. Native Android BaseProject
 
-- [ ] 기존 Flutter `BaseProject` 내용을 제거한다.
-- [ ] Gradle Wrapper를 정상 생성한다.
-- [ ] Kotlin Android application module을 구성한다.
-- [ ] `MainActivity.kt`를 추가한다.
-- [ ] `activity_main.xml`을 추가한다.
-- [ ] ViewBinding을 활성화한다.
-- [ ] INTERNET과 필요한 기본 manifest 설정을 추가한다.
-- [ ] 앱 label, application ID, Task ID, version code를 서버가 주입할 구조를 만든다.
-- [ ] 빈 템플릿을 signed release APK로 빌드한다.
+- [x] 기존 Flutter `BaseProject` 내용을 제거한다.
+- [x] Gradle Wrapper를 정상 생성한다.
+- [x] Kotlin Android application module을 구성한다.
+- [x] `MainActivity.kt`를 추가한다.
+- [x] `activity_main.xml`을 추가한다.
+- [x] ViewBinding을 활성화한다.
+- [x] INTERNET과 필요한 기본 manifest 설정을 추가한다.
+- [x] 앱 label, application ID, Task ID, version code를 서버가 주입할 구조를 만든다.
+- [x] 빈 템플릿을 signed release APK로 빌드한다.
 - [ ] APK를 ADB로 설치하고 실행한다.
 
 ### Phase 3. 서버 빌드 계층 분리
 
-- [ ] 프로젝트 준비·식별자·빌드·산출물 로직의 호출 지점을 목록화한다.
-- [ ] 작은 `ProjectBuilder` 계약을 만든다.
-- [ ] `NativeAndroidProjectBuilder`를 구현한다.
-- [ ] route와 worker에서 파일 조작을 builder 호출로 교체한다.
-- [ ] Flutter command, PUB_CACHE, Dart identity, pubspec version 처리를 제거한다.
-- [ ] native Gradle cache와 temporary directory 정책을 적용한다.
-- [ ] build, `.gradle`, `.tooling` 캐시 정리 정책을 유지한다.
-- [ ] revision과 branch가 native 프로젝트를 복사하도록 변경한다.
-- [ ] native APK 산출물 탐색과 검증을 구현한다.
-- [ ] 기본 템플릿 미변경 감지를 Kotlin/XML 기준으로 바꾼다.
+- [x] 프로젝트 준비·식별자·빌드·산출물 로직의 호출 지점을 목록화한다.
+- [x] 작은 `ProjectBuilder` 계약을 만든다.
+- [x] `NativeAndroidProjectBuilder`를 구현한다.
+- [x] route와 worker에서 파일 조작을 builder 호출로 교체한다.
+- [x] Flutter command, PUB_CACHE, Dart identity, pubspec version 처리를 제거한다.
+- [x] native Gradle cache와 temporary directory 정책을 적용한다.
+- [x] build, `.gradle`, `.tooling` 캐시 정리 정책을 유지한다.
+- [x] revision과 branch가 native 프로젝트를 복사하도록 변경한다.
+- [x] native APK 산출물 탐색과 검증을 구현한다.
+- [x] 기본 템플릿 미변경 감지를 Kotlin/XML 기준으로 바꾼다.
 
 ### Phase 4. 런타임 기능 이식
 
-- [ ] `VibeCrashReporter.kt`를 구현한다.
-- [ ] 호스트 앱 broadcast 계약을 검증한다.
-- [ ] `VibeLlmClient.kt`를 구현한다.
-- [ ] 텍스트·이미지 LLM 요청을 검증한다.
-- [ ] 전체 prompt, context, response, raw response, error logging을 검증한다.
-- [ ] `VibeDataClient.kt`를 구현한다.
+- [x] `VibeCrashReporter.kt`를 구현한다.
+- [x] 호스트 앱 broadcast 계약을 검증한다.
+- [x] `VibeLlmClient.kt`를 구현한다.
+- [x] 텍스트·이미지 LLM 요청을 검증한다.
+- [x] 전체 prompt, context, response, raw response, error logging을 검증한다.
+- [x] `VibeDataClient.kt`를 구현한다.
 - [ ] app data CRUD를 실기기에서 검증한다.
-- [ ] cleartext HTTP와 HTTPS 환경을 모두 점검한다.
-- [ ] timeout과 cancellation 처리를 검증한다.
+- [x] cleartext HTTP와 HTTPS 환경을 모두 점검한다.
+- [x] timeout과 cancellation 처리를 검증한다.
 
 ### Phase 5. Codex 지침과 결과 계약 전환
 
-- [ ] workspace `AGENTS.md`를 Native Android 기준으로 변경한다.
-- [ ] `prompt.md`의 Flutter 설명과 경로를 제거한다.
-- [ ] task result의 예상 APK 경로를 변경한다.
-- [ ] Codex가 application ID와 Task ID를 바꾸지 못하게 검증한다.
-- [ ] Codex가 Compose 또는 Flutter를 생성하면 실패 처리한다.
-- [ ] XML layout과 Kotlin source의 기본 품질 검증을 추가한다.
-- [ ] Gradle lint·compile·assemble 실패가 사용자 버블로 전달되는지 검증한다.
+- [x] workspace `AGENTS.md`를 Native Android 기준으로 변경한다.
+- [x] `prompt.md`의 Flutter 설명과 경로를 제거한다.
+- [x] task result의 예상 APK 경로를 변경한다.
+- [x] Codex가 application ID와 Task ID를 바꾸지 못하게 검증한다.
+- [x] Codex가 Compose 또는 Flutter를 생성하면 실패 처리한다.
+- [x] XML layout과 Kotlin source의 기본 품질 검증을 추가한다.
+- [x] Gradle lint·compile·assemble 실패가 사용자 버블로 전달되는지 검증한다.
 
 ### Phase 6. 서명과 설치 정책
 
-- [ ] 전용 keystore를 생성한다.
-- [ ] keystore를 Git 외부에 저장한다.
-- [ ] 암호화된 별도 백업을 만든다.
-- [ ] Gradle signing config를 환경변수 기반으로 연결한다.
-- [ ] 서명 설정이 없으면 명확한 서버 오류를 반환한다.
+- [x] 전용 keystore를 생성한다.
+- [x] keystore를 Git 외부에 저장한다.
+- [x] 암호화된 별도 백업을 만든다.
+- [x] Gradle signing config를 환경변수 기반으로 연결한다.
+- [x] 서명 설정이 없으면 명확한 서버 오류를 반환한다.
 - [ ] 동일 Task 리비전 APK가 기존 앱을 덮어쓰는지 확인한다.
-- [ ] 분기 Task APK가 의도한 package를 유지하는지 확인한다.
+- [x] 분기 Task APK가 의도한 package를 유지하는지 확인한다.
 - [ ] 설치 후 호스트 앱이 생성 앱을 자동 실행하는지 확인한다.
 
 ### Phase 7. 자동 검증
 
-- [ ] Python unit test 전체 통과
-- [ ] DB integrity 및 foreign key test 통과
-- [ ] 서버 API contract test 통과
-- [ ] 호스트 앱 unit test 전체 통과
-- [ ] 호스트 앱 Kotlin compile 통과
-- [ ] BaseProject Gradle lint 통과
-- [ ] BaseProject release assemble 통과
-- [ ] APK application ID 검증 통과
-- [ ] APK version code 검증 통과
-- [ ] APK signature 검증 통과
-- [ ] APK launcher Activity 검증 통과
+- [x] Python unit test 전체 통과
+- [x] DB integrity 및 foreign key test 통과
+- [x] 서버 API contract test 통과
+- [x] 호스트 앱 unit test 전체 통과
+- [x] 호스트 앱 Kotlin compile 통과
+- [x] BaseProject Gradle lint 통과
+- [x] BaseProject release assemble 통과
+- [x] APK application ID 검증 통과
+- [x] APK version code 검증 통과
+- [x] APK signature 검증 통과
+- [x] APK launcher Activity 검증 통과
 
 ### Phase 8. ADB 실기기 검증
 
@@ -422,12 +447,12 @@ workspace 백업 위치:
 
 각 측정은 같은 기기와 같은 네트워크에서 최소 3회 수행하고 median을 기록한다.
 
-- [ ] BaseProject cold Gradle build 시간
-- [ ] BaseProject warm Gradle build 시간
-- [ ] 실제 생성 앱 cold build 시간
-- [ ] 실제 수정 앱 warm build 시간
-- [ ] Codex 수행 시간과 Gradle build 시간을 분리 기록
-- [ ] signed release APK 크기
+- [x] BaseProject cold Gradle build 시간
+- [x] BaseProject warm Gradle build 시간
+- [x] 실제 생성 앱 cold build 시간
+- [x] 실제 수정 앱 warm build 시간
+- [x] Codex 수행 시간과 Gradle build 시간을 분리 기록
+- [x] signed release APK 크기
 - [ ] 서버에서 호스트까지 다운로드 시간
 - [ ] 설치 UI 진입 시간
 - [ ] 설치 후 자동 실행 시간
@@ -438,13 +463,20 @@ workspace 백업 위치:
 
 | 항목 | 1회 | 2회 | 3회 | Median | 비고 |
 |---|---:|---:|---:|---:|---|
-| BaseProject cold build | | | | | |
-| BaseProject warm build | | | | | |
-| 생성 앱 build | | | | | |
-| 수정 앱 build | | | | | |
-| APK 크기 | | | | | |
+| BaseProject cold build | 23.38초 | 22.86초 | 23.16초 | 23.16초 | no-daemon, clean release 기준 |
+| BaseProject warm build | 1.85초 | 2.29초 | 1.83초 | 1.85초 | Gradle daemon, up-to-date release 기준 |
+| 실제 생성 앱 clean-output build | 5.43초 | 4.83초 | 4.43초 | 4.83초 | 실제 Codex 생성 앱 소스, 새 project copy, 공유 dependency/build cache 및 daemon, lint + signed release |
+| 실제 수정 앱 incremental build | 20.64초 | 11.94초 | 11.85초 | 11.94초 | 실제 rev_0002 소스의 string resource를 매회 변경, lint + signed release |
+| BaseProject APK 크기 | 5,094,598B | 5,094,598B | 5,094,598B | 5,094,598B | 최종 BuildConfig 계약 반영본, R8/resource shrink 비활성화 |
+| 실제 생성 앱 APK 크기 | 5,135,235B | 5,138,951B | 5,138,955B | 5,138,951B | V1, V2, 성능 측정용 V2 변경본 |
 | APK 다운로드 | | | | | |
 | 설치 후 실행 | | | | | |
+
+실제 서버 단계 분리 기록:
+
+- 최초 생성: Codex 코드 생성 907초, 서버 lint 2초, 서버 signed release 66초. 최초 격리 cache에서 Codex가 lint 오류 2건을 수정하며 재실행한 시간 포함.
+- 최초 수정: Codex follow-up 판단 35초, Codex 코드 수정 130초, 서버 lint 2초, 서버 signed release 27초.
+- V1 분기 재빌드: workspace 생성부터 signed release 성공까지 56초. package name, versionCode, signer 유지 확인.
 
 ### Phase 10. 새 서비스 배포
 
@@ -537,6 +569,53 @@ workspace 백업 위치:
 - 키가 손상된 경우 package name을 바꾸거나 기존 앱을 제거해야 하므로 정상 migration으로 보지 않는다.
 
 ## 16. 작업 기록
+
+```text
+일시: 2026-08-14 KST
+Phase: 1-7 자동 구현·검증
+변경 파일: BaseProject 전체, flutter_apk_server/server.py, project_builder.py, tests, run-local-server.sh, aws/native/*
+실행 명령: Python unittest, py_compile, Gradle lintDebug/compileDebugKotlin/assembleRelease, apksigner verify, aapt dump badging
+테스트 결과: 서버 44개 통과, 호스트 unit/Kotlin compile 통과, Native lint/compile/signed release 통과
+ADB 기기: adb devices 결과 연결 기기 없음. 실기기 항목은 미완료로 유지
+빌드 시간: Native lint+compile+release 통합 warm build 1분 21초
+APK 크기: 5,094,722 bytes
+발견된 문제: Codex 성공 JSON 존재 시 서버 final build를 건너뛸 수 있었고, OkHttp coroutine 취소가 실제 Call을 취소하지 않았음. --no-daemon 사용 시 up-to-date build도 median 18.42초 소요
+해결 내용: 성공 JSON이면 서버가 항상 lint+signed release를 수행하고 기존 결과 필드를 보존. suspendCancellableCoroutine으로 OkHttp Call 취소 연결. 공유 Gradle daemon을 재사용해 warm release median 1.85초, clean lint+release fixture median 6.69초로 단축
+서명 fingerprint: SHA-256 6661f6b196932fbeabf06e955bc8820fe2ca438dcc8f9c270e9d32528560f277
+커밋 SHA: 미커밋
+다음 단계: ADB 실기기, 실제 Codex 생성·수정·리비전·분기, 성능 3회 측정, canary 배포
+```
+
+```text
+일시: 2026-08-14 KST
+Phase: 6-9 실제 Native 생성·수정·분기 및 성능 검증
+변경 파일: flutter_apk_server/server.py, project_builder.py, tests/test_host_api_contract.py, tests/test_project_identity.py, NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: 실제 gpt-5.4 /generate, follow-up /generate, revision branch, /status, /download Range, app data CRUD, unittest, Gradle lintDebug/assembleRelease, apksigner, aapt
+테스트 결과: 실제 V1·V2 생성 성공, 두 APK 모두 보존, package/versionCode/signer 동일, V2 기능 코드 반영, 분기 Task 즉시 생성 및 signed APK 성공, 서버 49개 테스트 통과
+ADB 기기: adb devices 결과 연결 기기 없음. 설치·덮어쓰기·자동 실행 항목은 미완료로 유지
+빌드 시간: 실제 생성 앱 clean-output median 4.83초, 실제 수정 앱 incremental median 11.94초. 최초 Codex 907초, 첫 수정 Codex 130초
+APK 크기: V1 5,135,235 bytes, V2 5,138,951 bytes
+발견된 문제: 분기 worker에서 정의되지 않은 source_root를 참조해 Error 발생. 분기 시 이전 project 내부 logs/.codex_result가 함께 복사됨. Codex subprocess에 signing/runtime/admin 비밀 환경변수가 전달될 수 있었고 AWS secrets 디렉터리는 서비스 사용자가 keystore를 읽을 수 없는 권한이었음. 최종 prompt의 명시적 앱 이름보다 최초 임시 이름이 우선됨
+해결 내용: source_project_path 검증으로 수정하고 worker 회귀 테스트 추가. project root runner 산출물은 revision/branch 복사 및 성공 후 cache prune에서 제외·제거. Codex 환경에서 비밀값을 제거하고 signing 값은 Gradle release 단계에만 주입. AWS secrets를 root:ubuntu 750, keystore root:ubuntu 640 정책으로 수정. 최종 prompt의 명시적 앱 이름을 최초 빌드 Task label에 반영하고 package는 유지
+서명 fingerprint: SHA-256 6661f6b196932fbeabf06e955bc8820fe2ca438dcc8f9c270e9d32528560f277
+커밋 SHA: 미커밋
+다음 단계: ADB 실기기 검증, 별도 Native AWS canary 배포, 최종 감사와 feature branch push
+```
+
+```text
+일시: 2026-08-14 KST
+Phase: 7 최종 자동 회귀 검증
+변경 파일: flutter_apk_server/tests/test_native_build_pipeline.py, NATIVE_ANDROID_MIGRATION_PLAN.md
+실행 명령: Python unittest, py_compile, bash -n, host Gradle unit/compile, Native Gradle lintDebug/assembleRelease, apksigner, aapt, git diff --check
+테스트 결과: 서버 50개 통과, 호스트 unit/Kotlin compile 통과, Native lint/signed release 통과, shell/Python 정적 검증 통과
+ADB 기기: 연결 기기 없음. 설치·덮어쓰기·자동 실행과 실기기 runtime 검증은 미완료
+빌드 시간: 최종 Native lint+signed release 27초
+APK 크기: 5,094,598 bytes
+발견된 문제: 기본 데이터 경로 분리를 직접 고정하는 회귀 테스트가 없었음
+해결 내용: 환경변수 미설정 시 native_tasks.db, native_app_data.db, native_workspaces, .native_tooling만 선택하는 테스트를 추가
+커밋 SHA: 미커밋
+다음 단계: 소스 감사와 feature branch push 후 ADB 실기기 및 별도 Native AWS canary 검증
+```
 
 각 작업 단계가 끝날 때 아래 형식으로 기록한다.
 
