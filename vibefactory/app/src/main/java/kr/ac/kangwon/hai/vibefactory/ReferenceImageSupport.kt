@@ -281,11 +281,7 @@ private object InlineImagePreviewLoader {
 
     private fun buildCacheKey(encoded: String, imageUrl: String, maxDimension: Int): String {
         return buildString {
-            append(encoded.length)
-            append(':')
-            append(encoded.take(48).hashCode())
-            append(':')
-            append(encoded.takeLast(48).hashCode())
+            append(UiRenderFingerprint.binaryPayload(encoded))
             append(':')
             append(imageUrl.hashCode())
             append(':')

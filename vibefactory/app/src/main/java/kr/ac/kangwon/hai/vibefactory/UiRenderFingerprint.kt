@@ -66,6 +66,7 @@ internal object UiRenderFingerprint {
     fun binaryPayload(payload: String): Long {
         if (payload.isEmpty()) return 0L
         var fingerprint = mix(SEED, payload.length)
+        fingerprint = mix(fingerprint, payload.hashCode())
         fingerprint = mix(fingerprint, payload.take(PAYLOAD_SAMPLE_LENGTH))
         fingerprint = mix(fingerprint, payload.takeLast(PAYLOAD_SAMPLE_LENGTH))
         return fingerprint

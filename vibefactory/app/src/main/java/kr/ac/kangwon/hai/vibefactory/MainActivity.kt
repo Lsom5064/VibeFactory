@@ -333,7 +333,25 @@ class MainActivity : AppCompatActivity() {
     )
 
     private val pickReferenceImageLauncher =
-        registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris: List<Uri> ->
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            finishAttachmentFlow()
+            if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+            val resultData = result.data
+            val uris = buildList {
+                resultData?.clipData?.let { clipData ->
+                    for (index in 0 until clipData.itemCount) {
+                        add(clipData.getItemAt(index).uri)
+                    }
+                }
+                resultData?.data?.let(::add)
+            }.distinct()
+            if (uris.isNotEmpty()) {
+                handleAttachmentsSelected(uris, SelectedAttachmentKind.IMAGE)
+            }
+        }
+
+    private val pickReferenceImageFallbackLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
             finishAttachmentFlow()
             if (uris.isNotEmpty()) {
                 handleAttachmentsSelected(uris, SelectedAttachmentKind.IMAGE)
@@ -4300,7 +4318,7 @@ ${record.stackTrace}
                 iconRes = android.R.drawable.ic_menu_gallery
             ) {
                 launchAttachmentPicker(dialog, choiceEnabledAt) {
-                    pickReferenceImageLauncher.launch("image/*")
+                    launchReferenceImagePicker()
                 }
             }
         )
@@ -4400,6 +4418,21 @@ ${record.stackTrace}
         val uri = FileProvider.getUriForFile(this, "${packageName}.provider", imageFile)
         pendingCameraImageUri = uri
         captureImageLauncher.launch(uri)
+    }
+
+    private fun launchReferenceImagePicker() {
+        val intent = Intent(
+            Intent.ACTION_PICK,
+            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        ).apply {
+            type = "image/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        if (intent.resolveActivity(packageManager) != null) {
+            pickReferenceImageLauncher.launch(intent)
+        } else {
+            pickReferenceImageFallbackLauncher.launch(arrayOf("image/*"))
+        }
     }
 
     private fun handleAttachmentSelected(uri: Uri, kind: SelectedAttachmentKind) {

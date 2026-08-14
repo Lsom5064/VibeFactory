@@ -31,13 +31,15 @@ class UiRenderFingerprintTest {
     }
 
     @Test
-    fun attachmentPayloadIdentityUsesSizeAndBothEdges() {
+    fun attachmentPayloadIdentityUsesSizeEdgesAndMiddleContent() {
         val middle = "m".repeat(200)
         val first = "a".repeat(48) + middle + "z".repeat(48)
         val changedStart = "b" + first.drop(1)
+        val changedMiddle = "a".repeat(48) + "n".repeat(200) + "z".repeat(48)
         val changedEnd = first.dropLast(1) + "y"
 
         assertNotEquals(UiRenderFingerprint.binaryPayload(first), UiRenderFingerprint.binaryPayload(changedStart))
+        assertNotEquals(UiRenderFingerprint.binaryPayload(first), UiRenderFingerprint.binaryPayload(changedMiddle))
         assertNotEquals(UiRenderFingerprint.binaryPayload(first), UiRenderFingerprint.binaryPayload(changedEnd))
         assertNotEquals(UiRenderFingerprint.binaryPayload(first), UiRenderFingerprint.binaryPayload(first + "m"))
     }
