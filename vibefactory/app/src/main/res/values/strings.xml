@@ -227,6 +227,8 @@
     <string name="ui_editor_no_layouts">편집할 XML 화면이 없어요.</string>
     <string name="ui_editor_load_failed">화면을 불러오지 못했어요.</string>
     <string name="ui_editor_canvas_meta">요소 %1$d개 · 잠김 %2$d개 · 확인 %3$d개</string>
+    <string name="ui_editor_scroll_mode">스크롤</string>
+    <string name="ui_editor_move_mode">요소 이동</string>
     <string name="ui_editor_add_text">텍스트</string>
     <string name="ui_editor_add_button">버튼</string>
     <string name="ui_editor_add_input">입력창</string>

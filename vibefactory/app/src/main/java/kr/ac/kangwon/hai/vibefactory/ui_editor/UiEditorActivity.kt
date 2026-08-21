@@ -17,6 +17,7 @@ import android.view.ViewConfiguration
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -69,9 +70,11 @@ class UiEditorActivity : AppCompatActivity() {
     private var renderGeneration = 0
     private var draftSaveJob: Job? = null
     private var pendingImageElementId: String? = null
+    private var pendingRevealElementId: String? = null
     private var currentNodeViews: Map<String, View> = emptyMap()
     private var isSubmitting = false
     private var isImeEditingMode = false
+    private var canvasInteractionMode = CanvasInteractionMode.SCROLL
     private val density by lazy { resources.displayMetrics.density }
     private val imagePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         val elementId = pendingImageElementId
@@ -142,6 +145,10 @@ class UiEditorActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnUiEditorLayerBack).setOnClickListener { reorderSelected(false) }
         findViewById<Button>(R.id.btnUiEditorLayerFront).setOnClickListener { reorderSelected(true) }
         findViewById<Button>(R.id.btnUiEditorDoneEditing).setOnClickListener { finishPropertyEditing() }
+        canvasInteractionMode = savedInstanceState?.getString(STATE_INTERACTION_MODE)
+            ?.let { saved -> CanvasInteractionMode.entries.firstOrNull { it.name == saved } }
+            ?: CanvasInteractionMode.SCROLL
+        bindCanvasInteractionMode()
         bindPalette()
         bindCanvasDropTarget()
 
@@ -168,6 +175,7 @@ class UiEditorActivity : AppCompatActivity() {
             outState.putString(STATE_LAYOUT_NAME, layout.layout_name)
             outState.putString(STATE_LAYOUT_CONFIGURATION, layout.configuration)
         }
+        outState.putString(STATE_INTERACTION_MODE, canvasInteractionMode.name)
         super.onSaveInstanceState(outState)
     }
 
@@ -237,6 +245,40 @@ class UiEditorActivity : AppCompatActivity() {
         currentFocus?.clearFocus()
         WindowCompat.getInsetsController(window, findViewById(R.id.uiEditorRoot))
             .hide(WindowInsetsCompat.Type.ime())
+        viewModel.session?.selectedElementId = null
+        highlightSelection(currentNodeViews)
+        bindSelectedElement()
+        scheduleDraftSave()
+    }
+
+    private fun bindCanvasInteractionMode() {
+        findViewById<Button>(R.id.btnUiEditorScrollMode).setOnClickListener {
+            setCanvasInteractionMode(CanvasInteractionMode.SCROLL)
+        }
+        findViewById<Button>(R.id.btnUiEditorMoveMode).setOnClickListener {
+            setCanvasInteractionMode(CanvasInteractionMode.MOVE)
+        }
+        updateCanvasInteractionModeUi()
+    }
+
+    private fun setCanvasInteractionMode(mode: CanvasInteractionMode) {
+        if (canvasInteractionMode == mode) return
+        canvasInteractionMode = mode
+        updateCanvasInteractionModeUi()
+        attachElementInteractions(currentNodeViews)
+    }
+
+    private fun updateCanvasInteractionModeUi() {
+        updateInteractionModeButton(R.id.btnUiEditorScrollMode, canvasInteractionMode == CanvasInteractionMode.SCROLL)
+        updateInteractionModeButton(R.id.btnUiEditorMoveMode, canvasInteractionMode == CanvasInteractionMode.MOVE)
+    }
+
+    private fun updateInteractionModeButton(viewId: Int, selected: Boolean) {
+        findViewById<Button>(viewId).apply {
+            isSelected = selected
+            setBackgroundResource(if (selected) R.drawable.bg_send_button else R.drawable.bg_button_secondary)
+            setTextColor(getColor(if (selected) R.color.text_inverse else R.color.text_primary))
+        }
     }
 
     private fun View.isDescendantOf(parent: View): Boolean {
@@ -531,7 +573,7 @@ class UiEditorActivity : AppCompatActivity() {
                 menu.add(0, index, index, label)
             }
             setOnMenuItemClickListener { item ->
-                nodes.getOrNull(item.itemId)?.let { node -> selectElement(node.stableId) } != null
+                nodes.getOrNull(item.itemId)?.let { node -> selectElement(node.stableId, reveal = true) } != null
             }
             show()
         }
@@ -570,7 +612,7 @@ class UiEditorActivity : AppCompatActivity() {
                 Toast.makeText(this, R.string.ui_editor_element_add_failed, Toast.LENGTH_SHORT).show()
                 return
             }
-        recordAndRender(before, newId)
+        recordAndRender(before, newId, revealSelection = true)
         val parentLabel = insertionParent?.simpleTag?.let(::displayElementType)
             ?: getString(R.string.ui_editor_screen)
         Toast.makeText(
@@ -636,27 +678,80 @@ class UiEditorActivity : AppCompatActivity() {
             updateHistoryActions()
             bindSelectedElement()
             showCanvas()
+            pendingRevealElementId?.let { stableId ->
+                pendingRevealElementId = null
+                revealElement(stableId)
+            }
         }
     }
 
     private fun attachElementInteractions(result: UiPreviewRenderResult) {
+        attachElementInteractions(result.nodeViews)
+    }
+
+    private fun attachElementInteractions(nodeViews: Map<String, View>) {
         val session = viewModel.session ?: return
-        result.nodeViews.forEach { (stableId, view) ->
+        nodeViews.forEach { (stableId, view) ->
             val node = session.document.root.descendantsAndSelf().firstOrNull { it.stableId == stableId }
                 ?: return@forEach
             view.isClickable = true
             view.setOnClickListener { selectElement(stableId) }
-            view.setOnTouchListener(ElementDragTouchListener(stableId, node.locked || node === session.document.root))
+            view.setOnTouchListener(
+                if (canvasInteractionMode == CanvasInteractionMode.MOVE) {
+                    ElementDragTouchListener(stableId, node.locked || node === session.document.root)
+                } else {
+                    null
+                }
+            )
         }
-        highlightSelection(result.nodeViews)
+        highlightSelection(nodeViews)
     }
 
-    private fun selectElement(stableId: String) {
+    private fun selectElement(stableId: String, reveal: Boolean = false) {
         val session = viewModel.session ?: return
         session.selectedElementId = stableId
         highlightSelection(currentNodeViews)
         bindSelectedElement()
+        if (reveal) revealElement(stableId)
         scheduleDraftSave()
+    }
+
+    private fun revealElement(stableId: String) {
+        val target = currentNodeViews[stableId] ?: return
+        val canvas = findViewById<FrameLayout>(R.id.uiEditorCanvas)
+        val horizontalViewport = findViewById<HorizontalScrollView>(R.id.uiEditorCanvasViewport)
+        val verticalViewport = findViewById<ScrollView>(R.id.uiEditorCanvasVerticalViewport)
+        target.post {
+            if (!target.isAttachedToWindow || !canvas.isAttachedToWindow) return@post
+            val bounds = Rect(0, 0, target.width, target.height)
+            canvas.offsetDescendantRectToMyCoords(target, bounds)
+            val horizontalTarget = (bounds.centerX() - horizontalViewport.width / 2)
+                .coerceIn(0, (canvas.width - horizontalViewport.width).coerceAtLeast(0))
+            val verticalTarget = (bounds.centerY() - verticalViewport.height / 2)
+                .coerceIn(0, (canvas.height - verticalViewport.height).coerceAtLeast(0))
+            horizontalViewport.smoothScrollTo(horizontalTarget, 0)
+            verticalViewport.smoothScrollTo(0, verticalTarget)
+            pulseElement(target)
+        }
+    }
+
+    private fun pulseElement(target: View) {
+        target.animate().cancel()
+        target.scaleX = 1f
+        target.scaleY = 1f
+        target.animate()
+            .scaleX(1.025f)
+            .scaleY(1.025f)
+            .setDuration(ELEMENT_PULSE_DURATION_MILLIS)
+            .withEndAction {
+                target.animate()
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(ELEMENT_PULSE_DURATION_MILLIS)
+                    .start()
+            }
+            .start()
+        target.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
     }
 
     private fun highlightSelection(nodeViews: Map<String, View>) {
@@ -757,7 +852,7 @@ class UiEditorActivity : AppCompatActivity() {
         val before = session.snapshot()
         val newId = UiDocumentEditor.duplicate(session.document, stableId) ?: return
         session.descriptions[stableId]?.let { session.descriptions[newId] = it }
-        recordAndRender(before, newId)
+        recordAndRender(before, newId, revealSelection = true)
     }
 
     private fun confirmDeleteSelected() {
@@ -785,9 +880,14 @@ class UiEditorActivity : AppCompatActivity() {
         imagePicker.launch("image/*")
     }
 
-    private fun recordAndRender(before: UiEditorSnapshot, selectedId: String?) {
+    private fun recordAndRender(
+        before: UiEditorSnapshot,
+        selectedId: String?,
+        revealSelection: Boolean = false
+    ) {
         val session = viewModel.session ?: return
         session.selectedElementId = selectedId
+        if (revealSelection) pendingRevealElementId = selectedId
         if (session.snapshot() != before) session.recordChange()
         renderCurrentSession()
         scheduleDraftSave()
@@ -1119,12 +1219,14 @@ class UiEditorActivity : AppCompatActivity() {
         const val EXTRA_APP_NAME = "ui_editor_app_name"
         private const val STATE_LAYOUT_NAME = "ui_editor_layout_name"
         private const val STATE_LAYOUT_CONFIGURATION = "ui_editor_layout_configuration"
+        private const val STATE_INTERACTION_MODE = "ui_editor_interaction_mode"
         private const val MENU_NEW_LAYOUT = 10_000
         private const val MENU_ADD_ELEMENT_BASE = 20_000
         private const val MENU_ADD_BASIC_GROUP = 30_001
         private const val MENU_ADD_CONTAINER_GROUP = 30_002
         private const val MENU_ADD_DATA_GROUP = 30_003
         private const val IME_SCROLL_DELAY_MILLIS = 120L
+        private const val ELEMENT_PULSE_DURATION_MILLIS = 140L
         private const val PROPERTY_PANEL_HEIGHT_DP = 250
         private const val DRAG_FEEDBACK_ALPHA = 235
         private const val DRAG_SOURCE_ALPHA = 0.22f
@@ -1133,6 +1235,7 @@ class UiEditorActivity : AppCompatActivity() {
             R.id.uiEditorActionToolbar,
             R.id.btnUiEditorSubmit,
             R.id.uiEditorCanvasMeta,
+            R.id.uiEditorInteractionMode,
             R.id.uiEditorPaletteToolbar,
             R.id.uiEditorCanvasContainer
         )
@@ -1159,6 +1262,11 @@ class UiEditorActivity : AppCompatActivity() {
             "RadioButton"
         )
         private val IMAGE_TAGS = setOf("ImageView", "ImageButton")
+    }
+
+    private enum class CanvasInteractionMode {
+        SCROLL,
+        MOVE
     }
 
     private inner class ElementDragFeedback(

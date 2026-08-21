@@ -138,6 +138,37 @@
         android:textColor="@color/text_secondary"
         android:textSize="12sp" />
 
+    <LinearLayout
+        android:id="@+id/uiEditorInteractionMode"
+        android:layout_width="match_parent"
+        android:layout_height="42dp"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnUiEditorScrollMode"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@drawable/bg_send_button"
+            android:minWidth="0dp"
+            android:text="@string/ui_editor_scroll_mode"
+            android:textAllCaps="false"
+            android:textColor="@color/text_inverse" />
+
+        <Button
+            android:id="@+id/btnUiEditorMoveMode"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_button_secondary"
+            android:minWidth="0dp"
+            android:text="@string/ui_editor_move_mode"
+            android:textAllCaps="false"
+            android:textColor="@color/text_primary" />
+    </LinearLayout>
+
     <HorizontalScrollView
         android:id="@+id/uiEditorPaletteToolbar"
         android:layout_width="match_parent"
@@ -238,6 +269,7 @@
             android:fillViewport="false">
 
             <ScrollView
+                android:id="@+id/uiEditorCanvasVerticalViewport"
                 android:layout_width="wrap_content"
                 android:layout_height="match_parent"
                 android:fillViewport="false">
