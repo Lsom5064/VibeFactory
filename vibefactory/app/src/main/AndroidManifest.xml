@@ -79,6 +79,11 @@
             android:name=".TaskLogDetailActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".ui_editor.UiEditorActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
         <service
             android:name=".BuildMonitorService"
             android:exported="false"

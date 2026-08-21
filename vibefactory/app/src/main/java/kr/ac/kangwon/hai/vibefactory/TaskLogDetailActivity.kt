@@ -18,6 +18,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.google.gson.GsonBuilder
+import kr.ac.kangwon.hai.vibefactory.ui_editor.UiEditorActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -187,6 +188,7 @@ class TaskLogDetailActivity : AppCompatActivity() {
             selector.visibility = View.GONE
             selector.setOnClickListener(null)
             bindBranchAction(payload, null)
+            bindUiEditorAction(payload, null)
             return
         }
         val selected = selectedRevision
@@ -218,6 +220,24 @@ class TaskLogDetailActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.taskLogRevisionValue).text = revisionSelectorText(revision)
         bindApkAction(apkActionForRevision(payload, revision))
         bindBranchAction(payload, revision)
+        bindUiEditorAction(payload, revision)
+    }
+
+    private fun bindUiEditorAction(payload: TaskLogDetailPayload, revision: TaskRevisionDto?) {
+        findViewById<Button>(R.id.btnTaskLogEditUi).apply {
+            val revisionLabel = revision?.revision_label.orEmpty().trim()
+            visibility = if (revisionLabel.isNotBlank()) View.VISIBLE else View.GONE
+            isEnabled = revisionLabel.isNotBlank()
+            setOnClickListener {
+                if (revisionLabel.isBlank()) return@setOnClickListener
+                startActivity(
+                    Intent(this@TaskLogDetailActivity, UiEditorActivity::class.java)
+                        .putExtra(UiEditorActivity.EXTRA_TASK_ID, payload.taskId)
+                        .putExtra(UiEditorActivity.EXTRA_REVISION_LABEL, revisionLabel)
+                        .putExtra(UiEditorActivity.EXTRA_APP_NAME, payload.appName)
+                )
+            }
+        }
     }
 
     private fun bindBranchAction(payload: TaskLogDetailPayload, revision: TaskRevisionDto?) {

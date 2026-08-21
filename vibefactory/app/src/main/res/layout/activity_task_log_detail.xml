@@ -136,6 +136,22 @@
                 android:textStyle="bold"
                 android:visibility="gone" />
 
+            <Button
+                android:id="@+id/btnTaskLogEditUi"
+                android:layout_width="match_parent"
+                android:layout_height="46dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_send_button"
+                android:minWidth="0dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/task_log_edit_ui"
+                android:textAllCaps="false"
+                android:textColor="@color/text_inverse"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
+
             <LinearLayout
                 android:id="@+id/taskLogApkCard"
                 android:layout_width="match_parent"

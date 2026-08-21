@@ -22,6 +22,7 @@ android {
         targetSdk = 35
         versionCode = 6
         versionName = "1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField(
             "String",
             "VIBE_SERVER_BASE_URL",
@@ -65,4 +66,7 @@ dependencies {
     // ⚡ Coroutines (비동기 처리)
     implementation(libs.kotlinx.coroutines.android)
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:core-ktx:1.5.0")
+    androidTestImplementation("androidx.test.ext:junit-ktx:1.1.5")
+    androidTestImplementation("androidx.test:runner:1.5.2")
 }

@@ -11,6 +11,7 @@ import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
 import retrofit2.http.Streaming
+import retrofit2.http.PUT
 
 data class DeviceInfo(
     val model: String,
@@ -189,6 +190,136 @@ data class TaskRevisionsResponse(
     val revisions: List<TaskRevisionDto> = emptyList()
 )
 
+data class UiLayoutSummaryDto(
+    val layout_name: String = "",
+    val configuration: String = "layout",
+    val resource_path: String = "",
+    val root_tag: String = "",
+    val sha256: String = "",
+    val size_bytes: Long = 0
+)
+
+data class UiLayoutsResponse(
+    val task_id: String = "",
+    val revision_label: String = "",
+    val source_available: Boolean = false,
+    val unavailable_reason: String = "",
+    val layouts: List<UiLayoutSummaryDto> = emptyList()
+)
+
+data class UiResourceReferenceDto(
+    val type: String = "",
+    val name: String = ""
+)
+
+data class UiResourceFileDto(
+    val resource_path: String = "",
+    val kind: String = "",
+    val media_type: String = "",
+    val sha256: String = "",
+    val size_bytes: Long = 0,
+    val content: String? = null
+)
+
+data class UiLayoutDocumentResponse(
+    val task_id: String = "",
+    val revision_label: String = "",
+    val source_available: Boolean = false,
+    val layout_name: String = "",
+    val configuration: String = "layout",
+    val resource_path: String = "",
+    val root_tag: String = "",
+    val xml: String = "",
+    val sha256: String = "",
+    val size_bytes: Long = 0,
+    val resource_references: List<UiResourceReferenceDto> = emptyList(),
+    val resource_files: List<UiResourceFileDto> = emptyList(),
+    val unresolved_resources: List<UiResourceReferenceDto> = emptyList()
+)
+
+data class UiEditorImageMetadataDto(
+    val original_size_bytes: Long = 0,
+    val stored_size_bytes: Long = 0,
+    val original_width: Int = 0,
+    val original_height: Int = 0,
+    val stored_width: Int = 0,
+    val stored_height: Int = 0,
+    val original_sha256: String = "",
+    val stored_sha256: String = ""
+)
+
+data class UiEditorImageDto(
+    val image_id: String = "",
+    val draft_id: String = "",
+    val element_stable_id: String = "",
+    val original_name: String = "",
+    val mime_type: String = "image/jpeg",
+    val resource_name: String = "",
+    val workspace_path: String = "",
+    val size_bytes: Long = 0,
+    val sha256: String = "",
+    val metadata: UiEditorImageMetadataDto? = null,
+    val created_at: String = ""
+)
+
+data class UiEditorDraftDto(
+    val draft_id: String = "",
+    val task_id: String = "",
+    val base_revision_label: String = "",
+    val layout_name: String = "",
+    val configuration: String = "layout",
+    val base_xml_sha256: String = "",
+    val original_xml: String = "",
+    val edited_xml: String = "",
+    val descriptions: Map<String, String> = emptyMap(),
+    val status: String = "draft",
+    val version: Int = 0,
+    val is_new_layout: Boolean = false,
+    val preview_workspace_path: String? = null,
+    val generated_revision_label: String? = null,
+    val created_at: String = "",
+    val updated_at: String = "",
+    val submitted_at: String? = null,
+    val images: List<UiEditorImageDto> = emptyList()
+)
+
+data class UiEditorDraftRequestDto(
+    val draft_id: String? = null,
+    val configuration: String,
+    val base_xml_sha256: String,
+    val original_xml: String,
+    val edited_xml: String,
+    val descriptions: Map<String, String>,
+    val expected_version: Int? = null,
+    val is_new_layout: Boolean
+)
+
+data class UiEditorImageUploadRequestDto(
+    val image_id: String,
+    val element_stable_id: String,
+    val original_name: String,
+    val mime_type: String,
+    val resource_name: String,
+    val base64: String
+)
+
+data class UiEditorImageResponseDto(
+    val image: UiEditorImageDto
+)
+
+data class UiEditorSubmitRequestDto(
+    val expected_version: Int,
+    val preview_image_base64: String? = null,
+    val preview_mime_type: String = "image/jpeg"
+)
+
+data class UiEditorSubmitResponseDto(
+    val task_id: String = "",
+    val status: String = "",
+    val message: String = "",
+    val draft: UiEditorDraftDto
+)
+
 data class TaskRenameRequest(
     val app_name: String
 )
@@ -239,6 +370,82 @@ interface VibeApiService {
         @Query("user_id") userId: String? = null,
         @Query("phone_number") phoneNumber: String? = null
     ): TaskRevisionsResponse
+
+    @GET("/tasks/{task_id}/revisions/{revision_label}/ui/layouts")
+    suspend fun getRevisionUiLayouts(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): UiLayoutsResponse
+
+    @GET("/tasks/{task_id}/revisions/{revision_label}/ui/layouts/{layout_name}")
+    suspend fun getRevisionUiLayout(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Path("layout_name") layoutName: String,
+        @Query("configuration") configuration: String = "layout",
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): UiLayoutDocumentResponse
+
+    @GET("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{layout_name}")
+    suspend fun getUiEditorDraft(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Path("layout_name") layoutName: String,
+        @Query("configuration") configuration: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): UiEditorDraftDto
+
+    @PUT("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{layout_name}")
+    suspend fun saveUiEditorDraft(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Path("layout_name") layoutName: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null,
+        @Body request: UiEditorDraftRequestDto
+    ): UiEditorDraftDto
+
+    @POST("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/images")
+    suspend fun uploadUiEditorImage(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Path("draft_id") draftId: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null,
+        @Body request: UiEditorImageUploadRequestDto
+    ): UiEditorImageResponseDto
+
+    @Streaming
+    @GET("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/images/{image_id}")
+    suspend fun getUiEditorImage(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Path("draft_id") draftId: String,
+        @Path("image_id") imageId: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null
+    ): ResponseBody
+
+    @POST("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/submit")
+    suspend fun submitUiEditorDraft(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Path("draft_id") draftId: String,
+        @Query("device_id") deviceId: String,
+        @Query("user_id") userId: String? = null,
+        @Query("phone_number") phoneNumber: String? = null,
+        @Body request: UiEditorSubmitRequestDto
+    ): UiEditorSubmitResponseDto
 
     @POST("/tasks/{task_id}/revisions/{revision_label}/branch")
     suspend fun branchTaskRevision(
