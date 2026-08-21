@@ -14,6 +14,7 @@ enum class UiPaletteElement(
     BUTTON("Button", "button", "wrap_content", "wrap_content"),
     INPUT("EditText", "input", "match_parent", "wrap_content"),
     IMAGE("ImageView", "image", "120dp", "100dp"),
+    ICON("ImageView", "icon", "48dp", "48dp"),
     CHECKBOX("CheckBox", "checkbox", "wrap_content", "wrap_content"),
     SWITCH("Switch", "switch", "wrap_content", "wrap_content"),
     CARD("com.google.android.material.card.MaterialCardView", "card", "match_parent", "120dp"),
@@ -215,6 +216,12 @@ object UiDocumentEditor {
                 UiPaletteElement.BUTTON -> element.setAndroidAttribute("text", "버튼")
                 UiPaletteElement.INPUT -> element.setAndroidAttribute("hint", "입력")
                 UiPaletteElement.IMAGE -> element.setAndroidAttribute("contentDescription", "추가한 이미지")
+                UiPaletteElement.ICON -> {
+                    element.setAndroidAttribute("src", "@android:drawable/ic_menu_info_details")
+                    element.setAndroidAttribute("contentDescription", "정보 아이콘")
+                    element.setAndroidAttribute("scaleType", "centerInside")
+                    element.setAndroidAttribute("padding", "8dp")
+                }
                 UiPaletteElement.CHECKBOX -> element.setAndroidAttribute("text", "선택 항목")
                 UiPaletteElement.SWITCH -> element.setAndroidAttribute("text", "설정")
                 UiPaletteElement.VERTICAL_LINEAR_LAYOUT -> {
@@ -372,6 +379,25 @@ object UiDocumentEditor {
         return true
     }
 
+    fun setPlatformIconReference(
+        document: AndroidXmlDocument,
+        stableId: String,
+        resourceName: String,
+        contentDescription: String
+    ): Boolean {
+        require(resourceName.matches(PLATFORM_ICON_PATTERN)) { "invalid platform icon" }
+        val node = document.root.descendantsAndSelf().firstOrNull { it.stableId == stableId } ?: return false
+        if (node.locked || node.simpleTag !in IMAGE_TAGS) return false
+        document.mutate {
+            document.element(stableId)?.apply {
+                setAndroidAttribute("src", "@android:drawable/$resourceName")
+                setAndroidAttribute("contentDescription", contentDescription.trim())
+                setAndroidAttribute("scaleType", "centerInside")
+            }
+        }
+        return true
+    }
+
     private fun Element.setAndroidAttribute(localName: String, value: String) {
         ensureNamespace("android", ANDROID_NAMESPACE_URI)
         setAttributeNS(ANDROID_NAMESPACE_URI, "android:$localName", value)
@@ -514,6 +540,7 @@ object UiDocumentEditor {
 
     private val COLOR_LITERAL_PATTERN = Regex("^#[0-9A-Fa-f]{3,4}(?:[0-9A-Fa-f]{3,4})?$")
     private val THEME_ATTRIBUTE_PATTERN = Regex("^\\?(?:android:)?attr/[a-zA-Z_][a-zA-Z0-9_.]*$")
+    private val PLATFORM_ICON_PATTERN = Regex("^ic_[a-z0-9_]+$")
     private val IMAGE_TAGS = setOf("ImageView", "ImageButton")
 
     private const val DEFAULT_ELEMENT_MARGIN_DP = 16

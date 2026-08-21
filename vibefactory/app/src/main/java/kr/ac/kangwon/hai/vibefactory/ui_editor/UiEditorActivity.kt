@@ -4,10 +4,12 @@ import android.content.ClipData
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.text.InputType
 import android.util.Base64
 import android.view.DragEvent
 import android.view.HapticFeedbackConstants
@@ -17,8 +19,10 @@ import android.view.ViewConfiguration
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
@@ -55,6 +59,7 @@ import retrofit2.HttpException
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.time.Instant
+import java.util.Locale
 
 class UiEditorActivity : AppCompatActivity() {
     private val gson = GsonBuilder().create()
@@ -74,6 +79,7 @@ class UiEditorActivity : AppCompatActivity() {
     private var currentNodeViews: Map<String, View> = emptyMap()
     private var isSubmitting = false
     private var isImeEditingMode = false
+    private var isPaletteExpanded = true
     private var canvasInteractionMode = CanvasInteractionMode.SCROLL
     private val density by lazy { resources.displayMetrics.density }
     private val imagePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -141,6 +147,7 @@ class UiEditorActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnUiEditorDuplicate).setOnClickListener { duplicateSelected() }
         findViewById<Button>(R.id.btnUiEditorDelete).setOnClickListener { confirmDeleteSelected() }
         findViewById<Button>(R.id.btnUiEditorAttachImage).setOnClickListener { selectImageForCurrentElement() }
+        findViewById<Button>(R.id.btnUiEditorChooseIcon).setOnClickListener(::showIconMenu)
         findViewById<Button>(R.id.btnUiEditorLayers).setOnClickListener { showLayerMenu(it) }
         findViewById<Button>(R.id.btnUiEditorLayerBack).setOnClickListener { reorderSelected(false) }
         findViewById<Button>(R.id.btnUiEditorLayerFront).setOnClickListener { reorderSelected(true) }
@@ -148,8 +155,11 @@ class UiEditorActivity : AppCompatActivity() {
         canvasInteractionMode = savedInstanceState?.getString(STATE_INTERACTION_MODE)
             ?.let { saved -> CanvasInteractionMode.entries.firstOrNull { it.name == saved } }
             ?: CanvasInteractionMode.SCROLL
+        isPaletteExpanded = savedInstanceState?.getBoolean(STATE_PALETTE_EXPANDED, true) ?: true
         bindCanvasInteractionMode()
+        bindPaletteSection()
         bindPalette()
+        bindColorPickers()
         bindCanvasDropTarget()
 
         val restoredName = savedInstanceState?.getString(STATE_LAYOUT_NAME).orEmpty()
@@ -176,6 +186,7 @@ class UiEditorActivity : AppCompatActivity() {
             outState.putString(STATE_LAYOUT_CONFIGURATION, layout.configuration)
         }
         outState.putString(STATE_INTERACTION_MODE, canvasInteractionMode.name)
+        outState.putBoolean(STATE_PALETTE_EXPANDED, isPaletteExpanded)
         super.onSaveInstanceState(outState)
     }
 
@@ -217,7 +228,7 @@ class UiEditorActivity : AppCompatActivity() {
         params.height = if (enabled) 0 else (PROPERTY_PANEL_HEIGHT_DP * density).toInt()
         params.weight = if (enabled) 1f else 0f
         panel.layoutParams = params
-        if (!enabled) renderCurrentSession()
+        if (!enabled) updatePaletteSectionVisibility()
     }
 
     private fun bindPropertyFieldFocusHandling() {
@@ -249,6 +260,163 @@ class UiEditorActivity : AppCompatActivity() {
         highlightSelection(currentNodeViews)
         bindSelectedElement()
         scheduleDraftSave()
+    }
+
+    private fun bindPaletteSection() {
+        findViewById<View>(R.id.uiEditorPaletteSectionHeader).setOnClickListener {
+            isPaletteExpanded = !isPaletteExpanded
+            updatePaletteSectionVisibility(animate = true)
+        }
+        updatePaletteSectionVisibility()
+    }
+
+    private fun updatePaletteSectionVisibility(animate: Boolean = false) {
+        val toolbar = findViewById<View>(R.id.uiEditorPaletteToolbar)
+        val summary = findViewById<View>(R.id.uiEditorPaletteSectionSummary)
+        val chevron = findViewById<ImageView>(R.id.uiEditorPaletteChevron)
+        toolbar.visibility = if (isPaletteExpanded) View.VISIBLE else View.GONE
+        summary.visibility = if (isPaletteExpanded) View.VISIBLE else View.GONE
+        val targetRotation = if (isPaletteExpanded) 90f else 0f
+        if (animate) {
+            chevron.animate().rotation(targetRotation).setDuration(SECTION_TOGGLE_DURATION_MILLIS).start()
+        } else {
+            chevron.rotation = targetRotation
+        }
+        chevron.contentDescription = getString(
+            if (isPaletteExpanded) R.string.ui_editor_collapse_palette else R.string.ui_editor_expand_palette
+        )
+    }
+
+    private fun bindColorPickers() {
+        bindColorPickerControl(
+            controlId = R.id.uiEditorTextColorControl,
+            fieldId = R.id.uiEditorTextColor,
+            swatchId = R.id.uiEditorTextColorSwatch,
+            titleRes = R.string.ui_editor_color_picker_title_text
+        )
+        bindColorPickerControl(
+            controlId = R.id.uiEditorBackgroundControl,
+            fieldId = R.id.uiEditorBackground,
+            swatchId = R.id.uiEditorBackgroundSwatch,
+            titleRes = R.string.ui_editor_color_picker_title_background
+        )
+    }
+
+    private fun bindColorPickerControl(controlId: Int, fieldId: Int, swatchId: Int, titleRes: Int) {
+        val listener = View.OnClickListener {
+            showColorPicker(
+                fieldId = fieldId,
+                swatchId = swatchId,
+                titleRes = titleRes
+            )
+        }
+        listOf(controlId, fieldId, swatchId).forEach { viewId ->
+            findViewById<View>(viewId).setOnClickListener(listener)
+        }
+        findViewById<EditText>(fieldId).apply {
+            isClickable = true
+            isLongClickable = false
+        }
+    }
+
+    private fun showColorPicker(fieldId: Int, swatchId: Int, titleRes: Int) {
+        val field = findViewById<EditText>(fieldId)
+        val currentValue = field.text.toString().trim()
+        val customInput = EditText(this).apply {
+            hint = getString(R.string.ui_editor_color_custom_hint)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+            isSingleLine = true
+            setText(currentValue)
+            setSelection(text.length)
+        }
+        val grid = GridLayout(this).apply {
+            columnCount = COLOR_PICKER_COLUMN_COUNT
+            alignmentMode = GridLayout.ALIGN_BOUNDS
+        }
+        var dialog: AlertDialog? = null
+        COLOR_PRESETS.forEach { value ->
+            val colorButton = View(this).apply {
+                background = colorSwatchDrawable(value, selected = value.equals(currentValue, ignoreCase = true))
+                contentDescription = value
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    setColorFieldValue(fieldId, swatchId, value)
+                    dialog?.dismiss()
+                }
+            }
+            grid.addView(
+                colorButton,
+                GridLayout.LayoutParams().apply {
+                    width = (COLOR_SWATCH_SIZE_DP * density).toInt()
+                    height = (COLOR_SWATCH_SIZE_DP * density).toInt()
+                    val margin = (COLOR_SWATCH_MARGIN_DP * density).toInt()
+                    setMargins(margin, margin, margin, margin)
+                }
+            )
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val horizontal = (20 * density).toInt()
+            val vertical = (8 * density).toInt()
+            setPadding(horizontal, vertical, horizontal, 0)
+            addView(grid, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            addView(
+                customInput,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (48 * density).toInt()).apply {
+                    topMargin = (10 * density).toInt()
+                }
+            )
+        }
+        dialog = AlertDialog.Builder(this)
+            .setTitle(titleRes)
+            .setView(content)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setNeutralButton(R.string.ui_editor_color_clear) { _, _ ->
+                setColorFieldValue(fieldId, swatchId, "")
+            }
+            .setPositiveButton(android.R.string.ok, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val normalized = normalizePickerColor(customInput.text.toString())
+                if (normalized == null) {
+                    customInput.error = getString(R.string.ui_editor_invalid_color)
+                    return@setOnClickListener
+                }
+                setColorFieldValue(fieldId, swatchId, normalized)
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun normalizePickerColor(value: String): String? {
+        val normalized = value.trim().uppercase(Locale.ROOT)
+        return normalized.takeIf { it.matches(PICKER_COLOR_PATTERN) }
+    }
+
+    private fun setColorFieldValue(fieldId: Int, swatchId: Int, value: String) {
+        findViewById<EditText>(fieldId).setText(value)
+        updateColorSwatch(fieldId, swatchId)
+    }
+
+    private fun updateColorSwatch(fieldId: Int, swatchId: Int) {
+        val value = findViewById<EditText>(fieldId).text.toString().trim()
+        findViewById<View>(swatchId).background = colorSwatchDrawable(value)
+    }
+
+    private fun colorSwatchDrawable(value: String, selected: Boolean = false): GradientDrawable {
+        val color = runCatching { Color.parseColor(value) }.getOrNull() ?: Color.TRANSPARENT
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 6 * density
+            setColor(color)
+            setStroke(
+                ((if (selected) 2 else 1) * density).toInt().coerceAtLeast(1),
+                getColor(if (selected) R.color.accent_primary_dark else R.color.text_secondary)
+            )
+        }
     }
 
     private fun bindCanvasInteractionMode() {
@@ -477,6 +645,7 @@ class UiEditorActivity : AppCompatActivity() {
             R.id.btnUiAddButton to UiPaletteElement.BUTTON,
             R.id.btnUiAddInput to UiPaletteElement.INPUT,
             R.id.btnUiAddImage to UiPaletteElement.IMAGE,
+            R.id.btnUiAddIcon to UiPaletteElement.ICON,
             R.id.btnUiAddCard to UiPaletteElement.CARD,
             R.id.btnUiAddList to UiPaletteElement.LIST
         )
@@ -508,6 +677,7 @@ class UiEditorActivity : AppCompatActivity() {
             addPaletteMenuItem(basic, UiPaletteElement.BUTTON, R.string.ui_editor_add_button)
             addPaletteMenuItem(basic, UiPaletteElement.INPUT, R.string.ui_editor_add_input)
             addPaletteMenuItem(basic, UiPaletteElement.IMAGE, R.string.ui_editor_add_image)
+            addPaletteMenuItem(basic, UiPaletteElement.ICON, R.string.ui_editor_add_icon)
             addPaletteMenuItem(basic, UiPaletteElement.CHECKBOX, R.string.ui_editor_add_checkbox)
             addPaletteMenuItem(basic, UiPaletteElement.SWITCH, R.string.ui_editor_add_switch)
 
@@ -632,6 +802,7 @@ class UiEditorActivity : AppCompatActivity() {
             UiPaletteElement.BUTTON -> R.string.ui_editor_add_button
             UiPaletteElement.INPUT -> R.string.ui_editor_add_input
             UiPaletteElement.IMAGE -> R.string.ui_editor_add_image
+            UiPaletteElement.ICON -> R.string.ui_editor_add_icon
             UiPaletteElement.CHECKBOX -> R.string.ui_editor_add_checkbox
             UiPaletteElement.SWITCH -> R.string.ui_editor_add_switch
             UiPaletteElement.CARD -> R.string.ui_editor_add_card
@@ -793,10 +964,13 @@ class UiEditorActivity : AppCompatActivity() {
         findViewById<EditText>(R.id.uiEditorMarginStart).setText(dpValue(node.androidAttribute("layout_marginStart")))
         findViewById<EditText>(R.id.uiEditorMarginTop).setText(dpValue(node.androidAttribute("layout_marginTop")))
         findViewById<EditText>(R.id.uiEditorTextColor).apply {
-            visibility = if (supportsText) View.VISIBLE else View.GONE
             setText(node.androidAttribute("textColor").orEmpty())
         }
         findViewById<EditText>(R.id.uiEditorBackground).setText(node.androidAttribute("background").orEmpty())
+        findViewById<View>(R.id.uiEditorTextColorControl).visibility =
+            if (supportsText) View.VISIBLE else View.GONE
+        updateColorSwatch(R.id.uiEditorTextColor, R.id.uiEditorTextColorSwatch)
+        updateColorSwatch(R.id.uiEditorBackground, R.id.uiEditorBackgroundSwatch)
         findViewById<EditText>(R.id.uiEditorDescription).setText(session.descriptions[node.stableId].orEmpty())
         val editable = !node.locked
         listOf(
@@ -808,6 +982,8 @@ class UiEditorActivity : AppCompatActivity() {
             R.id.uiEditorTextColor,
             R.id.uiEditorBackground,
             R.id.uiEditorDescription,
+            R.id.uiEditorTextColorControl,
+            R.id.uiEditorBackgroundControl,
             R.id.btnUiEditorApply,
             R.id.btnUiEditorDuplicate,
             R.id.btnUiEditorLayerBack,
@@ -815,6 +991,10 @@ class UiEditorActivity : AppCompatActivity() {
             R.id.btnUiEditorDelete
         ).forEach { findViewById<View>(it).isEnabled = editable }
         findViewById<Button>(R.id.btnUiEditorAttachImage).apply {
+            visibility = if (editable && node.simpleTag in IMAGE_TAGS) View.VISIBLE else View.GONE
+            isEnabled = editable
+        }
+        findViewById<Button>(R.id.btnUiEditorChooseIcon).apply {
             visibility = if (editable && node.simpleTag in IMAGE_TAGS) View.VISIBLE else View.GONE
             isEnabled = editable
         }
@@ -878,6 +1058,34 @@ class UiEditorActivity : AppCompatActivity() {
         val stableId = viewModel.session?.selectedElementId ?: return
         pendingImageElementId = stableId
         imagePicker.launch("image/*")
+    }
+
+    private fun showIconMenu(anchor: View) {
+        val session = viewModel.session ?: return
+        val stableId = session.selectedElementId ?: return
+        PopupMenu(this, anchor).apply {
+            PLATFORM_ICONS.forEachIndexed { index, option ->
+                menu.add(0, index, index, option.labelRes).apply {
+                    icon = getDrawable(option.drawableRes)
+                }
+            }
+            setOnMenuItemClickListener { item ->
+                val option = PLATFORM_ICONS.getOrNull(item.itemId)
+                    ?: return@setOnMenuItemClickListener false
+                val before = session.snapshot()
+                val changed = UiDocumentEditor.setPlatformIconReference(
+                    session.document,
+                    stableId,
+                    option.resourceName,
+                    getString(option.labelRes)
+                )
+                if (!changed) return@setOnMenuItemClickListener false
+                session.images.removeAll { it.elementStableId == stableId }
+                recordAndRender(before, stableId)
+                true
+            }
+            show()
+        }
     }
 
     private fun recordAndRender(
@@ -1220,6 +1428,7 @@ class UiEditorActivity : AppCompatActivity() {
         private const val STATE_LAYOUT_NAME = "ui_editor_layout_name"
         private const val STATE_LAYOUT_CONFIGURATION = "ui_editor_layout_configuration"
         private const val STATE_INTERACTION_MODE = "ui_editor_interaction_mode"
+        private const val STATE_PALETTE_EXPANDED = "ui_editor_palette_expanded"
         private const val MENU_NEW_LAYOUT = 10_000
         private const val MENU_ADD_ELEMENT_BASE = 20_000
         private const val MENU_ADD_BASIC_GROUP = 30_001
@@ -1227,17 +1436,19 @@ class UiEditorActivity : AppCompatActivity() {
         private const val MENU_ADD_DATA_GROUP = 30_003
         private const val IME_SCROLL_DELAY_MILLIS = 120L
         private const val ELEMENT_PULSE_DURATION_MILLIS = 140L
+        private const val SECTION_TOGGLE_DURATION_MILLIS = 160L
         private const val PROPERTY_PANEL_HEIGHT_DP = 250
+        private const val COLOR_PICKER_COLUMN_COUNT = 5
+        private const val COLOR_SWATCH_SIZE_DP = 44
+        private const val COLOR_SWATCH_MARGIN_DP = 4
         private const val DRAG_FEEDBACK_ALPHA = 235
         private const val DRAG_SOURCE_ALPHA = 0.22f
         private const val MAX_DRAG_BITMAP_PIXELS = 1_500_000L
         private val EDITOR_CONTENT_IDS = intArrayOf(
             R.id.uiEditorActionToolbar,
             R.id.btnUiEditorSubmit,
-            R.id.uiEditorCanvasMeta,
-            R.id.uiEditorInteractionMode,
-            R.id.uiEditorPaletteToolbar,
-            R.id.uiEditorCanvasContainer
+            R.id.uiEditorPaletteSection,
+            R.id.uiEditorCanvasSection
         )
         private val PROPERTY_FIELD_IDS = intArrayOf(
             R.id.uiEditorElementText,
@@ -1245,9 +1456,41 @@ class UiEditorActivity : AppCompatActivity() {
             R.id.uiEditorHeight,
             R.id.uiEditorMarginStart,
             R.id.uiEditorMarginTop,
-            R.id.uiEditorTextColor,
-            R.id.uiEditorBackground,
             R.id.uiEditorDescription
+        )
+        private val PICKER_COLOR_PATTERN = Regex("^#[0-9A-F]{6}(?:[0-9A-F]{2})?$")
+        private val COLOR_PRESETS = listOf(
+            "#17211B",
+            "#FFFFFF",
+            "#667085",
+            "#D92D20",
+            "#F79009",
+            "#F8D648",
+            "#1F6B4F",
+            "#0E9384",
+            "#1570EF",
+            "#3538CD",
+            "#7A5AF8",
+            "#C11574",
+            "#344054",
+            "#EAECF0",
+            "#00000000"
+        )
+        private val PLATFORM_ICONS = listOf(
+            PlatformIconOption(
+                R.string.ui_editor_icon_information,
+                "ic_menu_info_details",
+                android.R.drawable.ic_menu_info_details
+            ),
+            PlatformIconOption(R.string.ui_editor_icon_edit, "ic_menu_edit", android.R.drawable.ic_menu_edit),
+            PlatformIconOption(R.string.ui_editor_icon_delete, "ic_menu_delete", android.R.drawable.ic_menu_delete),
+            PlatformIconOption(R.string.ui_editor_icon_search, "ic_menu_search", android.R.drawable.ic_menu_search),
+            PlatformIconOption(R.string.ui_editor_icon_share, "ic_menu_share", android.R.drawable.ic_menu_share),
+            PlatformIconOption(R.string.ui_editor_icon_camera, "ic_menu_camera", android.R.drawable.ic_menu_camera),
+            PlatformIconOption(R.string.ui_editor_icon_location, "ic_menu_mylocation", android.R.drawable.ic_menu_mylocation),
+            PlatformIconOption(R.string.ui_editor_icon_save, "ic_menu_save", android.R.drawable.ic_menu_save),
+            PlatformIconOption(R.string.ui_editor_icon_refresh, "ic_popup_sync", android.R.drawable.ic_popup_sync),
+            PlatformIconOption(R.string.ui_editor_icon_help, "ic_menu_help", android.R.drawable.ic_menu_help)
         )
         private val TEXT_TAGS = setOf(
             "TextView",
@@ -1263,6 +1506,12 @@ class UiEditorActivity : AppCompatActivity() {
         )
         private val IMAGE_TAGS = setOf("ImageView", "ImageButton")
     }
+
+    private data class PlatformIconOption(
+        val labelRes: Int,
+        val resourceName: String,
+        val drawableRes: Int
+    )
 
     private enum class CanvasInteractionMode {
         SCROLL,

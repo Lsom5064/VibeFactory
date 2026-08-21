@@ -123,16 +123,18 @@ class UiPreviewRenderer(private val context: Context) {
         }
         "TextInputEditText" -> EditText(context)
         "ImageView" -> ImageView(context).apply {
-            val bitmap = imageBitmaps[node.stableId]
-            if (bitmap != null) setImageBitmap(bitmap) else setImageResource(android.R.drawable.ic_menu_gallery)
+            applyImageSource(this, node)
             scaleType = ImageView.ScaleType.CENTER_INSIDE
-            setBackgroundColor(Color.rgb(238, 241, 240))
+            if (!isPlatformDrawable(node.androidAttribute("src"))) {
+                setBackgroundColor(Color.rgb(238, 241, 240))
+            }
         }
         "ImageButton" -> ImageButton(context).apply {
-            val bitmap = imageBitmaps[node.stableId]
-            if (bitmap != null) setImageBitmap(bitmap) else setImageResource(android.R.drawable.ic_menu_gallery)
+            applyImageSource(this, node)
             scaleType = ImageView.ScaleType.CENTER_INSIDE
-            setBackgroundColor(Color.rgb(238, 241, 240))
+            if (!isPlatformDrawable(node.androidAttribute("src"))) {
+                setBackgroundColor(Color.rgb(238, 241, 240))
+            }
         }
         "CheckBox" -> CheckBox(context)
         "Switch", "SwitchCompat" -> Switch(context)
@@ -150,6 +152,25 @@ class UiPreviewRenderer(private val context: Context) {
         }
         else -> lockedPlaceholder(node)
     }
+
+    private fun applyImageSource(view: ImageView, node: UiNode) {
+        val bitmap = imageBitmaps[node.stableId]
+        if (bitmap != null) {
+            view.setImageBitmap(bitmap)
+            return
+        }
+        val platformDrawable = platformDrawableId(node.androidAttribute("src"))
+        view.setImageResource(platformDrawable ?: android.R.drawable.ic_menu_gallery)
+    }
+
+    private fun platformDrawableId(reference: String?): Int? {
+        if (!isPlatformDrawable(reference)) return null
+        val resourceName = reference.orEmpty().removePrefix("@android:drawable/")
+        return context.resources.getIdentifier(resourceName, "drawable", "android").takeIf { it != 0 }
+    }
+
+    private fun isPlatformDrawable(reference: String?): Boolean =
+        reference?.startsWith("@android:drawable/") == true
 
     private fun lockedPlaceholder(node: UiNode): TextView = TextView(context).apply {
         text = "잠김 · ${node.simpleTag}"

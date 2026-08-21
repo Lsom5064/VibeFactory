@@ -376,6 +376,35 @@ class UiDocumentEditorTest {
     }
 
     @Test
+    fun iconPaletteCreatesAndChangesAccessiblePlatformIcon() {
+        val document = AndroidXmlDocument.parse(xml)
+
+        val iconId = UiDocumentEditor.addElement(document, "id:root", UiPaletteElement.ICON)!!
+        val added = document.element(iconId)!!
+
+        assertEquals("ImageView", added.tagName)
+        assertEquals(
+            "@android:drawable/ic_menu_info_details",
+            added.getAttributeNS(ANDROID_NAMESPACE_URI, "src")
+        )
+        assertEquals("정보 아이콘", added.getAttributeNS(ANDROID_NAMESPACE_URI, "contentDescription"))
+        assertTrue(
+            UiDocumentEditor.setPlatformIconReference(
+                document,
+                iconId,
+                "ic_menu_search",
+                "검색"
+            )
+        )
+        assertEquals(
+            "@android:drawable/ic_menu_search",
+            added.getAttributeNS(ANDROID_NAMESPACE_URI, "src")
+        )
+        assertEquals("검색", added.getAttributeNS(ANDROID_NAMESPACE_URI, "contentDescription"))
+        AndroidXmlDocument.parse(document.xml())
+    }
+
+    @Test
     fun addingFromSelectedLeafUsesItsNearestContainer() {
         val nestedXml = """<androidx.constraintlayout.widget.ConstraintLayout
             xmlns:android="http://schemas.android.com/apk/res/android"
