@@ -723,12 +723,60 @@ class MainActivity : AppCompatActivity() {
                     closeDrawerOnSuccess = false,
                     selectionGeneration = selectionGeneration
                 )
-                fetchTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
                 logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
+                if (
+                    e is HttpException &&
+                    e.code() == 404 &&
+                    isTaskSelectionGenerationCurrent(selectionGeneration)
+                ) {
+                    clearMissingRestoredTask(taskId)
+                }
+            }
+
+            if (isTaskSelectionGenerationCurrent(selectionGeneration)) {
+                fetchTaskList(
+                    autoSelectPendingTask = false,
+                    selectionGeneration = selectionGeneration
+                )
             }
         }
+    }
+
+    private fun clearMissingRestoredTask(taskId: String) {
+        val before = TaskRestoreSelection(
+            pendingTaskId = pendingTaskSelectionKey,
+            currentTaskId = currentTaskId,
+            selectedTaskId = screenState.selectedTaskId,
+            lastSelectedTaskId = getLastSelectedTaskId()
+        )
+        val recovered = TaskRestorePolicy.removeMissingTask(taskId, before)
+        if (recovered == before) return
+
+        pendingTaskSelectionKey = recovered.pendingTaskId
+        currentTaskId = recovered.currentTaskId
+        if (recovered.lastSelectedTaskId != before.lastSelectedTaskId) {
+            persistLastSelectedTaskId(recovered.lastSelectedTaskId)
+        }
+        if (recovered.selectedTaskId != before.selectedTaskId) {
+            latestApkUrl = null
+            latestDownloadedApkFile = null
+            latestDownloadedTaskId = null
+            screenState = screenState.copy(
+                selectedTaskId = recovered.selectedTaskId,
+                displayedAppName = null,
+                messages = emptyList(),
+                pollingTaskId = screenState.pollingTaskId?.takeUnless { it == taskId },
+                inputMode = InputMode.NEW_GENERATE,
+                currentStatus = getString(R.string.status_new_chat),
+                statusDetail = getString(R.string.status_new_chat_detail),
+                canDownload = false,
+                canInstall = false
+            )
+            renderState()
+        }
+        Log.w(TAG, "Cleared missing restored task reference task_id=$taskId")
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
