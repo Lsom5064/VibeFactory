@@ -136,10 +136,31 @@ object UiDocumentEditor {
     ): Boolean {
         val node = document.root.descendantsAndSelf().firstOrNull { it.stableId == stableId } ?: return false
         if (node.locked || node === document.root) return false
+        val element = document.element(stableId) ?: return false
+        val marginStart = parseDp(element.getAttributeNS(ANDROID_NAMESPACE_URI, "layout_marginStart"))
+        val marginTop = parseDp(element.getAttributeNS(ANDROID_NAMESPACE_URI, "layout_marginTop"))
+        return placeAt(
+            document = document,
+            stableId = stableId,
+            startDp = marginStart + deltaXDp,
+            topDp = marginTop + deltaYDp,
+            renderedWidthDp = renderedWidthDp,
+            renderedHeightDp = renderedHeightDp
+        )
+    }
+
+    fun placeAt(
+        document: AndroidXmlDocument,
+        stableId: String,
+        startDp: Int,
+        topDp: Int,
+        renderedWidthDp: Int? = null,
+        renderedHeightDp: Int? = null
+    ): Boolean {
+        val node = document.root.descendantsAndSelf().firstOrNull { it.stableId == stableId } ?: return false
+        if (node.locked || node === document.root) return false
         document.mutate {
             val element = document.element(stableId) ?: return@mutate
-            val marginStart = parseDp(element.getAttributeNS(ANDROID_NAMESPACE_URI, "layout_marginStart"))
-            val marginTop = parseDp(element.getAttributeNS(ANDROID_NAMESPACE_URI, "layout_marginTop"))
             if (element.getAttributeNS(ANDROID_NAMESPACE_URI, "layout_width") == "0dp") {
                 renderedWidthDp?.takeIf { it > 0 }?.let {
                     element.setAndroidAttribute("layout_width", "${it}dp")
@@ -150,8 +171,8 @@ object UiDocumentEditor {
                     element.setAndroidAttribute("layout_height", "${it}dp")
                 }
             }
-            element.setAndroidAttribute("layout_marginStart", "${(marginStart + deltaXDp).coerceAtLeast(0)}dp")
-            element.setAndroidAttribute("layout_marginTop", "${(marginTop + deltaYDp).coerceAtLeast(0)}dp")
+            element.setAndroidAttribute("layout_marginStart", "${startDp.coerceAtLeast(0)}dp")
+            element.setAndroidAttribute("layout_marginTop", "${topDp.coerceAtLeast(0)}dp")
             val parent = element.parentNode as? Element
             if (parent?.tagName?.substringAfterLast('.') == "ConstraintLayout") {
                 element.removeConstraintAxis(horizontal = true)
@@ -370,6 +391,93 @@ object UiDocumentEditor {
         return true
     }
 
+    fun reorderSiblingRelative(
+        document: AndroidXmlDocument,
+        stableId: String,
+        targetStableId: String,
+        insertAfterTarget: Boolean
+    ): Boolean {
+        if (stableId == targetStableId) return false
+        val sourceNode = document.root.descendantsAndSelf().firstOrNull { it.stableId == stableId } ?: return false
+        val targetNode = document.root.descendantsAndSelf().firstOrNull { it.stableId == targetStableId } ?: return false
+        if (sourceNode.locked || sourceNode === document.root || targetNode === document.root) return false
+        val source = document.element(stableId) ?: return false
+        val target = document.element(targetStableId) ?: return false
+        val parent = source.parentNode ?: return false
+        if (target.parentNode !== parent) return false
+
+        val elementSiblings = buildList {
+            var child = parent.firstChild
+            while (child != null) {
+                if (child.nodeType == Node.ELEMENT_NODE) add(child)
+                child = child.nextSibling
+            }
+        }
+        val sourceIndex = elementSiblings.indexOf(source)
+        val targetIndex = elementSiblings.indexOf(target)
+        if (sourceIndex < 0 || targetIndex < 0) return false
+        if (insertAfterTarget && sourceIndex == targetIndex + 1) return false
+        if (!insertAfterTarget && sourceIndex + 1 == targetIndex) return false
+
+        document.mutate {
+            parent.removeChild(source)
+            if (insertAfterTarget) {
+                val next = target.nextSibling
+                if (next == null) parent.appendChild(source) else parent.insertBefore(source, next)
+            } else {
+                parent.insertBefore(source, target)
+            }
+        }
+        return true
+    }
+
+    fun reparentRelative(
+        document: AndroidXmlDocument,
+        stableId: String,
+        targetStableId: String,
+        insertAfterTarget: Boolean,
+        renderedWidthDp: Int? = null,
+        renderedHeightDp: Int? = null
+    ): Boolean {
+        if (stableId == targetStableId) return false
+        val sourceNode = document.root.descendantsAndSelf().firstOrNull { it.stableId == stableId } ?: return false
+        val targetNode = document.root.descendantsAndSelf().firstOrNull { it.stableId == targetStableId } ?: return false
+        if (sourceNode.locked || sourceNode === document.root || targetNode === document.root) return false
+        val source = document.element(stableId) ?: return false
+        val target = document.element(targetStableId) ?: return false
+        val targetParent = target.parentNode as? Element ?: return false
+        if (source.parentNode === targetParent) {
+            return reorderSiblingRelative(document, stableId, targetStableId, insertAfterTarget)
+        }
+        if (source.containsNode(targetParent)) return false
+
+        document.mutate {
+            source.parentNode?.removeChild(source)
+            source.removeAllConstraintAttributes()
+            source.removeAttributeNS(ANDROID_NAMESPACE_URI, "layout_weight")
+            source.removeAttributeNS(ANDROID_NAMESPACE_URI, "layout_gravity")
+            source.setAndroidAttribute("layout_marginStart", "0dp")
+            source.setAndroidAttribute("layout_marginTop", "${DEFAULT_REFLOW_GAP_DP}dp")
+            if (source.getAttributeNS(ANDROID_NAMESPACE_URI, "layout_width") == "0dp") {
+                renderedWidthDp?.takeIf { it > 0 }?.let {
+                    source.setAndroidAttribute("layout_width", "${it}dp")
+                }
+            }
+            if (source.getAttributeNS(ANDROID_NAMESPACE_URI, "layout_height") == "0dp") {
+                renderedHeightDp?.takeIf { it > 0 }?.let {
+                    source.setAndroidAttribute("layout_height", "${it}dp")
+                }
+            }
+            if (insertAfterTarget) {
+                val next = target.nextSibling
+                if (next == null) targetParent.appendChild(source) else targetParent.insertBefore(source, next)
+            } else {
+                targetParent.insertBefore(source, target)
+            }
+        }
+        return true
+    }
+
     fun setImageReference(document: AndroidXmlDocument, stableId: String, resourceName: String): Boolean {
         val node = document.root.descendantsAndSelf().firstOrNull { it.stableId == stableId } ?: return false
         if (node.locked || node.simpleTag !in IMAGE_TAGS) return false
@@ -432,6 +540,24 @@ object UiDocumentEditor {
             )
         }
         names.forEach { removeAttributeNS(APP_NAMESPACE_URI, it) }
+    }
+
+    private fun Element.removeAllConstraintAttributes() {
+        val names = (0 until attributes.length).mapNotNull { index ->
+            attributes.item(index)
+                ?.takeIf { it.namespaceURI == APP_NAMESPACE_URI && it.localName.startsWith("layout_constraint") }
+                ?.localName
+        }
+        names.forEach { removeAttributeNS(APP_NAMESPACE_URI, it) }
+    }
+
+    private fun Element.containsNode(candidate: Node): Boolean {
+        var current: Node? = candidate
+        while (current != null) {
+            if (current === this) return true
+            current = current.parentNode
+        }
+        return false
     }
 
     private fun Element.elementSequence(): Sequence<Element> = sequence {
@@ -544,5 +670,6 @@ object UiDocumentEditor {
     private val IMAGE_TAGS = setOf("ImageView", "ImageButton")
 
     private const val DEFAULT_ELEMENT_MARGIN_DP = 16
+    private const val DEFAULT_REFLOW_GAP_DP = 8
     private const val XMLNS_NAMESPACE_URI = "http://www.w3.org/2000/xmlns/"
 }

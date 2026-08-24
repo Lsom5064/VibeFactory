@@ -3,6 +3,7 @@ package kr.ac.kangwon.hai.vibefactory
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 
@@ -13,6 +14,7 @@ class CrashReportReceiver : BroadcastReceiver() {
 
         val taskId = intent.getStringExtra("task_id")?.trim().orEmpty()
         val packageName = intent.getStringExtra("package_name")?.trim().orEmpty()
+        if (!CrashReportSenderPolicy.accepts(this, packageName)) return
         val errorMessage = intent.getStringExtra("error_message")?.trim().orEmpty()
         val reportKind = intent.getStringExtra("report_kind")?.trim().orEmpty()
         val stackTrace = RuntimeErrorStoragePolicy.compactStackTrace(
@@ -56,5 +58,27 @@ class CrashReportReceiver : BroadcastReceiver() {
         private const val ACTION_CRASH_REPORT = "kr.ac.kangwon.hai.action.CRASH_REPORT"
         private const val PREFS_NAME = "vibefactory_prefs"
         private const val PREF_PENDING_RUNTIME_ERRORS = "pending_runtime_errors"
+    }
+}
+
+internal object CrashReportSenderPolicy {
+    fun accepts(receiver: BroadcastReceiver, reportedPackageName: String): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true
+        return accepts(
+            reportedPackageName = reportedPackageName,
+            senderPackageName = receiver.sentFromPackage,
+            senderIdentityAvailable = true,
+        )
+    }
+
+    fun accepts(
+        reportedPackageName: String,
+        senderPackageName: String?,
+        senderIdentityAvailable: Boolean,
+    ): Boolean {
+        if (!senderIdentityAvailable) return true
+        val reported = reportedPackageName.trim()
+        val sender = senderPackageName?.trim().orEmpty()
+        return reported.isNotBlank() && sender == reported
     }
 }

@@ -7,10 +7,12 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import androidx.recyclerview.widget.RecyclerView
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.google.gson.Gson
 import kr.ac.kangwon.hai.vibefactory.UiLayoutSummaryDto
+import kr.ac.kangwon.hai.vibefactory.UiResourceFileDto
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -167,5 +169,77 @@ class UiEditorDraftPersistenceInstrumentedTest {
         assertTrue(result.rootView is FrameLayout)
         assertTrue(result.nodeViews.getValue(progressNode.stableId) is ProgressBar)
         assertTrue(result.warnings.none { it.contains("CoordinatorLayout") || it.contains("ProgressBar") })
+    }
+
+    @Test
+    fun previewUsesToolsAttributesStylesAndRecyclerItemLayoutImmediately() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val document = AndroidXmlDocument.parse(
+            """<LinearLayout
+                xmlns:android="http://schemas.android.com/apk/res/android"
+                xmlns:tools="http://schemas.android.com/tools"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:orientation="vertical">
+                <TextView
+                    android:id="@+id/title"
+                    style="@style/PreviewTitle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Runtime title"
+                    android:visibility="gone"
+                    tools:text="Preview title"
+                    tools:visibility="visible" />
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/list"
+                    android:layout_width="match_parent"
+                    android:layout_height="120dp"
+                    tools:itemCount="2"
+                    tools:listitem="@layout/preview_row" />
+            </LinearLayout>"""
+        )
+        val resources = ResolvedUiResources.from(
+            listOf(
+                UiResourceFileDto(
+                    resource_path = "res/values/preview.xml",
+                    kind = "xml",
+                    content = """<resources>
+                        <color name="preview_color">#126E52</color>
+                        <style name="PreviewBase">
+                            <item name="android:padding">10dp</item>
+                        </style>
+                        <style name="PreviewTitle" parent="@style/PreviewBase">
+                            <item name="android:textColor">@color/preview_color</item>
+                        </style>
+                    </resources>"""
+                ),
+                UiResourceFileDto(
+                    resource_path = "res/layout/preview_row.xml",
+                    kind = "xml",
+                    content = """<TextView
+                        xmlns:android="http://schemas.android.com/apk/res/android"
+                        xmlns:tools="http://schemas.android.com/tools"
+                        android:layout_width="match_parent"
+                        android:layout_height="48dp"
+                        tools:text="Preview row" />"""
+                )
+            )
+        )
+        val canvas = FrameLayout(context)
+
+        val result = UiPreviewRenderer(context).render(document, resources, canvas)
+        val titleNode = document.root.children[0]
+        val listNode = document.root.children[1]
+        val title = result.nodeViews.getValue(titleNode.stableId) as TextView
+        val list = result.nodeViews.getValue(listNode.stableId) as RecyclerView
+
+        assertEquals("Preview title", title.text.toString())
+        assertEquals(android.view.View.VISIBLE, title.visibility)
+        assertTrue(title.paddingStart > 0)
+        assertEquals(2, list.adapter?.itemCount)
+
+        val holder = list.adapter!!.createViewHolder(list, 0)
+        val itemContainer = holder.itemView as FrameLayout
+        assertEquals("Preview row", (itemContainer.getChildAt(0) as TextView).text.toString())
     }
 }

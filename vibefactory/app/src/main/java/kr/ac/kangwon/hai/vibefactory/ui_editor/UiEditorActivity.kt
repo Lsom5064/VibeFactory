@@ -1,6 +1,7 @@
 package kr.ac.kangwon.hai.vibefactory.ui_editor
 
 import android.content.ClipData
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -16,6 +17,7 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -29,9 +31,11 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -46,7 +50,7 @@ import kr.ac.kangwon.hai.vibefactory.UiLayoutSummaryDto
 import kr.ac.kangwon.hai.vibefactory.UiEditorDraftDto
 import kr.ac.kangwon.hai.vibefactory.UiEditorDraftRequestDto
 import kr.ac.kangwon.hai.vibefactory.UiEditorImageUploadRequestDto
-import kr.ac.kangwon.hai.vibefactory.UiEditorSubmitRequestDto
+import kr.ac.kangwon.hai.vibefactory.UiEditorSaveRequestDto
 import kr.ac.kangwon.hai.vibefactory.buildSelectedAttachment
 import kr.ac.kangwon.hai.vibefactory.createVibeApiService
 import kotlinx.coroutines.Dispatchers
@@ -80,6 +84,7 @@ class UiEditorActivity : AppCompatActivity() {
     private var isSubmitting = false
     private var isImeEditingMode = false
     private var isPaletteExpanded = true
+    private var propertyPanelHeightPx = 0
     private var canvasInteractionMode = CanvasInteractionMode.SCROLL
     private val density by lazy { resources.displayMetrics.density }
     private val imagePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -123,8 +128,16 @@ class UiEditorActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_ui_editor)
+        propertyPanelHeightPx = ((
+            savedInstanceState?.getInt(STATE_PROPERTY_PANEL_HEIGHT_DP, PROPERTY_PANEL_DEFAULT_HEIGHT_DP)
+                ?: PROPERTY_PANEL_DEFAULT_HEIGHT_DP
+            ) * density).toInt()
         applyEditorWindowInsets()
         bindPropertyFieldFocusHandling()
+        bindPropertyPanelResizing()
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() = handleEditorBack()
+        })
 
         taskId = intent.getStringExtra(EXTRA_TASK_ID).orEmpty().trim()
         revisionLabel = intent.getStringExtra(EXTRA_REVISION_LABEL).orEmpty().trim()
@@ -134,15 +147,14 @@ class UiEditorActivity : AppCompatActivity() {
             return
         }
 
-        findViewById<ImageButton>(R.id.btnBackUiEditor).setOnClickListener { finish() }
+        findViewById<ImageButton>(R.id.btnBackUiEditor).setOnClickListener { handleEditorBack() }
         findViewById<TextView>(R.id.uiEditorTitle).text = appName.ifBlank { getString(R.string.ui_editor_title) }
         findViewById<TextView>(R.id.uiEditorRevision).text = revisionLabel
         findViewById<Button>(R.id.btnUiEditorScreen).setOnClickListener { anchor -> showLayoutMenu(anchor) }
         findViewById<Button>(R.id.btnUiEditorRetry).setOnClickListener { loadLayouts() }
         findViewById<Button>(R.id.btnUiEditorUndo).setOnClickListener { undo() }
         findViewById<Button>(R.id.btnUiEditorRedo).setOnClickListener { redo() }
-        findViewById<Button>(R.id.btnUiEditorSave).setOnClickListener { persistDraft(showConfirmation = true) }
-        findViewById<Button>(R.id.btnUiEditorSubmit).setOnClickListener { confirmSubmitDraft() }
+        findViewById<Button>(R.id.btnUiEditorSave).setOnClickListener { saveDraftForChat() }
         findViewById<Button>(R.id.btnUiEditorApply).setOnClickListener { applySelectedProperties() }
         findViewById<Button>(R.id.btnUiEditorDuplicate).setOnClickListener { duplicateSelected() }
         findViewById<Button>(R.id.btnUiEditorDelete).setOnClickListener { confirmDeleteSelected() }
@@ -151,7 +163,7 @@ class UiEditorActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnUiEditorLayers).setOnClickListener { showLayerMenu(it) }
         findViewById<Button>(R.id.btnUiEditorLayerBack).setOnClickListener { reorderSelected(false) }
         findViewById<Button>(R.id.btnUiEditorLayerFront).setOnClickListener { reorderSelected(true) }
-        findViewById<Button>(R.id.btnUiEditorDoneEditing).setOnClickListener { finishPropertyEditing() }
+        findViewById<Button>(R.id.btnUiEditorCloseProperties).setOnClickListener { closePropertyEditor() }
         canvasInteractionMode = savedInstanceState?.getString(STATE_INTERACTION_MODE)
             ?.let { saved -> CanvasInteractionMode.entries.firstOrNull { it.name == saved } }
             ?: CanvasInteractionMode.SCROLL
@@ -187,6 +199,10 @@ class UiEditorActivity : AppCompatActivity() {
         }
         outState.putString(STATE_INTERACTION_MODE, canvasInteractionMode.name)
         outState.putBoolean(STATE_PALETTE_EXPANDED, isPaletteExpanded)
+        outState.putInt(
+            STATE_PROPERTY_PANEL_HEIGHT_DP,
+            (propertyPanelHeightPx / density).toInt().coerceAtLeast(PROPERTY_PANEL_MIN_HEIGHT_DP)
+        )
         super.onSaveInstanceState(outState)
     }
 
@@ -223,9 +239,9 @@ class UiEditorActivity : AppCompatActivity() {
         EDITOR_CONTENT_IDS.forEach { viewId ->
             findViewById<View>(viewId).visibility = if (enabled) View.GONE else View.VISIBLE
         }
-        val panel = findViewById<ScrollView>(R.id.uiEditorPropertiesPanel)
+        val panel = findViewById<View>(R.id.uiEditorPropertiesPanel)
         val params = panel.layoutParams as LinearLayout.LayoutParams
-        params.height = if (enabled) 0 else (PROPERTY_PANEL_HEIGHT_DP * density).toInt()
+        params.height = if (enabled) 0 else propertyPanelHeightPx
         params.weight = if (enabled) 1f else 0f
         panel.layoutParams = params
         if (!enabled) updatePaletteSectionVisibility()
@@ -239,9 +255,63 @@ class UiEditorActivity : AppCompatActivity() {
         }
     }
 
+    private fun bindPropertyPanelResizing() {
+        val handle = findViewById<View>(R.id.uiEditorPropertiesResizeHandle)
+        var startRawY = 0f
+        var startHeight = 0
+        handle.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (isImeEditingMode) return@setOnTouchListener false
+                    startRawY = event.rawY
+                    startHeight = propertyPanelHeightPx
+                    view.isPressed = true
+                    view.parent?.requestDisallowInterceptTouchEvent(true)
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    updatePropertyPanelHeight(startHeight + (startRawY - event.rawY).toInt())
+                    true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    view.isPressed = false
+                    view.parent?.requestDisallowInterceptTouchEvent(false)
+                    view.performClick()
+                    true
+                }
+
+                MotionEvent.ACTION_CANCEL -> {
+                    view.isPressed = false
+                    view.parent?.requestDisallowInterceptTouchEvent(false)
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
+    private fun updatePropertyPanelHeight(requestedHeight: Int) {
+        val root = findViewById<View>(R.id.uiEditorRoot)
+        val availableHeight = root.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        val minimumHeight = (PROPERTY_PANEL_MIN_HEIGHT_DP * density).toInt()
+        val maximumHeight = (availableHeight * PROPERTY_PANEL_MAX_HEIGHT_RATIO).toInt()
+            .coerceAtLeast(minimumHeight)
+        propertyPanelHeightPx = requestedHeight.coerceIn(minimumHeight, maximumHeight)
+        if (isImeEditingMode) return
+        findViewById<View>(R.id.uiEditorPropertiesPanel).apply {
+            layoutParams = (layoutParams as LinearLayout.LayoutParams).also { params ->
+                params.height = propertyPanelHeightPx
+                params.weight = 0f
+            }
+        }
+    }
+
     private fun scrollFocusedPropertyIntoView() {
         val focused = currentFocus ?: return
-        val panel = findViewById<ScrollView>(R.id.uiEditorPropertiesPanel)
+        val panel = findViewById<ScrollView>(R.id.uiEditorPropertiesScroll)
         if (!focused.isDescendantOf(panel)) return
         panel.postDelayed({
             if (!focused.isAttachedToWindow || !focused.hasFocus()) return@postDelayed
@@ -251,15 +321,22 @@ class UiEditorActivity : AppCompatActivity() {
         }, IME_SCROLL_DELAY_MILLIS)
     }
 
-    private fun finishPropertyEditing() {
-        applySelectedProperties()
+    private fun closePropertyEditor() {
         currentFocus?.clearFocus()
         WindowCompat.getInsetsController(window, findViewById(R.id.uiEditorRoot))
             .hide(WindowInsetsCompat.Type.ime())
         viewModel.session?.selectedElementId = null
         highlightSelection(currentNodeViews)
         bindSelectedElement()
-        scheduleDraftSave()
+    }
+
+    private fun handleEditorBack() {
+        val propertyPanel = findViewById<View>(R.id.uiEditorPropertiesPanel)
+        if (propertyPanel.visibility == View.VISIBLE) {
+            closePropertyEditor()
+        } else {
+            finish()
+        }
     }
 
     private fun bindPaletteSection() {
@@ -271,11 +348,9 @@ class UiEditorActivity : AppCompatActivity() {
     }
 
     private fun updatePaletteSectionVisibility(animate: Boolean = false) {
-        val toolbar = findViewById<View>(R.id.uiEditorPaletteToolbar)
-        val summary = findViewById<View>(R.id.uiEditorPaletteSectionSummary)
+        val content = findViewById<View>(R.id.uiEditorPaletteContent)
         val chevron = findViewById<ImageView>(R.id.uiEditorPaletteChevron)
-        toolbar.visibility = if (isPaletteExpanded) View.VISIBLE else View.GONE
-        summary.visibility = if (isPaletteExpanded) View.VISIBLE else View.GONE
+        content.visibility = if (isPaletteExpanded) View.VISIBLE else View.GONE
         val targetRotation = if (isPaletteExpanded) 90f else 0f
         if (animate) {
             chevron.animate().rotation(targetRotation).setDuration(SECTION_TOGGLE_DURATION_MILLIS).start()
@@ -432,8 +507,14 @@ class UiEditorActivity : AppCompatActivity() {
     private fun setCanvasInteractionMode(mode: CanvasInteractionMode) {
         if (canvasInteractionMode == mode) return
         canvasInteractionMode = mode
+        if (mode == CanvasInteractionMode.MOVE) {
+            currentFocus?.clearFocus()
+            WindowCompat.getInsetsController(window, findViewById(R.id.uiEditorRoot))
+                .hide(WindowInsetsCompat.Type.ime())
+        }
         updateCanvasInteractionModeUi()
         attachElementInteractions(currentNodeViews)
+        bindSelectedElement()
     }
 
     private fun updateCanvasInteractionModeUi() {
@@ -871,7 +952,7 @@ class UiEditorActivity : AppCompatActivity() {
                 if (canvasInteractionMode == CanvasInteractionMode.MOVE) {
                     ElementDragTouchListener(stableId, node.locked || node === session.document.root)
                 } else {
-                    null
+                    ElementSelectionTouchListener()
                 }
             )
         }
@@ -935,11 +1016,18 @@ class UiEditorActivity : AppCompatActivity() {
     }
 
     private fun bindSelectedElement() {
-        val session = viewModel.session ?: return
+        val panel = findViewById<View>(R.id.uiEditorPropertiesPanel)
+        if (canvasInteractionMode == CanvasInteractionMode.MOVE) {
+            panel.visibility = View.GONE
+            return
+        }
+        val session = viewModel.session ?: run {
+            panel.visibility = View.GONE
+            return
+        }
         val node = session.selectedElementId?.let { selected ->
             session.document.root.descendantsAndSelf().firstOrNull { it.stableId == selected }
         }
-        val panel = findViewById<View>(R.id.uiEditorPropertiesPanel)
         if (node == null) {
             panel.visibility = View.GONE
             return
@@ -1066,7 +1154,7 @@ class UiEditorActivity : AppCompatActivity() {
         PopupMenu(this, anchor).apply {
             PLATFORM_ICONS.forEachIndexed { index, option ->
                 menu.add(0, index, index, option.labelRes).apply {
-                    icon = getDrawable(option.drawableRes)
+                    icon = AppCompatResources.getDrawable(this@UiEditorActivity, option.drawableRes)
                 }
             }
             setOnMenuItemClickListener { item ->
@@ -1123,8 +1211,7 @@ class UiEditorActivity : AppCompatActivity() {
         val history = viewModel.session?.history
         findViewById<Button>(R.id.btnUiEditorUndo).isEnabled = history?.canUndo == true
         findViewById<Button>(R.id.btnUiEditorRedo).isEnabled = history?.canRedo == true
-        findViewById<Button>(R.id.btnUiEditorSave).isEnabled = viewModel.session != null
-        findViewById<Button>(R.id.btnUiEditorSubmit).isEnabled = viewModel.session != null && !isSubmitting
+        findViewById<Button>(R.id.btnUiEditorSave).isEnabled = viewModel.session != null && !isSubmitting
     }
 
     private fun scheduleDraftSave() {
@@ -1196,23 +1283,15 @@ class UiEditorActivity : AppCompatActivity() {
         }
     }
 
-    private fun confirmSubmitDraft() {
-        if (isSubmitting || viewModel.session == null) return
-        AlertDialog.Builder(this)
-            .setTitle(R.string.ui_editor_submit_title)
-            .setMessage(R.string.ui_editor_submit_message)
-            .setNegativeButton(android.R.string.cancel, null)
-            .setPositiveButton(R.string.ui_editor_submit) { _, _ -> submitDraft() }
-            .show()
-    }
-
-    private fun submitDraft() {
+    private fun saveDraftForChat() {
         val session = viewModel.session ?: return
+        if (isSubmitting) return
+        applySelectedProperties()
         draftSaveJob?.cancel()
         val preview = captureCanvasPreview()
         isSubmitting = true
         updateHistoryActions()
-        showLoading(getString(R.string.ui_editor_submitting))
+        showLoading(getString(R.string.ui_editor_saving))
         lifecycleScope.launch {
             val result = runCatching {
                 val record = draftStore.recordFor(session)
@@ -1224,14 +1303,14 @@ class UiEditorActivity : AppCompatActivity() {
                     session.serverDraftVersion ?: saved.version
                 }
                 withContext(Dispatchers.IO) {
-                    apiService.submitUiEditorDraft(
+                    apiService.confirmUiEditorDraft(
                         taskId = session.taskId,
                         revisionLabel = session.revisionLabel,
                         draftId = session.serverDraftId ?: error("server draft ID is missing"),
                         deviceId = preferencesStore.getOrCreateDeviceId(),
                         userId = null,
                         phoneNumber = preferencesStore.loadPhoneNumber(),
-                        request = UiEditorSubmitRequestDto(
+                        request = UiEditorSaveRequestDto(
                             expected_version = uploadedVersion,
                             preview_image_base64 = preview
                         )
@@ -1240,10 +1319,13 @@ class UiEditorActivity : AppCompatActivity() {
             }
             result.onSuccess {
                 withContext(Dispatchers.IO) {
-                    draftStore.save(draftStore.recordFor(session, status = "submitting"))
+                    draftStore.save(draftStore.recordFor(session, status = "saved"))
                 }
-                Toast.makeText(this@UiEditorActivity, R.string.ui_editor_submitted, Toast.LENGTH_LONG).show()
-                setResult(RESULT_OK)
+                Toast.makeText(this@UiEditorActivity, R.string.ui_editor_saved, Toast.LENGTH_LONG).show()
+                setResult(
+                    RESULT_OK,
+                    Intent().putExtra(EXTRA_TASK_ID, session.taskId)
+                )
                 finish()
             }.onFailure { error ->
                 isSubmitting = false
@@ -1251,7 +1333,7 @@ class UiEditorActivity : AppCompatActivity() {
                 renderCurrentSession()
                 Toast.makeText(
                     this@UiEditorActivity,
-                    error.message?.takeIf { it.isNotBlank() } ?: getString(R.string.ui_editor_submit_failed),
+                    error.message?.takeIf { it.isNotBlank() } ?: getString(R.string.ui_editor_save_failed),
                     Toast.LENGTH_LONG
                 ).show()
             }
@@ -1353,9 +1435,9 @@ class UiEditorActivity : AppCompatActivity() {
         val localUpdatedAt = runCatching { Instant.parse(local?.updatedAt.orEmpty()) }.getOrNull()
         val remoteUpdatedAt = runCatching { Instant.parse(remote.updated_at) }.getOrNull()
         val localIsNewer = local != null && localUpdatedAt != null && remoteUpdatedAt != null && localUpdatedAt > remoteUpdatedAt
-        val resolved = if (localIsNewer) {
-            local!!.copy(
-                images = local.images.map { localImage ->
+        val resolved = local?.takeIf { localIsNewer }?.let { newerLocal ->
+            newerLocal.copy(
+                images = newerLocal.images.map { localImage ->
                     remote.images.firstOrNull { it.image_id == localImage.imageId }
                         ?.let { localImage.copy(serverWorkspacePath = it.workspace_path) }
                         ?: localImage
@@ -1363,9 +1445,7 @@ class UiEditorActivity : AppCompatActivity() {
                 serverDraftId = remote.draft_id,
                 serverDraftVersion = remote.version
             )
-        } else {
-            remoteRecord
-        }
+        } ?: remoteRecord
         draftStore.save(resolved)
         return resolved
     }
@@ -1391,6 +1471,7 @@ class UiEditorActivity : AppCompatActivity() {
     private fun dpValue(value: String?): String = value.orEmpty().trim().removeSuffix("dp")
 
     private fun showLoading(message: String) {
+        findViewById<View>(R.id.uiEditorStateOverlay).visibility = View.VISIBLE
         findViewById<ProgressBar>(R.id.uiEditorProgress).visibility = View.VISIBLE
         findViewById<TextView>(R.id.uiEditorStateText).apply {
             visibility = View.VISIBLE
@@ -1401,6 +1482,7 @@ class UiEditorActivity : AppCompatActivity() {
     }
 
     private fun showError(message: String) {
+        findViewById<View>(R.id.uiEditorStateOverlay).visibility = View.VISIBLE
         findViewById<ProgressBar>(R.id.uiEditorProgress).visibility = View.GONE
         findViewById<TextView>(R.id.uiEditorStateText).apply {
             visibility = View.VISIBLE
@@ -1414,12 +1496,215 @@ class UiEditorActivity : AppCompatActivity() {
         findViewById<ProgressBar>(R.id.uiEditorProgress).visibility = View.GONE
         findViewById<TextView>(R.id.uiEditorStateText).visibility = View.GONE
         findViewById<Button>(R.id.btnUiEditorRetry).visibility = View.GONE
+        findViewById<View>(R.id.uiEditorStateOverlay).visibility = View.GONE
         findViewById<View>(R.id.uiEditorCanvasViewport).visibility = View.VISIBLE
     }
 
     private fun layoutDisplayName(layout: UiLayoutSummaryDto): String =
         if (layout.configuration == "layout") layout.layout_name
         else "${layout.layout_name} · ${layout.configuration.removePrefix("layout-")}"
+
+    private fun resolveDragPlacement(
+        stableId: String,
+        draggedView: View,
+        translatedX: Float,
+        translatedY: Float
+    ): ResolvedDragPlacement? {
+        val session = viewModel.session ?: return null
+        val parentView = draggedView.parent as? ViewGroup ?: return null
+        val parentNode = findUiNodeParent(session.document.root, stableId) ?: return null
+        val draggedNode = parentNode.children.firstOrNull { it.stableId == stableId } ?: return null
+        val sourceAvoidsOverlap = avoidsUnnecessaryOverlap(draggedNode, draggedView, parentView)
+        val items = parentNode.children.mapNotNull { node ->
+            val view = currentNodeViews[node.stableId]
+                ?.takeIf { it.parent === parentView && it.visibility != View.GONE }
+                ?: return@mapNotNull null
+            UiEditorPlacementItem(
+                stableId = node.stableId,
+                left = view.left,
+                top = view.top,
+                right = view.right,
+                bottom = view.bottom,
+                canDisplace = sourceAvoidsOverlap && avoidsUnnecessaryOverlap(node, view, parentView)
+            )
+        }
+        if (items.none { it.stableId == stableId }) return null
+        val flow = when (parentView) {
+            is LinearLayout -> if (parentView.orientation == LinearLayout.HORIZONTAL) {
+                UiEditorParentFlow.HORIZONTAL
+            } else {
+                UiEditorParentFlow.VERTICAL
+            }
+
+            else -> UiEditorParentFlow.FREEFORM
+        }
+        val minLeft = parentView.paddingLeft
+        val maxLeft = (parentView.width - parentView.paddingRight - draggedView.width).coerceAtLeast(minLeft)
+        val minTop = parentView.paddingTop
+        val maxTop = (parentView.height - parentView.paddingBottom - draggedView.height).coerceAtLeast(minTop)
+        val dropLeft = (draggedView.left + translatedX).toInt().coerceIn(minLeft, maxLeft)
+        val dropTop = (draggedView.top + translatedY).toInt().coerceIn(minTop, maxTop)
+        val directPlacement = ResolvedDragPlacement(
+            flow = flow,
+            parentView = parentView,
+            decision = UiEditorPlacementPolicy.resolve(
+                flow = flow,
+                draggedStableId = stableId,
+                dropLeft = dropLeft,
+                dropTop = dropTop,
+                dropWidth = draggedView.width,
+                dropHeight = draggedView.height,
+                items = items
+            )
+        )
+        if (
+            flow == UiEditorParentFlow.FREEFORM &&
+            directPlacement.decision.targetStableId == null &&
+            sourceAvoidsOverlap
+        ) {
+            return resolveNestedLinearPlacement(
+                parentNode = parentNode,
+                parentView = parentView,
+                draggedView = draggedView,
+                dropLeft = dropLeft,
+                dropTop = dropTop
+            ) ?: directPlacement
+        }
+        return directPlacement
+    }
+
+    private fun commitDragPlacement(
+        session: UiEditorSession,
+        stableId: String,
+        draggedView: View,
+        placement: ResolvedDragPlacement
+    ): Boolean {
+        val decision = placement.decision
+        placement.nestedTargetStableId?.let { targetStableId ->
+            return UiDocumentEditor.reparentRelative(
+                document = session.document,
+                stableId = stableId,
+                targetStableId = targetStableId,
+                insertAfterTarget = false,
+                renderedWidthDp = (draggedView.width / density).toInt(),
+                renderedHeightDp = (draggedView.height / density).toInt()
+            )
+        }
+        if (placement.flow != UiEditorParentFlow.FREEFORM) {
+            val targetStableId = decision.targetStableId ?: return false
+            return UiDocumentEditor.reorderSiblingRelative(
+                document = session.document,
+                stableId = stableId,
+                targetStableId = targetStableId,
+                insertAfterTarget = decision.insertAfterTarget
+            )
+        }
+
+        val sourceStartDp = pxPositionToMarginDp(draggedView.left, placement.parentView.paddingLeft)
+        val sourceTopDp = pxPositionToMarginDp(draggedView.top, placement.parentView.paddingTop)
+        val sourceMoved = UiDocumentEditor.placeAt(
+            document = session.document,
+            stableId = stableId,
+            startDp = pxPositionToMarginDp(decision.snapLeft, placement.parentView.paddingLeft),
+            topDp = pxPositionToMarginDp(decision.snapTop, placement.parentView.paddingTop),
+            renderedWidthDp = (draggedView.width / density).toInt(),
+            renderedHeightDp = (draggedView.height / density).toInt()
+        )
+        val targetStableId = decision.targetStableId ?: return sourceMoved
+        val targetView = currentNodeViews[targetStableId] ?: return sourceMoved
+        val targetMoved = UiDocumentEditor.placeAt(
+            document = session.document,
+            stableId = targetStableId,
+            startDp = sourceStartDp,
+            topDp = sourceTopDp,
+            renderedWidthDp = (targetView.width / density).toInt(),
+            renderedHeightDp = (targetView.height / density).toInt()
+        )
+        return sourceMoved || targetMoved
+    }
+
+    private fun resolveNestedLinearPlacement(
+        parentNode: UiNode,
+        parentView: ViewGroup,
+        draggedView: View,
+        dropLeft: Int,
+        dropTop: Int
+    ): ResolvedDragPlacement? {
+        val parentLocation = IntArray(2).also(parentView::getLocationInWindow)
+        val dropRect = Rect(
+            dropLeft,
+            dropTop,
+            dropLeft + draggedView.width,
+            dropTop + draggedView.height
+        )
+        val collision = parentNode.descendantsAndSelf().asSequence()
+            .drop(1)
+            .mapNotNull { node ->
+                val view = currentNodeViews[node.stableId]
+                    ?.takeIf { it !== draggedView && it.visibility == View.VISIBLE }
+                    ?: return@mapNotNull null
+                val linearParent = view.parent as? LinearLayout ?: return@mapNotNull null
+                if (linearParent === parentView || !avoidsUnnecessaryOverlap(node, view, linearParent)) {
+                    return@mapNotNull null
+                }
+                val viewLocation = IntArray(2).also(view::getLocationInWindow)
+                val bounds = Rect(
+                    viewLocation[0] - parentLocation[0],
+                    viewLocation[1] - parentLocation[1],
+                    viewLocation[0] - parentLocation[0] + view.width,
+                    viewLocation[1] - parentLocation[1] + view.height
+                )
+                val intersection = Rect(dropRect)
+                if (!intersection.intersect(bounds)) return@mapNotNull null
+                NestedLinearCollision(node, linearParent, bounds, intersection.width() * intersection.height())
+            }
+            .maxByOrNull { it.intersectionArea }
+            ?: return null
+        val targetParentNode = findUiNodeParent(parentNode, collision.node.stableId) ?: return null
+        val targetIndex = targetParentNode.children.indexOfFirst { it.stableId == collision.node.stableId }
+        if (targetIndex < 0) return null
+        val previewGap = (REFLOW_PREVIEW_GAP_DP * density).toInt()
+        val shift = if (collision.parentView.orientation == LinearLayout.HORIZONTAL) {
+            UiEditorPlacementOffset(draggedView.width + previewGap, 0)
+        } else {
+            UiEditorPlacementOffset(0, draggedView.height + previewGap)
+        }
+        val offsets = targetParentNode.children.drop(targetIndex).mapNotNull { sibling ->
+            currentNodeViews[sibling.stableId]
+                ?.takeIf { it.parent === collision.parentView }
+                ?.let { sibling.stableId to shift }
+        }.toMap()
+        return ResolvedDragPlacement(
+            flow = UiEditorParentFlow.FREEFORM,
+            parentView = parentView,
+            decision = UiEditorPlacementDecision(
+                targetStableId = collision.node.stableId,
+                snapLeft = collision.bounds.left,
+                snapTop = collision.bounds.top,
+                insertAfterTarget = false,
+                siblingOffsets = offsets
+            ),
+            nestedTargetStableId = collision.node.stableId
+        )
+    }
+
+    private fun pxPositionToMarginDp(positionPx: Int, parentPaddingPx: Int): Int =
+        ((positionPx - parentPaddingPx).coerceAtLeast(0) / density).toInt()
+
+    private fun avoidsUnnecessaryOverlap(node: UiNode, view: View, parent: ViewGroup): Boolean {
+        if (node.locked) return false
+        if (node.simpleTag in NON_OVERLAPPING_CONTROL_TAGS) return true
+        if (node.simpleTag != "ImageView") return false
+        val parentWidth = parent.width.coerceAtLeast(1)
+        val parentHeight = parent.height.coerceAtLeast(1)
+        return view.width <= parentWidth * COMPACT_IMAGE_MAX_PARENT_RATIO &&
+            view.height <= parentHeight * COMPACT_IMAGE_MAX_PARENT_RATIO
+    }
+
+    private fun findUiNodeParent(root: UiNode, childStableId: String): UiNode? {
+        if (root.children.any { it.stableId == childStableId }) return root
+        return root.children.firstNotNullOfOrNull { child -> findUiNodeParent(child, childStableId) }
+    }
 
     companion object {
         const val EXTRA_TASK_ID = "ui_editor_task_id"
@@ -1429,6 +1714,7 @@ class UiEditorActivity : AppCompatActivity() {
         private const val STATE_LAYOUT_CONFIGURATION = "ui_editor_layout_configuration"
         private const val STATE_INTERACTION_MODE = "ui_editor_interaction_mode"
         private const val STATE_PALETTE_EXPANDED = "ui_editor_palette_expanded"
+        private const val STATE_PROPERTY_PANEL_HEIGHT_DP = "ui_editor_property_panel_height_dp"
         private const val MENU_NEW_LAYOUT = 10_000
         private const val MENU_ADD_ELEMENT_BASE = 20_000
         private const val MENU_ADD_BASIC_GROUP = 30_001
@@ -1437,16 +1723,21 @@ class UiEditorActivity : AppCompatActivity() {
         private const val IME_SCROLL_DELAY_MILLIS = 120L
         private const val ELEMENT_PULSE_DURATION_MILLIS = 140L
         private const val SECTION_TOGGLE_DURATION_MILLIS = 160L
-        private const val PROPERTY_PANEL_HEIGHT_DP = 250
+        private const val PROPERTY_PANEL_DEFAULT_HEIGHT_DP = 250
+        private const val PROPERTY_PANEL_MIN_HEIGHT_DP = 160
+        private const val PROPERTY_PANEL_MAX_HEIGHT_RATIO = 0.65f
         private const val COLOR_PICKER_COLUMN_COUNT = 5
         private const val COLOR_SWATCH_SIZE_DP = 44
         private const val COLOR_SWATCH_MARGIN_DP = 4
         private const val DRAG_FEEDBACK_ALPHA = 235
         private const val DRAG_SOURCE_ALPHA = 0.22f
         private const val MAX_DRAG_BITMAP_PIXELS = 1_500_000L
+        private const val EDGE_SCROLL_ZONE_DP = 56
+        private const val EDGE_SCROLL_MAX_STEP_DP = 8
+        private const val REORDER_PREVIEW_DURATION_MILLIS = 110L
+        private const val COMPACT_IMAGE_MAX_PARENT_RATIO = 0.5f
+        private const val REFLOW_PREVIEW_GAP_DP = 8
         private val EDITOR_CONTENT_IDS = intArrayOf(
-            R.id.uiEditorActionToolbar,
-            R.id.btnUiEditorSubmit,
             R.id.uiEditorPaletteSection,
             R.id.uiEditorCanvasSection
         )
@@ -1505,7 +1796,36 @@ class UiEditorActivity : AppCompatActivity() {
             "RadioButton"
         )
         private val IMAGE_TAGS = setOf("ImageView", "ImageButton")
+        private val NON_OVERLAPPING_CONTROL_TAGS = setOf(
+            "TextView",
+            "MaterialTextView",
+            "Button",
+            "MaterialButton",
+            "EditText",
+            "TextInputEditText",
+            "CheckBox",
+            "Switch",
+            "SwitchCompat",
+            "RadioButton",
+            "ImageButton",
+            "FloatingActionButton",
+            "ProgressBar"
+        )
     }
+
+    private data class ResolvedDragPlacement(
+        val flow: UiEditorParentFlow,
+        val parentView: ViewGroup,
+        val decision: UiEditorPlacementDecision,
+        val nestedTargetStableId: String? = null
+    )
+
+    private data class NestedLinearCollision(
+        val node: UiNode,
+        val parentView: LinearLayout,
+        val bounds: Rect,
+        val intersectionArea: Int
+    )
 
     private data class PlatformIconOption(
         val labelRes: Int,
@@ -1578,6 +1898,42 @@ class UiEditorActivity : AppCompatActivity() {
         }.getOrNull()
     }
 
+    private inner class ElementSelectionTouchListener : View.OnTouchListener {
+        private var downRawX = 0f
+        private var downRawY = 0f
+        private var moved = false
+        private val touchSlop = ViewConfiguration.get(this@UiEditorActivity).scaledTouchSlop
+
+        override fun onTouch(view: View, event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    moved = false
+                    return true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    if (
+                        kotlin.math.abs(event.rawX - downRawX) > touchSlop ||
+                        kotlin.math.abs(event.rawY - downRawY) > touchSlop
+                    ) {
+                        moved = true
+                    }
+                    return true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    if (!moved) view.performClick()
+                    return true
+                }
+
+                MotionEvent.ACTION_CANCEL -> return true
+            }
+            return false
+        }
+    }
+
     private inner class ElementDragTouchListener(
         private val stableId: String,
         private val movementLocked: Boolean
@@ -1588,7 +1944,53 @@ class UiEditorActivity : AppCompatActivity() {
         private var translatedY = 0f
         private var dragging = false
         private var feedback: ElementDragFeedback? = null
+        private var draggedView: View? = null
+        private var lastRawX = 0f
+        private var lastRawY = 0f
+        private var initialHorizontalScroll = 0
+        private var initialVerticalScroll = 0
+        private var edgeScrollPosted = false
+        private var currentPlacement: ResolvedDragPlacement? = null
+        private var previewTargetStableId: String? = null
+        private val previewOffsets = mutableMapOf<View, UiEditorPlacementOffset>()
         private val touchSlop = ViewConfiguration.get(this@UiEditorActivity).scaledTouchSlop
+        private val edgeScrollRunnable = object : Runnable {
+            override fun run() {
+                edgeScrollPosted = false
+                val view = draggedView ?: return
+                if (!dragging) return
+                val container = findViewById<FrameLayout>(R.id.uiEditorCanvasContainer)
+                val visibleBounds = Rect()
+                if (!container.getGlobalVisibleRect(visibleBounds)) return
+                val horizontalViewport = findViewById<HorizontalScrollView>(R.id.uiEditorCanvasViewport)
+                val verticalViewport = findViewById<ScrollView>(R.id.uiEditorCanvasVerticalViewport)
+                val edgeSize = (EDGE_SCROLL_ZONE_DP * density).toInt().coerceAtLeast(1)
+                val maxStep = (EDGE_SCROLL_MAX_STEP_DP * density).toInt().coerceAtLeast(1)
+                val horizontalStep = UiEditorEdgeScrollPolicy.step(
+                    pointer = lastRawX,
+                    viewportStart = visibleBounds.left,
+                    viewportEnd = visibleBounds.right,
+                    edgeSize = edgeSize,
+                    maxStep = maxStep
+                )
+                val verticalStep = UiEditorEdgeScrollPolicy.step(
+                    pointer = lastRawY,
+                    viewportStart = visibleBounds.top,
+                    viewportEnd = visibleBounds.bottom,
+                    edgeSize = edgeSize,
+                    maxStep = maxStep
+                )
+                if (horizontalStep != 0) horizontalViewport.scrollBy(horizontalStep, 0)
+                if (verticalStep != 0) verticalViewport.scrollBy(0, verticalStep)
+                updateDragTranslation(view)
+
+                val keepHorizontal = horizontalStep != 0 &&
+                    horizontalViewport.canScrollHorizontally(horizontalStep.sign())
+                val keepVertical = verticalStep != 0 &&
+                    verticalViewport.canScrollVertically(verticalStep.sign())
+                if (keepHorizontal || keepVertical) postEdgeScrollFrame(container)
+            }
+        }
 
         override fun onTouch(view: View, event: MotionEvent): Boolean {
             when (event.actionMasked) {
@@ -1598,6 +2000,14 @@ class UiEditorActivity : AppCompatActivity() {
                     translatedX = 0f
                     translatedY = 0f
                     dragging = false
+                    currentPlacement = null
+                    previewTargetStableId = null
+                    clearPlacementPreview()
+                    draggedView = view
+                    lastRawX = event.rawX
+                    lastRawY = event.rawY
+                    initialHorizontalScroll = findViewById<HorizontalScrollView>(R.id.uiEditorCanvasViewport).scrollX
+                    initialVerticalScroll = findViewById<ScrollView>(R.id.uiEditorCanvasVerticalViewport).scrollY
                     if (!movementLocked) {
                         view.parent?.requestDisallowInterceptTouchEvent(true)
                     }
@@ -1607,51 +2017,44 @@ class UiEditorActivity : AppCompatActivity() {
                 }
                 MotionEvent.ACTION_MOVE -> {
                     if (movementLocked) return true
-                    val deltaX = event.rawX - downRawX
-                    val deltaY = event.rawY - downRawY
+                    lastRawX = event.rawX
+                    lastRawY = event.rawY
+                    val deltaX = lastRawX - downRawX
+                    val deltaY = lastRawY - downRawY
                     if (!dragging && (kotlin.math.abs(deltaX) > touchSlop || kotlin.math.abs(deltaY) > touchSlop)) {
                         dragging = true
                         feedback = createElementDragFeedback(view)
                         view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                     }
                     if (dragging) {
-                        val bounds = feedback?.initialBounds
-                        val canvas = feedback?.canvas
-                        translatedX = clampedTranslation(
-                            delta = deltaX,
-                            minimum = -(bounds?.left ?: view.left).toFloat(),
-                            maximum = ((canvas?.width ?: Int.MAX_VALUE) - (bounds?.right ?: view.right)).toFloat()
-                        )
-                        translatedY = clampedTranslation(
-                            delta = deltaY,
-                            minimum = -(bounds?.top ?: view.top).toFloat(),
-                            maximum = ((canvas?.height ?: Int.MAX_VALUE) - (bounds?.bottom ?: view.bottom)).toFloat()
-                        )
-                        feedback?.moveTo(translatedX, translatedY) ?: run {
-                            view.translationX = translatedX
-                            view.translationY = translatedY
-                            view.translationZ = 8 * density
-                        }
+                        updateDragTranslation(view)
+                        postEdgeScrollFrame(findViewById(R.id.uiEditorCanvasContainer))
                     }
                     return true
                 }
                 MotionEvent.ACTION_UP -> {
+                    stopEdgeScroll()
                     view.parent?.requestDisallowInterceptTouchEvent(false)
                     if (dragging && !movementLocked) {
+                        val placement = currentPlacement
+                            ?: resolveDragPlacement(stableId, view, translatedX, translatedY)
+                        clearPlacementPreview()
                         feedback?.dispose()
                         feedback = null
                         val session = viewModel.session ?: return true
                         val before = session.snapshot()
-                        if (
-                            UiDocumentEditor.moveBy(
-                                session.document,
-                                stableId,
-                                (translatedX / density).toInt(),
-                                (translatedY / density).toInt(),
-                                renderedWidthDp = (view.width / density).toInt(),
-                                renderedHeightDp = (view.height / density).toInt()
-                            )
-                        ) {
+                        resetDraggedView(view)
+                        val changed = placement?.let {
+                            commitDragPlacement(session, stableId, view, it)
+                        } ?: UiDocumentEditor.moveBy(
+                            session.document,
+                            stableId,
+                            (translatedX / density).toInt(),
+                            (translatedY / density).toInt(),
+                            renderedWidthDp = (view.width / density).toInt(),
+                            renderedHeightDp = (view.height / density).toInt()
+                        )
+                        if (changed) {
                             recordAndRender(before, stableId)
                         } else {
                             resetDraggedView(view)
@@ -1666,6 +2069,8 @@ class UiEditorActivity : AppCompatActivity() {
                     return true
                 }
                 MotionEvent.ACTION_CANCEL -> {
+                    stopEdgeScroll()
+                    clearPlacementPreview()
                     feedback?.dispose()
                     feedback = null
                     resetDraggedView(view)
@@ -1677,6 +2082,87 @@ class UiEditorActivity : AppCompatActivity() {
             return false
         }
 
+        private fun updateDragTranslation(view: View) {
+            val horizontalViewport = findViewById<HorizontalScrollView>(R.id.uiEditorCanvasViewport)
+            val verticalViewport = findViewById<ScrollView>(R.id.uiEditorCanvasVerticalViewport)
+            val deltaX = lastRawX - downRawX + horizontalViewport.scrollX - initialHorizontalScroll
+            val deltaY = lastRawY - downRawY + verticalViewport.scrollY - initialVerticalScroll
+            val bounds = feedback?.initialBounds
+            val canvas = feedback?.canvas
+            translatedX = clampedTranslation(
+                delta = deltaX,
+                minimum = -(bounds?.left ?: view.left).toFloat(),
+                maximum = ((canvas?.width ?: Int.MAX_VALUE) - (bounds?.right ?: view.right)).toFloat()
+            )
+            translatedY = clampedTranslation(
+                delta = deltaY,
+                minimum = -(bounds?.top ?: view.top).toFloat(),
+                maximum = ((canvas?.height ?: Int.MAX_VALUE) - (bounds?.bottom ?: view.bottom)).toFloat()
+            )
+            feedback?.moveTo(translatedX, translatedY) ?: run {
+                view.translationX = translatedX
+                view.translationY = translatedY
+                view.translationZ = 8 * density
+            }
+            updatePlacementPreview(view)
+        }
+
+        private fun updatePlacementPreview(view: View) {
+            val placement = resolveDragPlacement(stableId, view, translatedX, translatedY) ?: return
+            val targetStableId = placement.decision.targetStableId
+            if (targetStableId != previewTargetStableId && targetStableId != null) {
+                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            }
+            previewTargetStableId = targetStableId
+            currentPlacement = placement
+
+            val desiredOffsets = placement.decision.siblingOffsets.mapNotNull { (siblingId, offset) ->
+                currentNodeViews[siblingId]?.let { sibling -> sibling to offset }
+            }.toMap()
+            previewOffsets.keys.minus(desiredOffsets.keys).forEach { sibling ->
+                sibling.animate().cancel()
+                sibling.animate()
+                    .translationX(0f)
+                    .translationY(0f)
+                    .setDuration(REORDER_PREVIEW_DURATION_MILLIS)
+                    .start()
+                previewOffsets.remove(sibling)
+            }
+            desiredOffsets.forEach { (sibling, offset) ->
+                if (previewOffsets[sibling] == offset) return@forEach
+                sibling.animate().cancel()
+                sibling.animate()
+                    .translationX(offset.deltaX.toFloat())
+                    .translationY(offset.deltaY.toFloat())
+                    .setDuration(REORDER_PREVIEW_DURATION_MILLIS)
+                    .start()
+                previewOffsets[sibling] = offset
+            }
+        }
+
+        private fun clearPlacementPreview() {
+            previewOffsets.keys.toList().forEach { sibling ->
+                sibling.animate().cancel()
+                sibling.translationX = 0f
+                sibling.translationY = 0f
+            }
+            previewOffsets.clear()
+            currentPlacement = null
+            previewTargetStableId = null
+        }
+
+        private fun postEdgeScrollFrame(host: View) {
+            if (edgeScrollPosted || !dragging) return
+            edgeScrollPosted = true
+            ViewCompat.postOnAnimation(host, edgeScrollRunnable)
+        }
+
+        private fun stopEdgeScroll() {
+            findViewById<View>(R.id.uiEditorCanvasContainer).removeCallbacks(edgeScrollRunnable)
+            edgeScrollPosted = false
+            draggedView = null
+        }
+
         private fun resetDraggedView(view: View) {
             view.translationX = 0f
             view.translationY = 0f
@@ -1686,5 +2172,7 @@ class UiEditorActivity : AppCompatActivity() {
         private fun clampedTranslation(delta: Float, minimum: Float, maximum: Float): Float {
             return if (minimum <= maximum) delta.coerceIn(minimum, maximum) else 0f
         }
+
+        private fun Int.sign(): Int = if (this < 0) -1 else 1
     }
 }

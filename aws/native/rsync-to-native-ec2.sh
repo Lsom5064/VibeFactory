@@ -23,6 +23,7 @@ rsync -az --progress \
   --exclude '.pytest_cache/' \
   --exclude 'debug_workspaces/' \
   --exclude 'exports/' \
+  --exclude 'flutter/' \
   --exclude 'aws/downloads/' \
   --exclude 'aws/*.pem' \
   --exclude 'aws/*.key' \

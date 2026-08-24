@@ -50,7 +50,7 @@ class HostPreferencesStore(
     fun getOrCreateDeviceId(): String {
         val existing = prefs.getString(HostAppConfig.PREF_DEVICE_ID, null)
         if (!existing.isNullOrBlank()) {
-            Log.d(logTag, "Reusing stored device_id=$existing")
+            Log.d(logTag, "Reusing stored device identity")
             return existing
         }
 
@@ -63,7 +63,7 @@ class HostPreferencesStore(
         if (stored.isNullOrBlank()) {
             throw IllegalStateException("Stored device_id is blank after commit")
         }
-        Log.d(logTag, "Generated new device_id=$stored")
+        Log.d(logTag, "Generated new device identity")
         return stored
     }
 

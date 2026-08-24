@@ -45,6 +45,13 @@ data class UiNode(
 
     fun appAttribute(localName: String): String? = attribute(APP_NAMESPACE_URI, localName)
 
+    fun toolsAttribute(localName: String): String? = attribute(TOOLS_NAMESPACE_URI, localName)
+
+    fun unqualifiedAttribute(localName: String): String? =
+        attributes.firstOrNull {
+            it.namespaceUri.isBlank() && it.localName == localName
+        }?.value
+
     fun descendantsAndSelf(): Sequence<UiNode> = sequence {
         yield(this@UiNode)
         children.forEach { yieldAll(it.descendantsAndSelf()) }

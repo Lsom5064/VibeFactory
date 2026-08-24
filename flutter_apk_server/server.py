@@ -6,7 +6,6 @@ import json
 import os
 import queue
 import re
-import selectors
 import shlex
 import shutil
 import signal
@@ -18,15 +17,68 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response
-from PIL import Image, ImageOps, UnidentifiedImageError  # type: ignore[import-untyped]
-from pydantic import BaseModel, Field
+
+try:
+    from .api_models import (
+        AppDataCreateRequest,
+        AppDataUpdateRequest,
+        AppLlmConfigRequest,
+        AppLlmRuntimeRequest,
+        DeviceInfoPayload,
+        GenerateAttachmentPayload,
+        GenerateRequest,
+        GlobalAppLlmDefaultsRequest,
+        RuntimeErrorReportRequest,
+        TaskUpdateRequest,
+        UiEditorDraftRequest,
+        UiEditorImageRequest,
+        UiEditorSubmitRequest,
+    )
+except ImportError:
+    from api_models import (  # type: ignore[no-redef]
+        AppDataCreateRequest,
+        AppDataUpdateRequest,
+        AppLlmConfigRequest,
+        AppLlmRuntimeRequest,
+        DeviceInfoPayload,
+        GenerateAttachmentPayload,
+        GenerateRequest,
+        GlobalAppLlmDefaultsRequest,
+        RuntimeErrorReportRequest,
+        TaskUpdateRequest,
+        UiEditorDraftRequest,
+        UiEditorImageRequest,
+        UiEditorSubmitRequest,
+    )
+
+try:
+    from .codex_rate_limits import (
+        CodexRateLimitSnapshot,
+        CodexRateLimitWindow,
+        fetch_codex_rate_limits,
+        fetch_codex_rate_limits_via_app_server,
+        fetch_codex_rate_limits_via_backend,
+        parse_backend_rate_limit_window,
+        parse_backend_rate_limits_payload,
+        read_codex_auth_access_token,
+    )
+except ImportError:
+    from codex_rate_limits import (  # type: ignore[no-redef]
+        CodexRateLimitSnapshot,
+        CodexRateLimitWindow,
+        fetch_codex_rate_limits,
+        fetch_codex_rate_limits_via_app_server,
+        fetch_codex_rate_limits_via_backend,
+        parse_backend_rate_limit_window,
+        parse_backend_rate_limits_payload,
+        read_codex_auth_access_token,
+    )
 
 try:
     from .project_builder import (
@@ -40,11 +92,82 @@ except ImportError:
     )
 
 try:
+    from .reference_attachments import (
+        REFERENCE_IMAGE_MAX_DIMENSION,
+        REFERENCE_IMAGE_MAX_SOURCE_BYTES,
+        REFERENCE_IMAGE_MAX_STORED_BYTES,
+        REFERENCE_PDF_MAX_BYTES,
+        build_reference_image_summary,
+        ensure_within_root,
+        first_reference_image_attachment,
+        infer_reference_image_suffix,
+        normalize_reference_attachments,
+        normalize_reference_image_base64,
+        normalize_reference_image_name,
+        optimize_reference_image_bytes,
+        pydantic_model_to_dict,
+        reference_attachment_event_payload,
+        reference_attachments_summary,
+        request_reference_attachments,
+        resolve_task_artifact_path,
+        resolve_workspace_path,
+        save_reference_attachments,
+        save_reference_file_attachment_result,
+        save_reference_image_attachment_result,
+    )
+except ImportError:
+    from reference_attachments import (  # type: ignore[no-redef]
+        REFERENCE_IMAGE_MAX_DIMENSION,
+        REFERENCE_IMAGE_MAX_SOURCE_BYTES,
+        REFERENCE_IMAGE_MAX_STORED_BYTES,
+        REFERENCE_PDF_MAX_BYTES,
+        build_reference_image_summary,
+        ensure_within_root,
+        first_reference_image_attachment,
+        infer_reference_image_suffix,
+        normalize_reference_attachments,
+        normalize_reference_image_base64,
+        normalize_reference_image_name,
+        optimize_reference_image_bytes,
+        pydantic_model_to_dict,
+        reference_attachment_event_payload,
+        reference_attachments_summary,
+        request_reference_attachments,
+        resolve_task_artifact_path,
+        resolve_workspace_path,
+        save_reference_attachments,
+        save_reference_file_attachment_result,
+        save_reference_image_attachment_result,
+    )
+
+try:
+    from .server_settings import (
+        GENERATED_APP_SIGNING_ENV_KEYS,
+        Settings,
+        build_subprocess_environment,
+        install_uvicorn_access_log_query_filter,
+        load_settings,
+        sanitize_component,
+        with_codex_reasoning_effort,
+    )
+except ImportError:
+    from server_settings import (  # type: ignore[no-redef]
+        GENERATED_APP_SIGNING_ENV_KEYS,
+        Settings,
+        build_subprocess_environment,
+        install_uvicorn_access_log_query_filter,
+        load_settings,
+        sanitize_component,
+        with_codex_reasoning_effort,
+    )
+
+try:
     from .ui_editor_server import (
         UiEditorFileTooLargeError,
         UiEditorInputError,
         UiEditorSecurityError,
         UiEditorXmlError,
+        build_ui_editor_chat_context,
         build_ui_editor_codex_prompt,
         collect_ui_editor_source_context,
         list_layout_documents,
@@ -62,6 +185,7 @@ except ImportError:
         UiEditorInputError,
         UiEditorSecurityError,
         UiEditorXmlError,
+        build_ui_editor_chat_context,
         build_ui_editor_codex_prompt,
         collect_ui_editor_source_context,
         list_layout_documents,
@@ -75,36 +199,6 @@ except ImportError:
     )
 
 
-GENERATED_APP_SIGNING_ENV_KEYS = (
-    "GENERATED_APP_KEYSTORE_PATH",
-    "GENERATED_APP_KEYSTORE_PASSWORD",
-    "GENERATED_APP_KEY_ALIAS",
-    "GENERATED_APP_KEY_PASSWORD",
-)
-SUBPROCESS_SECRET_ENV_KEYS = (
-    *GENERATED_APP_SIGNING_ENV_KEYS,
-    "APP_RUNTIME_OPENAI_API_KEY",
-    "ADMIN_API_TOKEN",
-)
-
-
-def build_subprocess_environment(
-    source: Optional[Mapping[str, str]] = None,
-) -> dict[str, str]:
-    env = dict(os.environ if source is None else source)
-    for key in SUBPROCESS_SECRET_ENV_KEYS:
-        env.pop(key, None)
-    return env
-
-
-REFERENCE_IMAGE_MAX_SOURCE_BYTES = 20 * 1024 * 1024
-REFERENCE_IMAGE_MAX_STORED_BYTES = 2 * 1024 * 1024
-REFERENCE_IMAGE_MAX_DIMENSION = 1600
-REFERENCE_IMAGE_JPEG_QUALITIES = (88, 82, 76, 68, 60, 52, 44)
-REFERENCE_IMAGE_DIMENSION_STEPS = (1600, 1400, 1200, 1024, 800)
-REFERENCE_PDF_MAX_BYTES = 10 * 1024 * 1024
-REFERENCE_TEXT_MAX_BYTES = 2 * 1024 * 1024
-REFERENCE_TEXT_SUFFIXES = {".txt", ".md", ".json", ".csv", ".xml", ".yaml", ".yml"}
 PRIMARY_KEY_INSERT_MAX_ATTEMPTS = 4
 
 
@@ -160,175 +254,6 @@ def utc_now_iso() -> str:
 
 def utc_now_compact() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def resolve_path(value: str, default: Path, root: Path) -> Path:
-    candidate = Path(value).expanduser() if value else default
-    if not candidate.is_absolute():
-        candidate = (root / candidate).resolve()
-    return candidate
-
-
-def default_base_project_path(root: Path) -> Path:
-    local_default = root / "base_android_project"
-    sibling_default = root.parent / "BaseProject"
-    if local_default.exists():
-        return local_default
-    if sibling_default.exists():
-        return sibling_default
-    return local_default
-
-
-def detect_codex_binary() -> str:
-    native_codex = (
-        Path.home()
-        / ".npm-global"
-        / "lib"
-        / "node_modules"
-        / "@openai"
-        / "codex"
-        / "vendor"
-        / "aarch64-apple-darwin"
-        / "codex"
-        / "codex"
-    )
-    user_local_codex = Path.home() / ".npm-global" / "bin" / "codex"
-    if native_codex.exists():
-        return str(native_codex)
-    if user_local_codex.exists():
-        return str(user_local_codex)
-    return "codex"
-
-
-def env_flag(name: str, default: bool) -> bool:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    normalized = raw_value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def default_codex_command(root: Path) -> str:
-    _ = root
-    args = [
-        shlex.quote(detect_codex_binary()),
-        "exec",
-        "--skip-git-repo-check",
-        "--json",
-    ]
-    codex_model = os.getenv("CODEX_MODEL", "gpt-5.4").strip() or "gpt-5.4"
-    args.extend(["--model", shlex.quote(codex_model)])
-    reasoning_effort = (os.getenv("CODEX_REASONING_EFFORT", "default").strip().lower() or "default")
-    if reasoning_effort == "default":
-        reasoning_effort = "medium"
-    args.extend(["-c", shlex.quote(f'model_reasoning_effort="{reasoning_effort}"')])
-    service_tier = (os.getenv("CODEX_SERVICE_TIER", "default").strip().lower() or "default")
-    args.extend(["-c", shlex.quote(f'service_tier="{service_tier}"')])
-    if env_flag("CODEX_FAST_MODE", service_tier in {"priority", "fast"}):
-        args.extend(["--enable", "fast_mode"])
-    if env_flag("CODEX_DANGEROUS_BYPASS", True):
-        args.append("--dangerously-bypass-approvals-and-sandbox")
-    else:
-        args.extend(
-            [
-                "--sandbox",
-                shlex.quote(os.getenv("CODEX_SANDBOX_MODE", "danger-full-access").strip() or "danger-full-access"),
-            ]
-        )
-    return f'{" ".join(args)} "{{prompt}}"'
-
-
-def normalize_codex_reasoning_effort(value: str, *, default: str = "medium") -> str:
-    normalized = value.strip().lower()
-    return normalized if normalized in {"minimal", "low", "medium", "high", "xhigh"} else default
-
-
-def with_codex_reasoning_effort(args: list[str], reasoning_effort: str) -> list[str]:
-    normalized_effort = normalize_codex_reasoning_effort(reasoning_effort, default="low")
-    updated = list(args)
-    config_value = f'model_reasoning_effort="{normalized_effort}"'
-    for index in range(len(updated) - 1):
-        if updated[index] != "-c":
-            continue
-        if updated[index + 1].split("=", 1)[0].strip() != "model_reasoning_effort":
-            continue
-        updated[index + 1] = config_value
-        return updated
-
-    insert_at = max(0, len(updated) - 1)
-    updated[insert_at:insert_at] = ["-c", config_value]
-    return updated
-
-
-def sanitize_component(value: str) -> str:
-    safe = "".join(
-        ch if (ch.isascii() and (ch.isalnum() or ch in ("-", "_", "."))) else "_"
-        for ch in value.strip()
-    )
-    safe = safe.strip("._")
-    return safe or "unknown"
-
-
-def infer_codex_cli_binary(codex_command: str) -> str:
-    try:
-        args = shlex.split(codex_command)
-    except ValueError:
-        return detect_codex_binary()
-    if not args:
-        return detect_codex_binary()
-    return args[0]
-
-
-def read_codex_auth_access_token(home_path: Optional[Path] = None) -> Optional[str]:
-    resolved_home = home_path or Path.home()
-    auth_path = resolved_home / ".codex" / "auth.json"
-    if not auth_path.exists():
-        return None
-    try:
-        payload = json.loads(auth_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    tokens = payload.get("tokens")
-    if not isinstance(tokens, dict):
-        return None
-    access_token = tokens.get("access_token")
-    if not isinstance(access_token, str) or not access_token.strip():
-        return None
-    return access_token.strip()
-def parse_backend_rate_limit_window(payload: Any) -> Optional["CodexRateLimitWindow"]:
-    if not isinstance(payload, dict):
-        return None
-    used_percent = payload.get("used_percent")
-    if used_percent is None:
-        return None
-    try:
-        used_percent_value = int(used_percent)
-    except (TypeError, ValueError):
-        return None
-    window_seconds = payload.get("limit_window_seconds")
-    reset_at = payload.get("reset_at")
-    return CodexRateLimitWindow(
-        used_percent=used_percent_value,
-        window_duration_mins=int(window_seconds // 60) if isinstance(window_seconds, (int, float)) else None,
-        resets_at=int(reset_at) if isinstance(reset_at, (int, float)) else None,
-    )
-
-
-def parse_backend_rate_limits_payload(payload: Any) -> "CodexRateLimitSnapshot":
-    if not isinstance(payload, dict):
-        raise RuntimeError("usage 응답이 JSON 객체가 아닙니다.")
-    rate_limit = payload.get("rate_limit")
-    if not isinstance(rate_limit, dict):
-        raise RuntimeError("usage 응답에 rate_limit 필드가 없습니다.")
-    return CodexRateLimitSnapshot(
-        limit_name="codex",
-        primary=parse_backend_rate_limit_window(rate_limit.get("primary_window")),
-        secondary=parse_backend_rate_limit_window(rate_limit.get("secondary_window")),
-    )
 
 
 CODEX_ENGINE_CONTACT_MESSAGE = (
@@ -439,675 +364,6 @@ def should_attempt_server_side_build(
     return not timed_out and engine_issue is None
 
 
-def _read_jsonrpc_result(process: subprocess.Popen[str], request_id: int, timeout_seconds: float) -> Any:
-    if process.stdout is None or process.stderr is None:
-        raise RuntimeError("Codex app-server 표준 입출력을 열지 못했습니다.")
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, data="stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, data="stderr")
-    stderr_lines: list[str] = []
-    deadline = time.monotonic() + timeout_seconds
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            events = selector.select(timeout=remaining)
-            if not events and process.poll() is not None:
-                break
-            for key, _ in events:
-                line = cast(Any, key.fileobj).readline()
-                if not line:
-                    continue
-                if key.data == "stderr":
-                    stderr_lines.append(line.strip())
-                    continue
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    payload = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if payload.get("id") != request_id:
-                    continue
-                if "error" in payload:
-                    error_payload = payload.get("error") or {}
-                    message = str(error_payload.get("message") or "알 수 없는 오류")
-                    raise RuntimeError(message)
-                return payload.get("result")
-    finally:
-        selector.close()
-    stderr_text = " | ".join(part for part in stderr_lines if part)
-    if stderr_text:
-        raise RuntimeError(f"응답 시간 초과 또는 종료됨: {stderr_text}")
-    raise RuntimeError("응답 시간 초과 또는 종료됨")
-
-
-def fetch_codex_rate_limits_via_app_server(
-    codex_binary: str,
-    timeout_seconds: float = 20.0,
-    *,
-    env: Optional[dict[str, str]] = None,
-) -> "CodexRateLimitSnapshot":
-    process_env = build_subprocess_environment(env)
-    process = subprocess.Popen(
-        [codex_binary, "app-server", "--listen", "stdio://"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=process_env,
-    )
-    try:
-        if process.stdin is None:
-            raise RuntimeError("Codex app-server 표준 입력을 열지 못했습니다.")
-        process.stdin.write(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {"clientInfo": {"name": "flutter_apk_server", "version": "1.0"}},
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-        process.stdin.flush()
-        _read_jsonrpc_result(process, 1, min(timeout_seconds, 5.0))
-        process.stdin.write(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "account/rateLimits/read",
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-        process.stdin.flush()
-        result = _read_jsonrpc_result(process, 2, timeout_seconds)
-        if not isinstance(result, dict):
-            raise RuntimeError("account/rateLimits/read 응답이 JSON 객체가 아닙니다.")
-
-        def parse_window(payload: Any) -> Optional["CodexRateLimitWindow"]:
-            if not isinstance(payload, dict):
-                return None
-            used_percent = payload.get("usedPercent")
-            if used_percent is None:
-                return None
-            try:
-                used_percent_value = int(used_percent)
-            except (TypeError, ValueError):
-                return None
-            window_duration_mins = payload.get("windowDurationMins")
-            resets_at = payload.get("resetsAt")
-            return CodexRateLimitWindow(
-                used_percent=used_percent_value,
-                window_duration_mins=int(window_duration_mins) if isinstance(window_duration_mins, (int, float)) else None,
-                resets_at=int(resets_at) if isinstance(resets_at, (int, float)) else None,
-            )
-
-        snapshot_payload = result.get("rateLimits")
-        if not isinstance(snapshot_payload, dict):
-            by_limit_id = result.get("rateLimitsByLimitId")
-            if isinstance(by_limit_id, dict):
-                snapshot_payload = by_limit_id.get("codex")
-        if not isinstance(snapshot_payload, dict):
-            raise RuntimeError("Codex rate limit snapshot이 없습니다.")
-        return CodexRateLimitSnapshot(
-            limit_name=str(snapshot_payload.get("limitName") or snapshot_payload.get("limitId") or "codex"),
-            primary=parse_window(snapshot_payload.get("primary")),
-            secondary=parse_window(snapshot_payload.get("secondary")),
-        )
-    finally:
-        try:
-            process.terminate()
-            process.wait(timeout=2)
-        except Exception:
-            try:
-                process.kill()
-                process.wait(timeout=2)
-            except Exception:
-                pass
-
-
-def fetch_codex_rate_limits_via_backend(timeout_seconds: float = 20.0, *, home_path: Optional[Path] = None) -> "CodexRateLimitSnapshot":
-    access_token = read_codex_auth_access_token(home_path)
-    if not access_token:
-        raise RuntimeError("~/.codex/auth.json에서 access_token을 찾지 못했습니다.")
-    response = httpx.get(
-        "https://chatgpt.com/backend-api/wham/usage",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "User-Agent": "flutter_apk_server/codex-limit-probe",
-        },
-        timeout=timeout_seconds,
-    )
-    response.raise_for_status()
-    return parse_backend_rate_limits_payload(response.json())
-
-
-def fetch_codex_rate_limits(
-    codex_command: str,
-    timeout_seconds: float = 20.0,
-    *,
-    env: Optional[dict[str, str]] = None,
-    home_path: Optional[Path] = None,
-) -> "CodexRateLimitSnapshot":
-    app_server_error: Optional[Exception] = None
-    codex_binary = infer_codex_cli_binary(codex_command)
-    try:
-        return fetch_codex_rate_limits_via_app_server(codex_binary, timeout_seconds=timeout_seconds, env=env)
-    except Exception as exc:
-        app_server_error = exc
-    try:
-        return fetch_codex_rate_limits_via_backend(timeout_seconds=timeout_seconds, home_path=home_path)
-    except Exception as backend_exc:
-        if app_server_error is not None:
-            raise RuntimeError(f"app-server: {app_server_error}; backend: {backend_exc}") from backend_exc
-        raise
-
-
-def ensure_within_root(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
-
-
-def resolve_workspace_path(workspace_root: Path, candidate: str) -> Path:
-    path = Path(candidate)
-    resolved = path.resolve() if path.is_absolute() else (workspace_root / path).resolve()
-    if not ensure_within_root(resolved, workspace_root):
-        raise ValueError("path escapes workspace")
-    return resolved
-
-
-def resolve_task_artifact_path(workspace_root: Path, candidate: str, project_root: Optional[Path] = None) -> Path:
-    path = Path(candidate)
-    if path.is_absolute():
-        resolved = path.resolve()
-        if not ensure_within_root(resolved, workspace_root):
-            raise ValueError("path escapes workspace")
-        return resolved
-
-    candidates: list[Path] = []
-    if project_root is not None:
-        project_root = project_root.resolve()
-        candidates.append((project_root.parent / path).resolve())
-        candidates.append((project_root / path).resolve())
-    candidates.append((workspace_root / path).resolve())
-
-    seen: set[Path] = set()
-    fallback: Optional[Path] = None
-    for candidate_path in candidates:
-        if candidate_path in seen:
-            continue
-        seen.add(candidate_path)
-        if not ensure_within_root(candidate_path, workspace_root):
-            continue
-        if fallback is None:
-            fallback = candidate_path
-        if candidate_path.exists():
-            return candidate_path
-
-    if fallback is None:
-        raise ValueError("path escapes workspace")
-    return fallback
-
-
-def normalize_reference_image_name(value: Optional[str]) -> str:
-    normalized = normalize_whitespace(str(value or ""))
-    if not normalized:
-        return ""
-    normalized = normalized.replace("\\", "/").split("/")[-1].strip()
-    if not normalized:
-        return ""
-    return normalized[:120]
-
-
-def normalize_reference_image_base64(value: Optional[str]) -> str:
-    normalized = str(value or "").strip()
-    if not normalized:
-        return ""
-    if normalized.startswith("data:"):
-        _, _, normalized = normalized.partition(",")
-    return "".join(normalized.split())
-
-
-def infer_reference_image_suffix(reference_image_name: str) -> str:
-    suffix = Path(reference_image_name).suffix.lower()
-    return suffix if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"} else ".png"
-
-
-def build_reference_image_summary(reference_image_name: str) -> str:
-    if not reference_image_name:
-        return ""
-    return f"참고 이미지 `{reference_image_name}`를 함께 전달받았어요. 앱 구조, UI, 스타일, 콘텐츠 맥락을 이 이미지를 참고해 해석합니다."
-
-
-def reference_attachment_file_metadata(workspace_root: Path, workspace_path: str) -> Optional[dict[str, Any]]:
-    normalized_path = normalize_whitespace(str(workspace_path or ""))
-    if not normalized_path:
-        return None
-    candidate = (workspace_root / normalized_path).resolve()
-    if not ensure_within_root(candidate, workspace_root.resolve()) or not candidate.is_file():
-        return None
-    try:
-        data = candidate.read_bytes()
-    except OSError:
-        return None
-    return {
-        "workspace_path": str(candidate.relative_to(workspace_root.resolve())),
-        "absolute_path": str(candidate),
-        "size_bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-    }
-
-
-def optimize_reference_image_bytes(image_bytes: bytes) -> dict[str, Any]:
-    original_size_bytes = len(image_bytes)
-    if original_size_bytes > REFERENCE_IMAGE_MAX_SOURCE_BYTES:
-        return {
-            "status": "failed",
-            "error_message": (
-                f"image exceeds source size limit "
-                f"({original_size_bytes} > {REFERENCE_IMAGE_MAX_SOURCE_BYTES} bytes)"
-            ),
-        }
-
-    try:
-        with Image.open(BytesIO(image_bytes)) as opened_image:
-            opened_image.load()
-            transposed_image = ImageOps.exif_transpose(opened_image)
-            original_width, original_height = transposed_image.size
-            if "A" in transposed_image.getbands():
-                rgba_image = transposed_image.convert("RGBA")
-                prepared_image = Image.new("RGB", rgba_image.size, "white")
-                prepared_image.paste(rgba_image, mask=rgba_image.getchannel("A"))
-                rgba_image.close()
-            else:
-                prepared_image = transposed_image.convert("RGB")
-    except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
-        return {
-            "status": "failed",
-            "error_message": f"invalid or unsupported image: {exc}",
-        }
-
-    smallest_candidate: Optional[bytes] = None
-    stored_width = prepared_image.width
-    stored_height = prepared_image.height
-    try:
-        for max_dimension in REFERENCE_IMAGE_DIMENSION_STEPS:
-            candidate_image = prepared_image.copy()
-            candidate_image.thumbnail(
-                (max_dimension, max_dimension),
-                Image.Resampling.LANCZOS,
-            )
-            try:
-                for quality in REFERENCE_IMAGE_JPEG_QUALITIES:
-                    output = BytesIO()
-                    candidate_image.save(
-                        output,
-                        format="JPEG",
-                        quality=quality,
-                        optimize=True,
-                    )
-                    candidate = output.getvalue()
-                    if smallest_candidate is None or len(candidate) < len(smallest_candidate):
-                        smallest_candidate = candidate
-                        stored_width, stored_height = candidate_image.size
-                    if len(candidate) <= REFERENCE_IMAGE_MAX_STORED_BYTES:
-                        return {
-                            "status": "optimized",
-                            "data": candidate,
-                            "mime_type": "image/jpeg",
-                            "suffix": ".jpg",
-                            "original_size_bytes": original_size_bytes,
-                            "size_bytes": len(candidate),
-                            "original_width": original_width,
-                            "original_height": original_height,
-                            "stored_width": candidate_image.width,
-                            "stored_height": candidate_image.height,
-                            "optimized": (
-                                candidate != image_bytes
-                                or original_width != candidate_image.width
-                                or original_height != candidate_image.height
-                            ),
-                        }
-            finally:
-                candidate_image.close()
-    finally:
-        prepared_image.close()
-
-    return {
-        "status": "failed",
-        "error_message": (
-            "image could not be compressed below storage limit "
-            f"({len(smallest_candidate or b'')} > {REFERENCE_IMAGE_MAX_STORED_BYTES} bytes, "
-            f"last dimensions {stored_width}x{stored_height})"
-        ),
-    }
-
-
-def save_reference_image_attachment_result(
-    workspace_root: Path,
-    *,
-    reference_image_name: str,
-    reference_image_base64: str,
-) -> dict[str, Any]:
-    normalized_name = normalize_reference_image_name(reference_image_name)
-    normalized_base64 = normalize_reference_image_base64(reference_image_base64)
-    if not normalized_name or not normalized_base64:
-        return {
-            "status": "failed",
-            "error_message": "missing image name or base64 payload",
-        }
-    try:
-        image_bytes = base64.b64decode(normalized_base64, validate=False)
-    except (ValueError, binascii.Error):
-        return {
-            "status": "failed",
-            "error_message": "invalid base64 image payload",
-        }
-    if not image_bytes:
-        return {
-            "status": "failed",
-            "error_message": "empty decoded image payload",
-        }
-
-    optimized = optimize_reference_image_bytes(image_bytes)
-    if optimized.get("status") != "optimized":
-        return optimized
-    stored_bytes = bytes(optimized.get("data") or b"")
-    if not stored_bytes:
-        return {
-            "status": "failed",
-            "error_message": "image optimization produced an empty payload",
-        }
-
-    image_dir = workspace_root / "reference_images"
-    image_dir.mkdir(parents=True, exist_ok=True)
-    safe_stem = sanitize_component(Path(normalized_name).stem or "reference_image")
-    filename = f"{utc_now_compact()}_{safe_stem}_{uuid.uuid4().hex[:8]}.jpg"
-    image_path = image_dir / filename
-    image_path.write_bytes(stored_bytes)
-    return {
-        "status": "saved",
-        "workspace_path": str(image_path.relative_to(workspace_root)),
-        "absolute_path": str(image_path),
-        "mime_type": "image/jpeg",
-        "size_bytes": len(stored_bytes),
-        "sha256": hashlib.sha256(stored_bytes).hexdigest(),
-        "original_size_bytes": int(optimized.get("original_size_bytes") or len(image_bytes)),
-        "original_width": int(optimized.get("original_width") or 0),
-        "original_height": int(optimized.get("original_height") or 0),
-        "stored_width": int(optimized.get("stored_width") or 0),
-        "stored_height": int(optimized.get("stored_height") or 0),
-        "optimized": bool(optimized.get("optimized")),
-    }
-
-
-def save_reference_file_attachment_result(
-    workspace_root: Path,
-    *,
-    attachment_type: str,
-    attachment_name: str,
-    attachment_mime_type: str,
-    attachment_base64: str,
-) -> dict[str, Any]:
-    normalized_type = normalize_whitespace(attachment_type).lower()
-    normalized_name = normalize_reference_image_name(attachment_name)
-    normalized_base64 = normalize_reference_image_base64(attachment_base64)
-    if normalized_type not in {"pdf", "text"}:
-        return {"status": "failed", "error_message": "unsupported reference file type"}
-    if not normalized_name or not normalized_base64:
-        return {"status": "failed", "error_message": "missing reference file name or base64 payload"}
-    try:
-        file_bytes = base64.b64decode(normalized_base64, validate=False)
-    except (ValueError, binascii.Error):
-        return {"status": "failed", "error_message": "invalid base64 reference file payload"}
-    if not file_bytes:
-        return {"status": "failed", "error_message": "empty decoded reference file payload"}
-
-    if normalized_type == "pdf":
-        if len(file_bytes) > REFERENCE_PDF_MAX_BYTES:
-            return {
-                "status": "failed",
-                "error_message": f"PDF exceeds size limit ({len(file_bytes)} > {REFERENCE_PDF_MAX_BYTES} bytes)",
-            }
-        if not file_bytes.startswith(b"%PDF-"):
-            return {"status": "failed", "error_message": "invalid PDF payload"}
-        suffix = ".pdf"
-        mime_type = "application/pdf"
-    else:
-        if len(file_bytes) > REFERENCE_TEXT_MAX_BYTES:
-            return {
-                "status": "failed",
-                "error_message": f"text file exceeds size limit ({len(file_bytes)} > {REFERENCE_TEXT_MAX_BYTES} bytes)",
-            }
-        try:
-            file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            return {"status": "failed", "error_message": "text attachment must be UTF-8 encoded"}
-        requested_suffix = Path(normalized_name).suffix.lower()
-        suffix = requested_suffix if requested_suffix in REFERENCE_TEXT_SUFFIXES else ".txt"
-        mime_type = attachment_mime_type if attachment_mime_type.lower().startswith("text/") else "text/plain"
-
-    attachment_dir = workspace_root / "reference_files"
-    attachment_dir.mkdir(parents=True, exist_ok=True)
-    safe_stem = sanitize_component(Path(normalized_name).stem or f"reference_{normalized_type}")
-    filename = f"{utc_now_compact()}_{safe_stem}_{uuid.uuid4().hex[:8]}{suffix}"
-    attachment_path = attachment_dir / filename
-    attachment_path.write_bytes(file_bytes)
-    return {
-        "status": "saved",
-        "workspace_path": str(attachment_path.relative_to(workspace_root)),
-        "absolute_path": str(attachment_path),
-        "mime_type": mime_type,
-        "size_bytes": len(file_bytes),
-        "sha256": hashlib.sha256(file_bytes).hexdigest(),
-        "original_size_bytes": len(file_bytes),
-        "original_width": 0,
-        "original_height": 0,
-        "stored_width": 0,
-        "stored_height": 0,
-        "optimized": False,
-    }
-
-
-def classify_reference_attachment_type(attachment_type: str, mime_type: str, name: str) -> str:
-    normalized_type = normalize_whitespace(attachment_type).lower()
-    normalized_mime = normalize_whitespace(mime_type).lower()
-    suffix = Path(name).suffix.lower()
-    if normalized_type == "image" or normalized_mime.startswith("image/"):
-        return "image"
-    if normalized_type == "pdf" or normalized_mime == "application/pdf" or suffix == ".pdf":
-        return "pdf"
-    if normalized_type == "text" or normalized_mime.startswith("text/") or suffix in REFERENCE_TEXT_SUFFIXES:
-        return "text"
-    return ""
-
-
-def normalize_reference_attachments(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-    normalized: list[dict[str, str]] = []
-    for item in value[:8]:
-        if isinstance(item, BaseModel):
-            raw = pydantic_model_to_dict(item)
-        elif isinstance(item, dict):
-            raw = item
-        else:
-            continue
-        attachment_type = normalize_whitespace(str(raw.get("type") or raw.get("payload_type") or "")).lower()
-        mime_type = normalize_whitespace(str(raw.get("mime_type") or raw.get("mimeType") or ""))
-        name = normalize_reference_image_name(raw.get("name") or raw.get("displayName") or raw.get("reference_image_name"))
-        base64_value = normalize_reference_image_base64(raw.get("base64") or raw.get("reference_image_base64"))
-        workspace_path = normalize_whitespace(str(raw.get("workspace_path") or raw.get("reference_image_workspace_path") or ""))
-        normalized_type = classify_reference_attachment_type(attachment_type, mime_type, name)
-        if not normalized_type:
-            continue
-        if not name:
-            name = f"reference_{normalized_type}"
-        if not base64_value and not workspace_path:
-            continue
-        if normalized_type == "image":
-            normalized_mime_type = mime_type or f"image/{infer_reference_image_suffix(name).lstrip('.')}"
-        elif normalized_type == "pdf":
-            normalized_mime_type = "application/pdf"
-        else:
-            normalized_mime_type = mime_type if mime_type.lower().startswith("text/") else "text/plain"
-        normalized.append(
-            {
-                "type": normalized_type,
-                "mime_type": normalized_mime_type,
-                "name": name,
-                "base64": base64_value,
-                "workspace_path": workspace_path,
-            }
-        )
-    return normalized
-
-
-def pydantic_model_to_dict(model: BaseModel) -> dict[str, Any]:
-    model_dump = getattr(model, "model_dump", None)
-    payload = model_dump() if callable(model_dump) else model.dict()
-    return dict(payload) if isinstance(payload, dict) else {}
-
-
-def request_reference_attachments(request: "GenerateRequest") -> list[dict[str, str]]:
-    attachments = normalize_reference_attachments(request.attachments)
-    legacy_name = normalize_reference_image_name(request.reference_image_name)
-    legacy_base64 = normalize_reference_image_base64(request.reference_image_base64)
-    if legacy_name and legacy_base64:
-        legacy = {
-            "type": "image",
-            "mime_type": f"image/{infer_reference_image_suffix(legacy_name).lstrip('.')}",
-            "name": legacy_name,
-            "base64": legacy_base64,
-            "workspace_path": "",
-        }
-        if not any(item.get("base64") == legacy_base64 for item in attachments):
-            attachments.insert(0, legacy)
-    return attachments[:8]
-
-
-def first_reference_image_attachment(attachments: list[dict[str, str]]) -> dict[str, str]:
-    return next(
-        (
-            item
-            for item in attachments
-            if item.get("type") == "image" and (item.get("base64") or item.get("workspace_path"))
-        ),
-        {},
-    )
-
-
-def save_reference_attachments(workspace_root: Path, attachments: list[dict[str, str]]) -> list[dict[str, Any]]:
-    saved: list[dict[str, Any]] = []
-    for attachment in normalize_reference_attachments(attachments):
-        workspace_path = attachment.get("workspace_path") or ""
-        save_result: dict[str, Any] = {}
-        existing_metadata = reference_attachment_file_metadata(workspace_root, workspace_path)
-        if existing_metadata:
-            save_result = {
-                "status": "existing",
-                **existing_metadata,
-            }
-        if attachment.get("base64"):
-            if not existing_metadata:
-                if attachment.get("type") == "image":
-                    save_result = save_reference_image_attachment_result(
-                        workspace_root,
-                        reference_image_name=attachment.get("name") or "reference_image",
-                        reference_image_base64=attachment.get("base64") or "",
-                    )
-                else:
-                    save_result = save_reference_file_attachment_result(
-                        workspace_root,
-                        attachment_type=attachment.get("type") or "",
-                        attachment_name=attachment.get("name") or "reference_file",
-                        attachment_mime_type=attachment.get("mime_type") or "",
-                        attachment_base64=attachment.get("base64") or "",
-                    )
-            workspace_path = str(save_result.get("workspace_path") or workspace_path)
-        elif not save_result:
-            save_result = {
-                "status": "pending",
-                "error_message": "attachment payload is referenced by path only or has not been saved yet",
-            }
-        saved.append(
-            {
-                **attachment,
-                "mime_type": str(save_result.get("mime_type") or attachment.get("mime_type") or ""),
-                "workspace_path": workspace_path,
-                "base64": "" if workspace_path else attachment.get("base64", ""),
-                "save_status": str(save_result.get("status") or ""),
-                "absolute_path": str(save_result.get("absolute_path") or ""),
-                "size_bytes": str(save_result.get("size_bytes") or ""),
-                "sha256": str(save_result.get("sha256") or ""),
-                "original_size_bytes": str(save_result.get("original_size_bytes") or ""),
-                "original_width": str(save_result.get("original_width") or ""),
-                "original_height": str(save_result.get("original_height") or ""),
-                "stored_width": str(save_result.get("stored_width") or ""),
-                "stored_height": str(save_result.get("stored_height") or ""),
-                "optimized": bool(save_result.get("optimized")),
-                "error_message": str(save_result.get("error_message") or ""),
-            }
-        )
-    return saved
-
-
-def reference_attachment_event_payload(attachment: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "type": attachment.get("type") or "",
-        "mime_type": attachment.get("mime_type") or "",
-        "name": attachment.get("name") or "reference_attachment",
-        "workspace_path": attachment.get("workspace_path") or "",
-        "absolute_path": attachment.get("absolute_path") or "",
-        "size_bytes": int(attachment.get("size_bytes") or 0),
-        "sha256": attachment.get("sha256") or "",
-        "original_size_bytes": int(attachment.get("original_size_bytes") or 0),
-        "original_width": int(attachment.get("original_width") or 0),
-        "original_height": int(attachment.get("original_height") or 0),
-        "stored_width": int(attachment.get("stored_width") or 0),
-        "stored_height": int(attachment.get("stored_height") or 0),
-        "optimized": bool(attachment.get("optimized")),
-        "status": attachment.get("save_status") or "",
-        "error_message": attachment.get("error_message") or "",
-    }
-
-
-def reference_attachments_summary(attachments: list[dict[str, str]]) -> str:
-    normalized = normalize_reference_attachments(attachments)
-    if not normalized:
-        return ""
-    names = [item.get("name") or "reference_attachment" for item in normalized]
-    image_count = sum(1 for item in normalized if item.get("type") == "image")
-    file_count = len(normalized) - image_count
-    kind_parts = []
-    if image_count:
-        kind_parts.append(f"이미지 {image_count}개")
-    if file_count:
-        kind_parts.append(f"파일 {file_count}개")
-    kind_summary = ", ".join(kind_parts)
-    if len(names) == 1:
-        item = normalized[0]
-        if item.get("type") == "image":
-            return build_reference_image_summary(names[0])
-        return f"참고 파일 `{names[0]}`을 함께 전달받았어요. 파일 내용을 사용자 요청과 함께 확인합니다."
-    preview = ", ".join(names[:3])
-    suffix = f" 외 {len(names) - 3}개" if len(names) > 3 else ""
-    return f"참고 첨부 {kind_summary}({preview}{suffix})를 함께 전달받았어요. 이미지와 파일 내용을 사용자 요청과 함께 확인합니다."
-
-
 def read_text_if_exists(path: Path, limit: Optional[int] = 20000) -> str:
     if not path.exists() or not path.is_file():
         return ""
@@ -1156,127 +412,6 @@ def sanitize_user_visible_text(text: str) -> str:
     sanitized = re.sub(r"logs/작업 엔진_stdout\.log", "작업 표준 출력 로그", sanitized)
     sanitized = re.sub(r"logs/작업 엔진_stderr\.log", "작업 오류 출력 로그", sanitized)
     return sanitized
-
-
-@dataclass(frozen=True)
-class Settings:
-    base_project_path: Path
-    workspaces_root: Path
-    build_cache_root: Path
-    codex_command: str
-    codex_timeout_seconds: Optional[int]
-    server_base_url: str
-    max_concurrent_codex_runs: int
-    db_path: Path
-    app_data_db_path: Path
-    mock_codex: bool
-    status_log_line_limit: int
-    intent_agent_enabled: bool
-    intent_agent_model: str
-    intent_agent_timeout_seconds: int
-    codex_existing_task_followup_enabled: bool
-    codex_followup_decision_timeout_seconds: int
-    codex_followup_reasoning_effort: str
-    app_runtime_enabled_by_default: bool
-    app_runtime_provider: str
-    app_runtime_model: str
-    app_runtime_api_key: str
-    app_runtime_base_url: str
-    app_runtime_system_prompt: str
-    app_runtime_daily_request_limit: int
-    app_runtime_daily_token_limit: int
-    app_runtime_max_output_tokens: int
-    app_runtime_temperature: float
-    generated_app_keystore_path: str
-    generated_app_keystore_password: str
-    generated_app_key_alias: str
-    generated_app_key_password: str
-    shared_build_cache_enabled: bool
-    admin_api_token: str
-
-
-def load_settings() -> Settings:
-    root = Path(__file__).resolve().parent
-    mock_codex = os.getenv("MOCK_CODEX", "0") == "1"
-    runtime_api_key = os.getenv("APP_RUNTIME_OPENAI_API_KEY", "").strip()
-    runtime_enabled_default = env_flag("APP_RUNTIME_ENABLED", bool(runtime_api_key))
-    codex_timeout_raw = int(os.getenv("CODEX_TIMEOUT_SECONDS", "0"))
-    codex_timeout_seconds = codex_timeout_raw if codex_timeout_raw > 0 else None
-    return Settings(
-        base_project_path=resolve_path(
-            os.getenv("BASE_PROJECT_PATH", ""),
-            default_base_project_path(root),
-            root,
-        ),
-        workspaces_root=resolve_path(
-            os.getenv("WORKSPACES_ROOT", ""),
-            root / "native_workspaces",
-            root,
-        ),
-        build_cache_root=resolve_path(
-            os.getenv("BUILD_CACHE_ROOT", ""),
-            root / ".native_tooling",
-            root,
-        ),
-        codex_command=os.getenv("CODEX_COMMAND", default_codex_command(root)),
-        codex_timeout_seconds=codex_timeout_seconds,
-        server_base_url=os.getenv("SERVER_BASE_URL", "http://127.0.0.1:8000").rstrip("/"),
-        max_concurrent_codex_runs=max(1, int(os.getenv("MAX_CONCURRENT_CODEX_RUNS", "1"))),
-        db_path=resolve_path(
-            os.getenv("DB_PATH", ""),
-            root / "native_tasks.db",
-            root,
-        ),
-        app_data_db_path=resolve_path(
-            os.getenv("APP_DATA_DB_PATH", ""),
-            root / "native_app_data.db",
-            root,
-        ),
-        mock_codex=mock_codex,
-        status_log_line_limit=max(1, int(os.getenv("STATUS_LOG_LINE_LIMIT", "50"))),
-        intent_agent_enabled=env_flag("INTENT_AGENT_ENABLED", not mock_codex),
-        intent_agent_model=os.getenv("INTENT_AGENT_MODEL", "gpt-5.4").strip() or "gpt-5.4",
-        intent_agent_timeout_seconds=max(5, int(os.getenv("INTENT_AGENT_TIMEOUT_SECONDS", "20"))),
-        codex_existing_task_followup_enabled=env_flag("CODEX_EXISTING_TASK_FOLLOWUP_ENABLED", True),
-        codex_followup_decision_timeout_seconds=max(10, int(os.getenv("CODEX_FOLLOWUP_DECISION_TIMEOUT_SECONDS", "90"))),
-        codex_followup_reasoning_effort=normalize_codex_reasoning_effort(
-            os.getenv("CODEX_FOLLOWUP_REASONING_EFFORT", "low"),
-            default="low",
-        ),
-        app_runtime_enabled_by_default=runtime_enabled_default,
-        app_runtime_provider=os.getenv("APP_RUNTIME_PROVIDER", "openai").strip() or "openai",
-        app_runtime_model=os.getenv("APP_RUNTIME_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini",
-        app_runtime_api_key=runtime_api_key,
-        app_runtime_base_url=os.getenv("APP_RUNTIME_BASE_URL", "https://api.openai.com/v1/responses").strip() or "https://api.openai.com/v1/responses",
-        app_runtime_system_prompt=os.getenv(
-            "APP_RUNTIME_SYSTEM_PROMPT",
-            "사용자가 보낸 텍스트와 이미지를 바탕으로 실용적이고 구체적인 조언을 한국어로 제공하세요. 추측은 줄이고, 관찰 가능한 내용과 실행 가능한 제안을 우선하세요.",
-        ).strip(),
-        app_runtime_daily_request_limit=max(1, int(os.getenv("APP_RUNTIME_DAILY_REQUEST_LIMIT", "100"))),
-        app_runtime_daily_token_limit=max(1, int(os.getenv("APP_RUNTIME_DAILY_TOKEN_LIMIT", "50000"))),
-        app_runtime_max_output_tokens=max(0, int(os.getenv("APP_RUNTIME_MAX_OUTPUT_TOKENS", "0"))),
-        app_runtime_temperature=float(os.getenv("APP_RUNTIME_TEMPERATURE", "0.4")),
-        generated_app_keystore_path=os.getenv("GENERATED_APP_KEYSTORE_PATH", "").strip(),
-        generated_app_keystore_password=os.getenv("GENERATED_APP_KEYSTORE_PASSWORD", "").strip(),
-        generated_app_key_alias=os.getenv("GENERATED_APP_KEY_ALIAS", "").strip(),
-        generated_app_key_password=os.getenv("GENERATED_APP_KEY_PASSWORD", "").strip(),
-        shared_build_cache_enabled=env_flag("SHARED_BUILD_CACHE_ENABLED", True),
-        admin_api_token=os.getenv("ADMIN_API_TOKEN", "").strip(),
-    )
-
-
-@dataclass(frozen=True)
-class CodexRateLimitWindow:
-    used_percent: int
-    window_duration_mins: Optional[int]
-    resets_at: Optional[int]
-
-
-@dataclass(frozen=True)
-class CodexRateLimitSnapshot:
-    limit_name: Optional[str]
-    primary: Optional[CodexRateLimitWindow]
-    secondary: Optional[CodexRateLimitWindow]
 
 
 @dataclass(frozen=True)
@@ -1333,14 +468,6 @@ class TaskUsageRecord:
     status: str
     raw_output_text: str = ""
     payload: Optional[dict[str, Any]] = None
-
-
-class DeviceInfoPayload(BaseModel):
-    model: str = Field(..., min_length=1)
-    sdk: int = Field(..., ge=1)
-    width: int = Field(..., ge=1)
-    height: int = Field(..., ge=1)
-    sensors: list[str] = Field(default_factory=list)
 
 
 def normalize_whitespace(value: str) -> str:
@@ -3757,103 +2884,6 @@ def decide_intent(
     )
 
 
-class GenerateAttachmentPayload(BaseModel):
-    type: str = ""
-    mime_type: str = ""
-    name: str = ""
-    base64: str = ""
-
-
-class GenerateRequest(BaseModel):
-    task_id: Optional[str] = None
-    device_id: str = Field(..., min_length=1)
-    phone_number: Optional[str] = None
-    prompt: str = ""
-    display_prompt: Optional[str] = None
-    request_action: Optional[str] = None
-    device_info: Optional[DeviceInfoPayload] = None
-    reference_image_path: Optional[str] = None
-    reference_image_name: Optional[str] = None
-    reference_image_base64: Optional[str] = None
-    attachments: list[GenerateAttachmentPayload] = Field(default_factory=list)
-
-
-class UiEditorDraftRequest(BaseModel):
-    draft_id: Optional[str] = None
-    configuration: str = "layout"
-    base_xml_sha256: str = Field(..., min_length=64, max_length=64)
-    original_xml: str = Field(..., min_length=1)
-    edited_xml: str = Field(..., min_length=1)
-    descriptions: dict[str, str] = Field(default_factory=dict)
-    expected_version: Optional[int] = Field(default=None, ge=1)
-    is_new_layout: bool = False
-
-
-class UiEditorImageRequest(BaseModel):
-    image_id: str = Field(..., min_length=1, max_length=120)
-    element_stable_id: str = Field(..., min_length=1, max_length=500)
-    original_name: str = Field(default="ui_editor_image.jpg", max_length=255)
-    mime_type: str = Field(default="image/jpeg", max_length=100)
-    resource_name: str = Field(..., min_length=1, max_length=120)
-    base64: str = Field(..., min_length=1)
-
-
-class UiEditorSubmitRequest(BaseModel):
-    expected_version: int = Field(..., ge=1)
-    preview_image_base64: Optional[str] = None
-    preview_mime_type: str = Field(default="image/jpeg", max_length=100)
-
-
-class TaskUpdateRequest(BaseModel):
-    app_name: str = Field(..., min_length=1, max_length=80)
-
-
-class AppLlmConfigRequest(BaseModel):
-    enabled: bool = True
-    provider: str = Field(default="openai", min_length=1)
-    model: str = Field(default="gpt-5.4-mini", min_length=1)
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
-    system_prompt: Optional[str] = None
-    daily_request_limit: int = Field(default=100, ge=1)
-    daily_token_limit: int = Field(default=50000, ge=1)
-    max_output_tokens: int = Field(default=0, ge=0)
-    temperature: float = Field(default=0.4, ge=0.0, le=2.0)
-
-
-class GlobalAppLlmDefaultsRequest(AppLlmConfigRequest):
-    apply_to_existing_tasks: bool = True
-
-
-class AppLlmRuntimeRequest(BaseModel):
-    package_name: str = Field(..., min_length=1)
-    user_message: str = Field(..., min_length=1)
-    context: Optional[str] = None
-    image_base64: Optional[str] = None
-    image_mime_type: Optional[str] = None
-
-
-class AppDataCreateRequest(BaseModel):
-    package_name: str = Field(..., min_length=1)
-    owner_id: Optional[str] = None
-    data: dict[str, Any] = Field(default_factory=dict)
-
-
-class AppDataUpdateRequest(BaseModel):
-    package_name: str = Field(..., min_length=1)
-    owner_id: Optional[str] = None
-    data: dict[str, Any] = Field(default_factory=dict)
-    replace: bool = False
-
-
-class RuntimeErrorReportRequest(BaseModel):
-    package_name: str = Field(..., min_length=1)
-    summary: str = Field(..., min_length=1)
-    stack_trace: str = Field(..., min_length=1)
-    error_message: Optional[str] = None
-    report_kind: Optional[str] = None
-
-
 APP_DATA_COLLECTION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
@@ -4588,6 +3618,7 @@ class Database:
                     is_new_layout INTEGER NOT NULL,
                     preview_workspace_path TEXT,
                     generated_revision_label TEXT,
+                    confirmed_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     submitted_at TEXT,
@@ -4595,6 +3626,7 @@ class Database:
                 )
                 """
             )
+            self.ensure_column(connection, "ui_editor_drafts", "confirmed_at", "TEXT")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_ui_editor_drafts_scope
@@ -5261,8 +4293,8 @@ class Database:
                             draft_id, task_id, base_revision_label, layout_name, configuration,
                             base_xml_sha256, original_xml, edited_xml, descriptions_json,
                             status, version, is_new_layout, preview_workspace_path,
-                            generated_revision_label, created_at, updated_at, submitted_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, NULL, NULL, ?, ?, NULL)
+                            generated_revision_label, confirmed_at, created_at, updated_at, submitted_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, NULL, NULL, NULL, ?, ?, NULL)
                         """,
                         (
                             allocated_id,
@@ -5320,13 +4352,19 @@ class Database:
             if expected_version is None or int(current["version"]) != expected_version:
                 connection.rollback()
                 raise UiEditorDraftConflictError(current)
+            material_changed = (
+                str(current.get("edited_xml") or "") != edited_xml
+                or current.get("descriptions") != descriptions
+            )
+            confirmed_at = None if material_changed else current.get("confirmed_at")
             cursor = connection.execute(
                 """
                 UPDATE ui_editor_drafts
-                SET edited_xml = ?, descriptions_json = ?, version = version + 1, updated_at = ?
+                SET edited_xml = ?, descriptions_json = ?, confirmed_at = ?,
+                    version = version + 1, updated_at = ?
                 WHERE draft_id = ? AND version = ? AND status = 'draft'
                 """,
-                (edited_xml, descriptions_json, now, draft_id, expected_version),
+                (edited_xml, descriptions_json, confirmed_at, now, draft_id, expected_version),
             )
             if cursor.rowcount != 1:
                 latest = connection.execute(
@@ -5342,6 +4380,44 @@ class Database:
         if updated is None:
             raise RuntimeError("updated UI editor draft was not found")
         return updated, False
+
+    def list_confirmed_ui_editor_drafts(
+        self,
+        *,
+        task_id: str,
+        base_revision_label: str,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM ui_editor_drafts
+                WHERE task_id = ? AND base_revision_label = ?
+                  AND status = 'draft' AND confirmed_at IS NOT NULL
+                ORDER BY updated_at ASC, rowid ASC
+                """,
+                (task_id, base_revision_label),
+            ).fetchall()
+        return [self.serialize_ui_editor_draft(row) for row in rows]
+
+    def confirm_ui_editor_draft(
+        self,
+        draft_id: str,
+        *,
+        expected_version: int,
+        preview_workspace_path: str,
+    ) -> bool:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ui_editor_drafts
+                SET confirmed_at = ?, preview_workspace_path = ?, updated_at = ?
+                WHERE draft_id = ? AND version = ? AND status = 'draft'
+                """,
+                (now, preview_workspace_path, now, draft_id, expected_version),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
 
     def list_ui_editor_images(self, draft_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -6374,6 +5450,7 @@ Context:
             task_id=str(task.get("task_id") or ""),
             workspace=str(workspace_path),
             project=str(project_path),
+            build_cache=str(settings.build_cache_root),
         )
     except KeyError:
         return None
@@ -8247,6 +7324,7 @@ class CodexTaskRunner:
                 task_id=task["task_id"],
                 workspace=str(workspace_path),
                 project=str(project_path),
+                build_cache=str(self.settings.build_cache_root),
             )
         except KeyError as exc:
             raise RuntimeError(f"CODEX_COMMAND placeholder error: {exc}") from exc
@@ -9891,6 +8969,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    install_uvicorn_access_log_query_filter()
     app = FastAPI(title="Native Android APK Builder Server", lifespan=lifespan)
     dashboard_module_name = (
         f"{__package__}.admin_dashboard"
@@ -10014,23 +9093,32 @@ def create_app() -> FastAPI:
             previous_conversation_state = build_task_conversation_state(previous_task_for_context)
             existing_workspace_ready = bool(previous_task_for_context.get("workspace_path") and previous_task_for_context.get("project_path"))
             is_initial_prompt_submission = request_action == "submit_initial_prompt"
+            selected_ui_editor_drafts: list[dict[str, Any]] = []
+            selected_ui_base_revision_label = ""
             if is_initial_prompt_submission and (
                 existing_workspace_ready
                 or not bool(previous_conversation_state.get("awaiting_prompt_review"))
                 or previous_conversation_state.get("confirmation_action") != "submit_initial_prompt"
             ):
                 raise HTTPException(status_code=409, detail="task is not waiting for initial prompt review")
-            db.update_task(
-                followup_task_id,
-                status="Pending Decision",
-                message="요청을 검토하고 있어요.",
-                device_id=request.device_id,
-                phone_number=request.phone_number,
-            )
-            pending_decision_task = db.get_task(followup_task_id)
-            if pending_decision_task:
-                task = pending_decision_task
-                log_task_status_event(db, pending_decision_task)
+            if request.use_ui_editor_draft:
+                current_project_value = normalize_whitespace(str(task.get("project_path") or ""))
+                if not current_project_value or not Path(current_project_value).is_dir():
+                    raise HTTPException(status_code=409, detail="UI editing is unavailable for this task")
+                selected_ui_base_revision_label = current_revision_label(Path(current_project_value))
+                _, selected_ui_snapshot = require_ui_revision(
+                    followup_task_id,
+                    selected_ui_base_revision_label,
+                    device_id=request.device_id,
+                    phone_number=request.phone_number,
+                )
+                selected_ui_editor_drafts = validated_ui_editor_drafts_for_chat(
+                    task=task,
+                    snapshot=selected_ui_snapshot,
+                    revision_label=selected_ui_base_revision_label,
+                )
+                if not selected_ui_editor_drafts:
+                    raise HTTPException(status_code=409, detail="saved UI was not found for the current revision")
             visible_user_prompt = (
                 request.prompt
                 if request.display_prompt is None
@@ -10057,6 +9145,11 @@ def create_app() -> FastAPI:
                     ),
                     "request_action": request_action,
                     "final_generation_prompt": request.prompt if is_initial_prompt_submission else "",
+                    "use_ui_editor_draft": bool(selected_ui_editor_drafts),
+                    "ui_editor_base_revision": selected_ui_base_revision_label,
+                    "ui_editor_draft_ids": [
+                        str(draft.get("draft_id") or "") for draft in selected_ui_editor_drafts
+                    ],
                     "attachment_count": len(requested_reference_attachments),
                     "attachments": [
                         reference_attachment_event_payload(attachment)
@@ -10079,6 +9172,17 @@ def create_app() -> FastAPI:
                     raise HTTPException(status_code=400, detail=f"attachment save failed: {exc}") from exc
                 if saved_requested_attachments:
                     requested_reference_attachments = saved_requested_attachments
+            db.update_task(
+                followup_task_id,
+                status="Pending Decision",
+                message="요청을 검토하고 있어요.",
+                device_id=request.device_id,
+                phone_number=request.phone_number,
+            )
+            pending_decision_task = db.get_task(followup_task_id)
+            if pending_decision_task:
+                task = pending_decision_task
+                log_task_status_event(db, pending_decision_task)
             previous_reference_attachments = normalize_reference_attachments(
                 previous_conversation_state.get("reference_attachments") or []
             )
@@ -10117,6 +9221,34 @@ def create_app() -> FastAPI:
                     "confirmation_action": "",
                     "confirmation_payload": "",
                 }
+            elif selected_ui_editor_drafts:
+                current_app_name = current_task_app_name(task, previous_conversation_state)
+                decision = build_intent_decision(
+                    mode="build",
+                    task_id=followup_task_id,
+                    existing_task=True,
+                    existing_workspace_ready=True,
+                    user_prompt=request.prompt,
+                    effective_user_prompt=request.prompt,
+                    reason="사용자가 저장한 UI 편집 내용과 최신 채팅 요청을 함께 반영합니다.",
+                    request_scope="existing_app_modification",
+                    suggested_app_name=current_app_name,
+                    primary_user_flow=normalize_whitespace(
+                        str(previous_conversation_state.get("latest_primary_user_flow") or request.prompt)
+                    ),
+                    secondary_requirements=normalize_secondary_requirements(
+                        previous_conversation_state.get("latest_secondary_requirements")
+                    ),
+                    secondary_scope_confirmed=True,
+                    acceptance_criteria=normalize_prompt_items(
+                        previous_conversation_state.get("latest_acceptance_criteria") or [
+                            "저장한 UI 배치와 요소 설명이 앱 화면에 반영되어야 합니다.",
+                            "최신 채팅 요청의 기능과 동작이 함께 반영되어야 합니다.",
+                            "기존 앱의 주요 기능과 데이터가 유지되어야 합니다.",
+                        ],
+                        max_items=8,
+                    ),
+                )
             elif codex_followup_enabled:
                 codex_followup_payload = run_codex_existing_task_followup_decision(
                     settings,
@@ -10385,6 +9517,23 @@ def create_app() -> FastAPI:
                     reference_image_workspace_path=reference_image_workspace_path or previous_conversation_state.get("reference_image_workspace_path"),
                     reference_attachments=saved_reference_attachments or effective_reference_attachments,
                 )
+                if selected_ui_editor_drafts:
+                    ui_context_prompt, ui_context_payload = build_ui_editor_chat_context(
+                        task_id=followup_task_id,
+                        base_revision_label=selected_ui_base_revision_label,
+                        generated_revision_label=revision_label,
+                        user_prompt=request.prompt,
+                        drafts=selected_ui_editor_drafts,
+                    )
+                    with (workspace_path_obj / "prompt.md").open("a", encoding="utf-8") as prompt_file:
+                        prompt_file.write("\n\n" + ui_context_prompt)
+                    db.log_event(
+                        followup_task_id,
+                        actor="system",
+                        event_type="ui_editor_chat_context_attached",
+                        message_text="저장한 UI 편집 내용을 현재 수정 요청에 연결했습니다.",
+                        payload=ui_context_payload,
+                    )
                 db.record_project_snapshot(
                     task_id=followup_task_id,
                     revision_label=revision_label,
@@ -10690,7 +9839,7 @@ def create_app() -> FastAPI:
         )
 
     @app.post("/tasks/{task_id}/cancel")
-    def cancel_task(
+    def cancel_task_endpoint(
         task_id: str,
         device_id: Optional[str] = Query(default=None),
         phone_number: Optional[str] = Query(default=None),
@@ -10803,6 +9952,10 @@ def create_app() -> FastAPI:
         task = db.get_task(task_id)
         if not task or not is_task_access_allowed(task, device_id=device_id, phone_number=phone_number):
             raise HTTPException(status_code=404, detail="task not found")
+        reported_package_name = request.package_name.strip()
+        expected_package_name = current_task_package_name(task)
+        if expected_package_name and reported_package_name != expected_package_name:
+            raise HTTPException(status_code=400, detail="package_name does not match task")
         summary = normalize_whitespace(request.summary)
         stack_trace = request.stack_trace.strip()
         db.log_event(
@@ -10811,7 +9964,7 @@ def create_app() -> FastAPI:
             event_type="runtime_error_detected",
             message_text=summary,
             payload={
-                "package_name": request.package_name.strip(),
+                "package_name": reported_package_name,
                 "summary": summary,
                 "stack_trace": stack_trace,
                 "error_message": normalize_whitespace(request.error_message) if request.error_message else None,
@@ -10827,7 +9980,7 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/apps/{task_id}/llm-config")
-    def get_app_llm_config(
+    def get_app_llm_config_endpoint(
         task_id: str,
         device_id: Optional[str] = Query(default=None),
         phone_number: Optional[str] = Query(default=None),
@@ -11312,6 +10465,135 @@ def create_app() -> FastAPI:
             "images": db.list_ui_editor_images(str(draft["draft_id"])),
         }
 
+    def validated_ui_editor_drafts_for_chat(
+        *,
+        task: dict[str, Any],
+        snapshot: dict[str, Any],
+        revision_label: str,
+    ) -> list[dict[str, Any]]:
+        settings: Settings = app.state.settings
+        db: Database = app.state.db
+        source = resolve_revision_source(
+            workspaces_root=settings.workspaces_root,
+            task=task,
+            snapshot=snapshot,
+            revision_label=revision_label,
+        )
+        if not source.available or source.project_root is None:
+            raise HTTPException(status_code=409, detail=source.reason)
+        workspace = Path(str(task.get("workspace_path") or "")).resolve()
+        if not workspace.is_dir() or not ensure_within_root(workspace, settings.workspaces_root.resolve()):
+            raise HTTPException(status_code=409, detail="task workspace is unavailable")
+
+        validated: list[dict[str, Any]] = []
+        for draft in db.list_confirmed_ui_editor_drafts(
+            task_id=str(task.get("task_id") or ""),
+            base_revision_label=revision_label,
+        ):
+            if bool(draft["is_new_layout"]):
+                layout_path = safe_layout_path(
+                    source.project_root,
+                    str(draft["layout_name"]),
+                    str(draft["configuration"]),
+                )
+                if layout_path.exists():
+                    raise HTTPException(status_code=409, detail="saved UI base layout has changed")
+                base_sha = sha256_bytes(str(draft["original_xml"]).encode("utf-8"))
+            else:
+                try:
+                    current_layout = load_layout_document(
+                        source.project_root,
+                        layout_name=str(draft["layout_name"]),
+                        configuration=str(draft["configuration"]),
+                    )
+                except FileNotFoundError as exc:
+                    raise HTTPException(status_code=409, detail="saved UI base layout is unavailable") from exc
+                base_sha = str(current_layout["sha256"])
+            if base_sha.lower() != str(draft["base_xml_sha256"]).lower():
+                raise HTTPException(status_code=409, detail="saved UI is based on an older revision")
+
+            images = db.list_ui_editor_images(str(draft["draft_id"]))
+            for image in images:
+                image_path = (workspace / str(image["workspace_path"])).resolve()
+                if (
+                    not ensure_within_root(image_path, workspace)
+                    or not image_path.is_file()
+                    or hashlib.sha256(image_path.read_bytes()).hexdigest() != str(image["sha256"])
+                ):
+                    raise HTTPException(status_code=409, detail="saved UI image is missing or changed")
+            validated.append({**draft, "images": images})
+        return validated
+
+    def save_ui_editor_preview(
+        *,
+        task: dict[str, Any],
+        draft_id: str,
+        preview_image_base64: Optional[str],
+    ) -> str:
+        settings: Settings = app.state.settings
+        preview_base64 = normalize_reference_image_base64(preview_image_base64)
+        if not preview_base64:
+            return ""
+        if len(preview_base64) > (REFERENCE_IMAGE_MAX_SOURCE_BYTES * 4 // 3) + 16:
+            raise UiEditorFileTooLargeError("preview image exceeds source size limit")
+        try:
+            preview_original = base64.b64decode(preview_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise UiEditorInputError("invalid preview image encoding") from exc
+        preview_optimized = optimize_reference_image_bytes(preview_original)
+        if preview_optimized.get("status") != "optimized":
+            raise UiEditorInputError(str(preview_optimized.get("error_message") or "invalid preview"))
+        workspace = Path(str(task.get("workspace_path") or "")).resolve()
+        if not workspace.is_dir() or not ensure_within_root(workspace, settings.workspaces_root.resolve()):
+            raise UiEditorDraftStateError("task workspace is unavailable")
+        preview_relative = Path(".ui_editor_drafts") / draft_id / "preview.jpg"
+        preview_target = (workspace / preview_relative).resolve()
+        if not ensure_within_root(preview_target, workspace):
+            raise UiEditorSecurityError("unsafe preview path")
+        preview_target.parent.mkdir(parents=True, exist_ok=True)
+        preview_target.write_bytes(cast(bytes, preview_optimized["data"]))
+        return preview_relative.as_posix()
+
+    @app.get("/tasks/{task_id}/ui/editor-context")
+    def get_task_ui_editor_context(
+        task_id: str,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        _ = user_id
+        db: Database = app.state.db
+        task = db.get_task(task_id)
+        if not task or not is_task_access_allowed(
+            task,
+            device_id=device_id,
+            phone_number=phone_number,
+        ):
+            raise HTTPException(status_code=404, detail="task not found")
+        project_value = normalize_whitespace(str(task.get("project_path") or ""))
+        if not project_value or not Path(project_value).is_dir():
+            return {
+                "task_id": task_id,
+                "revision_label": "",
+                "source_available": False,
+                "has_saved_ui": False,
+                "saved_draft_count": 0,
+                "saved_at": "",
+            }
+        revision_label = current_revision_label(Path(project_value))
+        drafts = db.list_confirmed_ui_editor_drafts(
+            task_id=task_id,
+            base_revision_label=revision_label,
+        )
+        return {
+            "task_id": task_id,
+            "revision_label": revision_label,
+            "source_available": True,
+            "has_saved_ui": bool(drafts),
+            "saved_draft_count": len(drafts),
+            "saved_at": max((str(draft.get("confirmed_at") or "") for draft in drafts), default=""),
+        }
+
     def validate_ui_editor_draft_request(
         *,
         task: dict[str, Any],
@@ -11378,7 +10660,7 @@ def create_app() -> FastAPI:
         return authoritative_original, authoritative_sha
 
     @app.get("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{layout_name}")
-    def get_ui_editor_draft(
+    def get_ui_editor_draft_endpoint(
         task_id: str,
         revision_label: str,
         layout_name: str,
@@ -11406,7 +10688,7 @@ def create_app() -> FastAPI:
         return ui_editor_draft_response(db, draft)
 
     @app.put("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{layout_name}")
-    def save_ui_editor_draft(
+    def save_ui_editor_draft_endpoint(
         task_id: str,
         revision_label: str,
         layout_name: str,
@@ -11473,6 +10755,121 @@ def create_app() -> FastAPI:
             },
         )
         return ui_editor_draft_response(db, draft)
+
+    @app.post("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/confirm")
+    def confirm_ui_editor_draft_endpoint(
+        task_id: str,
+        revision_label: str,
+        draft_id: str,
+        request: UiEditorSubmitRequest,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        _ = user_id
+        db: Database = app.state.db
+        task, snapshot = require_ui_revision(
+            task_id,
+            revision_label,
+            device_id=device_id,
+            phone_number=phone_number,
+        )
+        draft = db.get_ui_editor_draft(draft_id)
+        if (
+            draft is None
+            or str(draft["task_id"]) != task_id
+            or str(draft["base_revision_label"]) != revision_label
+        ):
+            raise HTTPException(status_code=404, detail="UI editor draft not found")
+        if draft["status"] != "draft" or int(draft["version"]) != request.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "draft version conflict", "current": ui_editor_draft_response(db, draft)},
+            )
+        validated = validated_ui_editor_drafts_for_chat(
+            task=task,
+            snapshot=snapshot,
+            revision_label=revision_label,
+        )
+        if not any(str(item["draft_id"]) == draft_id for item in validated):
+            # The draft has not been confirmed yet, so validate its base and images explicitly.
+            source = resolve_revision_source(
+                workspaces_root=app.state.settings.workspaces_root,
+                task=task,
+                snapshot=snapshot,
+                revision_label=revision_label,
+            )
+            if not source.available or source.project_root is None:
+                raise HTTPException(status_code=409, detail=source.reason)
+            if bool(draft["is_new_layout"]):
+                layout_path = safe_layout_path(
+                    source.project_root,
+                    str(draft["layout_name"]),
+                    str(draft["configuration"]),
+                )
+                if layout_path.exists():
+                    raise HTTPException(status_code=409, detail="layout already exists in base revision")
+                base_sha = sha256_bytes(str(draft["original_xml"]).encode("utf-8"))
+            else:
+                try:
+                    base_sha = str(
+                        load_layout_document(
+                            source.project_root,
+                            layout_name=str(draft["layout_name"]),
+                            configuration=str(draft["configuration"]),
+                        )["sha256"]
+                    )
+                except FileNotFoundError as exc:
+                    raise HTTPException(status_code=409, detail="base layout is unavailable") from exc
+            if base_sha.lower() != str(draft["base_xml_sha256"]).lower():
+                raise HTTPException(status_code=409, detail="base XML changed; reload the revision")
+            workspace = Path(str(task.get("workspace_path") or "")).resolve()
+            for image in db.list_ui_editor_images(draft_id):
+                image_path = (workspace / str(image["workspace_path"])).resolve()
+                if (
+                    not ensure_within_root(image_path, workspace)
+                    or not image_path.is_file()
+                    or hashlib.sha256(image_path.read_bytes()).hexdigest() != str(image["sha256"])
+                ):
+                    raise HTTPException(status_code=409, detail="UI editor image is missing or changed")
+        try:
+            preview_workspace_path = save_ui_editor_preview(
+                task=task,
+                draft_id=draft_id,
+                preview_image_base64=request.preview_image_base64,
+            )
+        except (UiEditorInputError, UiEditorSecurityError, UiEditorFileTooLargeError) as exc:
+            raise ui_editor_http_exception(exc) from exc
+        if not db.confirm_ui_editor_draft(
+            draft_id,
+            expected_version=request.expected_version,
+            preview_workspace_path=preview_workspace_path,
+        ):
+            latest = db.get_ui_editor_draft(draft_id)
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "draft version conflict", "current": latest},
+            )
+        confirmed = db.get_ui_editor_draft(draft_id) or draft
+        db.log_event(
+            task_id,
+            actor="user",
+            event_type="ui_editor_draft_confirmed",
+            message_text="UI 편집 내용을 저장했습니다.",
+            payload={
+                "draft": confirmed,
+                "edited_xml": confirmed["edited_xml"],
+                "descriptions": confirmed["descriptions"],
+                "images": db.list_ui_editor_images(draft_id),
+                "preview_workspace_path": preview_workspace_path,
+            },
+        )
+        return {
+            "task_id": task_id,
+            "status": "saved",
+            "message": "UI 편집 내용을 저장했어요.",
+            "draft": ui_editor_draft_response(db, confirmed),
+        }
 
     @app.post("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/images")
     def upload_ui_editor_image(
@@ -11731,22 +11128,11 @@ def create_app() -> FastAPI:
         workspace = Path(str(task.get("workspace_path") or "")).resolve()
         submission_committed = False
         try:
-            preview_workspace_path = ""
-            preview_base64 = normalize_reference_image_base64(request.preview_image_base64)
-            if preview_base64:
-                if len(preview_base64) > (REFERENCE_IMAGE_MAX_SOURCE_BYTES * 4 // 3) + 16:
-                    raise UiEditorFileTooLargeError("preview image exceeds source size limit")
-                preview_original = base64.b64decode(preview_base64, validate=True)
-                preview_optimized = optimize_reference_image_bytes(preview_original)
-                if preview_optimized.get("status") != "optimized":
-                    raise UiEditorInputError(str(preview_optimized.get("error_message") or "invalid preview"))
-                preview_relative = Path(".ui_editor_drafts") / draft_id / "preview.jpg"
-                preview_target = (workspace / preview_relative).resolve()
-                if not ensure_within_root(preview_target, workspace):
-                    raise UiEditorSecurityError("unsafe preview path")
-                preview_target.parent.mkdir(parents=True, exist_ok=True)
-                preview_target.write_bytes(cast(bytes, preview_optimized["data"]))
-                preview_workspace_path = preview_relative.as_posix()
+            preview_workspace_path = save_ui_editor_preview(
+                task=task,
+                draft_id=draft_id,
+                preview_image_base64=request.preview_image_base64,
+            )
 
             images = db.list_ui_editor_images(draft_id)
             for image in images:
@@ -12200,7 +11586,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/tasks")
-    def list_tasks(
+    def list_tasks_endpoint(
         user_id: Optional[str] = Query(default=None),
         device_id: Optional[str] = Query(default=None),
         phone_number: Optional[str] = Query(default=None),

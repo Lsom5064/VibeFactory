@@ -35,7 +35,8 @@ WORKSPACES_ROOT=flutter_apk_server/native_workspaces
 BUILD_CACHE_ROOT=flutter_apk_server/.native_tooling
 ```
 
-기존 `tasks.db`, `app_data.db`, `workspaces/`는 마이그레이션 이전 데이터이므로 새 서비스에서 쓰지 않으며 삭제하지 않는다.
+기존 `tasks.db`, `app_data.db`, `workspaces/`는 `../flutter/runtime/`에 보존된
+마이그레이션 이전 데이터이므로 새 서비스에서 쓰지 않으며 삭제하지 않는다.
 
 ## 필수 환경
 
@@ -63,6 +64,8 @@ CODEX_MODEL
 CODEX_REASONING_EFFORT
 CODEX_SERVICE_TIER
 CODEX_FAST_MODE
+CODEX_SANDBOX_MODE
+CODEX_DANGEROUS_BYPASS
 CODEX_TIMEOUT_SECONDS
 MAX_CONCURRENT_CODEX_RUNS
 
@@ -79,6 +82,10 @@ GENERATED_APP_KEY_PASSWORD
 ```
 
 서명키와 비밀번호는 Git에 추가하지 않는다. 실제 빌드에서 서명 설정이 없거나 keystore 파일을 찾을 수 없으면 서버는 Task를 명확한 build 실패로 종료한다.
+
+Codex는 기본적으로 `workspace-write` sandbox에서 Task workspace와 공유 Gradle
+cache만 수정한다. 외부 격리 환경이 별도로 검증된 경우가 아니면
+`CODEX_DANGEROUS_BYPASS=1`을 사용하지 않는다.
 
 ## Mock 실행
 
@@ -127,6 +134,8 @@ Native 템플릿은 다음 Kotlin client를 제공한다.
 package name은 `applicationContext.packageName`, Task ID는 `BuildConfig.VIBE_TASK_ID`, 빌드 대상 서버 주소는 `BuildConfig.VIBE_SERVER_BASE_URL`을 사용한다. 서버는 LLM 입력, system prompt, context, 이미지 메타데이터, raw response, parsed response, 오류 응답을 축약하지 않고 기록한다.
 
 Codex와 사용량 조회 subprocess에는 keystore 비밀번호, 런타임 API 키, 관리자 토큰을 전달하지 않는다. release Gradle subprocess에만 서명 환경변수 4개를 제한적으로 전달한다.
+Uvicorn access log는 endpoint와 상태 코드는 유지하되 전화번호·device ID가 들어 있는
+query string을 출력하지 않는다.
 
 ## API 계약
 
@@ -174,4 +183,6 @@ cd vibefactory
 - 새 Native 서비스는 기존 Flutter 서비스와 다른 배포 경로, DB, workspace, systemd unit, canary port를 사용한다.
 - 기존 DB/workspace를 새 DB로 복사하거나 덮어쓰지 않는다.
 - 공개 네트워크 배포 시 TLS, 인증, 다운로드 권한 검증이 필요하다.
+- 호스트와 생성 앱은 Android cloud backup 및 device transfer에서 로컬 파일, DB,
+  SharedPreferences를 제외한다. 서버 DB와 workspace 백업은 별도 운영 절차로 관리한다.
 - keystore를 잃으면 동일 package 앱을 업데이트할 수 없으므로 암호화 백업을 유지한다.

@@ -1,6 +1,7 @@
 package kr.ac.kangwon.hai.vibefactory
 
 import kr.ac.kangwon.hai.vibefactory.ui_editor.AndroidXmlDocument
+import kr.ac.kangwon.hai.vibefactory.ui_editor.ANDROID_NAMESPACE_URI
 import kr.ac.kangwon.hai.vibefactory.ui_editor.ResolvedUiResources
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -79,9 +80,30 @@ class UiEditorXmlDocumentTest {
                     content = """<resources>
                         <string name="title">화면 제목</string>
                         <color name="accent">#126E52</color>
+                        <color name="accent_alias">@color/accent</color>
                         <dimen name="space">16dp</dimen>
+                        <dimen name="space_alias">@dimen/space</dimen>
                         <style name="Card"><item name="android:padding">12dp</item></style>
+                        <style name="Card.Emphasis">
+                            <item name="android:textColor">@color/accent_alias</item>
+                        </style>
+                        <style name="Explicit" parent="@style/Card">
+                            <item name="android:textSize">18sp</item>
+                        </style>
                     </resources>"""
+                ),
+                UiResourceFileDto(
+                    resource_path = "res/layout/preview_row.xml",
+                    kind = "xml",
+                    content = """<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+                        android:layout_width="match_parent" android:layout_height="48dp" />"""
+                ),
+                UiResourceFileDto(
+                    resource_path = "res/drawable/card_background.xml",
+                    kind = "xml",
+                    content = """<shape xmlns:android="http://schemas.android.com/apk/res/android">
+                        <solid android:color="@color/accent" />
+                    </shape>"""
                 )
             )
         )
@@ -89,8 +111,38 @@ class UiEditorXmlDocumentTest {
         assertEquals("화면 제목", resources.text("@string/title"))
         assertEquals("@string/missing", resources.text("@string/missing"))
         assertEquals("#126E52", resources.color("@color/accent"))
+        assertEquals("#126E52", resources.color("@color/accent_alias"))
         assertEquals("16dp", resources.dimen("@dimen/space"))
+        assertEquals("16dp", resources.dimen("@dimen/space_alias"))
         assertEquals("12dp", resources.styles.getValue("Card").getValue("android:padding"))
+        assertEquals(
+            "12dp",
+            resources.styleValue("@style/Card.Emphasis", ANDROID_NAMESPACE_URI, "padding")
+        )
+        assertEquals(
+            "@color/accent_alias",
+            resources.styleValue("@style/Card.Emphasis", ANDROID_NAMESPACE_URI, "textColor")
+        )
+        assertEquals("18sp", resources.styleValue("@style/Explicit", ANDROID_NAMESPACE_URI, "textSize"))
+        assertTrue(resources.layout("@layout/preview_row")!!.contains("TextView"))
+        assertTrue(resources.drawableXml("@drawable/card_background")!!.contains("shape"))
+    }
+
+    @Test
+    fun exposesToolsAndUnqualifiedAttributesWithoutChangingRuntimeAttributes() {
+        val document = AndroidXmlDocument.parse(
+            """<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+                xmlns:tools="http://schemas.android.com/tools"
+                style="@style/Preview"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Runtime"
+                tools:text="Preview" />"""
+        )
+
+        assertEquals("Runtime", document.root.androidAttribute("text"))
+        assertEquals("Preview", document.root.toolsAttribute("text"))
+        assertEquals("@style/Preview", document.root.unqualifiedAttribute("style"))
     }
 
     @Test

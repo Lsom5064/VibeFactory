@@ -1,7 +1,7 @@
 # VibeFactory Native Android Migration Plan
 
 - 작성일: 2026-08-14
-- 문서 상태: 구현 진행 중
+- 문서 상태: 로컬 Native 전환 및 XML 편집기 통합 완료, 별도 배포 검증 대기
 - 기준 저장소: `/Users/hai/Desktop/buildingAppswithCodex`
 - 원본 기준: GitHub가 아니라 현재 로컬 작업 트리
 
@@ -29,6 +29,7 @@
 - 기존 Flutter 프로젝트의 동시 빌드나 수정 호환 계층은 구현하지 않는다.
 - 기존 FastAPI endpoint와 호스트 앱 응답 계약은 유지한다.
 - 기존 Flutter 런타임 데이터는 삭제하지 않고 별도로 보존한다.
+- 기존 Flutter 전용 소스와 운영 자료는 `flutter/` 아래의 읽기 전용 archive로 분리한다.
 - 새 네이티브 서비스는 별도 DB와 workspace 경로를 사용한다.
 - 일반 Android 기기 설치를 위해 APK는 고정된 전용 키로 서명한다.
 - 초기 release 빌드는 R8와 리소스 축소를 끄고 안정성과 빌드 속도를 우선한다.
@@ -295,7 +296,7 @@ project/app/build/outputs/apk/release/app-release.apk
 
 ## 11. 데이터 전환 정책
 
-- 기존 `flutter_apk_server/tasks.db`, `app_data.db`, `workspaces/`를 삭제하지 않는다.
+- 기존 Flutter `tasks.db`, `app_data.db`, `workspaces/`는 `flutter/runtime/`에 보존하며 삭제하지 않는다.
 - 기존 데이터는 migration 시작 시점에 NAS 또는 별도 디렉터리로 백업한다.
 - 새 서비스는 새로운 `DB_PATH`, `APP_DATA_DB_PATH`, `WORKSPACES_ROOT`를 사용한다.
 - 예시 이름은 `native_tasks.db`, `native_app_data.db`, `native_workspaces/`다.
@@ -549,7 +550,7 @@ workspace 백업 위치: /volume1/vibefactory-archive/pre-native-android-2026081
 - [x] 런타임 LLM, 첨부 이미지, 전체 로깅이 동작한다.
 - [x] app data CRUD가 동작한다.
 - [x] 런타임 오류 보고가 동작한다.
-- [ ] 자동 테스트와 ADB 실기기 테스트가 통과한다.
+- [x] 자동 테스트와 ADB 실기기 테스트가 통과한다.
 - [x] APK 크기와 build delay 측정 결과가 기록됐다.
 - [x] 기존 DB와 workspace가 삭제되지 않았다.
 - [ ] 새 서비스 배포와 smoke test가 통과했다.
@@ -743,4 +744,19 @@ APK 크기:
 해결 내용:
 커밋 SHA:
 다음 단계:
+```
+
+```text
+일시: 2026-08-24 17:30-18:17 KST
+Phase: Native 전용 코드·문서·보안 경계 최종 감사
+변경 파일: 서버 설정/계약 테스트/통합 문서, 호스트 manifest·오류 수신·로그 정책·UI editor, Native BaseProject backup rules, Native AWS 환경 예시, Flutter archive 분리 자료
+실행 명령: 서버 unittest/compileall, 호스트 및 BaseProject unit/compile/lint/assemble, bash syntax, SQLite integrity/FK, 임시 8011 latest-source health/access log, ADB install/launch/UI hierarchy/rotation/logcat/spoof broadcast
+테스트 결과: 서버 85개 통과. 호스트 unit/Kotlin compile/lint/debug APK 및 BaseProject unit/Kotlin compile/lint/debug APK 통과. Native DB 2개 integrity=ok, foreign_key_check 빈 결과. Uvicorn access log query 제거 확인
+ADB 기기: R5CT60A8H4R (SM-S908N, API 36). cold start 479ms. 혜택캘린더 rev_0009 XML 33개 요소 로드, 이동 모드·속성 패널·회전 복구·2단계 뒤로가기, 로그 전체 터치 영역, v1-v9 사용자용 리비전 메뉴 확인. AndroidRuntime crash 없음
+빌드 시간: 호스트 최종 warm assemble 3초, 전체 unit/compile/lint/assemble 35초. BaseProject lint 23초
+APK 크기: 이번 감사에서는 debug APK 기능 검증만 수행
+발견된 문제: 오래된 절대경로/격리 Goal 문서, Android 자동 backup/기기 전송, 기본 Codex sandbox bypass, 런타임 오류 package 미검증, query 및 logcat의 식별정보 노출, API 36에서 위조 crash broadcast 수신 가능성
+해결 내용: 문서를 현재 상대경로/역사 기록으로 정리. backup 및 device transfer 전부 제외. Codex 기본을 workspace-write로 제한. Task-package 및 Android 14+ 발신 패키지 검증 추가. access log query와 phone/device/error body 로그 제거. ADB shell 위조 broadcast가 거부됨을 확인
+커밋 SHA: 이 작업 기록을 포함한 Native 보안·정리 커밋
+다음 단계: 사용자가 실행 중인 8000 서버는 중단하지 않았으므로 이후 명시적 재시작 때 최신 서버 보안 변경을 반영. Native AWS canary의 TLS·인증·배포 smoke test는 별도 진행
 ```

@@ -43,6 +43,12 @@ LAYOUT_XML = """<?xml version="1.0" encoding="utf-8"?>
         android:layout_width="120dp"
         android:layout_height="80dp"
         app:srcCompat="@drawable/editor_frame" />
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/list"
+        android:layout_width="match_parent"
+        android:layout_height="120dp"
+        tools:itemCount="2"
+        tools:listitem="@layout/editor_item" />
     <com.example.UnsupportedWidget
         android:id="@+id/unsupported"
         android:layout_width="32dp"
@@ -64,6 +70,13 @@ class UiEditorApiTests(unittest.TestCase):
         (resource_root / "values").mkdir(parents=True)
         (resource_root / "drawable").mkdir(parents=True)
         (resource_root / "layout" / "activity_main.xml").write_text(LAYOUT_XML, encoding="utf-8")
+        (resource_root / "layout" / "editor_item.xml").write_text(
+            '<TextView xmlns:android="http://schemas.android.com/apk/res/android" '
+            'xmlns:tools="http://schemas.android.com/tools" '
+            'android:layout_width="match_parent" android:layout_height="48dp" '
+            'tools:text="Preview row" />',
+            encoding="utf-8",
+        )
         (resource_root / "values" / "strings.xml").write_text(
             '<resources><string name="editor_title">Editor title</string></resources>',
             encoding="utf-8",
@@ -163,6 +176,7 @@ class UiEditorApiTests(unittest.TestCase):
         self.assertIn("res/values/strings.xml", resource_paths)
         self.assertIn("res/values/colors.xml", resource_paths)
         self.assertIn("res/drawable/editor_frame.xml", resource_paths)
+        self.assertIn("res/layout/editor_item.xml", resource_paths)
         self.assertEqual([], detail["unresolved_resources"])
 
     def test_binary_resource_download_uses_allowlisted_relative_path(self) -> None:
@@ -269,6 +283,13 @@ class UiEditorApiTests(unittest.TestCase):
             json=payload,
         )
 
+    def confirm_draft(self, draft: dict[str, object]):
+        return self.client.post(
+            self.endpoint(f"drafts/{draft['draft_id']}/confirm"),
+            params={"device_id": self.device_id, "phone_number": self.phone_number},
+            json={"expected_version": draft["version"]},
+        )
+
     def test_draft_auto_save_uses_optimistic_lock_and_preserves_base_revision(self) -> None:
         edited_v1 = LAYOUT_XML.replace("@string/editor_title", "첫 번째 편집")
         created = self.save_draft(edited_xml=edited_v1)
@@ -348,6 +369,87 @@ class UiEditorApiTests(unittest.TestCase):
 
         attachments = self.db.list_task_attachments(self.task_id)
         self.assertTrue(any(item["source"] == "ui_editor" for item in attachments))
+
+    def test_confirmed_draft_is_available_to_chat_until_materially_changed(self) -> None:
+        edited = LAYOUT_XML.replace("@string/editor_title", "저장한 UI 제목")
+        draft = self.save_draft(edited_xml=edited).json()
+        before = self.client.get(
+            f"/tasks/{self.task_id}/ui/editor-context",
+            params={"device_id": self.device_id, "phone_number": self.phone_number},
+        )
+        self.assertEqual(200, before.status_code, before.text)
+        self.assertFalse(before.json()["has_saved_ui"])
+
+        confirmed = self.confirm_draft(draft)
+        self.assertEqual(200, confirmed.status_code, confirmed.text)
+        self.assertEqual("saved", confirmed.json()["status"])
+        self.assertTrue(confirmed.json()["draft"]["confirmed_at"])
+
+        available = self.client.get(
+            f"/tasks/{self.task_id}/ui/editor-context",
+            params={"device_id": self.device_id, "phone_number": self.phone_number},
+        )
+        self.assertEqual(200, available.status_code, available.text)
+        self.assertTrue(available.json()["has_saved_ui"])
+        self.assertEqual(1, available.json()["saved_draft_count"])
+
+        unchanged = self.save_draft(
+            edited_xml=edited,
+            draft_id=draft["draft_id"],
+            version=draft["version"],
+        )
+        self.assertEqual(200, unchanged.status_code, unchanged.text)
+        self.assertTrue(unchanged.json()["confirmed_at"])
+
+        changed = self.save_draft(
+            edited_xml=edited.replace("저장한 UI 제목", "다시 편집한 제목"),
+            draft_id=draft["draft_id"],
+            version=unchanged.json()["version"],
+        )
+        self.assertEqual(200, changed.status_code, changed.text)
+        self.assertIsNone(changed.json()["confirmed_at"])
+
+    def test_checked_chat_request_attaches_confirmed_ui_to_normal_revision(self) -> None:
+        edited = LAYOUT_XML.replace("@string/editor_title", "채팅에서 반영할 제목")
+        draft = self.save_draft(edited_xml=edited).json()
+        confirmed = self.confirm_draft(draft)
+        self.assertEqual(200, confirmed.status_code, confirmed.text)
+        (self.workspace / "prompt.md").write_text("# Original request\n", encoding="utf-8")
+        fake_runner = Mock()
+        self.app.state.runner = fake_runner
+
+        def fake_create_revision(workspace: Path, source: Path, _base: Path):
+            destination = workspace / "revisions" / "rev_0002" / "project"
+            shutil.copytree(source, destination)
+            return destination, "rev_0002"
+
+        with (
+            patch.object(server_module, "create_followup_project_revision", side_effect=fake_create_revision),
+            patch.object(server_module, "apply_project_defaults", return_value=False),
+        ):
+            generated = self.client.post(
+                "/generate",
+                json={
+                    "task_id": self.task_id,
+                    "device_id": self.device_id,
+                    "phone_number": self.phone_number,
+                    "prompt": "저장한 배치를 유지하고 제목 동작도 수정해줘",
+                    "use_ui_editor_draft": True,
+                },
+            )
+        self.assertEqual(200, generated.status_code, generated.text)
+        fake_runner.enqueue.assert_called_once_with(self.task_id)
+        prompt = (self.workspace / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn("채팅 요청에 선택된 저장 UI", prompt)
+        self.assertIn("채팅에서 반영할 제목", prompt)
+        self.assertIn("저장한 배치를 유지하고 제목 동작도 수정해줘", prompt)
+        attached_event = next(
+            event
+            for event in self.db.list_events(self.task_id)
+            if event["event_type"] == "ui_editor_chat_context_attached"
+        )
+        self.assertIn("채팅에서 반영할 제목", attached_event["payload_json"])
+        self.assertEqual("rev_0002", Path(self.db.get_task(self.task_id)["project_path"]).parent.name)
 
     def test_submit_creates_new_revision_prompt_without_mutating_base(self) -> None:
         edited = LAYOUT_XML.replace("@string/editor_title", "사용자가 확정한 제목")

@@ -61,10 +61,13 @@ class UiEditorViewModel : ViewModel() {
     ): UiEditorSession {
         val initialSnapshot = UiEditorSnapshot(baseDocument.xml(), emptyMap(), emptyList())
         val history = UiEditorHistory(initialSnapshot)
-        val draftApplies = draft?.baseXmlSha256.equals(baseDocument.originalSha256, ignoreCase = true)
-        val document = if (draftApplies) AndroidXmlDocument.parse(draft!!.editedXml) else baseDocument
-        val descriptions = if (draftApplies) draft!!.descriptions.toMutableMap() else mutableMapOf()
-        val images = if (draftApplies) draft!!.images.toMutableList() else mutableListOf()
+        val applicableDraft = draft?.takeIf {
+            it.baseXmlSha256.equals(baseDocument.originalSha256, ignoreCase = true)
+        }
+        val draftApplies = applicableDraft != null
+        val document = applicableDraft?.let { AndroidXmlDocument.parse(it.editedXml) } ?: baseDocument
+        val descriptions = applicableDraft?.descriptions?.toMutableMap() ?: mutableMapOf()
+        val images = applicableDraft?.images?.toMutableList() ?: mutableListOf()
         val created = UiEditorSession(
             taskId = taskId,
             revisionLabel = revisionLabel,
@@ -77,10 +80,10 @@ class UiEditorViewModel : ViewModel() {
             isNewLayout = isNewLayout,
             descriptions = descriptions,
             images = images,
-            selectedElementId = draft?.selectedElementId?.takeIf { draftApplies },
+            selectedElementId = applicableDraft?.selectedElementId,
             history = history,
-            serverDraftId = draft?.serverDraftId?.takeIf { draftApplies },
-            serverDraftVersion = draft?.serverDraftVersion?.takeIf { draftApplies }
+            serverDraftId = applicableDraft?.serverDraftId,
+            serverDraftVersion = applicableDraft?.serverDraftVersion
         )
         if (draftApplies && created.snapshot() != initialSnapshot) history.record(created.snapshot())
         session = created

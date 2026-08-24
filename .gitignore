@@ -24,6 +24,7 @@ aws/*.key
 aws/*.env
 !aws/*.env.example
 aws/downloads/
+flutter/aws/downloads/
 
 # Server runtime data. Keep these on the server/data volume, not in Git.
 flutter_apk_server/tasks.db*
@@ -40,6 +41,14 @@ flutter_apk_server/.tooling/
 flutter_apk_server/.native_tooling/
 flutter_apk_server/.venv/
 flutter_apk_server/venv/
+
+# Archived Flutter runtime data. Keep the archive layout, but never commit its data.
+flutter/runtime/*.db*
+flutter/runtime/*.sqlite*
+flutter/runtime/workspaces/
+flutter/runtime/profiles/
+flutter/runtime/workspace_archive_index/
+flutter/runtime/.tooling/
 
 # Generated task workspaces/results
 **/workspaces/

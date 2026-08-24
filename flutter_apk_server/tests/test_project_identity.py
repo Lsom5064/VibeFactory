@@ -1,7 +1,9 @@
+import logging
 import shutil
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from flutter_apk_server.project_builder import native_android_project_builder
@@ -12,6 +14,8 @@ from flutter_apk_server.server import (
     build_subprocess_environment,
     build_codex_followup_build_summary,
     build_intent_decision,
+    create_followup_project_revision,
+    create_initial_project_revision,
     ensure_project_revision_version,
     project_android_identity_issues,
     render_task_agents_md,
@@ -21,6 +25,7 @@ from flutter_apk_server.server import (
     utc_now_iso,
     with_codex_reasoning_effort,
 )
+from flutter_apk_server.server_settings import UvicornAccessLogQueryFilter, default_codex_command
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +33,35 @@ BASE_PROJECT = REPOSITORY_ROOT / "BaseProject"
 
 
 class ProjectIdentityTests(unittest.TestCase):
+    def test_uvicorn_access_log_filter_removes_query_string(self) -> None:
+        record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=(
+                "127.0.0.1:1234",
+                "GET",
+                "/status/task-1?phone_number=01000000000&device_id=secret",
+                "1.1",
+                200,
+            ),
+            exc_info=None,
+        )
+
+        self.assertTrue(UvicornAccessLogQueryFilter().filter(record))
+        self.assertEqual("/status/task-1", record.args[2])
+
+    def test_default_codex_command_uses_workspace_sandbox(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            command = default_codex_command(REPOSITORY_ROOT)
+
+        self.assertIn("--sandbox workspace-write", command)
+        self.assertIn("--add-dir", command)
+        self.assertIn("{build_cache}", command)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+
     def test_codex_subprocess_environment_removes_server_secrets(self) -> None:
         source = {
             "PATH": "/usr/bin",
@@ -363,6 +397,51 @@ class ProjectIdentityTests(unittest.TestCase):
                 properties,
             )
             self.assertFalse(ensure_project_revision_version(project_root, "rev_0001"))
+
+    def test_followup_revisions_preserve_one_install_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "task-workspace"
+            task_id = "task-revision-identity"
+            app_name = "리비전 검증 앱"
+            package_name = "kr.ac.kangwon.hai.generated.revisionidentity"
+            project_root, revision_label = create_initial_project_revision(
+                workspace,
+                BASE_PROJECT,
+            )
+
+            for expected_revision in range(1, 7):
+                self.assertEqual(f"rev_{expected_revision:04d}", revision_label)
+                apply_project_defaults(
+                    project_root,
+                    task_id,
+                    app_name,
+                    package_name,
+                )
+                self.assertEqual(
+                    [],
+                    project_android_identity_issues(project_root, package_name, task_id),
+                )
+                properties = (project_root / "gradle.properties").read_text(encoding="utf-8")
+                self.assertEqual(
+                    1,
+                    properties.count(f"GENERATED_APP_APPLICATION_ID={package_name}"),
+                )
+                self.assertEqual(
+                    1,
+                    properties.count(f"GENERATED_APP_TASK_ID={task_id}"),
+                )
+                self.assertEqual(
+                    1,
+                    properties.count(
+                        f"GENERATED_APP_VERSION_CODE={GENERATED_APK_SIDELOAD_VERSION_CODE}"
+                    ),
+                )
+                if expected_revision < 6:
+                    project_root, revision_label = create_followup_project_revision(
+                        workspace,
+                        project_root,
+                        BASE_PROJECT,
+                    )
 
     def test_native_validation_rejects_flutter_and_compose(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

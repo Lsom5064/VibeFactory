@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCHIVE_SCRIPT="$ROOT_DIR/aws/archive-local-workspaces-to-nas.sh"
-DB_PATH="${DB_PATH:-$ROOT_DIR/flutter_apk_server/tasks.db}"
-WORKSPACES_ROOT="${WORKSPACES_ROOT:-$ROOT_DIR/flutter_apk_server/workspaces}"
+DB_PATH="${DB_PATH:-$ROOT_DIR/runtime/tasks.db}"
+WORKSPACES_ROOT="${WORKSPACES_ROOT:-$ROOT_DIR/runtime/workspaces}"
 STATE_ROOT="$ROOT_DIR/aws/downloads/workspace_archive_index"
 START_AT="${ARCHIVE_START_AT:-2026-08-12 22:05:00}"
 LOG_FILE="$STATE_ROOT/scheduled-20260812-2205.log"

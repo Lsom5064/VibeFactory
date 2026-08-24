@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DB_PATH="${DB_PATH:-$ROOT_DIR/flutter_apk_server/tasks.db}"
-WORKSPACES_ROOT="${WORKSPACES_ROOT:-$ROOT_DIR/flutter_apk_server/workspaces}"
+DB_PATH="${DB_PATH:-$ROOT_DIR/runtime/tasks.db}"
+WORKSPACES_ROOT="${WORKSPACES_ROOT:-$ROOT_DIR/runtime/workspaces}"
 INDEX_ROOT="${INDEX_ROOT:-$ROOT_DIR/aws/downloads/workspace_archive_index}"
 
 NAS_HOST="${NAS_HOST:-192.168.0.15}"

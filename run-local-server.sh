@@ -58,6 +58,98 @@ print(auth_mode if isinstance(auth_mode, str) and auth_mode.strip() else "unknow
 PY
 }
 
+list_codex_models() {
+  local cache_file="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
+  if [[ -f "$cache_file" ]]; then
+    "$PYTHON_BIN" - "$cache_file" <<'PY' 2>/dev/null && return
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+seen = set()
+for item in payload.get("models", []):
+    if not isinstance(item, dict) or item.get("visibility") != "list":
+        continue
+    slug = str(item.get("slug") or "").strip()
+    if not slug or slug in seen:
+        continue
+    seen.add(slug)
+    label = str(item.get("display_name") or item.get("name") or slug).strip()
+    print(f"{slug}\t{label}")
+PY
+  fi
+
+  cat <<'EOF'
+gpt-5.6-sol	GPT-5.6-Sol
+gpt-5.6-terra	GPT-5.6-Terra
+gpt-5.6-luna	GPT-5.6-Luna
+gpt-5.5	GPT-5.5
+gpt-5.4	GPT-5.4
+gpt-5.4-mini	GPT-5.4-Mini
+gpt-5.3-codex-spark	GPT-5.3-Codex-Spark
+EOF
+}
+
+prompt_codex_model() {
+  local current="$1"
+  local selected custom_model slug label index custom_index
+  local -a model_slugs=()
+  local -a model_labels=()
+
+  while IFS=$'\t' read -r slug label; do
+    [[ -n "$slug" ]] || continue
+    model_slugs+=("$slug")
+    model_labels+=("${label:-$slug}")
+  done < <(list_codex_models)
+
+  if [[ ${#model_slugs[@]} -eq 0 ]]; then
+    model_slugs+=("$current")
+    model_labels+=("$current")
+  fi
+
+  custom_index=$((${#model_slugs[@]} + 1))
+  while true; do
+    printf 'Codex model (current: %s):\n' "$current" >&2
+    for ((index = 0; index < ${#model_slugs[@]}; index++)); do
+      if [[ "${model_slugs[$index]}" == "$current" ]]; then
+        printf '  %d) %s [%s] (default)\n' "$((index + 1))" "${model_labels[$index]}" "${model_slugs[$index]}" >&2
+      else
+        printf '  %d) %s [%s]\n' "$((index + 1))" "${model_labels[$index]}" "${model_slugs[$index]}" >&2
+      fi
+    done
+    printf '  %d) Enter another model ID\n' "$custom_index" >&2
+    printf 'Choose a number or press Enter for %s: ' "$current" >&2
+    IFS= read -r selected
+
+    if [[ -z "$selected" ]]; then
+      printf '%s\n' "$current"
+      return
+    fi
+    if [[ "$selected" =~ ^[0-9]+$ ]]; then
+      if ((selected >= 1 && selected <= ${#model_slugs[@]})); then
+        printf '%s\n' "${model_slugs[$((selected - 1))]}"
+        return
+      fi
+      if ((selected == custom_index)); then
+        printf 'Model ID: ' >&2
+        IFS= read -r custom_model
+        if [[ "$custom_model" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+          printf '%s\n' "$custom_model"
+          return
+        fi
+        echo 'Model ID may contain only letters, numbers, dot, underscore, colon, and hyphen.' >&2
+        continue
+      fi
+    elif [[ "$selected" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+      printf '%s\n' "$selected"
+      return
+    fi
+    printf 'Choose 1-%d, press Enter, or enter a valid model ID.\n' "$custom_index" >&2
+  done
+}
+
 prompt_reasoning_effort() {
   local current="$1"
   local selected
@@ -125,7 +217,8 @@ export BUILD_CACHE_ROOT="${BUILD_CACHE_ROOT:-$SERVER_DIR/.native_tooling}"
 export SERVER_BASE_URL="${SERVER_BASE_URL:-http://$LOCAL_IP:$PORT}"
 export MOCK_CODEX="${MOCK_CODEX:-0}"
 export INTENT_AGENT_ENABLED="${INTENT_AGENT_ENABLED:-1}"
-export CODEX_DANGEROUS_BYPASS="${CODEX_DANGEROUS_BYPASS:-1}"
+export CODEX_DANGEROUS_BYPASS="${CODEX_DANGEROUS_BYPASS:-0}"
+export CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-workspace-write}"
 export CODEX_MODEL="${CODEX_MODEL:-gpt-5.4}"
 export CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-default}"
 export CODEX_SERVICE_TIER="${CODEX_SERVICE_TIER:-default}"
@@ -139,6 +232,8 @@ export APP_RUNTIME_OPENAI_API_KEY="${APP_RUNTIME_OPENAI_API_KEY:-${OPENAI_API_KE
 
 if [[ -t 0 && "${LOCAL_SERVER_PROMPTS:-1}" != "0" ]]; then
   echo "Codex account: $(detect_codex_user)"
+  CODEX_MODEL="$(prompt_codex_model "$CODEX_MODEL")"
+  export CODEX_MODEL
   CODEX_REASONING_EFFORT="$(prompt_reasoning_effort "$CODEX_REASONING_EFFORT")"
   export CODEX_REASONING_EFFORT
   CODEX_FAST_MODE="$(prompt_fast_mode "$CODEX_FAST_MODE")"
@@ -178,6 +273,8 @@ echo "  CODEX_MODEL=$CODEX_MODEL"
 echo "  CODEX_REASONING_EFFORT=$CODEX_REASONING_EFFORT"
 echo "  CODEX_FAST_MODE=$CODEX_FAST_MODE"
 echo "  CODEX_SERVICE_TIER=$CODEX_SERVICE_TIER"
+echo "  CODEX_SANDBOX_MODE=$CODEX_SANDBOX_MODE"
+echo "  CODEX_DANGEROUS_BYPASS=$CODEX_DANGEROUS_BYPASS"
 
 cd "$SERVER_DIR"
 exec "$VENV_DIR/bin/uvicorn" server:app --host "$HOST" --port "$PORT"

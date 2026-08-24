@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Bitmap
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.Gravity
@@ -11,6 +13,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.CompoundButton
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -87,7 +90,7 @@ class UiPreviewRenderer(private val context: Context) {
                     childView is TextView &&
                     childView.hint.isNullOrBlank()
                 ) {
-                    childView.hint = resources.text(node.androidAttribute("hint"))
+                    childView.hint = resources.text(previewAndroidValue(node, "hint"))
                 }
                 view.addView(childView)
             }
@@ -102,7 +105,7 @@ class UiPreviewRenderer(private val context: Context) {
         "ConstraintLayout" -> ConstraintLayout(context)
         "CoordinatorLayout" -> FrameLayout(context)
         "LinearLayout" -> LinearLayout(context).apply {
-            orientation = if (node.androidAttribute("orientation") == "horizontal") {
+            orientation = if (previewAndroidValue(node, "orientation") == "horizontal") {
                 LinearLayout.HORIZONTAL
             } else {
                 LinearLayout.VERTICAL
@@ -123,16 +126,16 @@ class UiPreviewRenderer(private val context: Context) {
         }
         "TextInputEditText" -> EditText(context)
         "ImageView" -> ImageView(context).apply {
-            applyImageSource(this, node)
+            val sourceApplied = applyImageSource(this, node)
             scaleType = ImageView.ScaleType.CENTER_INSIDE
-            if (!isPlatformDrawable(node.androidAttribute("src"))) {
+            if (!sourceApplied) {
                 setBackgroundColor(Color.rgb(238, 241, 240))
             }
         }
         "ImageButton" -> ImageButton(context).apply {
-            applyImageSource(this, node)
+            val sourceApplied = applyImageSource(this, node)
             scaleType = ImageView.ScaleType.CENTER_INSIDE
-            if (!isPlatformDrawable(node.androidAttribute("src"))) {
+            if (!sourceApplied) {
                 setBackgroundColor(Color.rgb(238, 241, 240))
             }
         }
@@ -148,19 +151,28 @@ class UiPreviewRenderer(private val context: Context) {
         }
         "RecyclerView" -> RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
-            adapter = DummyAdapter()
+            adapter = DummyAdapter(node)
         }
         else -> lockedPlaceholder(node)
     }
 
-    private fun applyImageSource(view: ImageView, node: UiNode) {
+    private fun applyImageSource(view: ImageView, node: UiNode): Boolean {
         val bitmap = imageBitmaps[node.stableId]
         if (bitmap != null) {
             view.setImageBitmap(bitmap)
-            return
+            return true
         }
-        val platformDrawable = platformDrawableId(node.androidAttribute("src"))
-        view.setImageResource(platformDrawable ?: android.R.drawable.ic_menu_gallery)
+        val reference = imageSource(node)
+        platformDrawableId(reference)?.let {
+            view.setImageResource(it)
+            return true
+        }
+        drawable(reference)?.let {
+            view.setImageDrawable(it)
+            return true
+        }
+        view.setImageResource(android.R.drawable.ic_menu_gallery)
+        return false
     }
 
     private fun platformDrawableId(reference: String?): Int? {
@@ -185,31 +197,38 @@ class UiPreviewRenderer(private val context: Context) {
     }
 
     private fun applyCommonAttributes(view: View, node: UiNode) {
-        view.contentDescription = resources.text(node.androidAttribute("contentDescription"))
-        view.visibility = when (node.androidAttribute("visibility")) {
+        view.contentDescription = resources.text(previewAndroidValue(node, "contentDescription"))
+        view.visibility = when (previewAndroidValue(node, "visibility")) {
             "gone" -> View.GONE
             "invisible" -> View.INVISIBLE
             else -> View.VISIBLE
         }
-        node.androidAttribute("alpha")?.toFloatOrNull()?.let { view.alpha = it.coerceIn(0f, 1f) }
+        previewAndroidValue(node, "alpha")?.toFloatOrNull()?.let { view.alpha = it.coerceIn(0f, 1f) }
+        previewAndroidValue(node, "enabled")?.toBooleanStrictOrNull()?.let { view.isEnabled = it }
+        previewAndroidValue(node, "selected")?.toBooleanStrictOrNull()?.let { view.isSelected = it }
         applyPadding(view, node)
 
-        resources.color(node.androidAttribute("background"))?.let(::parseColor)?.let(view::setBackgroundColor)
+        drawable(previewAndroidValue(node, "background"))?.let { view.background = it }
         if (view is TextView) {
-            resources.text(node.androidAttribute("text"))?.let { view.text = it }
-            resources.text(node.androidAttribute("hint"))?.let { view.hint = it }
-            resources.color(node.androidAttribute("textColor"))?.let(::parseColor)?.let(view::setTextColor)
-            parseTextSize(node.androidAttribute("textSize"))?.let { view.setTextSize(TypedValue.COMPLEX_UNIT_PX, it) }
-            view.gravity = parseGravity(node.androidAttribute("gravity")) ?: view.gravity
-            when (node.androidAttribute("textStyle")) {
+            resources.text(previewAndroidValue(node, "text"))?.let { view.text = it }
+            resources.text(previewAndroidValue(node, "hint"))?.let { view.hint = it }
+            resources.color(previewAndroidValue(node, "textColor"))?.let(::parseColor)?.let(view::setTextColor)
+            parseTextSize(previewAndroidValue(node, "textSize"))?.let {
+                view.setTextSize(TypedValue.COMPLEX_UNIT_PX, it)
+            }
+            view.gravity = parseGravity(previewAndroidValue(node, "gravity")) ?: view.gravity
+            when (previewAndroidValue(node, "textStyle")) {
                 "bold" -> view.setTypeface(view.typeface, Typeface.BOLD)
                 "italic" -> view.setTypeface(view.typeface, Typeface.ITALIC)
                 "bold|italic", "italic|bold" -> view.setTypeface(view.typeface, Typeface.BOLD_ITALIC)
             }
-            node.androidAttribute("maxLines")?.toIntOrNull()?.let { view.maxLines = it.coerceAtLeast(1) }
+            previewAndroidValue(node, "maxLines")?.toIntOrNull()?.let { view.maxLines = it.coerceAtLeast(1) }
+        }
+        if (view is CompoundButton) {
+            previewAndroidValue(node, "checked")?.toBooleanStrictOrNull()?.let { view.isChecked = it }
         }
         if (view is ImageView) {
-            view.scaleType = when (node.androidAttribute("scaleType")) {
+            view.scaleType = when (previewAndroidValue(node, "scaleType")) {
                 "centerCrop" -> ImageView.ScaleType.CENTER_CROP
                 "fitCenter" -> ImageView.ScaleType.FIT_CENTER
                 "fitXY" -> ImageView.ScaleType.FIT_XY
@@ -218,7 +237,7 @@ class UiPreviewRenderer(private val context: Context) {
             }
         }
         if (view is LinearLayout) {
-            parseGravity(node.androidAttribute("gravity"))?.let { view.gravity = it }
+            parseGravity(previewAndroidValue(node, "gravity"))?.let { view.gravity = it }
         }
     }
 
@@ -226,7 +245,7 @@ class UiPreviewRenderer(private val context: Context) {
         if (node.children.isNotEmpty() || node.simpleTag !in EMPTY_CONTAINER_TAGS) return
         view.minimumWidth = dp(96)
         view.minimumHeight = dp(72)
-        if (node.androidAttribute("background").isNullOrBlank()) {
+        if (previewAndroidValue(node, "background").isNullOrBlank()) {
             view.background = GradientDrawable().apply {
                 setColor(Color.rgb(247, 249, 248))
                 setStroke(dp(1).coerceAtLeast(1), Color.rgb(152, 166, 160), dp(6).toFloat(), dp(4).toFloat())
@@ -248,19 +267,25 @@ class UiPreviewRenderer(private val context: Context) {
     }
 
     private fun applyPadding(view: View, node: UiNode) {
-        val all = dimensionPx(node.androidAttribute("padding"))
-        val horizontal = dimensionPx(node.androidAttribute("paddingHorizontal"))
-        val vertical = dimensionPx(node.androidAttribute("paddingVertical"))
-        val start = dimensionPx(node.androidAttribute("paddingStart")) ?: horizontal ?: all ?: 0
-        val top = dimensionPx(node.androidAttribute("paddingTop")) ?: vertical ?: all ?: 0
-        val end = dimensionPx(node.androidAttribute("paddingEnd")) ?: horizontal ?: all ?: 0
-        val bottom = dimensionPx(node.androidAttribute("paddingBottom")) ?: vertical ?: all ?: 0
+        val all = dimensionPx(previewAndroidValue(node, "padding"))
+        val horizontal = dimensionPx(previewAndroidValue(node, "paddingHorizontal"))
+        val vertical = dimensionPx(previewAndroidValue(node, "paddingVertical"))
+        val start = dimensionPx(previewAndroidValue(node, "paddingStart")) ?: horizontal ?: all ?: 0
+        val top = dimensionPx(previewAndroidValue(node, "paddingTop")) ?: vertical ?: all ?: 0
+        val end = dimensionPx(previewAndroidValue(node, "paddingEnd")) ?: horizontal ?: all ?: 0
+        val bottom = dimensionPx(previewAndroidValue(node, "paddingBottom")) ?: vertical ?: all ?: 0
         view.setPaddingRelative(start, top, end, bottom)
     }
 
     private fun layoutParamsFor(parent: ViewGroup, node: UiNode): ViewGroup.LayoutParams {
-        val width = layoutSize(node.androidAttribute("layout_width"), fallback = ViewGroup.LayoutParams.WRAP_CONTENT)
-        val height = layoutSize(node.androidAttribute("layout_height"), fallback = ViewGroup.LayoutParams.WRAP_CONTENT)
+        val width = layoutSize(
+            previewAndroidValue(node, "layout_width"),
+            fallback = ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        val height = layoutSize(
+            previewAndroidValue(node, "layout_height"),
+            fallback = ViewGroup.LayoutParams.WRAP_CONTENT
+        )
         return when (parent) {
             is ConstraintLayout -> ConstraintLayout.LayoutParams(width, height).apply {
                 applyMargins(this, node)
@@ -272,39 +297,41 @@ class UiPreviewRenderer(private val context: Context) {
                 constraint(node, "layout_constraintTop_toBottomOf")?.let { topToBottom = it }
                 constraint(node, "layout_constraintBottom_toTopOf")?.let { bottomToTop = it }
                 constraint(node, "layout_constraintBottom_toBottomOf")?.let { bottomToBottom = it }
-                horizontalBias = node.appAttribute("layout_constraintHorizontal_bias")?.toFloatOrNull() ?: 0.5f
-                verticalBias = node.appAttribute("layout_constraintVertical_bias")?.toFloatOrNull() ?: 0.5f
+                horizontalBias = previewAppValue(node, "layout_constraintHorizontal_bias")?.toFloatOrNull() ?: 0.5f
+                verticalBias = previewAppValue(node, "layout_constraintVertical_bias")?.toFloatOrNull() ?: 0.5f
+                editorAbsoluteX = dimensionPx(node.toolsAttribute("layout_editor_absoluteX")) ?: -1
+                editorAbsoluteY = dimensionPx(node.toolsAttribute("layout_editor_absoluteY")) ?: -1
             }
             is LinearLayout -> LinearLayout.LayoutParams(width, height).apply {
                 applyMargins(this, node)
-                weight = node.androidAttribute("layout_weight")?.toFloatOrNull() ?: 0f
-                gravity = parseGravity(node.androidAttribute("layout_gravity")) ?: -1
+                weight = previewAndroidValue(node, "layout_weight")?.toFloatOrNull() ?: 0f
+                gravity = parseGravity(previewAndroidValue(node, "layout_gravity")) ?: -1
             }
             is FrameLayout -> FrameLayout.LayoutParams(width, height).apply {
                 applyMargins(this, node)
-                gravity = parseGravity(node.androidAttribute("layout_gravity")) ?: Gravity.NO_GRAVITY
+                gravity = parseGravity(previewAndroidValue(node, "layout_gravity")) ?: Gravity.NO_GRAVITY
             }
             else -> ViewGroup.MarginLayoutParams(width, height).apply { applyMargins(this, node) }
         }
     }
 
     private fun frameLayoutParams(node: UiNode): FrameLayout.LayoutParams = FrameLayout.LayoutParams(
-        layoutSize(node.androidAttribute("layout_width"), ViewGroup.LayoutParams.MATCH_PARENT),
-        layoutSize(node.androidAttribute("layout_height"), ViewGroup.LayoutParams.WRAP_CONTENT)
+        layoutSize(previewAndroidValue(node, "layout_width"), ViewGroup.LayoutParams.MATCH_PARENT),
+        layoutSize(previewAndroidValue(node, "layout_height"), ViewGroup.LayoutParams.WRAP_CONTENT)
     ).apply { applyMargins(this, node) }
 
     private fun applyMargins(params: ViewGroup.MarginLayoutParams, node: UiNode) {
-        val all = dimensionPx(node.androidAttribute("layout_margin")) ?: 0
-        val horizontal = dimensionPx(node.androidAttribute("layout_marginHorizontal"))
-        val vertical = dimensionPx(node.androidAttribute("layout_marginVertical"))
-        params.marginStart = dimensionPx(node.androidAttribute("layout_marginStart")) ?: horizontal ?: all
-        params.topMargin = dimensionPx(node.androidAttribute("layout_marginTop")) ?: vertical ?: all
-        params.marginEnd = dimensionPx(node.androidAttribute("layout_marginEnd")) ?: horizontal ?: all
-        params.bottomMargin = dimensionPx(node.androidAttribute("layout_marginBottom")) ?: vertical ?: all
+        val all = dimensionPx(previewAndroidValue(node, "layout_margin")) ?: 0
+        val horizontal = dimensionPx(previewAndroidValue(node, "layout_marginHorizontal"))
+        val vertical = dimensionPx(previewAndroidValue(node, "layout_marginVertical"))
+        params.marginStart = dimensionPx(previewAndroidValue(node, "layout_marginStart")) ?: horizontal ?: all
+        params.topMargin = dimensionPx(previewAndroidValue(node, "layout_marginTop")) ?: vertical ?: all
+        params.marginEnd = dimensionPx(previewAndroidValue(node, "layout_marginEnd")) ?: horizontal ?: all
+        params.bottomMargin = dimensionPx(previewAndroidValue(node, "layout_marginBottom")) ?: vertical ?: all
     }
 
     private fun constraint(node: UiNode, name: String): Int? {
-        val value = node.appAttribute(name)?.trim().orEmpty()
+        val value = previewAppValue(node, name)?.trim().orEmpty()
         if (value.isBlank()) return null
         if (value == "parent") return ConstraintLayout.LayoutParams.PARENT_ID
         val targetName = resourceIdName(value) ?: return null
@@ -380,8 +407,106 @@ class UiPreviewRenderer(private val context: Context) {
 
     private fun dp(value: Int): Int = (value * density).toInt()
 
-    private inner class DummyAdapter : RecyclerView.Adapter<DummyViewHolder>() {
+    private fun previewAndroidValue(node: UiNode, localName: String): String? =
+        node.toolsAttribute(localName)
+            ?: node.androidAttribute(localName)
+            ?: resources.styleValue(node.unqualifiedAttribute("style"), ANDROID_NAMESPACE_URI, localName)
+
+    private fun previewAppValue(node: UiNode, localName: String): String? =
+        node.appAttribute(localName)
+            ?: resources.styleValue(node.unqualifiedAttribute("style"), APP_NAMESPACE_URI, localName)
+
+    private fun imageSource(node: UiNode): String? =
+        node.toolsAttribute("src")
+            ?: node.toolsAttribute("srcCompat")
+            ?: node.androidAttribute("src")
+            ?: node.appAttribute("srcCompat")
+            ?: resources.styleValue(node.unqualifiedAttribute("style"), ANDROID_NAMESPACE_URI, "src")
+            ?: resources.styleValue(node.unqualifiedAttribute("style"), APP_NAMESPACE_URI, "srcCompat")
+
+    private fun drawable(value: String?): Drawable? {
+        resources.color(value)?.let(::parseColor)?.let { return ColorDrawable(it) }
+        val xml = resources.drawableXml(value) ?: return null
+        return parseXmlDrawable(xml)
+    }
+
+    private fun parseXmlDrawable(xml: String): Drawable? = runCatching {
+        val root = SecureAndroidXml.parse(xml).documentElement
+        when (root.tagName.substringAfterLast('.')) {
+            "shape" -> parseShapeDrawable(root)
+            "selector" -> root.childElements().firstNotNullOfOrNull { item ->
+                if (item.tagName.substringAfterLast('.') != "item") return@firstNotNullOfOrNull null
+                drawable(item.getAttributeNS(ANDROID_NAMESPACE_URI, "drawable"))
+                    ?: resources.color(item.getAttributeNS(ANDROID_NAMESPACE_URI, "color"))
+                        ?.let(::parseColor)
+                        ?.let(::ColorDrawable)
+            }
+            else -> null
+        }
+    }.getOrNull()
+
+    private fun parseShapeDrawable(root: org.w3c.dom.Element): GradientDrawable {
+        val result = GradientDrawable()
+        result.shape = when (root.getAttributeNS(ANDROID_NAMESPACE_URI, "shape")) {
+            "oval" -> GradientDrawable.OVAL
+            "line" -> GradientDrawable.LINE
+            "ring" -> GradientDrawable.RING
+            else -> GradientDrawable.RECTANGLE
+        }
+        root.childElements().forEach { child ->
+            when (child.tagName.substringAfterLast('.')) {
+                "solid" -> resources.color(child.getAttributeNS(ANDROID_NAMESPACE_URI, "color"))
+                    ?.let(::parseColor)
+                    ?.let(result::setColor)
+                "stroke" -> {
+                    val width = dimensionPx(child.getAttributeNS(ANDROID_NAMESPACE_URI, "width")) ?: 0
+                    resources.color(child.getAttributeNS(ANDROID_NAMESPACE_URI, "color"))
+                        ?.let(::parseColor)
+                        ?.let { result.setStroke(width, it) }
+                }
+                "corners" -> dimensionPx(child.getAttributeNS(ANDROID_NAMESPACE_URI, "radius"))
+                    ?.let { result.cornerRadius = it.toFloat() }
+            }
+        }
+        return result
+    }
+
+    private fun org.w3c.dom.Element.childElements(): List<org.w3c.dom.Element> = buildList {
+        var child = firstChild
+        while (child != null) {
+            if (child.nodeType == org.w3c.dom.Node.ELEMENT_NODE) add(child as org.w3c.dom.Element)
+            child = child.nextSibling
+        }
+    }
+
+    private inner class DummyAdapter(private val sourceNode: UiNode) : RecyclerView.Adapter<DummyViewHolder>() {
+        private val count = sourceNode.toolsAttribute("itemCount")
+            ?.toIntOrNull()
+            ?.coerceIn(0, MAX_PREVIEW_LIST_ITEMS)
+            ?: DEFAULT_PREVIEW_LIST_ITEMS
+        private val itemLayoutReference = sourceNode.toolsAttribute("listitem")
+        private val itemLayoutXml = resources.layout(itemLayoutReference)
+
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): DummyViewHolder {
+            val sampleXml = itemLayoutXml
+            if (sampleXml != null) {
+                val container = FrameLayout(parent.context).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                }
+                val sampleDocument = runCatching { AndroidXmlDocument.parse(sampleXml) }.getOrNull()
+                if (sampleDocument != null) {
+                    UiPreviewRenderer(parent.context).render(
+                        document = sampleDocument,
+                        resources = resources,
+                        canvas = container,
+                        imageBitmaps = imageBitmaps
+                    )
+                    return DummyViewHolder(container)
+                }
+            }
             val text = TextView(parent.context).apply {
                 layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52))
                 gravity = Gravity.CENTER_VERTICAL
@@ -391,16 +516,21 @@ class UiPreviewRenderer(private val context: Context) {
             return DummyViewHolder(text)
         }
 
-        override fun getItemCount(): Int = 3
+        override fun getItemCount(): Int = count
 
         override fun onBindViewHolder(holder: DummyViewHolder, position: Int) {
-            holder.text.text = "목록 항목 ${position + 1}"
+            (holder.itemView as? TextView)?.text = buildString {
+                append("목록 항목 ${position + 1}")
+                itemLayoutReference?.substringAfterLast('/')?.let { append(" · ").append(it) }
+            }
         }
     }
 
-    private class DummyViewHolder(val text: TextView) : RecyclerView.ViewHolder(text)
+    private class DummyViewHolder(view: View) : RecyclerView.ViewHolder(view)
 
     private companion object {
+        const val DEFAULT_PREVIEW_LIST_ITEMS = 3
+        const val MAX_PREVIEW_LIST_ITEMS = 20
         val EMPTY_CONTAINER_TAGS = setOf(
             "ConstraintLayout",
             "CoordinatorLayout",

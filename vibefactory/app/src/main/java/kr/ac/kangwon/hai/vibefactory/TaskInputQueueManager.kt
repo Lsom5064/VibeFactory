@@ -4,7 +4,8 @@ data class QueuedTaskInput(
     val prompt: String,
     val displayPrompt: String,
     val imagePreview: ChatImagePreview?,
-    val attachments: List<SelectedAttachment>
+    val attachments: List<SelectedAttachment>,
+    val useSavedUi: Boolean = false
 )
 
 data class TaskInputQueueState(

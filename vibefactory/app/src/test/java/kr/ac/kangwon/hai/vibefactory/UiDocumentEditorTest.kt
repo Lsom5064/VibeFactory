@@ -432,4 +432,110 @@ class UiDocumentEditorTest {
         assertEquals("id:group", insertionParent?.stableId)
         assertTrue(document.element(addedId)?.parentNode === document.element("id:group"))
     }
+
+    @Test
+    fun placeAtUsesRenderedAbsoluteSlotAndResponsiveConstraints() {
+        val document = AndroidXmlDocument.parse(xml)
+
+        assertTrue(
+            UiDocumentEditor.placeAt(
+                document = document,
+                stableId = "id:title",
+                startDp = 72,
+                topDp = 96,
+                renderedWidthDp = 180,
+                renderedHeightDp = 48
+            )
+        )
+
+        val placed = document.root.descendantsAndSelf().first { it.stableId == "id:title" }
+        assertEquals("72dp", placed.androidAttribute("layout_marginStart"))
+        assertEquals("96dp", placed.androidAttribute("layout_marginTop"))
+        assertEquals("parent", placed.appAttribute("layout_constraintStart_toStartOf"))
+        assertEquals("parent", placed.appAttribute("layout_constraintTop_toTopOf"))
+        assertFalse(document.xml().contains("layout_constraintEnd_toEndOf"))
+    }
+
+    @Test
+    fun siblingCanMoveDirectlyToAnotherLinearLayoutSlot() {
+        val linearXml = """<LinearLayout
+            xmlns:android="http://schemas.android.com/apk/res/android"
+            android:id="@+id/root"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+            <TextView android:id="@+id/first" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+            <Button android:id="@+id/second" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+            <Switch android:id="@+id/third" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        </LinearLayout>"""
+        val document = AndroidXmlDocument.parse(linearXml)
+
+        assertTrue(
+            UiDocumentEditor.reorderSiblingRelative(
+                document = document,
+                stableId = "id:first",
+                targetStableId = "id:third",
+                insertAfterTarget = true
+            )
+        )
+
+        assertEquals(listOf("id:second", "id:third", "id:first"), document.root.children.map { it.stableId })
+        assertFalse(
+            UiDocumentEditor.reorderSiblingRelative(
+                document = document,
+                stableId = "id:first",
+                targetStableId = "id:third",
+                insertAfterTarget = true
+            )
+        )
+    }
+
+    @Test
+    fun nestedLinearCollisionCanReparentControlBeforeTarget() {
+        val nestedXml = """<androidx.constraintlayout.widget.ConstraintLayout
+            xmlns:android="http://schemas.android.com/apk/res/android"
+            xmlns:app="http://schemas.android.com/apk/res-auto"
+            android:id="@+id/root"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent">
+            <TextView
+                android:id="@+id/floating"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent" />
+            <LinearLayout
+                android:id="@+id/actions"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintTop_toTopOf="parent">
+                <Button android:id="@+id/primary" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+                <Button android:id="@+id/secondary" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+            </LinearLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>"""
+        val document = AndroidXmlDocument.parse(nestedXml)
+
+        assertTrue(
+            UiDocumentEditor.reparentRelative(
+                document = document,
+                stableId = "id:floating",
+                targetStableId = "id:primary",
+                insertAfterTarget = false,
+                renderedWidthDp = 160,
+                renderedHeightDp = 48
+            )
+        )
+
+        val actionChildren = document.root.children
+            .first { it.stableId == "id:actions" }
+            .children
+            .map { it.stableId }
+        assertEquals(listOf("id:floating", "id:primary", "id:secondary"), actionChildren)
+        val moved = document.root.descendantsAndSelf().first { it.stableId == "id:floating" }
+        assertEquals("160dp", moved.androidAttribute("layout_width"))
+        assertEquals(null, moved.appAttribute("layout_constraintStart_toStartOf"))
+        assertEquals(null, moved.appAttribute("layout_constraintTop_toTopOf"))
+    }
 }

@@ -392,8 +392,7 @@ internal object ApkArtifactActionHandler {
     }
 
     fun needsInstallPermission(activity: Activity): Boolean {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-            !activity.packageManager.canRequestPackageInstalls()
+        return !activity.packageManager.canRequestPackageInstalls()
     }
 
     fun requestInstallPermission(activity: Activity): Boolean {

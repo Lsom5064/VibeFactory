@@ -2,10 +2,6 @@ package kr.ac.kangwon.hai.vibefactory
 
 import android.Manifest
 import android.app.Activity
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -18,6 +14,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
+import android.graphics.Paint
 import android.text.Editable
 import android.text.InputFilter
 import android.text.InputType
@@ -32,6 +29,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.ImageView
@@ -42,11 +40,10 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.GravityCompat
@@ -65,6 +62,7 @@ import com.google.gson.GsonBuilder
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.android.material.bottomsheet.BottomSheetDialog
+import kr.ac.kangwon.hai.vibefactory.ui_editor.UiEditorActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -77,16 +75,8 @@ import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
-import java.text.ParsePosition
-import java.text.SimpleDateFormat
-import java.time.Instant
-import java.time.LocalDateTime
-import java.time.OffsetDateTime
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 import java.util.Date
 import java.util.Locale
-import java.util.TimeZone
 
 class MainActivity : AppCompatActivity() {
 
@@ -117,7 +107,6 @@ class MainActivity : AppCompatActivity() {
         private const val INSTALL_RESOLUTION_DELAY_MS = 500L
         private const val REQUEST_PHONE_NUMBER_PERMISSION = 7001
         private const val REQUEST_NOTIFICATION_PERMISSION = 7002
-        private const val BUILD_NOTIFICATION_CHANNEL_ID = "build_complete_alerts"
         private const val MAX_ATTACHMENT_IMAGE_ORIGINAL_BYTES = 15 * 1024 * 1024
         private const val MAX_ATTACHMENT_IMAGE_PAYLOAD_BYTES = 4 * 1024 * 1024
         private const val MAX_ATTACHMENT_PDF_BYTES = 10 * 1024 * 1024
@@ -129,29 +118,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val gson: Gson = GsonBuilder().create()
-    private val koreaZoneId: ZoneId = ZoneId.of("Asia/Seoul")
-    private val koreaTimeZone: TimeZone = TimeZone.getTimeZone(koreaZoneId)
-    private val serverTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.KOREA).apply {
-        timeZone = koreaTimeZone
-        isLenient = false
-    }
-    private val displayTimestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.KOREA).apply {
-        timeZone = koreaTimeZone
-        isLenient = false
-    }
-    private val bubbleTimestampFormat = SimpleDateFormat("a h:mm", Locale.KOREA).apply {
-        timeZone = koreaTimeZone
-        isLenient = false
-    }
-    private val dateSeparatorTimestampFormat = SimpleDateFormat("yyyy년 M월 d일 EEEE", Locale.KOREA).apply {
-        timeZone = koreaTimeZone
-        isLenient = false
-    }
-    private val localTimestampParsers = listOf(
-        DateTimeFormatter.ISO_LOCAL_DATE_TIME,
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.KOREA),
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.KOREA)
-    )
+    private val timestampFormatter = KoreanTimestampFormatter()
 
     private lateinit var apiService: VibeApiService
     private lateinit var downloadApiService: VibeApiService
@@ -179,6 +146,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var composerBar: LinearLayout
     private lateinit var topLogChip: LinearLayout
     private lateinit var topTitleChip: LinearLayout
+    private lateinit var uiDraftContextBar: LinearLayout
+    private lateinit var checkUseSavedUi: CheckBox
+    private lateinit var btnOpenUiEditor: TextView
     private lateinit var phoneGateOverlay: View
     private lateinit var phoneGateContent: View
     private lateinit var drawerContent: LinearLayout
@@ -244,6 +214,9 @@ class MainActivity : AppCompatActivity() {
         )
     }
     private val taskArtifactStates = mutableMapOf<String, PersistedArtifactState>()
+    private val uiEditorContextByTask = mutableMapOf<String, UiEditorContextResponseDto>()
+    private val useSavedUiByTask = mutableMapOf<String, Boolean>()
+    private var isRenderingUiDraftContext = false
     private val taskLastStatusKeys = mutableMapOf<String, String>()
     private val hiddenTaskIds = mutableSetOf<String>()
     private var taskSummaryById: Map<String, TaskSummary> = emptyMap()
@@ -297,40 +270,6 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.attachment_only_chat_prompt)
         ).map(::normalizeMessageTextForDedupe).toSet()
     }
-
-    private data class TimelineEventSnapshot(
-        val eventId: String,
-        val createdAt: String,
-        val kind: String,
-        val title: String,
-        val body: String,
-        val detail: String,
-        val eventType: String,
-        val confirmationAction: String?,
-        val confirmationPayload: String?,
-        val preparedPrompt: String?,
-        val renderMode: String?,
-        val apkUrl: String?,
-        val apkPath: String?,
-        val apkSizeBytes: Long?,
-        val appName: String?,
-        val packageName: String?,
-        val imagePreviews: List<ChatImagePreview>
-    )
-
-    private data class TimelineEventPage(
-        val events: List<TimelineEventSnapshot>,
-        val nextCursor: String?
-    )
-
-    private data class ChatScrollSnapshot(
-        val messageId: String,
-        val topOffset: Int
-    )
-
-    private data class ChatBottomScrollSnapshot(
-        val bottomOffset: Int
-    )
 
     private val pickReferenceImageLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -392,6 +331,17 @@ class MainActivity : AppCompatActivity() {
             submitReviewedInitialPrompt(taskId, finalPrompt, messageId)
         }
 
+    private val uiEditorLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+            val taskId = result.data?.getStringExtra(UiEditorActivity.EXTRA_TASK_ID)
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: screenState.selectedTaskId
+                ?: return@registerForActivityResult
+            refreshTaskUiEditorContext(taskId)
+        }
+
     private val crashReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != "kr.ac.kangwon.hai.action.CRASH_REPORT") return
@@ -402,6 +352,10 @@ class MainActivity : AppCompatActivity() {
             val reportKind = intent.getStringExtra("report_kind")
             lastStackTrace = intent.getStringExtra("stack_trace")
             val pkg = lastCrashPackage.orEmpty()
+            if (!CrashReportSenderPolicy.accepts(this, pkg)) {
+                Log.w(TAG, "Crash report dropped because sender package did not match")
+                return
+            }
             val stack = lastStackTrace.orEmpty()
             val taskId = resolveCrashTaskId(rawTaskId, pkg)
             lastCrashTaskId = taskId ?: rawTaskId
@@ -449,7 +403,7 @@ class MainActivity : AppCompatActivity() {
         createNotificationChannel()
         deviceId = preferencesStore.getOrCreateDeviceId()
         userIdentity = getOrCreateUserIdentity()
-        Log.d(TAG, "App start device_id=$deviceId")
+        Log.d(TAG, "App start identity_ready=${deviceId.isNotBlank()}")
         val requestedNotificationPermission = requestNotificationPermissionIfNeeded()
         if (!requestedNotificationPermission && !hasRequiredPhoneNumber()) {
             requestPhoneNumberPermissionIfNeeded()
@@ -474,15 +428,21 @@ class MainActivity : AppCompatActivity() {
         applyImmediateBranchedTaskState(intent)
         renderState()
 
-        registerReceiver(crashReceiver, IntentFilter("kr.ac.kangwon.hai.action.CRASH_REPORT"), RECEIVER_EXPORTED)
-        registerReceiver(
+        ContextCompat.registerReceiver(
+            this,
+            crashReceiver,
+            IntentFilter("kr.ac.kangwon.hai.action.CRASH_REPORT"),
+            ContextCompat.RECEIVER_EXPORTED
+        )
+        ContextCompat.registerReceiver(
+            this,
             packageInstallReceiver,
             IntentFilter().apply {
                 addAction(Intent.ACTION_PACKAGE_ADDED)
                 addAction(Intent.ACTION_PACKAGE_REPLACED)
                 addDataScheme("package")
             },
-            RECEIVER_EXPORTED
+            ContextCompat.RECEIVER_EXPORTED
         )
         if (hasRequiredPhoneNumber()) {
             skipNextResumeRestore = true
@@ -515,6 +475,9 @@ class MainActivity : AppCompatActivity() {
         composerBar = findViewById(R.id.composerBar)
         topLogChip = findViewById(R.id.topLogChip)
         topTitleChip = findViewById(R.id.topTitleChip)
+        uiDraftContextBar = findViewById(R.id.uiDraftContextBar)
+        checkUseSavedUi = findViewById(R.id.checkUseSavedUi)
+        btnOpenUiEditor = findViewById(R.id.btnOpenUiEditor)
         phoneGateOverlay = findViewById(R.id.phoneGateOverlay)
         phoneGateContent = findViewById(R.id.phoneGateContent)
         drawerContent = findViewById(R.id.drawerContent)
@@ -723,6 +686,9 @@ class MainActivity : AppCompatActivity() {
                     closeDrawerOnSuccess = false,
                     selectionGeneration = selectionGeneration
                 )
+                if (isTaskSelectionGenerationCurrent(selectionGeneration)) {
+                    refreshTaskUiEditorContext(taskId)
+                }
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
                 logApiFailure("/status/{task_id}", taskId = taskId, deviceId = deviceId, throwable = e)
@@ -835,18 +801,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        val channel = NotificationChannel(
-            BUILD_NOTIFICATION_CHANNEL_ID,
-            getString(R.string.notification_channel_builds),
-            NotificationManager.IMPORTANCE_HIGH
-        ).apply {
-            enableVibration(true)
-            setShowBadge(true)
-            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-        }
-        manager.createNotificationChannel(channel)
+        BuildNotificationController.createChannels(this, includeMonitorChannel = false)
     }
 
     private fun requestNotificationPermissionIfNeeded(): Boolean {
@@ -858,6 +813,7 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     private fun showNotificationPermissionPrompt() {
         AlertDialog.Builder(this)
             .setTitle(R.string.notification_permission_rationale_title)
@@ -896,34 +852,13 @@ class MainActivity : AppCompatActivity() {
 
                 isFormatting = true
 
-                val digits = s.toString().filter { it.isDigit() }.take(11)
-                val formatted = formatKoreanPhoneNumber(digits)
+                val formatted = KoreanPhoneNumberFormatter.format(s.toString())
 
                 if (formatted != s.toString()) {
                     s.replace(0, s.length, formatted)
                 }
 
                 isFormatting = false
-            }
-
-            private fun formatKoreanPhoneNumber(digits: String): String {
-                return when {
-                    digits.startsWith("02") -> {
-                        when {
-                            digits.length <= 2 -> digits
-                            digits.length <= 5 -> "${digits.substring(0, 2)}-${digits.substring(2)}"
-                            digits.length <= 9 -> "${digits.substring(0, 2)}-${digits.substring(2, digits.length - 4)}-${digits.takeLast(4)}"
-                            else -> "${digits.substring(0, 2)}-${digits.substring(2, 6)}-${digits.substring(6, 10)}"
-                        }
-                    }
-                    else -> {
-                        when {
-                            digits.length <= 3 -> digits
-                            digits.length <= 7 -> "${digits.substring(0, 3)}-${digits.substring(3)}"
-                            else -> "${digits.substring(0, 3)}-${digits.substring(3, 7)}-${digits.substring(7)}"
-                        }
-                    }
-                }
             }
         })
 
@@ -981,12 +916,92 @@ class MainActivity : AppCompatActivity() {
         topLogChip.setOnClickListener {
             openTaskLogDetail()
         }
+        checkUseSavedUi.setOnCheckedChangeListener { _, checked ->
+            if (isRenderingUiDraftContext) return@setOnCheckedChangeListener
+            screenState.selectedTaskId?.let { taskId ->
+                useSavedUiByTask[taskId] = checked && uiEditorContextByTask[taskId]?.has_saved_ui == true
+            }
+        }
+        btnOpenUiEditor.paintFlags = btnOpenUiEditor.paintFlags or Paint.UNDERLINE_TEXT_FLAG
+        btnOpenUiEditor.setOnClickListener { openUiEditorForSelectedTask() }
     }
 
     private fun openTaskLogDetail() {
         val taskId = screenState.selectedTaskId?.trim()?.takeIf { it.isNotBlank() }
             ?: currentTaskId?.trim()?.takeIf { it.isNotBlank() }
         launchTaskLogDetail(taskId)
+    }
+
+    private fun openUiEditorForSelectedTask() {
+        val taskId = screenState.selectedTaskId
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: return
+        refreshTaskUiEditorContext(taskId, openEditorAfterLoad = true)
+    }
+
+    private fun refreshTaskUiEditorContext(
+        taskId: String,
+        openEditorAfterLoad: Boolean = false
+    ) {
+        val apiTaskId = resolveApiTaskId(taskId, "/tasks/{task_id}/ui/editor-context") ?: return
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runSuspendCatching {
+                    apiService.getTaskUiEditorContext(
+                        taskId = apiTaskId,
+                        deviceId = deviceId,
+                        userId = null,
+                        phoneNumber = userIdentity.phoneNumber
+                    )
+                }
+            }
+            result.onSuccess { context ->
+                uiEditorContextByTask[apiTaskId] = context
+                if (!context.has_saved_ui) useSavedUiByTask[apiTaskId] = false
+                if (screenState.selectedTaskId == apiTaskId) renderState()
+                if (openEditorAfterLoad) {
+                    if (context.source_available && context.revision_label.isNotBlank()) {
+                        uiEditorLauncher.launch(
+                            Intent(this@MainActivity, UiEditorActivity::class.java)
+                                .putExtra(UiEditorActivity.EXTRA_TASK_ID, apiTaskId)
+                                .putExtra(UiEditorActivity.EXTRA_REVISION_LABEL, context.revision_label)
+                                .putExtra(
+                                    UiEditorActivity.EXTRA_APP_NAME,
+                                    taskSummaryById[apiTaskId]?.appName ?: screenState.displayedAppName.orEmpty()
+                                )
+                        )
+                    } else {
+                        Toast.makeText(
+                            this@MainActivity,
+                            R.string.ui_editor_context_unavailable,
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }.onFailure { error ->
+                logApiFailure(
+                    "/tasks/{task_id}/ui/editor-context",
+                    taskId = apiTaskId,
+                    deviceId = deviceId,
+                    throwable = error
+                )
+                if (openEditorAfterLoad) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        getString(R.string.ui_editor_context_load_failed),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun shouldUseSavedUi(taskId: String?): Boolean {
+        val normalizedTaskId = taskId?.trim().orEmpty()
+        return normalizedTaskId.isNotBlank() &&
+            useSavedUiByTask[normalizedTaskId] == true &&
+            uiEditorContextByTask[normalizedTaskId]?.has_saved_ui == true
     }
 
     private fun launchTaskLogDetail(taskId: String?) {
@@ -1216,6 +1231,7 @@ class MainActivity : AppCompatActivity() {
         if (displayPrompt.isBlank() && attachments.isEmpty()) return
         val prompt = displayPrompt
         val attachedImagePreview = attachments.toChatImagePreview()
+        val useSavedUi = shouldUseSavedUi(currentTaskId ?: screenState.selectedTaskId)
 
         if (isComposerOnNewChatSurface()) {
             clearComposerDraftAfterSubmit()
@@ -1242,7 +1258,14 @@ class MainActivity : AppCompatActivity() {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
                     clearComposerDraftAfterSubmit()
-                    startTaskChatMessage(taskId, prompt, attachedImagePreview, attachments, displayPrompt = displayPrompt)
+                    startTaskChatMessage(
+                        taskId,
+                        prompt,
+                        attachedImagePreview,
+                        attachments,
+                        displayPrompt = displayPrompt,
+                        useSavedUi = useSavedUi
+                    )
                 } else {
                     clearComposerDraftAfterSubmit()
                     startAppSynthesis(prompt, attachedImagePreview, attachments = attachments, displayPrompt = displayPrompt)
@@ -1252,28 +1275,55 @@ class MainActivity : AppCompatActivity() {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
                     clearComposerDraftAfterSubmit()
-                    continueClarification(taskId, prompt, attachments = attachments, displayPrompt = displayPrompt)
+                    continueClarification(
+                        taskId,
+                        prompt,
+                        attachments = attachments,
+                        displayPrompt = displayPrompt,
+                        useSavedUi = useSavedUi
+                    )
                 }
             }
             InputMode.REFINE_EXISTING -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
                     clearComposerDraftAfterSubmit()
-                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachments, displayPrompt = displayPrompt)
+                    dispatchLatestTaskFeedback(
+                        taskId,
+                        prompt,
+                        attachedImagePreview,
+                        attachments,
+                        displayPrompt = displayPrompt,
+                        useSavedUi = useSavedUi
+                    )
                 }
             }
             InputMode.RETRY_FAILED -> {
                 val taskId = currentTaskId
                 if (!taskId.isNullOrBlank()) {
                     clearComposerDraftAfterSubmit()
-                    dispatchLatestTaskFeedback(taskId, prompt, attachedImagePreview, attachments, displayPrompt = displayPrompt)
+                    dispatchLatestTaskFeedback(
+                        taskId,
+                        prompt,
+                        attachedImagePreview,
+                        attachments,
+                        displayPrompt = displayPrompt,
+                        useSavedUi = useSavedUi
+                    )
                 }
             }
             InputMode.READ_ONLY -> {
                 val taskId = currentTaskId ?: screenState.selectedTaskId
                 if (!taskId.isNullOrBlank() && isTaskInputQueueActive(taskId)) {
                     clearComposerDraftAfterSubmit()
-                    enqueueInputForActiveTask(taskId, prompt, displayPrompt, attachedImagePreview, attachments)
+                    enqueueInputForActiveTask(
+                        taskId,
+                        prompt,
+                        displayPrompt,
+                        attachedImagePreview,
+                        attachments,
+                        useSavedUi
+                    )
                 } else {
                     Toast.makeText(this, R.string.read_only_hint, Toast.LENGTH_SHORT).show()
                 }
@@ -1308,7 +1358,8 @@ class MainActivity : AppCompatActivity() {
         prompt: String,
         displayPrompt: String,
         imagePreview: ChatImagePreview?,
-        attachments: List<SelectedAttachment>
+        attachments: List<SelectedAttachment>,
+        useSavedUi: Boolean
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         taskInputQueueManager.enqueue(
@@ -1317,7 +1368,8 @@ class MainActivity : AppCompatActivity() {
                 prompt = prompt,
                 displayPrompt = displayPrompt,
                 imagePreview = imagePreview,
-                attachments = attachments
+                attachments = attachments,
+                useSavedUi = useSavedUi
             )
         )
         appendOptimisticTaskMessage(
@@ -1381,7 +1433,8 @@ class MainActivity : AppCompatActivity() {
             attachments = nextInput.attachments,
             mode = InputMode.REFINE_EXISTING,
             appendUserMessage = false,
-            displayPrompt = nextInput.displayPrompt
+            displayPrompt = nextInput.displayPrompt,
+            useSavedUi = nextInput.useSavedUi
         )
         return true
     }
@@ -1391,7 +1444,8 @@ class MainActivity : AppCompatActivity() {
         feedback: String,
         imagePreview: ChatImagePreview? = null,
         attachments: List<SelectedAttachment> = selectedAttachments.toList(),
-        displayPrompt: String = feedback
+        displayPrompt: String = feedback,
+        useSavedUi: Boolean = false
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/status/{task_id}") ?: return
         val referenceImagePreview = if (screenState.inputMode == InputMode.REFINE_EXISTING) {
@@ -1405,7 +1459,8 @@ class MainActivity : AppCompatActivity() {
             imagePreview = referenceImagePreview,
             attachments = attachments,
             mode = screenState.inputMode,
-            displayPrompt = displayPrompt
+            displayPrompt = displayPrompt,
+            useSavedUi = useSavedUi
         )
     }
 
@@ -1572,7 +1627,8 @@ class MainActivity : AppCompatActivity() {
         attachments: List<SelectedAttachment> = selectedAttachments.toList(),
         sourceTaskId: String? = null,
         displayPrompt: String? = null,
-        requestAction: String? = null
+        requestAction: String? = null,
+        useSavedUi: Boolean = false
     ) {
         val deviceInfo = collectDeviceInfo()
         val referenceImagePreview = imagePreview ?: attachments.toChatImagePreview()
@@ -1608,7 +1664,8 @@ class MainActivity : AppCompatActivity() {
                         reference_image_name = referenceImageName,
                         reference_image_base64 = referenceImageBase64,
                         request_action = requestAction,
-                        attachments = attachmentPayloads
+                        attachments = attachmentPayloads,
+                        use_ui_editor_draft = useSavedUi
                     )
                 )
                 if (sourceTaskId == null) {
@@ -1616,6 +1673,11 @@ class MainActivity : AppCompatActivity() {
                     pendingResponseScrollTaskIds += response.task_id
                 }
                 currentTaskId = response.task_id
+                if (sourceTaskId != null) {
+                    useSavedUiByTask[sourceTaskId] = false
+                    uiEditorContextByTask.remove(sourceTaskId)
+                    refreshTaskUiEditorContext(response.task_id)
+                }
                 removeLoadingMessages(response.task_id)
                 val shouldStartBuildWorkflow = shouldStartBuildWorkflow(response)
                 applyGenerateDecisionResponse(response)
@@ -1652,7 +1714,8 @@ class MainActivity : AppCompatActivity() {
         appendUserMessage: Boolean = true,
         attachments: List<SelectedAttachment> = selectedAttachments.toList(),
         displayPrompt: String = prompt,
-        requestAction: String? = null
+        requestAction: String? = null,
+        useSavedUi: Boolean = false
     ) {
         startFollowupSynthesis(
             taskId,
@@ -1662,7 +1725,8 @@ class MainActivity : AppCompatActivity() {
             mode = InputMode.CONTINUE_CLARIFICATION,
             appendUserMessage = appendUserMessage,
             displayPrompt = displayPrompt,
-            requestAction = requestAction
+            requestAction = requestAction,
+            useSavedUi = useSavedUi
         )
     }
 
@@ -1693,6 +1757,7 @@ class MainActivity : AppCompatActivity() {
         )
         drawerLayout.closeDrawer(GravityCompat.START)
         renderState()
+        refreshTaskUiEditorContext(resolvedTaskId)
 
         taskSyncJob = lifecycleScope.launch {
             try {
@@ -2271,37 +2336,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun notifyBuildCompleted(taskId: String, appName: String?) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            return
-        }
-
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra(STATE_SELECTED_TASK_ID, taskId)
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            taskId.hashCode(),
-            openIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
         val resolvedName = appName?.takeIf { it.isNotBlank() } ?: getString(R.string.untitled_task)
-        val notification = NotificationCompat.Builder(this, BUILD_NOTIFICATION_CHANNEL_ID)
-            .setSmallIcon(R.drawable.logo3)
-            .setContentTitle(getString(R.string.notification_build_success_title))
-            .setContentText(getString(R.string.notification_build_success_body, resolvedName))
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
-            .setCategory(NotificationCompat.CATEGORY_STATUS)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setAutoCancel(true)
-            .setContentIntent(pendingIntent)
-            .build()
-
-        NotificationManagerCompat.from(this).notify(taskId.hashCode(), notification)
+        BuildNotificationController.showTerminal(
+            context = this,
+            taskId = taskId,
+            taskName = resolvedName,
+            type = TerminalBuildNotification.SUCCESS
+        )
     }
 
     private fun showRenameTaskDialog() {
@@ -2538,7 +2579,8 @@ class MainActivity : AppCompatActivity() {
         mode: InputMode,
         appendUserMessage: Boolean = true,
         displayPrompt: String = prompt,
-        requestAction: String? = null
+        requestAction: String? = null,
+        useSavedUi: Boolean = false
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
@@ -2596,7 +2638,8 @@ class MainActivity : AppCompatActivity() {
             attachments = attachments,
             sourceTaskId = apiTaskId,
             displayPrompt = displayPrompt,
-            requestAction = requestAction
+            requestAction = requestAction,
+            useSavedUi = useSavedUi
         )
     }
 
@@ -2605,7 +2648,8 @@ class MainActivity : AppCompatActivity() {
         prompt: String,
         imagePreview: ChatImagePreview? = null,
         attachments: List<SelectedAttachment> = selectedAttachments.toList(),
-        displayPrompt: String = prompt
+        displayPrompt: String = prompt,
+        useSavedUi: Boolean = false
     ) {
         val apiTaskId = resolveApiTaskId(taskId, "/generate") ?: return
         currentTaskId = apiTaskId
@@ -2650,7 +2694,8 @@ class MainActivity : AppCompatActivity() {
             imagePreview = imagePreview,
             attachments = attachments,
             sourceTaskId = apiTaskId,
-            displayPrompt = displayPrompt
+            displayPrompt = displayPrompt,
+            useSavedUi = useSavedUi
         )
     }
 
@@ -2713,7 +2758,7 @@ ${record.stackTrace}
         if (savedPhoneNumber.isNullOrBlank() && !phoneNumber.isNullOrBlank()) {
             preferencesStore.savePhoneNumber(phoneNumber)
         }
-        Log.d(TAG, "Loaded user_identity phone_number=${phoneNumber ?: "-"}")
+        Log.d(TAG, "Loaded user identity phone_number_available=${!phoneNumber.isNullOrBlank()}")
         return UserIdentity(
             phoneNumber = phoneNumber
         )
@@ -3483,6 +3528,15 @@ ${record.stackTrace}
     }
 
     private fun renderState() {
+        val phoneGateVisible = renderPhoneGate()
+        renderTaskListIfChanged()
+        val visibleMessages = visibleMessagesForRender()
+        renderMessagesAndScrollState(visibleMessages)
+        if (phoneGateVisible) return
+        renderComposer(visibleMessages)
+    }
+
+    private fun renderPhoneGate(): Boolean {
         val phoneGateVisible = !hasRequiredPhoneNumber()
         updateTopTitle(phoneGateVisible)
         phoneGateOverlay.visibility = if (phoneGateVisible) View.VISIBLE else View.GONE
@@ -3504,7 +3558,16 @@ ${record.stackTrace}
         inputPhoneGate.isEnabled = false
         inputPhoneGate.visibility = if (phoneGateVisible) View.GONE else View.VISIBLE
         btnSavePhoneGate.isEnabled = true
+        renderUiDraftContext(phoneGateVisible)
+        if (phoneGateVisible) {
+            inputModeLabel.text = getString(R.string.phone_gate_title)
+            inputPrompt.hint = getString(R.string.phone_gate_hint)
+            setComposerEnabled(false)
+        }
+        return phoneGateVisible
+    }
 
+    private fun renderTaskListIfChanged() {
         val taskListFingerprint = UiRenderFingerprint.taskList(
             screenState.taskList,
             screenState.selectedTaskId,
@@ -3517,12 +3580,18 @@ ${record.stackTrace}
             }
             taskAdapter.submitList(taskListForRender, screenState.selectedTaskId)
         }
+    }
+
+    private fun visibleMessagesForRender(): List<ChatMessage> {
         val baseVisibleMessages = screenState.messages
             .map(::withTransientArtifactDownloadState)
             .filter { it.kind != MessageKind.LOG }
             .filterNot(::isRedundantDownloadedStatusMessage)
             .filterNot(::isRedundantModificationEchoMessage)
-        val visibleMessages = withColdStartMessage(withDownloadProgressMessage(baseVisibleMessages))
+        return withColdStartMessage(withDownloadProgressMessage(baseVisibleMessages))
+    }
+
+    private fun renderMessagesAndScrollState(visibleMessages: List<ChatMessage>) {
         activateRestoredChatScrollIfReady(screenState.selectedTaskId, visibleMessages)
         val hasTransientProgressUpdate = visibleMessages.any {
             it.isLoading ||
@@ -3588,13 +3657,23 @@ ${record.stackTrace}
         }
         emptyChatText.visibility = if (visibleMessages.isEmpty()) View.VISIBLE else View.GONE
 
-        if (phoneGateVisible) {
-            inputModeLabel.text = getString(R.string.phone_gate_title)
-            inputPrompt.hint = getString(R.string.phone_gate_hint)
-            setComposerEnabled(false)
-            return
+        val selectedTaskId = screenState.selectedTaskId
+        if (scrollLatestAfterResponse || !anchorMessageId.isNullOrBlank()) {
+            // submitList commit callback applies the requested scroll after DiffUtil finishes.
+        } else if (
+            visibleMessages.isNotEmpty() &&
+            !selectedTaskId.isNullOrBlank() &&
+            pendingInitialChatScrollTaskId == selectedTaskId
+        ) {
+            pendingInitialChatScrollTaskId = null
+        } else if (shouldAutoScrollNewMessage && !shouldPreserveManualScroll) {
+            recyclerMessages.post {
+                recyclerMessages.scrollToPosition(visibleMessages.lastIndex)
+            }
         }
+    }
 
+    private fun renderComposer(visibleMessages: List<ChatMessage>) {
         val awaitingPromptReview = screenState.inputMode == InputMode.CONTINUE_CLARIFICATION &&
             visibleMessages.any { message ->
                 message.promptReviewTaskId == screenState.selectedTaskId &&
@@ -3651,19 +3730,29 @@ ${record.stackTrace}
         }
         renderSelectedAttachmentsIfChanged()
         inputModeLabel.visibility = if (isDownloadingApk) View.VISIBLE else View.GONE
+    }
 
-        val selectedTaskId = screenState.selectedTaskId
-        if (scrollLatestAfterResponse) {
-            // submitList commit callback scrolls after DiffUtil applies the latest item heights.
-        } else if (!anchorMessageId.isNullOrBlank()) {
-            // submitList commit callback scrolls after DiffUtil applies the latest item heights.
-        } else if (visibleMessages.isNotEmpty() && !selectedTaskId.isNullOrBlank() && pendingInitialChatScrollTaskId == selectedTaskId) {
-            pendingInitialChatScrollTaskId = null
-        } else if (shouldAutoScrollNewMessage && !shouldPreserveManualScroll) {
-            recyclerMessages.post {
-                recyclerMessages.scrollToPosition(visibleMessages.lastIndex)
-            }
-        }
+    private fun renderUiDraftContext(phoneGateVisible: Boolean) {
+        val taskId = screenState.selectedTaskId
+        val context = taskId?.let(uiEditorContextByTask::get)
+        val canEditCurrentRevision = !phoneGateVisible &&
+            !taskId.isNullOrBlank() &&
+            context?.source_available == true &&
+            context.revision_label.isNotBlank()
+        uiDraftContextBar.visibility = if (canEditCurrentRevision) View.VISIBLE else View.GONE
+        btnOpenUiEditor.isEnabled = canEditCurrentRevision
+        btnOpenUiEditor.alpha = if (canEditCurrentRevision) 1f else 0.45f
+
+        val canSelectSavedUi = canEditCurrentRevision &&
+            context?.has_saved_ui == true &&
+            screenState.inputMode != InputMode.NEW_GENERATE &&
+            screenState.inputMode != InputMode.READ_ONLY
+        val checked = canSelectSavedUi && taskId?.let { useSavedUiByTask[it] } == true
+        isRenderingUiDraftContext = true
+        checkUseSavedUi.isEnabled = canSelectSavedUi
+        checkUseSavedUi.alpha = if (canSelectSavedUi) 1f else 0.55f
+        checkUseSavedUi.isChecked = checked
+        isRenderingUiDraftContext = false
     }
 
     private fun renderSelectedAttachmentsIfChanged(force: Boolean = false) {
@@ -4469,13 +4558,7 @@ ${record.stackTrace}
     }
 
     private fun launchReferenceImagePicker() {
-        val intent = Intent(
-            Intent.ACTION_PICK,
-            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        ).apply {
-            type = "image/*"
-            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-        }
+        val intent = AttachmentPickerIntentFactory.multipleImages()
         if (intent.resolveActivity(packageManager) != null) {
             pickReferenceImageLauncher.launch(intent)
         } else {
@@ -5916,12 +5999,12 @@ ${record.stackTrace}
         val summary = taskSummaryById[resolvedTaskId]
         Log.d(
             TAG,
-            "Task selection requested_task_id=$requestedTaskId resolved_task_id=$resolvedTaskId app_name=${summary?.appName ?: "-"} title=${summary?.title ?: "-"}"
+            "Task selection requested_task_id=$requestedTaskId resolved_task_id=$resolvedTaskId summary_available=${summary != null}"
         )
     }
 
     private fun logStatusFetchTaskId(taskId: String, source: String) {
-        Log.d(TAG, "Status fetch source=$source task_id=$taskId app_name=${taskSummaryById[taskId]?.appName ?: "-"}")
+        Log.d(TAG, "Status fetch source=$source task_id=$taskId")
     }
 
     private fun logTaskIdForApi(endpoint: String, taskId: String) {
@@ -6366,17 +6449,14 @@ ${record.stackTrace}
         var lastDateKey: String? = null
         messages.forEach { message ->
             if (message.kind == MessageKind.DATE_SEPARATOR) return@forEach
-            val messageDate = parseMessageTimestamp(message.createdAt)
-                ?.toInstant()
-                ?.atZone(koreaZoneId)
-                ?.toLocalDate()
+            val messageDate = timestampFormatter.localDate(message.createdAt)
             val dateKey = messageDate?.toString()
             if (dateKey != null && dateKey != lastDateKey) {
                 result += ChatMessage(
                     id = "date-separator-$dateKey-${result.size}",
                     kind = MessageKind.DATE_SEPARATOR,
                     title = null,
-                    body = dateSeparatorTimestampFormat.format(Date.from(messageDate.atStartOfDay(koreaZoneId).toInstant())),
+                    body = timestampFormatter.formatDateSeparator(messageDate),
                     createdAt = dateKey
                 )
                 lastDateKey = dateKey
@@ -6789,122 +6869,35 @@ ${record.stackTrace}
     }
 
     private fun ChatMessage.sameContentAs(other: ChatMessage): Boolean {
-        if (kind != other.kind) return false
-        if (PromptReviewMessagePolicy.areEquivalent(this, other)) return true
-        val artifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(this)
-        val otherArtifactKey = TaskProgressTimelinePolicy.artifactDedupeKey(other)
-        if (artifactKey != null || otherArtifactKey != null) {
-            return artifactKey != null && artifactKey == otherArtifactKey
-        }
-        val ownImagePreviews = allImagePreviews()
-        val otherImagePreviews = other.allImagePreviews()
-        val sameBody = if (kind == MessageKind.USER) {
-            val ownBody = AttachmentOnlyMessagePolicy.canonicalUserBody(
-                normalizedBody = normalizeMessageTextForDedupe(body),
-                hasImages = ownImagePreviews.isNotEmpty(),
-                normalizedSyntheticPrompts = attachmentOnlyPromptKeys
-            )
-            val otherBody = AttachmentOnlyMessagePolicy.canonicalUserBody(
-                normalizedBody = normalizeMessageTextForDedupe(other.body),
-                hasImages = otherImagePreviews.isNotEmpty(),
-                normalizedSyntheticPrompts = attachmentOnlyPromptKeys
-            )
-            hasSameMessageText(ownBody, otherBody)
-        } else {
-            hasSameMessageText(body, other.body)
-        }
-        val sameDetail = hasSameMessageText(detail, other.detail)
-        return when (kind) {
-            MessageKind.USER -> {
-                val hasImage = ownImagePreviews.isNotEmpty()
-                val otherHasImage = otherImagePreviews.isNotEmpty()
-                when {
-                    hasImage != otherHasImage -> sameBody
-                    hasImage -> sameBody && AttachmentOnlyMessagePolicy.imageSelectionsEquivalent(
-                        ownImagePreviews,
-                        otherImagePreviews
-                    )
-                    else -> sameBody
-                }
-            }
-            MessageKind.ASSISTANT,
-            MessageKind.CONFIRMATION,
-            MessageKind.LOG -> sameBody && sameDetail
-            MessageKind.DATE_SEPARATOR -> sameBody
-            MessageKind.STATUS,
-            MessageKind.BUILD_LOG -> sameBody && sameDetail && normalizeMessageTextForDedupe(title) == normalizeMessageTextForDedupe(other.title)
-        }
+        return ChatMessageTextPolicy.areSameContent(this, other, attachmentOnlyPromptKeys)
     }
 
     private fun hasSameMessageText(left: String?, right: String?): Boolean {
-        val normalizedLeft = normalizeMessageTextForDedupe(left)
-        val normalizedRight = normalizeMessageTextForDedupe(right)
-        if (normalizedLeft == normalizedRight) return true
-        val compactLeft = compactMessageTextForDedupe(normalizedLeft)
-        val compactRight = compactMessageTextForDedupe(normalizedRight)
-        if (compactLeft == compactRight) return true
-        return stripInlineListMarkersForDedupe(compactLeft) == stripInlineListMarkersForDedupe(compactRight)
+        return ChatMessageTextPolicy.sameText(left, right)
     }
 
     private fun normalizeMessageTextForDedupe(value: String?): String {
-        return stripMarkdownForDedupe(value.orEmpty())
-            .replace("\r\n", "\n")
-            .replace('\r', '\n')
-            .lineSequence()
-            .map { it.trim().replace(Regex("[ \\t]+"), " ") }
-            .filter { it.isNotBlank() }
-            .joinToString("\n")
-            .trim()
-    }
-
-    private fun stripMarkdownForDedupe(value: String): String {
-        return value
-            .replace(Regex("""\*\*(.*?)\*\*""")) { match -> match.groupValues[1] }
-            .replace(Regex("""`([^`]*)`""")) { match -> match.groupValues[1] }
-            .lineSequence()
-            .map { line ->
-                line.trim()
-                    .replace(Regex("""^[-*•]\s+"""), "")
-                    .replace(Regex("""^\d+[.)]\s+"""), "")
-            }
-            .joinToString("\n")
+        return ChatMessageTextPolicy.normalize(value)
     }
 
     private fun compactMessageTextForDedupe(value: String): String {
-        return value.replace(Regex("\\s+"), " ").trim()
-    }
-
-    private fun stripInlineListMarkersForDedupe(value: String): String {
-        return value
-            .replace(Regex("""(^|\s)(?:[-*•]|\d+[.)])\s+"""), "$1")
-            .replace(Regex("\\s+"), " ")
-            .trim()
+        return ChatMessageTextPolicy.compact(value)
     }
 
     private fun isPrebuildConfirmationHeader(value: String?): Boolean {
-        val normalized = compactMessageTextForDedupe(normalizeMessageTextForDedupe(value))
-        return normalized == "앱 생성을 시작하기 전에 몇 가지만 확인할게요." ||
-            normalized == "수정을 시작하기 전에 몇 가지만 확인할게요." ||
-            PromptReviewMessagePolicy.isStandaloneReadyMessage(value)
+        return ChatMessageTextPolicy.isPrebuildConfirmationHeader(value)
     }
 
     private fun isHiddenOperationalBuildMessage(value: String?): Boolean {
-        val normalized = compactMessageTextForDedupe(normalizeMessageTextForDedupe(value))
-        return normalized == "APK build completed" ||
-            normalized == "APK 빌드가 완료되었어요." ||
-            normalized == "APK 생성이 완료되었어요." ||
-            normalized == "앱 생성이 완료되었어요." ||
-            normalized == "앱 생성이 완료되었어요" ||
-            normalized == "앱 생성 작업을 진행하고 있습니다." ||
-            normalized == "앱 생성 작업을 진행하고 있습니다"
+        return ChatMessageTextPolicy.isHiddenOperationalBuildMessage(value)
     }
 
     private fun currentTimestampString(): String {
-        return serverTimestampFormat.format(Date())
+        return timestampFormatter.nowServerTimestamp()
     }
 
     private fun currentTaskSummaryTimestampString(): String {
-        return displayTimestampFormat.format(Date())
+        return timestampFormatter.nowSummaryTimestamp()
     }
 
     private fun advanceTaskSelectionGeneration(): Long {
@@ -6917,15 +6910,11 @@ ${record.stackTrace}
     }
 
     private fun formatMessageTimestamp(value: String?): String? {
-        val raw = value?.trim().orEmpty()
-        if (raw.isBlank()) return null
-        return parseMessageTimestamp(raw)?.let(displayTimestampFormat::format) ?: raw
+        return timestampFormatter.formatDisplay(value)
     }
 
     private fun formatTaskSummaryTimestamp(value: String?): String? {
-        val raw = value?.trim().orEmpty()
-        if (raw.isBlank()) return null
-        return parseMessageTimestamp(raw)?.let(displayTimestampFormat::format) ?: raw
+        return timestampFormatter.formatDisplay(value)
     }
 
     private fun taskSummaryLastBubbleTimestamp(taskId: String): String? {
@@ -6935,37 +6924,16 @@ ${record.stackTrace}
             .asReversed()
             .firstNotNullOfOrNull { message ->
                 if (message.kind == MessageKind.DATE_SEPARATOR) return@firstNotNullOfOrNull null
-                parseMessageTimestamp(message.createdAt)?.let(displayTimestampFormat::format)
+                timestampFormatter.formatDisplay(message.createdAt)
             }
     }
 
     private fun formatMessageTimestampForBubble(value: String?): String? {
-        val parsed = parseMessageTimestamp(value) ?: return null
-        return bubbleTimestampFormat.format(parsed)
+        return timestampFormatter.formatBubble(value)
     }
 
     private fun parseMessageTimestamp(value: String?): Date? {
-        val raw = value?.trim().orEmpty()
-        if (raw.isBlank()) return null
-
-        return runCatching { Date.from(Instant.parse(raw)) }.getOrNull()
-            ?: runCatching { Date.from(OffsetDateTime.parse(raw).toInstant()) }.getOrNull()
-            ?: parseLocalTimestamp(raw)
-            ?: parseStrictTimestamp(serverTimestampFormat, raw)
-    }
-
-    private fun parseLocalTimestamp(value: String): Date? {
-        for (formatter in localTimestampParsers) {
-            val parsed = runCatching { LocalDateTime.parse(value, formatter) }.getOrNull() ?: continue
-            return Date.from(parsed.atZone(koreaZoneId).toInstant())
-        }
-        return null
-    }
-
-    private fun parseStrictTimestamp(format: SimpleDateFormat, value: String): Date? {
-        val position = ParsePosition(0)
-        val parsed = format.parse(value, position) ?: return null
-        return if (position.index == value.length) parsed else null
+        return timestampFormatter.parseDate(value)
     }
 
     private fun ChatMessage.withUniqueId(taskId: String, position: Int): ChatMessage {
@@ -6976,36 +6944,6 @@ ${record.stackTrace}
             id = "$taskId-$position-${kind.name.lowercase()}-${body.hashCode()}-${detail.hashCode()}",
             createdAt = createdAt ?: currentTimestampString()
         )
-    }
-
-    private fun showLocalSystemMessage(title: String, body: String, detail: String? = null, kind: MessageKind = MessageKind.STATUS) {
-        val taskId = currentTaskId?.takeIf { it.isNotBlank() }
-            ?: screenState.selectedTaskId?.takeIf { it.isNotBlank() }
-        if (!taskId.isNullOrBlank()) {
-            addTaskEvent(
-                taskId,
-                ChatMessage(
-                    id = "local-system-$taskId-${System.currentTimeMillis()}",
-                    kind = kind,
-                    title = title,
-                    body = body,
-                    detail = detail,
-                    createdAt = currentTimestampString()
-                )
-            )
-            return
-        }
-        screenState = screenState.copy(
-            messages = screenState.messages + ChatMessage(
-                id = "local-system-${System.currentTimeMillis()}",
-                kind = kind,
-                title = title,
-                body = body,
-                detail = detail,
-                createdAt = currentTimestampString()
-            )
-        )
-        renderState()
     }
 
     private fun showThinkingMessage() {
@@ -7023,7 +6961,7 @@ ${record.stackTrace}
         body: String,
         detail: String? = null,
         kind: MessageKind = MessageKind.STATUS,
-        isLoading: Boolean
+        isLoading: Boolean = false
     ) {
         val message = ChatMessage(
             id = "local-system-${System.currentTimeMillis()}",
@@ -7284,7 +7222,7 @@ ${record.stackTrace}
 
     private fun logApiRequest(endpoint: String, taskId: String? = null, deviceId: String, extra: String? = null) {
         val suffix = extra?.let { " $it" }.orEmpty()
-        Log.d(TAG, "API request endpoint=$endpoint task_id=${taskId ?: "-"} device_id=$deviceId$suffix")
+        Log.d(TAG, "API request endpoint=$endpoint task_id=${taskId ?: "-"} identity_ready=${deviceId.isNotBlank()}$suffix")
     }
 
     private fun logApiFailure(endpoint: String, taskId: String? = null, deviceId: String, throwable: Throwable) {
@@ -7296,13 +7234,13 @@ ${record.stackTrace}
             }
             Log.e(
                 TAG,
-                "API failure endpoint=$endpoint task_id=${taskId ?: "-"} device_id=$deviceId http=${throwable.code()} body=${rawBody ?: "<empty>"}",
+                "API failure endpoint=$endpoint task_id=${taskId ?: "-"} identity_ready=${deviceId.isNotBlank()} http=${throwable.code()} body_length=${rawBody?.length ?: 0}",
                 throwable
             )
         } else {
             Log.e(
                 TAG,
-                "API failure endpoint=$endpoint task_id=${taskId ?: "-"} device_id=$deviceId message=${throwable.message}",
+                "API failure endpoint=$endpoint task_id=${taskId ?: "-"} identity_ready=${deviceId.isNotBlank()} error_type=${throwable::class.java.simpleName}",
                 throwable
             )
         }

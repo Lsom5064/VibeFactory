@@ -1,9 +1,11 @@
+import base64
 import json
 import shutil
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -26,8 +28,6 @@ REQUIRED_ROUTES = {
     ("PATCH", "/tasks/{task_id}"),
     ("GET", "/tasks/{task_id}/usage"),
     ("GET", "/tasks/{task_id}/revisions"),
-    ("POST", "/tasks/{task_id}/revisions/{revision_label}/branch"),
-    ("POST", "/tasks/{task_id}/runtime-error"),
     ("GET", "/tasks/{task_id}/revisions/{revision_label}/ui/layouts"),
     ("GET", "/tasks/{task_id}/revisions/{revision_label}/ui/layouts/{layout_name}"),
     ("GET", "/tasks/{task_id}/revisions/{revision_label}/ui/resource"),
@@ -36,6 +36,8 @@ REQUIRED_ROUTES = {
     ("POST", "/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/images"),
     ("GET", "/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/images/{image_id}"),
     ("POST", "/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/submit"),
+    ("POST", "/tasks/{task_id}/revisions/{revision_label}/branch"),
+    ("POST", "/tasks/{task_id}/runtime-error"),
     ("GET", "/download/{task_id}"),
     ("POST", "/apps/{task_id}/llm/respond"),
     ("GET", "/apps/{task_id}/data/{collection}"),
@@ -256,6 +258,41 @@ class HostApiContractTests(unittest.TestCase):
         self.assertEqual("Cancelled", payload["status"])
         self.assertFalse(payload["cancel_allowed"])
 
+    def test_oversized_followup_attachment_preserves_existing_task_status(self) -> None:
+        oversized_pdf = b"%PDF-1.4\n" + (b"x" * 32)
+
+        with patch("flutter_apk_server.reference_attachments.REFERENCE_PDF_MAX_BYTES", 16):
+            response = self.client.post(
+                "/generate",
+                json={
+                    "task_id": self.task_id,
+                    "device_id": self.device_id,
+                    "phone_number": self.phone_number,
+                    "prompt": "첨부한 문서를 반영해줘",
+                    "attachments": [
+                        {
+                            "type": "pdf",
+                            "mime_type": "application/pdf",
+                            "name": "oversized.pdf",
+                            "base64": base64.b64encode(oversized_pdf).decode("ascii"),
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(400, response.status_code)
+        task = self.db.get_task(self.task_id)
+        self.assertIsNotNone(task)
+        self.assertEqual("Success", task["status"])
+        self.assertEqual("APK 빌드가 완료되었어요.", task["message"])
+        failed_attachment = self.db.list_task_attachments(self.task_id)[-1]
+        self.assertEqual("failed", failed_attachment["status"])
+        self.assertEqual("oversized.pdf", failed_attachment["original_name"])
+        self.assertIn(
+            "attachment_save_failed",
+            [event["event_type"] for event in self.db.list_events(self.task_id)],
+        )
+
     def test_branch_creates_immediate_task_with_preserved_package(self) -> None:
         response = self.client.post(
             f"/tasks/{self.task_id}/revisions/rev_0001/branch?{self.query()}"
@@ -324,6 +361,21 @@ class HostApiContractTests(unittest.TestCase):
         event = self.db.list_events(self.task_id)[-1]
         event_payload = json.loads(event["payload_json"])
         self.assertEqual(stack_trace.strip(), event_payload["stack_trace"])
+
+    def test_runtime_error_rejects_package_from_another_task(self) -> None:
+        event_count = len(self.db.list_events(self.task_id))
+        response = self.client.post(
+            f"/tasks/{self.task_id}/runtime-error?{self.query()}",
+            json={
+                "package_name": "kr.ac.kangwon.hai.generated.other",
+                "summary": "다른 앱에서 온 오류",
+                "stack_trace": "java.lang.IllegalStateException: spoofed",
+            },
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("package_name does not match task", response.json()["detail"])
+        self.assertEqual(event_count, len(self.db.list_events(self.task_id)))
 
     def test_generated_app_data_crud_contract(self) -> None:
         collection_url = f"/apps/{self.task_id}/data/notes"

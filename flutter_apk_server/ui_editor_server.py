@@ -15,7 +15,7 @@ REVISION_LABEL_PATTERN = re.compile(r"^rev_\d{4}$")
 LAYOUT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 LAYOUT_CONFIGURATION_PATTERN = re.compile(r"^layout(?:-[A-Za-z0-9]+)*$")
 RESOURCE_DIRECTORY_PATTERN = re.compile(
-    r"^(?:values|drawable|mipmap|color|font)(?:-[A-Za-z0-9]+)*$"
+    r"^(?:values|layout|drawable|mipmap|color|font)(?:-[A-Za-z0-9]+)*$"
 )
 RESOURCE_REFERENCE_PATTERN = re.compile(
     r"@(?P<framework>android:)?(?P<type>[A-Za-z_][A-Za-z0-9_]*)/"
@@ -548,6 +548,109 @@ def build_ui_editor_codex_prompt(
         "package_name": package_name,
         "app_name": app_name,
         "source_context": source_context,
+        "prompt": prompt,
+    }
+    return prompt, payload
+
+
+def build_ui_editor_chat_context(
+    *,
+    task_id: str,
+    base_revision_label: str,
+    generated_revision_label: str,
+    user_prompt: str,
+    drafts: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    draft_payloads: list[dict[str, Any]] = []
+    sections: list[str] = []
+    for index, draft in enumerate(drafts, start=1):
+        original_xml = str(draft.get("original_xml") or "")
+        edited_xml = str(draft.get("edited_xml") or "")
+        descriptions = draft.get("descriptions")
+        if not isinstance(descriptions, dict):
+            descriptions = {}
+        images = draft.get("images")
+        if not isinstance(images, list):
+            images = []
+        diff = structural_xml_diff(original_xml, edited_xml)
+        image_lines = "\n".join(
+            "- element `{element}`: `{path}` (resource `{resource}`, SHA-256 `{sha}`)".format(
+                element=image.get("element_stable_id") or "",
+                path=image.get("workspace_path") or "",
+                resource=image.get("resource_name") or "",
+                sha=image.get("sha256") or "",
+            )
+            for image in images
+            if isinstance(image, dict)
+        ) or "- 없음"
+        sections.append(
+            f"""### 저장 UI {index}: `app/src/main/res/{draft.get('configuration') or 'layout'}/{draft.get('layout_name') or ''}.xml`
+
+#### 사용자가 저장한 XML 전문
+
+```xml
+{edited_xml}
+```
+
+#### 기준 XML과의 구조적 차이
+
+```json
+{json.dumps(diff['operations'], ensure_ascii=False, indent=2)}
+```
+
+#### 요소별 설명
+
+```json
+{json.dumps(descriptions, ensure_ascii=False, indent=2, sort_keys=True)}
+```
+
+#### 편집 화면 미리보기
+
+`{draft.get('preview_workspace_path') or '(없음)'}`
+
+#### UI 편집에 첨부된 이미지
+
+{image_lines}"""
+        )
+        draft_payloads.append(
+            {
+                "draft_id": draft.get("draft_id") or "",
+                "version": int(draft.get("version") or 0),
+                "layout_name": draft.get("layout_name") or "",
+                "configuration": draft.get("configuration") or "layout",
+                "original_xml": original_xml,
+                "edited_xml": edited_xml,
+                "diff": diff,
+                "descriptions": descriptions,
+                "images": images,
+                "preview_workspace_path": draft.get("preview_workspace_path") or "",
+                "confirmed_at": draft.get("confirmed_at") or "",
+            }
+        )
+
+    prompt = f"""## 채팅 요청에 선택된 저장 UI
+
+사용자가 아래 UI 편집 내용을 현재 채팅 요청의 시각적 기준으로 선택했다.
+
+- Task ID: `{task_id}`
+- 기준 Revision: `{base_revision_label}`
+- 작업 Revision: `{generated_revision_label}`
+- 최신 채팅 요청: {user_prompt.strip()}
+- 저장된 UI 구조와 요소 설명을 실제 앱 코드에 반영한다.
+- 최신 채팅 요청은 기능과 세부 동작을 설명하며, 명시적으로 충돌하는 경우 최신 채팅 요청을 우선한다.
+- 기존 View ID, Kotlin 동작, package name, Task ID, 런타임 API와 오류 보고 계약을 유지한다.
+- 요소 추가·삭제·이동에 맞춰 Kotlin 참조와 이벤트 처리를 함께 수정한다.
+- UI 편집 이미지는 명시된 workspace 상대 경로에서 읽어 Android 리소스로 반영한다.
+- 이 섹션이 없는 후속 요청에서는 저장 UI 초안을 새 입력으로 간주하지 않는다.
+
+{chr(10).join(sections)}
+""".strip() + "\n"
+    payload = {
+        "task_id": task_id,
+        "base_revision_label": base_revision_label,
+        "generated_revision_label": generated_revision_label,
+        "user_prompt": user_prompt,
+        "drafts": draft_payloads,
         "prompt": prompt,
     }
     return prompt, payload

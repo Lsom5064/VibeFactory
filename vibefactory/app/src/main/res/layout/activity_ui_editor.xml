@@ -51,85 +51,6 @@
         </LinearLayout>
     </LinearLayout>
 
-    <HorizontalScrollView
-        android:id="@+id/uiEditorActionToolbar"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:fillViewport="true"
-        android:scrollbars="none">
-
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
-
-            <Button
-                android:id="@+id/btnUiEditorScreen"
-                android:layout_width="wrap_content"
-                android:layout_height="42dp"
-                android:background="@drawable/bg_button_secondary"
-                android:minWidth="140dp"
-                android:paddingStart="14dp"
-                android:paddingEnd="14dp"
-                android:text="@string/ui_editor_screen"
-                android:textAllCaps="false"
-                android:textColor="@color/text_primary" />
-
-            <Button
-                android:id="@+id/btnUiEditorUndo"
-                android:layout_width="48dp"
-                android:layout_height="42dp"
-                android:layout_marginStart="8dp"
-                android:background="@drawable/bg_button_secondary"
-                android:contentDescription="@string/ui_editor_undo"
-                android:minWidth="0dp"
-                android:text="↶"
-                android:textAllCaps="false"
-                android:textColor="@color/text_primary"
-                android:textSize="19sp" />
-
-            <Button
-                android:id="@+id/btnUiEditorRedo"
-                android:layout_width="48dp"
-                android:layout_height="42dp"
-                android:layout_marginStart="6dp"
-                android:background="@drawable/bg_button_secondary"
-                android:contentDescription="@string/ui_editor_redo"
-                android:minWidth="0dp"
-                android:text="↷"
-                android:textAllCaps="false"
-                android:textColor="@color/text_primary"
-                android:textSize="19sp" />
-
-            <Button
-                android:id="@+id/btnUiEditorSave"
-                android:layout_width="wrap_content"
-                android:layout_height="42dp"
-                android:layout_marginStart="8dp"
-                android:background="@drawable/bg_send_button"
-                android:minWidth="0dp"
-                android:paddingStart="16dp"
-                android:paddingEnd="16dp"
-                android:text="@string/ui_editor_save"
-                android:textAllCaps="false"
-                android:textColor="@color/text_inverse" />
-
-        </LinearLayout>
-    </HorizontalScrollView>
-
-    <Button
-        android:id="@+id/btnUiEditorSubmit"
-        android:layout_width="match_parent"
-        android:layout_height="42dp"
-        android:layout_marginTop="8dp"
-        android:background="@drawable/bg_send_button"
-        android:minWidth="0dp"
-        android:text="@string/ui_editor_submit"
-        android:textAllCaps="false"
-        android:textColor="@color/text_inverse" />
-
     <LinearLayout
         android:id="@+id/uiEditorPaletteSection"
         android:layout_width="match_parent"
@@ -179,17 +100,102 @@
                 android:src="@drawable/ic_chevron_right" />
         </LinearLayout>
 
-        <HorizontalScrollView
-            android:id="@+id/uiEditorPaletteToolbar"
+        <LinearLayout
+            android:id="@+id/uiEditorPaletteContent"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:scrollbars="none">
+            android:orientation="vertical">
 
-            <LinearLayout
-                android:layout_width="wrap_content"
+            <HorizontalScrollView
+                android:id="@+id/uiEditorActionToolbar"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:orientation="horizontal">
+                android:layout_marginTop="4dp"
+                android:fillViewport="true"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <Button
+                        android:id="@+id/btnUiEditorScreen"
+                        android:layout_width="wrap_content"
+                        android:layout_height="42dp"
+                        android:background="@drawable/bg_button_secondary"
+                        android:minWidth="140dp"
+                        android:paddingStart="14dp"
+                        android:paddingEnd="14dp"
+                        android:text="@string/ui_editor_screen"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary" />
+
+                    <Button
+                        android:id="@+id/btnUiEditorUndo"
+                        android:layout_width="48dp"
+                        android:layout_height="42dp"
+                        android:layout_marginStart="8dp"
+                        android:background="@drawable/bg_button_secondary"
+                        android:contentDescription="@string/ui_editor_undo"
+                        android:minWidth="0dp"
+                        android:text="↶"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        android:textSize="19sp" />
+
+                    <Button
+                        android:id="@+id/btnUiEditorRedo"
+                        android:layout_width="48dp"
+                        android:layout_height="42dp"
+                        android:layout_marginStart="6dp"
+                        android:background="@drawable/bg_button_secondary"
+                        android:contentDescription="@string/ui_editor_redo"
+                        android:minWidth="0dp"
+                        android:text="↷"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        android:textSize="19sp" />
+
+                    <Button
+                        android:id="@+id/btnUiEditorSave"
+                        android:layout_width="wrap_content"
+                        android:layout_height="42dp"
+                        android:layout_marginStart="8dp"
+                        android:background="@drawable/bg_send_button"
+                        android:minWidth="0dp"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="16dp"
+                        android:text="@string/ui_editor_save"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_inverse" />
+
+                </LinearLayout>
+            </HorizontalScrollView>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:paddingStart="4dp"
+                android:paddingEnd="4dp"
+                android:text="@string/ui_editor_elements_label"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp"
+                android:textStyle="bold" />
+
+            <HorizontalScrollView
+                android:id="@+id/uiEditorPaletteToolbar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
 
                 <Button
                     android:id="@+id/btnUiEditorLayers"
@@ -276,8 +282,9 @@
                     android:layout_marginStart="6dp"
                     android:text="@string/ui_editor_add_list"
                     android:textAllCaps="false" />
-            </LinearLayout>
-        </HorizontalScrollView>
+                </LinearLayout>
+            </HorizontalScrollView>
+        </LinearLayout>
     </LinearLayout>
 
     <LinearLayout
@@ -381,8 +388,11 @@
             </HorizontalScrollView>
 
             <LinearLayout
+                android:id="@+id/uiEditorStateOverlay"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
+                android:clickable="true"
+                android:focusable="true"
                 android:gravity="center"
                 android:orientation="vertical"
                 android:padding="24dp">
@@ -416,14 +426,38 @@
         </FrameLayout>
     </LinearLayout>
 
-    <ScrollView
+    <LinearLayout
         android:id="@+id/uiEditorPropertiesPanel"
         android:layout_width="match_parent"
         android:layout_height="250dp"
         android:layout_marginTop="8dp"
         android:background="@drawable/bg_ui_editor_section"
-        android:fillViewport="true"
+        android:orientation="vertical"
         android:visibility="gone">
+
+        <FrameLayout
+            android:id="@+id/uiEditorPropertiesResizeHandle"
+            android:layout_width="match_parent"
+            android:layout_height="28dp"
+            android:clickable="true"
+            android:contentDescription="@string/ui_editor_resize_properties"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground">
+
+            <View
+                android:layout_width="48dp"
+                android:layout_height="4dp"
+                android:layout_gravity="center"
+                android:background="@drawable/bg_ui_editor_resize_handle"
+                android:importantForAccessibility="no" />
+        </FrameLayout>
+
+        <ScrollView
+            android:id="@+id/uiEditorPropertiesScroll"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:fillViewport="true">
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -447,14 +481,14 @@
                     android:textStyle="bold" />
 
                 <Button
-                    android:id="@+id/btnUiEditorDoneEditing"
+                    android:id="@+id/btnUiEditorCloseProperties"
                     android:layout_width="wrap_content"
                     android:layout_height="38dp"
                     android:background="@drawable/bg_button_secondary"
                     android:minWidth="0dp"
                     android:paddingStart="12dp"
                     android:paddingEnd="12dp"
-                    android:text="@string/ui_editor_done_editing"
+                    android:text="@string/ui_editor_close_properties"
                     android:textAllCaps="false"
                     android:textColor="@color/text_primary" />
             </LinearLayout>
@@ -477,6 +511,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
+                android:baselineAligned="false"
                 android:orientation="horizontal">
 
                 <EditText
@@ -545,6 +580,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
+                android:baselineAligned="false"
                 android:orientation="horizontal">
 
                 <LinearLayout
@@ -723,5 +759,6 @@
                 </LinearLayout>
             </HorizontalScrollView>
         </LinearLayout>
-    </ScrollView>
+        </ScrollView>
+    </LinearLayout>
 </LinearLayout>
