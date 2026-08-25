@@ -350,7 +350,11 @@ class UiEditorActivity : AppCompatActivity() {
     private fun updatePaletteSectionVisibility(animate: Boolean = false) {
         val content = findViewById<View>(R.id.uiEditorPaletteContent)
         val chevron = findViewById<ImageView>(R.id.uiEditorPaletteChevron)
+        val stateLabel = findViewById<TextView>(R.id.uiEditorPaletteSectionSummary)
         content.visibility = if (isPaletteExpanded) View.VISIBLE else View.GONE
+        stateLabel.setText(
+            if (isPaletteExpanded) R.string.ui_editor_palette_close else R.string.ui_editor_palette_open
+        )
         val targetRotation = if (isPaletteExpanded) 90f else 0f
         if (animate) {
             chevron.animate().rotation(targetRotation).setDuration(SECTION_TOGGLE_DURATION_MILLIS).start()
@@ -1043,10 +1047,10 @@ class UiEditorActivity : AppCompatActivity() {
             )
         }
         val supportsText = node.simpleTag in TEXT_TAGS
-        findViewById<EditText>(R.id.uiEditorElementText).apply {
-            visibility = if (supportsText) View.VISIBLE else View.GONE
-            setText(node.androidAttribute("text") ?: node.androidAttribute("hint").orEmpty())
-        }
+        findViewById<View>(R.id.uiEditorElementTextContainer).visibility =
+            if (supportsText) View.VISIBLE else View.GONE
+        findViewById<EditText>(R.id.uiEditorElementText)
+            .setText(node.androidAttribute("text") ?: node.androidAttribute("hint").orEmpty())
         findViewById<EditText>(R.id.uiEditorWidth).setText(node.androidAttribute("layout_width").orEmpty())
         findViewById<EditText>(R.id.uiEditorHeight).setText(node.androidAttribute("layout_height").orEmpty())
         findViewById<EditText>(R.id.uiEditorMarginStart).setText(dpValue(node.androidAttribute("layout_marginStart")))

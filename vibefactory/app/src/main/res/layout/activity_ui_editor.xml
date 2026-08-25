@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/uiEditorRoot"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -86,7 +87,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginEnd="4dp"
-                android:text="@string/ui_editor_palette_section_summary"
+                android:text="@string/ui_editor_palette_close"
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
 
@@ -493,19 +494,25 @@
                     android:textColor="@color/text_primary" />
             </LinearLayout>
 
-            <EditText
-                android:id="@+id/uiEditorElementText"
+            <com.google.android.material.textfield.TextInputLayout
+                android:id="@+id/uiEditorElementTextContainer"
                 android:layout_width="match_parent"
-                android:layout_height="44dp"
+                android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:background="@drawable/bg_surface_alt"
                 android:hint="@string/ui_editor_property_text"
-                android:imeOptions="actionNext"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:singleLine="true"
-                android:textColor="@color/text_primary"
-                android:textColorHint="@color/text_secondary" />
+                app:boxBackgroundColor="@color/bg_panel_alt"
+                app:boxBackgroundMode="filled"
+                app:boxStrokeColor="@color/accent_primary"
+                app:hintTextColor="@color/text_secondary">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/uiEditorElementText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:imeOptions="actionNext"
+                    android:singleLine="true"
+                    android:textColor="@color/text_primary" />
+            </com.google.android.material.textfield.TextInputLayout>
 
             <LinearLayout
                 android:layout_width="match_parent"
@@ -514,66 +521,97 @@
                 android:baselineAligned="false"
                 android:orientation="horizontal">
 
-                <EditText
-                    android:id="@+id/uiEditorWidth"
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/uiEditorWidthContainer"
                     android:layout_width="0dp"
-                    android:layout_height="44dp"
+                    android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:background="@drawable/bg_surface_alt"
                     android:hint="@string/ui_editor_property_width"
-                    android:imeOptions="actionNext"
-                    android:paddingStart="10dp"
-                    android:paddingEnd="10dp"
-                    android:singleLine="true"
-                    android:textColor="@color/text_primary"
-                    android:textColorHint="@color/text_secondary" />
+                    app:boxBackgroundColor="@color/bg_panel_alt"
+                    app:boxBackgroundMode="filled"
+                    app:boxStrokeColor="@color/accent_primary"
+                    app:hintTextColor="@color/text_secondary">
 
-                <EditText
-                    android:id="@+id/uiEditorHeight"
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/uiEditorWidth"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:imeOptions="actionNext"
+                        android:singleLine="true"
+                        android:textColor="@color/text_primary" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/uiEditorHeightContainer"
                     android:layout_width="0dp"
-                    android:layout_height="44dp"
+                    android:layout_height="wrap_content"
                     android:layout_marginStart="6dp"
                     android:layout_weight="1"
-                    android:background="@drawable/bg_surface_alt"
                     android:hint="@string/ui_editor_property_height"
-                    android:imeOptions="actionNext"
-                    android:paddingStart="10dp"
-                    android:paddingEnd="10dp"
-                    android:singleLine="true"
-                    android:textColor="@color/text_primary"
-                    android:textColorHint="@color/text_secondary" />
+                    app:boxBackgroundColor="@color/bg_panel_alt"
+                    app:boxBackgroundMode="filled"
+                    app:boxStrokeColor="@color/accent_primary"
+                    app:hintTextColor="@color/text_secondary">
 
-                <EditText
-                    android:id="@+id/uiEditorMarginStart"
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/uiEditorHeight"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:imeOptions="actionNext"
+                        android:singleLine="true"
+                        android:textColor="@color/text_primary" />
+                </com.google.android.material.textfield.TextInputLayout>
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:baselineAligned="false"
+                android:orientation="horizontal">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/uiEditorMarginStartContainer"
                     android:layout_width="0dp"
-                    android:layout_height="44dp"
-                    android:layout_marginStart="6dp"
+                    android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:background="@drawable/bg_surface_alt"
                     android:hint="@string/ui_editor_property_x"
-                    android:imeOptions="actionNext"
-                    android:inputType="number"
-                    android:paddingStart="10dp"
-                    android:paddingEnd="10dp"
-                    android:singleLine="true"
-                    android:textColor="@color/text_primary"
-                    android:textColorHint="@color/text_secondary" />
+                    app:boxBackgroundColor="@color/bg_panel_alt"
+                    app:boxBackgroundMode="filled"
+                    app:boxStrokeColor="@color/accent_primary"
+                    app:hintTextColor="@color/text_secondary">
 
-                <EditText
-                    android:id="@+id/uiEditorMarginTop"
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/uiEditorMarginStart"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:imeOptions="actionNext"
+                        android:inputType="number"
+                        android:singleLine="true"
+                        android:textColor="@color/text_primary" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/uiEditorMarginTopContainer"
                     android:layout_width="0dp"
-                    android:layout_height="44dp"
+                    android:layout_height="wrap_content"
                     android:layout_marginStart="6dp"
                     android:layout_weight="1"
-                    android:background="@drawable/bg_surface_alt"
                     android:hint="@string/ui_editor_property_y"
-                    android:imeOptions="actionNext"
-                    android:inputType="number"
-                    android:paddingStart="10dp"
-                    android:paddingEnd="10dp"
-                    android:singleLine="true"
-                    android:textColor="@color/text_primary"
-                    android:textColorHint="@color/text_secondary" />
+                    app:boxBackgroundColor="@color/bg_panel_alt"
+                    app:boxBackgroundMode="filled"
+                    app:boxStrokeColor="@color/accent_primary"
+                    app:hintTextColor="@color/text_secondary">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/uiEditorMarginTop"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:imeOptions="actionNext"
+                        android:inputType="number"
+                        android:singleLine="true"
+                        android:textColor="@color/text_primary" />
+                </com.google.android.material.textfield.TextInputLayout>
             </LinearLayout>
 
             <LinearLayout
@@ -586,94 +624,135 @@
                 <LinearLayout
                     android:id="@+id/uiEditorTextColorControl"
                     android:layout_width="0dp"
-                    android:layout_height="44dp"
+                    android:layout_height="56dp"
                     android:layout_weight="1"
                     android:background="@drawable/bg_surface_alt"
                     android:clickable="true"
                     android:contentDescription="@string/ui_editor_choose_text_color"
                     android:focusable="true"
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal"
+                    android:orientation="vertical"
                     android:paddingStart="7dp"
-                    android:paddingEnd="6dp">
+                    android:paddingTop="3dp"
+                    android:paddingEnd="6dp"
+                    android:paddingBottom="3dp">
 
-                    <View
-                        android:id="@+id/uiEditorTextColorSwatch"
-                        android:layout_width="28dp"
-                        android:layout_height="28dp"
-                        android:background="@drawable/bg_color_swatch_empty"
-                        android:importantForAccessibility="no" />
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/ui_editor_property_text_color"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="10sp" />
 
-                    <EditText
-                        android:id="@+id/uiEditorTextColor"
-                        android:layout_width="0dp"
-                        android:layout_height="match_parent"
-                        android:layout_marginStart="6dp"
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="0dp"
                         android:layout_weight="1"
-                        android:background="@android:color/transparent"
-                        android:clickable="false"
-                        android:cursorVisible="false"
-                        android:focusable="false"
-                        android:hint="@string/ui_editor_property_text_color"
-                        android:padding="0dp"
-                        android:singleLine="true"
-                        android:textColor="@color/text_primary"
-                        android:textColorHint="@color/text_secondary"
-                        android:textSize="12sp" />
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+
+                        <View
+                            android:id="@+id/uiEditorTextColorSwatch"
+                            android:layout_width="24dp"
+                            android:layout_height="24dp"
+                            android:background="@drawable/bg_color_swatch_empty"
+                            android:importantForAccessibility="no" />
+
+                        <EditText
+                            android:id="@+id/uiEditorTextColor"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginStart="6dp"
+                            android:layout_weight="1"
+                            android:background="@android:color/transparent"
+                            android:clickable="false"
+                            android:cursorVisible="false"
+                            android:focusable="false"
+                            android:hint="@string/ui_editor_property_text_color"
+                            android:padding="0dp"
+                            android:singleLine="true"
+                            android:textColor="@color/text_primary"
+                            android:textColorHint="@color/text_secondary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
                 </LinearLayout>
 
                 <LinearLayout
                     android:id="@+id/uiEditorBackgroundControl"
                     android:layout_width="0dp"
-                    android:layout_height="44dp"
+                    android:layout_height="56dp"
                     android:layout_marginStart="6dp"
                     android:layout_weight="1"
                     android:background="@drawable/bg_surface_alt"
                     android:clickable="true"
                     android:contentDescription="@string/ui_editor_choose_background_color"
                     android:focusable="true"
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal"
+                    android:orientation="vertical"
                     android:paddingStart="7dp"
-                    android:paddingEnd="6dp">
+                    android:paddingTop="3dp"
+                    android:paddingEnd="6dp"
+                    android:paddingBottom="3dp">
 
-                    <View
-                        android:id="@+id/uiEditorBackgroundSwatch"
-                        android:layout_width="28dp"
-                        android:layout_height="28dp"
-                        android:background="@drawable/bg_color_swatch_empty"
-                        android:importantForAccessibility="no" />
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/ui_editor_property_background"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="10sp" />
 
-                    <EditText
-                        android:id="@+id/uiEditorBackground"
-                        android:layout_width="0dp"
-                        android:layout_height="match_parent"
-                        android:layout_marginStart="6dp"
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="0dp"
                         android:layout_weight="1"
-                        android:background="@android:color/transparent"
-                        android:clickable="false"
-                        android:cursorVisible="false"
-                        android:focusable="false"
-                        android:hint="@string/ui_editor_property_background"
-                        android:padding="0dp"
-                        android:singleLine="true"
-                        android:textColor="@color/text_primary"
-                        android:textColorHint="@color/text_secondary"
-                        android:textSize="12sp" />
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+
+                        <View
+                            android:id="@+id/uiEditorBackgroundSwatch"
+                            android:layout_width="24dp"
+                            android:layout_height="24dp"
+                            android:background="@drawable/bg_color_swatch_empty"
+                            android:importantForAccessibility="no" />
+
+                        <EditText
+                            android:id="@+id/uiEditorBackground"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginStart="6dp"
+                            android:layout_weight="1"
+                            android:background="@android:color/transparent"
+                            android:clickable="false"
+                            android:cursorVisible="false"
+                            android:focusable="false"
+                            android:hint="@string/ui_editor_property_background"
+                            android:padding="0dp"
+                            android:singleLine="true"
+                            android:textColor="@color/text_primary"
+                            android:textColorHint="@color/text_secondary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
                 </LinearLayout>
             </LinearLayout>
 
-            <EditText
-                android:id="@+id/uiEditorDescription"
+            <com.google.android.material.textfield.TextInputLayout
                 android:layout_width="match_parent"
-                android:layout_height="72dp"
+                android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:background="@drawable/bg_surface_alt"
-                android:gravity="top|start"
                 android:hint="@string/ui_editor_property_description"
-                android:padding="10dp"
-                android:textColor="@color/text_primary"
-                android:textColorHint="@color/text_secondary" />
+                app:boxBackgroundColor="@color/bg_panel_alt"
+                app:boxBackgroundMode="filled"
+                app:boxStrokeColor="@color/accent_primary"
+                app:hintTextColor="@color/text_secondary">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/uiEditorDescription"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="top|start"
+                    android:inputType="textMultiLine"
+                    android:minHeight="72dp"
+                    android:minLines="2"
+                    android:textColor="@color/text_primary" />
+            </com.google.android.material.textfield.TextInputLayout>
 
             <HorizontalScrollView
                 android:layout_width="match_parent"

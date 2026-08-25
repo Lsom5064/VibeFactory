@@ -1,6 +1,7 @@
 package kr.ac.kangwon.hai.vibefactory
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -64,5 +65,30 @@ class PromptReviewMessagePolicyTest {
         assertTrue(PromptReviewMessagePolicy.shouldShowConfirmationActions(promptReview, handled = false))
         assertFalse(PromptReviewMessagePolicy.shouldShowConfirmationActions(promptReview, handled = true))
         assertTrue(PromptReviewMessagePolicy.shouldShowConfirmationActions(normalConfirmation, handled = true))
+    }
+
+    @Test
+    fun `submitted prompt replaces every expandable prompt review value`() {
+        val original = ChatMessage(
+            id = "prompt-review",
+            kind = MessageKind.CONFIRMATION,
+            title = "확인",
+            body = "수정 전 프롬프트",
+            detail = PromptReviewMessagePolicy.READY_MESSAGE,
+            confirmAction = "submit_initial_prompt",
+            confirmPayload = "수정 전 프롬프트",
+            promptReviewText = "수정 전 프롬프트"
+        )
+
+        val submitted = PromptReviewMessagePolicy.withSubmittedPrompt(
+            message = original,
+            submittedPrompt = "  수정 후 최종 프롬프트  ",
+            submittedDetail = "전송한 최종 프롬프트"
+        )
+
+        assertEquals("수정 후 최종 프롬프트", submitted.body)
+        assertEquals("수정 후 최종 프롬프트", submitted.confirmPayload)
+        assertEquals("수정 후 최종 프롬프트", submitted.promptReviewText)
+        assertEquals("전송한 최종 프롬프트", submitted.detail)
     }
 }

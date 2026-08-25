@@ -154,6 +154,7 @@
     <string name="prompt_review_send">전송하기</string>
     <string name="prompt_review_empty">앱 생성 프롬프트를 입력해 주세요.</string>
     <string name="prompt_review_sent_bubble">만들어진 프롬프트대로 생성요청 문구를 보냈어요</string>
+    <string name="prompt_review_submitted_detail">사용자가 확인하고 전송한 최종 프롬프트</string>
     <string name="status_summary_template">상태: %1$s\n작업: %2$s</string>
     <string name="status_new_chat">새 채팅 준비</string>
     <string name="status_new_chat_detail">아래 입력창에 원하는 앱을 설명해 주세요.</string>
@@ -231,7 +232,8 @@
     <string name="ui_editor_load_failed">화면을 불러오지 못했어요.</string>
     <string name="ui_editor_canvas_meta">요소 %1$d개 · 잠김 %2$d개 · 확인 %3$d개</string>
     <string name="ui_editor_palette_section_title">편집창</string>
-    <string name="ui_editor_palette_section_summary">화면 · 저장 · 요소</string>
+    <string name="ui_editor_palette_open">열기</string>
+    <string name="ui_editor_palette_close">닫기</string>
     <string name="ui_editor_elements_label">요소 추가</string>
     <string name="ui_editor_canvas_section_title">XML 화면 편집</string>
     <string name="ui_editor_collapse_palette">편집창 접기</string>
@@ -259,13 +261,13 @@
     <string name="ui_editor_element_added">%1$s을(를) %2$s 안에 추가했어요.</string>
     <string name="ui_editor_element_add_failed">이 위치에는 요소를 추가할 수 없어요.</string>
     <string name="ui_editor_property_text">표시 문구</string>
-    <string name="ui_editor_property_width">너비 (예: 120dp)</string>
-    <string name="ui_editor_property_height">높이 (예: wrap_content)</string>
-    <string name="ui_editor_property_x">X</string>
-    <string name="ui_editor_property_y">Y</string>
+    <string name="ui_editor_property_width">너비</string>
+    <string name="ui_editor_property_height">높이</string>
+    <string name="ui_editor_property_x">왼쪽 여백</string>
+    <string name="ui_editor_property_y">위쪽 여백</string>
     <string name="ui_editor_property_text_color">글자색 (#RRGGBB)</string>
     <string name="ui_editor_property_background">배경색 (#RRGGBB)</string>
-    <string name="ui_editor_property_description">표시 내용, 사용 목적, 탭 동작, 데이터, 화면 이동, 오류·빈 상태, 접근성 설명</string>
+    <string name="ui_editor_property_description">요소 설명</string>
     <string name="ui_editor_apply">적용</string>
     <string name="ui_editor_close_properties">닫기</string>
     <string name="ui_editor_resize_properties">위아래로 드래그하여 편집창 높이 조절</string>

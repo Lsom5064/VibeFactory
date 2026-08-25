@@ -62,6 +62,23 @@ class TimelineCursorTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual("", event["body"])
 
+    def test_ui_editor_auto_save_events_are_not_shown_in_chat_timeline(self) -> None:
+        for event_type in ("ui_editor_draft_created", "ui_editor_draft_saved"):
+            with self.subTest(event_type=event_type):
+                event = task_event_to_timeline_event(
+                    {
+                        "event_id": f"event-{event_type}",
+                        "task_id": "task-1",
+                        "actor": "user",
+                        "event_type": event_type,
+                        "message_text": "UI 편집 초안을 자동 저장했습니다.",
+                        "payload_json": "{}",
+                        "created_at": "2026-08-25T00:00:00+00:00",
+                    }
+                )
+
+                self.assertIsNone(event)
+
 
 if __name__ == "__main__":
     unittest.main()

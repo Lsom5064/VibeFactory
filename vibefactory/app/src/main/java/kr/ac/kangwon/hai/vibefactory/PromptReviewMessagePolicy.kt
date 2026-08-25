@@ -30,6 +30,21 @@ internal object PromptReviewMessagePolicy {
         return !handled || !isPromptReview(message)
     }
 
+    fun withSubmittedPrompt(
+        message: ChatMessage,
+        submittedPrompt: String,
+        submittedDetail: String
+    ): ChatMessage {
+        val finalPrompt = submittedPrompt.trim()
+        if (!isPromptReview(message) || finalPrompt.isBlank()) return message
+        return message.copy(
+            body = finalPrompt,
+            detail = submittedDetail.trim().ifBlank { message.detail },
+            confirmPayload = finalPrompt,
+            promptReviewText = finalPrompt
+        )
+    }
+
     private fun canonicalPrompt(message: ChatMessage): String {
         val prompt = message.promptReviewText?.takeIf { it.isNotBlank() }
             ?: message.confirmPayload?.takeIf { it.isNotBlank() }

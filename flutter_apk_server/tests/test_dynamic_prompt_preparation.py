@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from flutter_apk_server.server import (
     extract_explicit_app_name,
     materialize_conversation_spec_payload,
     nonblank_text_or_fallback,
+    render_prompt_md,
     sanitize_codex_followup_user_text,
 )
 
@@ -240,6 +242,10 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                 workspace = root / "workspaces" / "conversation-task"
                 project = workspace / "revisions" / "rev_0001" / "project"
                 project.mkdir(parents=True, exist_ok=True)
+                (workspace / "prompt.md").write_text(
+                    render_prompt_md(_task, _settings),
+                    encoding="utf-8",
+                )
                 return workspace, project
 
             with patch.dict(os.environ, environment, clear=False), patch(
@@ -292,6 +298,21 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                     edited_prompt = result["prepared_prompt"].replace(
                         "## 앱 이름\n일정 모아보기",
                         "## 앱 이름\n대화 일정",
+                    ).replace(
+                        "## 앱 목적\n메시지를 공유받아 일정 후보를 확인하고 달력에 저장한다.",
+                        "## 앱 목적\n공유 메시지에서 날짜와 장소를 확인한 뒤 사용자가 승인한 일정만 저장한다.",
+                    ).replace(
+                        "- 일정 후보 확인",
+                        "- 일정 검토 및 승인",
+                    ).replace(
+                        "- 날짜와 약속 내용 추출",
+                        "- 날짜와 장소 추출",
+                    ).replace(
+                        "- 확정한 일정",
+                        "- 사용자가 승인한 일정",
+                    ).replace(
+                        "- 공유받은 텍스트에서 일정 후보가 표시돼야 함",
+                        "- 사용자가 승인하기 전에는 일정이 저장되지 않아야 함",
                     )
                     submitted = client.post(
                         "/generate",
@@ -310,7 +331,31 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                     self.assertEqual(submitted_result["interaction_type"], "build_started")
                     self.assertEqual(submitted_result["tool"], "codex")
                     self.assertEqual(submitted_result["app_name"], "대화 일정")
-                    self.assertEqual(app.state.db.get_task(task_id)["app_name"], "대화 일정")
+                    self.assertEqual(submitted_result["prepared_prompt"], edited_prompt)
+                    self.assertEqual(
+                        submitted_result["primary_user_flow"],
+                        "공유 메시지에서 날짜와 장소를 확인한 뒤 사용자가 승인한 일정만 저장한다.",
+                    )
+                    self.assertIn("일정 검토 및 승인", submitted_result["key_screens"])
+                    self.assertIn("사용자가 승인한 일정", submitted_result["stored_data"])
+                    self.assertIn(
+                        "사용자가 승인하기 전에는 일정이 저장되지 않아야 함",
+                        submitted_result["acceptance_criteria"],
+                    )
+                    saved_task = app.state.db.get_task(task_id)
+                    self.assertEqual(saved_task["app_name"], "대화 일정")
+                    self.assertEqual(saved_task["build_request_prompt"], edited_prompt)
+                    self.assertIn("날짜와 장소 추출", saved_task["normalized_prompt"])
+                    codex_prompt = (Path(saved_task["workspace_path"]) / "prompt.md").read_text(encoding="utf-8")
+                    self.assertIn("## 최종 사용자 확정 요청 (최우선)", codex_prompt)
+                    self.assertIn(edited_prompt, codex_prompt)
+                    self.assertNotIn("## 최초 사용자 입력 (참고)", codex_prompt)
+                    saved_state = json.loads(saved_task["codex_result_json"])
+                    self.assertEqual(saved_state["prepared_prompt"], edited_prompt)
+                    self.assertEqual(
+                        saved_state["conversation_state"]["final_generation_prompt"],
+                        edited_prompt,
+                    )
                     self.assertNotEqual(submitted_result.get("confirmation_action"), "submit_initial_prompt")
 
 

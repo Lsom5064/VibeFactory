@@ -115,6 +115,10 @@ class MainActivity : AppCompatActivity() {
         private const val MAX_CHAT_TIMELINE_EVENTS_FOR_RENDER = 120
         private const val MAX_RECENT_ASSISTANT_MESSAGES_FOR_RENDER = 24
         private const val MAX_IN_MEMORY_TASK_MESSAGES = 180
+        private val HIDDEN_UI_EDITOR_DRAFT_EVENT_TYPES = setOf(
+            "ui_editor_draft_created",
+            "ui_editor_draft_saved"
+        )
     }
 
     private val gson: Gson = GsonBuilder().create()
@@ -1494,6 +1498,11 @@ class MainActivity : AppCompatActivity() {
                 refreshConfirmationActions(setOf(promptReviewMessageId))
             }
         }
+        updateSubmittedPromptReviewMessage(
+            taskId = apiTaskId,
+            finalPrompt = trimmedPrompt,
+            preferredMessageId = promptReviewMessageId
+        )
         val displayPrompt = getString(R.string.prompt_review_sent_bubble)
         ensureTaskChatLoaded(apiTaskId)
         appendOptimisticTaskMessage(
@@ -4736,6 +4745,7 @@ ${record.stackTrace}
                 allowDuplicateContent = !message.artifactTaskId.isNullOrBlank()
             )
         }
+        reconcileSubmittedPromptReviewMessage(taskId, response)
         appendStatusTransitionMessage(taskId, response)
         return buildTaskTimeline(taskId).also {
             timelinePage.nextCursor
@@ -5818,6 +5828,73 @@ ${record.stackTrace}
         refreshConfirmationActions(changedMessageIds)
     }
 
+    private fun reconcileSubmittedPromptReviewMessage(taskId: String, response: StatusResponse) {
+        if (isPromptReviewRenderMode(response)) return
+        val conversationState = response.conversation_state
+            ?.takeIf { it.isJsonObject }
+            ?.asJsonObject
+            ?: return
+        val awaitingPromptReview = conversationState.get("awaiting_prompt_review")
+            ?.takeIf { it.isJsonPrimitive }
+            ?.asBoolean == true
+        if (awaitingPromptReview) return
+        val finalPrompt = firstString(conversationState, "final_generation_prompt")
+            ?.trim()
+            .orEmpty()
+        if (finalPrompt.isBlank()) return
+        updateSubmittedPromptReviewMessage(
+            taskId = taskId,
+            finalPrompt = finalPrompt,
+            renderVisibleTask = false
+        )
+    }
+
+    private fun updateSubmittedPromptReviewMessage(
+        taskId: String,
+        finalPrompt: String,
+        preferredMessageId: String = "",
+        renderVisibleTask: Boolean = true
+    ) {
+        val normalizedTaskId = taskId.trim()
+        val submittedPrompt = finalPrompt.trim()
+        if (normalizedTaskId.isBlank() || submittedPrompt.isBlank()) return
+        if (!ensureTaskChatLoaded(normalizedTaskId)) return
+        val timeline = taskConversationMessages[normalizedTaskId] ?: return
+        val promptReviewIndices = timeline.indices.filter { index ->
+            val message = timeline[index]
+            PromptReviewMessagePolicy.isPromptReview(message) &&
+                (message.promptReviewTaskId ?: message.confirmTaskId) == normalizedTaskId
+        }
+        if (promptReviewIndices.isEmpty()) return
+        val preferredIndex = promptReviewIndices.firstOrNull { index ->
+            timeline[index].id == preferredMessageId
+        }
+        val messageIndex = preferredIndex ?: promptReviewIndices.last()
+        val existing = timeline[messageIndex]
+        val updated = PromptReviewMessagePolicy.withSubmittedPrompt(
+            message = existing,
+            submittedPrompt = submittedPrompt,
+            submittedDetail = getString(R.string.prompt_review_submitted_detail)
+        )
+        val promptReviewIndexSet = promptReviewIndices.toSet()
+        val nextTimeline = timeline.mapIndexedNotNull { index, message ->
+            when {
+                index == messageIndex -> updated
+                index in promptReviewIndexSet -> null
+                else -> message
+            }
+        }
+        handledConfirmationMessageIds += promptReviewIndices.map { index -> timeline[index].id }
+        if (nextTimeline == timeline) return
+        taskConversationMessages[normalizedTaskId] = nextTimeline.toMutableList()
+        taskTimelineRenderCache.markChanged(normalizedTaskId)
+        persistTaskChat(normalizedTaskId)
+        if (renderVisibleTask && screenState.selectedTaskId == normalizedTaskId) {
+            screenState = screenState.copy(messages = buildTaskTimeline(normalizedTaskId))
+            renderState()
+        }
+    }
+
     private fun refreshConfirmationActions(messageIds: Set<String>) {
         if (messageIds.isEmpty()) return
         recyclerMessages.post {
@@ -6467,6 +6544,7 @@ ${record.stackTrace}
     }
 
     private fun shouldShowChatMessage(message: ChatMessage): Boolean {
+        if (message.eventType in HIDDEN_UI_EDITOR_DRAFT_EVENT_TYPES) return false
         if (isPrebuildConfirmationHeader(message.body)) return false
         if (isHiddenOperationalBuildMessage(message.body)) return false
         val body = processingAnimationBaseText(message.body)

@@ -1736,6 +1736,36 @@ def build_initial_prompt_review_decision(decision: IntentDecision) -> IntentDeci
     )
 
 
+def parse_reviewed_generation_prompt(prompt: str) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current_title = ""
+    for raw_line in prompt.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            current_title = normalize_whitespace(line[3:])
+            if current_title:
+                sections.setdefault(current_title, [])
+            continue
+        if line.startswith("# "):
+            continue
+        if current_title and line:
+            sections[current_title].append(line)
+    return sections
+
+
+def reviewed_prompt_section_text(sections: dict[str, list[str]], title: str) -> str:
+    return normalize_whitespace(
+        "\n".join(line.removeprefix("- ").strip() for line in sections.get(title, []))
+    )
+
+
+def reviewed_prompt_section_items(sections: dict[str, list[str]], title: str) -> list[str]:
+    return normalize_prompt_items(
+        [line.removeprefix("- ").strip() for line in sections.get(title, [])],
+        max_items=8,
+    )
+
+
 def build_initial_prompt_submission_decision(
     *,
     task_id: str,
@@ -1743,7 +1773,10 @@ def build_initial_prompt_submission_decision(
     previous_conversation_state: dict[str, Any],
 ) -> IntentDecision:
     submitted_prompt = final_prompt.strip()
-    app_name = extract_explicit_app_name(submitted_prompt) or normalize_whitespace(
+    reviewed_sections = parse_reviewed_generation_prompt(submitted_prompt)
+    app_name = reviewed_prompt_section_text(reviewed_sections, "앱 이름") or extract_explicit_app_name(
+        submitted_prompt
+    ) or normalize_whitespace(
         str(
             previous_conversation_state.get("pending_app_name")
             or previous_conversation_state.get("app_name")
@@ -1754,6 +1787,17 @@ def build_initial_prompt_submission_decision(
     package_name = normalize_whitespace(
         str(previous_conversation_state.get("pending_package_name") or previous_conversation_state.get("package_name") or "")
     )
+    local_storage_lines = reviewed_prompt_section_items(reviewed_sections, "저장할 정보와 방식")
+    shared_storage_lines = reviewed_prompt_section_items(reviewed_sections, "공유 데이터와 저장 방식")
+    storage_mode = "server" if shared_storage_lines else ("local" if local_storage_lines else "unspecified")
+    stored_data = [
+        item
+        for item in (shared_storage_lines or local_storage_lines)
+        if item not in {
+            "해당 정보는 앱을 다시 열어도 유지되도록 기기에 저장한다.",
+            "공유 정보는 서버 데이터 API를 통해 저장하고 불러온다.",
+        }
+    ]
     decision = build_intent_decision(
         mode="build",
         task_id=task_id,
@@ -1764,44 +1808,15 @@ def build_initial_prompt_submission_decision(
         reason="사용자가 확인한 최종 앱 생성 프롬프트를 그대로 사용해 빌드를 시작합니다.",
         request_scope="new_app",
         suggested_app_name=app_name,
-        primary_user_flow=normalize_whitespace(
-            str(
-                previous_conversation_state.get("pending_primary_user_flow")
-                or previous_conversation_state.get("latest_primary_user_flow")
-                or ""
-            )
-        ),
-        secondary_requirements=normalize_secondary_requirements(
-            previous_conversation_state.get("pending_secondary_requirements")
-            or previous_conversation_state.get("latest_secondary_requirements")
-        ),
-        secondary_scope_confirmed=bool(
-            previous_conversation_state.get("pending_secondary_scope_confirmed")
-            or previous_conversation_state.get("latest_secondary_scope_confirmed")
-        ),
-        acceptance_criteria=normalize_acceptance_criteria(
-            previous_conversation_state.get("pending_acceptance_criteria")
-            or previous_conversation_state.get("latest_acceptance_criteria")
-        ),
-        target_users=normalize_target_users(
-            previous_conversation_state.get("pending_target_users")
-            or previous_conversation_state.get("latest_target_users")
-        ),
-        key_screens=normalize_prompt_items(
-            previous_conversation_state.get("pending_key_screens")
-            or previous_conversation_state.get("latest_key_screens"),
-            max_items=6,
-        ),
-        storage_mode=str(
-            previous_conversation_state.get("pending_storage_mode")
-            or previous_conversation_state.get("latest_storage_mode")
-            or "unspecified"
-        ),
-        stored_data=normalize_prompt_items(
-            previous_conversation_state.get("pending_stored_data")
-            or previous_conversation_state.get("latest_stored_data"),
-            max_items=6,
-        ),
+        primary_user_flow=reviewed_prompt_section_text(reviewed_sections, "앱 목적"),
+        core_features=reviewed_prompt_section_items(reviewed_sections, "핵심 기능"),
+        secondary_requirements=reviewed_prompt_section_items(reviewed_sections, "추가 기능"),
+        secondary_scope_confirmed="추가 기능" in reviewed_sections,
+        acceptance_criteria=reviewed_prompt_section_items(reviewed_sections, "완성 조건"),
+        target_users=reviewed_prompt_section_items(reviewed_sections, "주요 사용자"),
+        key_screens=reviewed_prompt_section_items(reviewed_sections, "주요 화면"),
+        storage_mode=storage_mode,
+        stored_data=stored_data,
         image_reference_summary=normalize_whitespace(str(previous_conversation_state.get("image_reference_summary") or "")),
         image_conflict_note=normalize_whitespace(str(previous_conversation_state.get("image_conflict_note") or "")),
     )
@@ -1810,7 +1825,7 @@ def build_initial_prompt_submission_decision(
     return replace(
         decision,
         effective_user_prompt=submitted_prompt,
-        prepared_prompt=str(previous_conversation_state.get("prepared_prompt") or "").strip(),
+        prepared_prompt=submitted_prompt,
     )
 
 
@@ -4879,11 +4894,7 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 
 {reference_image_section}
 
-## 사용자 요청
-
-{task['prompt']}
-
-## 실제 빌드 대상 요청
+## 최종 사용자 확정 요청 (최우선)
 
 {build_request_prompt}
 
@@ -4934,6 +4945,7 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - 결과는 반드시 `.codex_result/task_result.json`에 기록한다.
 - 성공 시 Android APK 경로를 넣고, 실패 시 짧은 한국어 오류 요약을 넣는다.
 - `1차 핵심 흐름`은 이번 빌드에서 반드시 완성되어야 하는 첫 출시 범위다.
+- `최종 사용자 확정 요청`은 사용자가 직접 검토하고 전송한 최종 명세다. 다른 참고 정보와 충돌하면 반드시 이 요청을 우선한다.
 - `2차 고도화 요구`는 이번 빌드에 포함되면 좋지만, `1차 핵심 흐름`보다 우선순위가 낮다. 둘이 충돌하면 1차를 우선한다.
 - 위의 `빌드 성공 조건`은 실제로 동작하는 사용자 기능 기준이다. 핵심 조건을 빠뜨린 채 UI만 그럴듯하게 만들면 성공이 아니다.
 - 카메라, OCR, 외부 정보 조회, AI 분석, 영구 저장처럼 사용자가 명시한 기능은 실제 흐름으로 구현한다.
@@ -6516,6 +6528,8 @@ def parse_event_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, Any]]:
     event_type = str(row.get("event_type") or "")
+    if event_type in {"ui_editor_draft_created", "ui_editor_draft_saved"}:
+        return None
     actor = str(row.get("actor") or "")
     message_text = sanitize_user_visible_text(str(row.get("message_text") or ""))
     payload = parse_event_payload(row)
@@ -9182,7 +9196,8 @@ def create_app() -> FastAPI:
             pending_decision_task = db.get_task(followup_task_id)
             if pending_decision_task:
                 task = pending_decision_task
-                log_task_status_event(db, pending_decision_task)
+                if not is_initial_prompt_submission:
+                    log_task_status_event(db, pending_decision_task)
             previous_reference_attachments = normalize_reference_attachments(
                 previous_conversation_state.get("reference_attachments") or []
             )
@@ -9212,6 +9227,7 @@ def create_app() -> FastAPI:
                     "awaiting_prompt_review": False,
                     "awaiting_confirmation": False,
                     "final_generation_prompt": request.prompt,
+                    "prepared_prompt": request.prompt,
                     "latest_effective_user_prompt": request.prompt,
                     "app_name": decision.app_name,
                     "generated_app_name": decision.app_name,
