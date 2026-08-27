@@ -87,6 +87,9 @@ Codex는 기본적으로 `workspace-write` sandbox에서 Task workspace와 공�
 cache만 수정한다. 외부 격리 환경이 별도로 검증된 경우가 아니면
 `CODEX_DANGEROUS_BYPASS=1`을 사용하지 않는다.
 
+Codex의 기본 모델은 `gpt-5.6-sol`이다. 로컬 실행 시 모델 선택 화면이나
+`CODEX_MODEL` 환경변수로 명시적으로 다른 모델을 선택할 수 있다.
+
 ## Mock 실행
 
 ```bash

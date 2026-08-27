@@ -60,6 +60,7 @@ class ProjectIdentityTests(unittest.TestCase):
         self.assertIn("--sandbox workspace-write", command)
         self.assertIn("--add-dir", command)
         self.assertIn("{build_cache}", command)
+        self.assertIn("--model gpt-5.6-sol", command)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
 
     def test_codex_subprocess_environment_removes_server_secrets(self) -> None:

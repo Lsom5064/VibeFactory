@@ -107,7 +107,7 @@ def default_codex_command(root: Path) -> str:
         "--skip-git-repo-check",
         "--json",
     ]
-    codex_model = os.getenv("CODEX_MODEL", "gpt-5.4").strip() or "gpt-5.4"
+    codex_model = os.getenv("CODEX_MODEL", "gpt-5.6-sol").strip() or "gpt-5.6-sol"
     args.extend(["--model", shlex.quote(codex_model)])
     reasoning_effort = os.getenv("CODEX_REASONING_EFFORT", "default").strip().lower() or "default"
     if reasoning_effort == "default":
