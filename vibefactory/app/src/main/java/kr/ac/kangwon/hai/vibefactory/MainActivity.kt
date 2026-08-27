@@ -544,10 +544,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        visibleTaskIdCandidate(
-            screenState.pollingTaskId ?: currentTaskId ?: screenState.selectedTaskId ?: getLastSelectedTaskId()
-        )
-            ?.let(::stopBuildCompletionMonitoring)
         val darkModeEnabled = preferencesStore.loadDarkModeEnabled()
         AppThemeController.applyDarkModePreference(darkModeEnabled)
         if (AppThemeController.shouldRecreateForPreference(this, darkModeEnabled)) {
@@ -1691,6 +1687,7 @@ class MainActivity : AppCompatActivity() {
                 val shouldStartBuildWorkflow = shouldStartBuildWorkflow(response)
                 applyGenerateDecisionResponse(response)
                 if (shouldStartBuildWorkflow) {
+                    startBuildCompletionMonitoring(response.task_id)
                     refreshCurrentTaskAfterFollowup(
                         response.task_id,
                         autoInstallOnSuccess = true,
@@ -2245,9 +2242,8 @@ class MainActivity : AppCompatActivity() {
         if (isSuccess) {
             loadNotifiedBuildSuccessTaskIds()
         }
-        if (isSuccess && notifiedBuildSuccessTaskIds.add(taskId)) {
-            persistNotifiedBuildSuccessTaskIds()
-            notifyBuildCompleted(
+        if (isSuccess && taskId !in notifiedBuildSuccessTaskIds) {
+            val posted = notifyBuildCompleted(
                 taskId,
                 buildTaskContentTitle(
                     initialPrompt = response.conversation_state
@@ -2258,6 +2254,10 @@ class MainActivity : AppCompatActivity() {
                     conversationState = response.conversation_state
                 ) ?: taskSummaryById[taskId]?.title ?: resolvedAppName
             )
+            if (posted) {
+                notifiedBuildSuccessTaskIds.add(taskId)
+                persistNotifiedBuildSuccessTaskIds()
+            }
         }
 
         if (isSuccess && autoInstallOnSuccess && latestApkUrl != null) {
@@ -2324,9 +2324,8 @@ class MainActivity : AppCompatActivity() {
         if (isSuccess) {
             loadNotifiedBuildSuccessTaskIds()
         }
-        if (isSuccess && notifiedBuildSuccessTaskIds.add(taskId)) {
-            persistNotifiedBuildSuccessTaskIds()
-            notifyBuildCompleted(
+        if (isSuccess && taskId !in notifiedBuildSuccessTaskIds) {
+            val posted = notifyBuildCompleted(
                 taskId,
                 buildTaskContentTitle(
                     initialPrompt = response.conversation_state
@@ -2337,6 +2336,10 @@ class MainActivity : AppCompatActivity() {
                     conversationState = response.conversation_state
                 ) ?: taskSummaryById[taskId]?.title ?: resolvedAppName
             )
+            if (posted) {
+                notifiedBuildSuccessTaskIds.add(taskId)
+                persistNotifiedBuildSuccessTaskIds()
+            }
         }
 
         // Only the drawer row is allowed to change for an inactive task. The
@@ -2344,9 +2347,9 @@ class MainActivity : AppCompatActivity() {
         renderState()
     }
 
-    private fun notifyBuildCompleted(taskId: String, appName: String?) {
+    private fun notifyBuildCompleted(taskId: String, appName: String?): Boolean {
         val resolvedName = appName?.takeIf { it.isNotBlank() } ?: getString(R.string.untitled_task)
-        BuildNotificationController.showTerminal(
+        return BuildNotificationController.showTerminal(
             context = this,
             taskId = taskId,
             taskName = resolvedName,
@@ -2508,6 +2511,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startPolling(taskId: String) {
+        startBuildCompletionMonitoring(taskId)
         if (pollingJob?.isActive == true && screenState.pollingTaskId == taskId) return
 
         stopPolling()
@@ -4310,29 +4314,19 @@ ${record.stackTrace}
         if (isDownloadingApk) return
         val taskId = message.artifactTaskId?.trim().orEmpty()
         if (taskId.isBlank()) return
-        val packageName = message.artifactPackageName
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: taskSummaryById[taskId]?.packageName?.trim()?.takeIf { it.isNotBlank() }
         val artifactPath = message.artifactApkPath?.trim()?.takeIf { it.isNotBlank() }
         val artifactUrl = message.artifactApkUrl?.trim()?.takeIf { it.isNotBlank() }
+        val apkUrl = artifactUrl ?: persistedApkUrlForTask(taskId)
+        if (apkUrl != null) {
+            downloadAndInstall(taskId, apkUrl, artifactPath)
+            return
+        }
+
         val artifactIdentity = ApkArtifactActionHandler.artifactIdentity(
             taskId,
             artifactUrl,
             artifactPath
         )
-        if (
-            packageName != null &&
-            isPackageInstalled(packageName) &&
-            ApkArtifactActionHandler.installedArtifactMatches(
-                this,
-                packageName,
-                artifactIdentity
-            )
-        ) {
-            launchGeneratedApp(packageName)
-            return
-        }
         val messageDownloadedFile = message.artifactDownloadedPath
             ?.trim()
             ?.takeIf { it.isNotBlank() }
@@ -4354,8 +4348,6 @@ ${record.stackTrace}
             )
             return
         }
-        val apkUrl = artifactUrl ?: persistedApkUrlForTask(taskId)
-        apkUrl?.let { downloadAndInstall(taskId, it, artifactPath) }
     }
 
     private fun launchGeneratedApp(packageName: String) {

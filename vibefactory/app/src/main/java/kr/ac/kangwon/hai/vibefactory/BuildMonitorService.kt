@@ -236,11 +236,14 @@ class BuildMonitorService : Service() {
         }
         val stored = loadStringSet(prefKey)
         if (taskId in stored) return
-        persistStringSet(prefKey, stored + taskId)
-        showTerminalNotification(taskId, response, statusKey)
+        if (showTerminalNotification(taskId, response, statusKey)) {
+            persistStringSet(prefKey, stored + taskId)
+        } else {
+            Log.w(TAG, "Terminal notification was not posted task_id=$taskId status=$statusKey")
+        }
     }
 
-    private fun showTerminalNotification(taskId: String, response: StatusResponse, statusKey: String) {
+    private fun showTerminalNotification(taskId: String, response: StatusResponse, statusKey: String): Boolean {
         val notificationType = when (statusKey) {
             "success" -> TerminalBuildNotification.SUCCESS
             "failed", "error" -> TerminalBuildNotification.FAILED
@@ -251,7 +254,7 @@ class BuildMonitorService : Service() {
             appName = taskDisplayName(response.generated_app_name) ?: taskDisplayName(response.app_name),
             conversationState = response.conversation_state
         ) ?: taskId
-        BuildNotificationController.showTerminal(this, taskId, taskName, notificationType)
+        return BuildNotificationController.showTerminal(this, taskId, taskName, notificationType)
     }
 
     private fun clearTerminalNotificationMarkers(taskId: String) {
