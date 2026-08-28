@@ -209,6 +209,12 @@ if [[ -f "$SIGNING_ENV_FILE" ]]; then
   source "$SIGNING_ENV_FILE"
 fi
 
+INTEGRATIONS_ENV_FILE="${VIBEFACTORY_INTEGRATIONS_ENV_FILE:-$HOME/.vibefactory/integrations.env}"
+if [[ -f "$INTEGRATIONS_ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$INTEGRATIONS_ENV_FILE"
+fi
+
 export BASE_PROJECT_PATH="${BASE_PROJECT_PATH:-$ROOT_DIR/BaseProject}"
 export WORKSPACES_ROOT="${WORKSPACES_ROOT:-$SERVER_DIR/native_workspaces}"
 export DB_PATH="${DB_PATH:-$SERVER_DIR/native_tasks.db}"

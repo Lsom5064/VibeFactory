@@ -48,6 +48,16 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "VIBE_TASK_ID", quotedBuildConfigValue(generatedTaskId))
         buildConfigField("String", "VIBE_SERVER_BASE_URL", quotedBuildConfigValue(generatedServerBaseUrl))
+        buildConfigField(
+            "String",
+            "OPENWEATHER_API_KEY",
+            quotedBuildConfigValue(configuredValue("OPENWEATHER_API_KEY")),
+        )
+        buildConfigField(
+            "String",
+            "DATA_GO_KR_SERVICE_KEY",
+            quotedBuildConfigValue(configuredValue("DATA_GO_KR_SERVICE_KEY")),
+        )
     }
 
     signingConfigs {

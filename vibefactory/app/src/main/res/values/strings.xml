@@ -140,6 +140,8 @@
     <string name="input_mode_read_only">입력 모드: 읽기 전용</string>
     <string name="confirmation_title">실행 전 확인</string>
     <string name="confirmation_accept">진행</string>
+    <string name="prebuild_requirements_confirm">준비사항 확인</string>
+    <string name="prebuild_requirements_recheck">등록 상태 다시 확인</string>
     <string name="confirmation_cancel">취소</string>
     <string name="confirmation_dismissed">실행하지 않고 대기할게요. 필요하면 다시 입력해 주세요.</string>
     <string name="confirmation_refine_preview">이 메시지는 앱 수정 요청으로 판단됐어요. 수정 빌드를 시작할까요?</string>

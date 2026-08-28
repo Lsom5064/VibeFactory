@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Mapping, Optional, cast
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -89,6 +89,25 @@ except ImportError:
     from project_builder import (  # type: ignore[no-redef]
         GENERATED_APK_SIDELOAD_VERSION_CODE,
         native_android_project_builder,
+    )
+
+try:
+    from .prebuild_requirements import (
+        client_build_environment_for_requirements,
+        extract_participant_credential,
+        format_prebuild_requirements,
+        missing_blocking_requirements,
+        pending_participant_credential_requirement,
+        resolve_prebuild_requirements,
+    )
+except ImportError:
+    from prebuild_requirements import (  # type: ignore[no-redef]
+        client_build_environment_for_requirements,
+        extract_participant_credential,
+        format_prebuild_requirements,
+        missing_blocking_requirements,
+        pending_participant_credential_requirement,
+        resolve_prebuild_requirements,
     )
 
 try:
@@ -444,6 +463,7 @@ class IntentDecision:
     key_screens: list[str] = field(default_factory=list)
     storage_mode: str = "unspecified"
     stored_data: list[str] = field(default_factory=list)
+    prebuild_requirements: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1488,6 +1508,7 @@ def build_intent_decision(
     key_screens: Optional[list[str]] = None,
     storage_mode: str = "unspecified",
     stored_data: Optional[list[str]] = None,
+    prebuild_requirements: Optional[list[dict[str, Any]]] = None,
 ) -> IntentDecision:
     raw_effective_prompt = effective_user_prompt or user_prompt
     effective_prompt = normalize_whitespace(raw_effective_prompt)
@@ -1512,6 +1533,11 @@ def build_intent_decision(
     if resolved_storage_mode == "unspecified":
         resolved_storage_mode = inferred_storage_mode
     resolved_stored_data = normalize_prompt_items(stored_data, max_items=6) or inferred_stored_data
+    resolved_prebuild_requirements = [
+        dict(item)
+        for item in (prebuild_requirements or [])
+        if isinstance(item, dict)
+    ][:8]
     if mode in {"build", "ask_confirmation"} and not resolved_acceptance_criteria:
         resolved_acceptance_criteria = infer_acceptance_criteria(raw_effective_prompt, feature_points)
     resolved_request_scope = request_scope or ("existing_app_modification" if existing_task else "new_app")
@@ -1548,6 +1574,7 @@ def build_intent_decision(
             key_screens=[],
             storage_mode="unspecified",
             stored_data=[],
+            prebuild_requirements=[],
         )
     if mode == "build":
         continue_existing_app = resolved_request_scope == "existing_app_modification"
@@ -1606,6 +1633,7 @@ def build_intent_decision(
             key_screens=resolved_key_screens,
             storage_mode=resolved_storage_mode,
             stored_data=resolved_stored_data,
+            prebuild_requirements=resolved_prebuild_requirements,
         )
     clarification_questions = questions or build_clarification_questions(effective_prompt)
     clarification_message = "수정을 시작하기 전에 몇 가지만 확인할게요." if resolved_request_scope == "existing_app_modification" else "앱 생성을 시작하기 전에 몇 가지만 확인할게요."
@@ -1646,6 +1674,7 @@ def build_intent_decision(
         key_screens=resolved_key_screens,
         storage_mode=resolved_storage_mode,
         stored_data=resolved_stored_data,
+        prebuild_requirements=resolved_prebuild_requirements,
     )
 
 
@@ -1702,13 +1731,101 @@ def build_prepared_generation_prompt(decision: IntentDecision) -> str:
     if image_conflict_note:
         attachment_lines.append(f"주의: {image_conflict_note}")
     add_list_section("첨부 자료 반영", attachment_lines)
+    integration_lines: list[str] = []
+    for requirement in decision.prebuild_requirements:
+        title = normalize_whitespace(str(requirement.get("title") or "추가 준비사항"))
+        reason = normalize_whitespace(str(requirement.get("reason") or ""))
+        execution_location = normalize_whitespace(str(requirement.get("execution_location") or ""))
+        client_env_names = normalize_prompt_items(
+            requirement.get("client_build_environment"),
+            max_items=4,
+        )
+        contract_parts = [title]
+        if reason:
+            contract_parts.append(reason)
+        if execution_location:
+            contract_parts.append(f"실행 위치: {execution_location}")
+        if client_env_names:
+            contract_parts.append(
+                "서버 최종 빌드에서 주입되는 설정 이름: " + ", ".join(client_env_names)
+            )
+            contract_parts.append(
+                "작업 엔진에서 실제 값이 보이지 않아도 빈 값으로 대체하거나 실패 처리하지 말고, 해당 설정을 읽는 코드만 구현한다."
+            )
+            if all(name in {"OPENWEATHER_API_KEY", "DATA_GO_KR_SERVICE_KEY"} for name in client_env_names):
+                contract_parts.append(
+                    "앱 코드에서는 같은 이름의 BuildConfig 필드를 사용한다."
+                )
+        integration_lines.append(" / ".join(contract_parts))
+    add_list_section("외부 연동 및 필수 조건", integration_lines)
     add_list_section("완성 조건", acceptance_criteria)
     add_text_section("구체화된 앱 생성 요청", original_request)
     return "\n".join(sections).strip()
 
 
-def build_initial_prompt_review_decision(decision: IntentDecision) -> IntentDecision:
-    if decision.request_scope != "new_app" or decision.mode not in {"build", "ask_confirmation"}:
+def build_prebuild_requirements_review_decision(
+    decision: IntentDecision,
+    *,
+    prerequisite_reviewed: bool = False,
+    known_requirement_ids: Optional[set[str]] = None,
+    environment: Optional[Mapping[str, str]] = None,
+) -> IntentDecision:
+    if decision.mode != "build":
+        return decision
+    requirements = resolve_prebuild_requirements(
+        decision.effective_user_prompt,
+        decision.prebuild_requirements,
+        environment=environment,
+        package_name=decision.package_name,
+    )
+    decision = replace(decision, prebuild_requirements=requirements)
+    missing_requirements = missing_blocking_requirements(requirements)
+    known_ids = {normalize_whitespace(item) for item in (known_requirement_ids or set()) if item}
+    has_new_requirement = any(
+        normalize_whitespace(str(item.get("id") or "")) not in known_ids
+        for item in requirements
+    )
+    if requirements and (missing_requirements or (has_new_requirement and not prerequisite_reviewed)):
+        guidance = format_prebuild_requirements(requirements)
+        action = "recheck_prebuild_requirements" if missing_requirements else "confirm_prebuild_requirements"
+        return replace(
+            decision,
+            mode="ask_confirmation",
+            status="Pending Decision",
+            tool="ask_confirmation",
+            message=guidance,
+            summary=(
+                "필수 외부 연동이 아직 준비되지 않아 앱 생성 프롬프트를 만들기 전에 확인이 필요해요."
+                if missing_requirements
+                else "앱 생성에 영향을 주는 외부 연동과 기기 조건을 먼저 확인하고 있어요."
+            ),
+            questions=[guidance],
+            reason="필수 계정, 자격증명, 권한 또는 서비스 이용 조건을 앱 생성 전에 확인합니다.",
+            confirmation_action=action,
+            confirmation_payload=(
+                "필수 준비사항의 등록 상태를 다시 확인해 주세요."
+                if missing_requirements
+                else "필수 준비사항을 확인했습니다."
+            ),
+            prepared_prompt="",
+        )
+    return decision
+
+
+def build_initial_prompt_review_decision(
+    decision: IntentDecision,
+    *,
+    prerequisite_reviewed: bool = False,
+    environment: Optional[Mapping[str, str]] = None,
+) -> IntentDecision:
+    if decision.request_scope != "new_app" or decision.mode != "build":
+        return decision
+    decision = build_prebuild_requirements_review_decision(
+        decision,
+        prerequisite_reviewed=prerequisite_reviewed,
+        environment=environment,
+    )
+    if decision.mode != "build":
         return decision
     prepared_prompt = build_prepared_generation_prompt(decision)
     return replace(
@@ -1798,6 +1915,15 @@ def build_initial_prompt_submission_decision(
             "공유 정보는 서버 데이터 API를 통해 저장하고 불러온다.",
         }
     ]
+    prebuild_requirements = [
+        dict(item)
+        for item in (
+            previous_conversation_state.get("latest_prebuild_requirements")
+            or previous_conversation_state.get("pending_prebuild_requirements")
+            or []
+        )
+        if isinstance(item, dict)
+    ][:8]
     decision = build_intent_decision(
         mode="build",
         task_id=task_id,
@@ -1817,6 +1943,7 @@ def build_initial_prompt_submission_decision(
         key_screens=reviewed_prompt_section_items(reviewed_sections, "주요 화면"),
         storage_mode=storage_mode,
         stored_data=stored_data,
+        prebuild_requirements=prebuild_requirements,
         image_reference_summary=normalize_whitespace(str(previous_conversation_state.get("image_reference_summary") or "")),
         image_conflict_note=normalize_whitespace(str(previous_conversation_state.get("image_conflict_note") or "")),
     )
@@ -1827,6 +1954,94 @@ def build_initial_prompt_submission_decision(
         effective_user_prompt=submitted_prompt,
         prepared_prompt=submitted_prompt,
     )
+
+
+def build_prebuild_recheck_decision(
+    *,
+    task_id: str,
+    previous_conversation_state: dict[str, Any],
+    existing_workspace_ready: bool,
+) -> IntentDecision:
+    effective_prompt = normalize_whitespace(
+        str(
+            previous_conversation_state.get("pending_user_prompt")
+            or previous_conversation_state.get("latest_effective_user_prompt")
+            or previous_conversation_state.get("initial_user_prompt")
+            or ""
+        )
+    )
+    requirements = [
+        dict(item)
+        for item in (
+            previous_conversation_state.get("pending_prebuild_requirements")
+            or previous_conversation_state.get("latest_prebuild_requirements")
+            or []
+        )
+        if isinstance(item, dict)
+    ][:8]
+    decision = build_intent_decision(
+        mode="build",
+        task_id=task_id,
+        existing_task=True,
+        existing_workspace_ready=existing_workspace_ready,
+        user_prompt=effective_prompt,
+        effective_user_prompt=effective_prompt,
+        reason="앱 생성 전 필수 준비사항의 등록 상태를 다시 확인합니다.",
+        used_previous_pending_prompt=True,
+        request_scope=(
+            "existing_app_modification"
+            if existing_workspace_ready
+            else "new_app"
+        ),
+        suggested_app_name=normalize_whitespace(
+            str(
+                previous_conversation_state.get("pending_app_name")
+                or previous_conversation_state.get("app_name")
+                or ""
+            )
+        ),
+        primary_user_flow=normalize_whitespace(
+            str(previous_conversation_state.get("pending_primary_user_flow") or "")
+        ),
+        secondary_requirements=normalize_secondary_requirements(
+            previous_conversation_state.get("pending_secondary_requirements")
+        ),
+        secondary_scope_confirmed=bool(
+            previous_conversation_state.get("pending_secondary_scope_confirmed")
+        ),
+        acceptance_criteria=normalize_acceptance_criteria(
+            previous_conversation_state.get("pending_acceptance_criteria")
+        ),
+        target_users=normalize_target_users(
+            previous_conversation_state.get("pending_target_users")
+        ),
+        key_screens=normalize_prompt_items(
+            previous_conversation_state.get("pending_key_screens"),
+            max_items=6,
+        ),
+        storage_mode=normalize_storage_mode(
+            previous_conversation_state.get("pending_storage_mode")
+        ),
+        stored_data=normalize_prompt_items(
+            previous_conversation_state.get("pending_stored_data"),
+            max_items=6,
+        ),
+        prebuild_requirements=requirements,
+        image_reference_summary=normalize_whitespace(
+            str(previous_conversation_state.get("image_reference_summary") or "")
+        ),
+        image_conflict_note=normalize_whitespace(
+            str(previous_conversation_state.get("image_conflict_note") or "")
+        ),
+    )
+    package_name = normalize_whitespace(
+        str(
+            previous_conversation_state.get("pending_package_name")
+            or previous_conversation_state.get("package_name")
+            or ""
+        )
+    )
+    return replace(decision, package_name=package_name) if package_name else decision
 
 
 def fallback_decide_intent(
@@ -2099,12 +2314,14 @@ def build_agent_conversation_history(db: Optional["Database"], task_id: str) -> 
         message = str(event.get("message_text") or "").strip()
         attachment_names: list[str] = []
         raw_payload = event.get("payload_json")
+        payload: dict[str, Any] = {}
         if raw_payload:
             try:
-                payload = json.loads(str(raw_payload))
+                parsed_payload = json.loads(str(raw_payload))
             except (TypeError, json.JSONDecodeError):
-                payload = {}
-            if isinstance(payload, dict):
+                parsed_payload = {}
+            if isinstance(parsed_payload, dict):
+                payload = parsed_payload
                 attachments = payload.get("attachments")
                 if isinstance(attachments, list):
                     attachment_names = normalize_prompt_items(
@@ -2115,6 +2332,16 @@ def build_agent_conversation_history(db: Optional["Database"], task_id: str) -> 
                         ],
                         max_items=20,
                     )
+        if actor == "user" and bool(payload.get("external_credential_submission")):
+            requirement_title = normalize_whitespace(
+                str(payload.get("credential_requirement_title") or "외부 서비스")
+            )
+            credential_label = (
+                f"{requirement_title} 키"
+                if requirement_title.lower().endswith("api")
+                else f"{requirement_title} API 키"
+            )
+            message = f"[{credential_label} 등록 완료]"
         if not message and not attachment_names:
             continue
         entry = {
@@ -2289,6 +2516,7 @@ def run_spec_clarification_agent(
             "storage_mode",
             "stored_data",
             "acceptance_criteria",
+            "prebuild_requirements",
             "use_previous_pending_request",
             "requires_existing_task_context",
             "reason",
@@ -2342,6 +2570,59 @@ def run_spec_clarification_agent(
                 "items": {"type": "string"},
                 "maxItems": 8,
             },
+            "prebuild_requirements": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "id",
+                        "title",
+                        "type",
+                        "reason",
+                        "blocking",
+                        "execution_location",
+                        "setup_steps",
+                        "setup_url",
+                        "security_note",
+                    ],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "type": {
+                            "type": "string",
+                            "enum": [
+                                "api_key",
+                                "server_api_key",
+                                "android_api_key",
+                                "oauth",
+                                "external_account",
+                                "provider_account",
+                                "payment_account",
+                                "server_credential",
+                                "cloud_project",
+                                "backend",
+                                "data_source",
+                                "special_permission",
+                                "hardware",
+                                "background_execution",
+                                "policy",
+                            ],
+                        },
+                        "reason": {"type": "string"},
+                        "blocking": {"type": "boolean"},
+                        "execution_location": {"type": "string"},
+                        "setup_steps": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 5,
+                        },
+                        "setup_url": {"type": "string"},
+                        "security_note": {"type": "string"},
+                    },
+                },
+            },
             "use_previous_pending_request": {"type": "boolean"},
             "requires_existing_task_context": {"type": "boolean"},
             "reason": {"type": "string"},
@@ -2382,6 +2663,15 @@ Rules:
 - If a single unsupported feature can simply be removed or replaced while preserving the rest of the same new app request, prefer mode=ask_confirmation instead of mode=answer_question.
 - In that case, set effective_user_prompt to the revised buildable request, ask one short Korean confirmation question such as whether to proceed without that unsupported feature, and keep the rest of the app context intact.
 - Examples of likely-infeasible requests include deep Bixby integration or device-vendor/private assistant control that depends on private or policy-restricted capabilities.
+- For every build or ask_confirmation result, inspect the requested features for material pre-build requirements and fill prebuild_requirements.
+- Include requirements that must be known before showing the final generation prompt: external API keys, provider accounts, billing activation, OAuth consent, backend or shared-data infrastructure, privileged Android settings, required hardware or sensors, exact background scheduling limits, regulated or sensitive-data policies, and unavailable external data sources.
+- Do not ask a participant to register an Android package name, signing certificate, OAuth redirect, service account, payment account, or provider application. Those are researcher-managed setup items.
+- A provider that only requires the participant to create an account and issue a standalone research API key may ask the participant to enter that key in the VibeFactory chat. The server handles storage and build injection; never copy an entered key into your output.
+- Do not add ordinary Android runtime permissions such as camera or location by themselves unless the request also requires a special Settings screen grant, background access, policy-sensitive access, or unavailable hardware.
+- Use a stable catalog id when it applies: openai, google_maps_platform, firebase, supabase, google_oauth, weather, public_data_portal, email_delivery, sms_delivery, payments, kakao_platform, naver_platform, youtube_data.
+- For an unknown provider or requirement, use a short lowercase id and provide concrete Korean setup_steps. Never invent an API key or claim an account is already configured.
+- Set blocking=true when the app cannot deliver the requested real behavior without the account, credential, backend, data source, or hardware. Use blocking=false for an important limitation that the user only needs to acknowledge.
+- API keys, passwords, tokens, and OAuth secrets must never appear in any returned field. Tell the user to register them through server configuration rather than chat.
 - request_scope=new_app when the user is asking to create a brand-new app.
 - request_scope=existing_app_modification when the user is trying to change an app that already exists.
 - Always propose app_name for build or ask_confirmation.
@@ -2407,7 +2697,9 @@ Rules:
   2. secondary_scope_confirmed is true and secondary_requirements are either explicitly listed or explicitly confirmed as none for now.
 - If the user's message does not clearly separate first-release core flow from second-phase enhancements, use mode=ask_confirmation and propose 2-5 short feature questions yourself.
 - Do not ask the user to write or organize 1차 핵심 흐름 and 2차 고도화 요구 from scratch.
-- This build system does not provide a backend database, account system, cloud storage, or multi-device sync for each generated app by default.
+- This build system provides `VibeDataClient` for simple shared records through the VibeFactory server. It does not provide production-grade login, identity verification, per-role authorization, tenant isolation, file cloud storage, or end-to-end encrypted sync by default.
+- Do not add a blocking backend requirement when the request only needs ordinary shared records and `VibeDataClient` is sufficient.
+- Add a blocking backend, authentication, or policy requirement when the request needs accounts, owner/student/parent or doctor/patient role separation, private per-user records, sensitive personal data, cloud files, external web access, or provider-specific synchronization.
 - Do not ask whether login, account creation, server storage, cloud sync, or multi-device sync is needed unless the user explicitly requested login, accounts, sharing across users, teams, cloud sync, or multi-device use.
 - If persistent storage is implied or requested, assume local on-device persistence by default.
 - Do not ask where data should be stored. Only ask what user-visible data or actions must be saved when that materially changes the app.
@@ -2464,6 +2756,7 @@ Rules:
 - For answer_question, acceptance_criteria must be an empty array.
 - For answer_question, secondary_scope_confirmed must be false.
 - For answer_question, target_users, key_screens, core_features, and stored_data must be empty arrays, and storage_mode must be unspecified.
+- For answer_question, prebuild_requirements must be an empty array.
 
 Return JSON only.
 """
@@ -2664,6 +2957,11 @@ def decide_intent(
             spec_storage_mode = normalize_storage_mode(spec_payload.get("storage_mode"))
             spec_stored_data = normalize_prompt_items(spec_payload.get("stored_data"), max_items=6)
             spec_acceptance_criteria = normalize_acceptance_criteria(spec_payload.get("acceptance_criteria"))
+            spec_prebuild_requirements = [
+                dict(item)
+                for item in (spec_payload.get("prebuild_requirements") or [])
+                if isinstance(item, dict)
+            ][:8]
             supported_revision = revise_prompt_for_supported_android_scope(prompt)
             if supported_revision and looks_like_build_request(prompt, existing_task):
                 return build_supported_revision_confirmation_decision(
@@ -2726,6 +3024,7 @@ def decide_intent(
                         key_screens=spec_key_screens,
                         storage_mode=spec_storage_mode,
                         stored_data=spec_stored_data,
+                        prebuild_requirements=spec_prebuild_requirements,
                     )
                 return build_intent_decision(
                     mode="answer_question",
@@ -2796,6 +3095,7 @@ def decide_intent(
                         key_screens=spec_key_screens,
                         storage_mode=spec_storage_mode,
                         stored_data=spec_stored_data,
+                        prebuild_requirements=spec_prebuild_requirements,
                     )
                 if (
                     spec_mode == "ask_confirmation"
@@ -2829,6 +3129,7 @@ def decide_intent(
                         key_screens=spec_key_screens,
                         storage_mode=spec_storage_mode,
                         stored_data=spec_stored_data,
+                        prebuild_requirements=spec_prebuild_requirements,
                     )
                 if request_scope == "new_app" and not spec_secondary_scope_confirmed:
                     forced_questions = questions or build_scope_clarification_questions(
@@ -2859,6 +3160,7 @@ def decide_intent(
                         key_screens=spec_key_screens,
                         storage_mode=spec_storage_mode,
                         stored_data=spec_stored_data,
+                        prebuild_requirements=spec_prebuild_requirements,
                     )
                 return build_intent_decision(
                     mode=spec_mode,
@@ -2885,6 +3187,7 @@ def decide_intent(
                     key_screens=spec_key_screens,
                     storage_mode=spec_storage_mode,
                     stored_data=spec_stored_data,
+                    prebuild_requirements=spec_prebuild_requirements,
                     image_reference_summary=reference_attachments_summary(reference_attachments or [])
                     or build_reference_image_summary(normalize_reference_image_name(reference_image_name)),
                 )
@@ -3618,6 +3921,29 @@ class Database:
             self.ensure_relation_indexes(connection)
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS task_integration_credentials (
+                    task_id TEXT NOT NULL,
+                    requirement_id TEXT NOT NULL,
+                    credential_name TEXT NOT NULL,
+                    credential_value TEXT NOT NULL,
+                    source_event_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, requirement_id, credential_name),
+                    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+                    FOREIGN KEY(task_id, source_event_id)
+                        REFERENCES task_events(task_id, event_id) ON DELETE RESTRICT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_integration_credentials_task
+                ON task_integration_credentials(task_id, updated_at DESC)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS ui_editor_drafts (
                     draft_id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL,
@@ -3796,6 +4122,71 @@ class Database:
             )
             connection.commit()
         return event_id
+
+    def upsert_task_integration_credential(
+        self,
+        *,
+        task_id: str,
+        requirement_id: str,
+        credential_name: str,
+        credential_value: str,
+        source_event_id: Optional[str],
+    ) -> None:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_integration_credentials (
+                    task_id, requirement_id, credential_name, credential_value,
+                    source_event_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, requirement_id, credential_name) DO UPDATE SET
+                    credential_value = excluded.credential_value,
+                    source_event_id = excluded.source_event_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    requirement_id,
+                    credential_name,
+                    credential_value,
+                    source_event_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+
+    def task_integration_environment(self, task_id: str) -> dict[str, str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT credential_name, credential_value
+                FROM task_integration_credentials
+                WHERE task_id = ?
+                ORDER BY updated_at ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return {
+            str(row["credential_name"]): str(row["credential_value"])
+            for row in rows
+            if str(row["credential_name"] or "").strip()
+        }
+
+    def list_task_integration_credentials(self, task_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_id, requirement_id, credential_name, credential_value,
+                       source_event_id, created_at, updated_at
+                FROM task_integration_credentials
+                WHERE task_id = ?
+                ORDER BY created_at ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_task_attachment(
         self,
@@ -4719,6 +5110,10 @@ def render_task_agents_md(task_id: str) -> str:
 - 런타임 Task ID는 `BuildConfig.VIBE_TASK_ID`를 사용한다.
 - 런타임 서버 주소는 하드코딩하지 말고 `BuildConfig.VIBE_SERVER_BASE_URL`을 사용한다.
 - 서버 런타임 AI는 `VibeLlmClient`, 공유 데이터는 `VibeDataClient`, 오류 보고는 `VibeCrashReporter`를 우선 재사용한다.
+- `prompt.md`의 `외부 연동 및 필수 조건`에 서버 최종 빌드에서 주입되는 설정 이름이 있으면 실제 값은 읽거나 출력하려 하지 말고 Gradle 환경변수 또는 manifest placeholder로만 연결한다.
+- `OPENWEATHER_API_KEY`와 `DATA_GO_KR_SERVICE_KEY`는 BaseProject에 같은 이름의 `BuildConfig` 필드가 준비되어 있으므로 앱 코드에서 해당 필드를 사용한다.
+- 외부 API 키, OAuth 비밀 값, 비밀번호, 토큰을 소스 코드, 리소스, 로그, `task_result.json`에 하드코딩하지 않는다.
+- 작업 엔진 환경에 외부 자격증명이 보이지 않는 것은 정상이다. 사전 검사에서 연결됨으로 확인된 항목은 키가 없다고 실패 처리하지 말고 서버 최종 빌드 주입 계약을 따른다.
 - `VibeLlmClient` 호출 실패는 `VibeLlmRequestException.userMessage` 또는 예외의 사용자용 message를 화면에 표시한다. HTTP 응답 본문, endpoint, API 키, 내부 경로는 사용자에게 노출하지 않는다.
 - 코드 생성 중에는 `./gradlew :app:lintDebug`로 정적 오류를 검증한다.
 - 최종 signed release APK 빌드는 서버가 수행하므로 `assembleRelease`를 직접 실행하지 않는다.
@@ -4779,8 +5174,17 @@ def render_task_agents_md(task_id: str) -> str:
 def build_app_runtime_metadata(task: dict[str, Any], settings: Settings) -> dict[str, str]:
     package_name = str(task.get("package_name") or "").strip() or "(미정)"
     runtime_endpoint = f"{settings.server_base_url}/apps/{task['task_id']}/llm/respond"
+    task_openai_configured = any(
+        str(requirement.get("id") or "") == "openai"
+        and bool(requirement.get("configured"))
+        and bool(requirement.get("supported"))
+        for requirement in current_task_prebuild_requirements(task)
+    )
     return {
-        "runtime_available": "yes" if settings.app_runtime_enabled_by_default and bool(settings.app_runtime_api_key) else "no",
+        "runtime_available": "yes"
+        if task_openai_configured
+        or (settings.app_runtime_enabled_by_default and bool(settings.app_runtime_api_key))
+        else "no",
         "runtime_endpoint": runtime_endpoint,
         "package_name": package_name,
         "model": settings.app_runtime_model,
@@ -5030,10 +5434,14 @@ def default_app_llm_config(settings: Settings) -> dict[str, Any]:
 def app_llm_config_with_environment_key(
     config: dict[str, Any],
     settings: Settings,
+    *,
+    task_api_key: str = "",
 ) -> dict[str, Any]:
     effective = dict(config)
-    if not str(effective.get("api_key") or "").strip() and settings.app_runtime_api_key:
-        effective["api_key"] = settings.app_runtime_api_key
+    if not str(effective.get("api_key") or "").strip():
+        effective["api_key"] = task_api_key.strip() or settings.app_runtime_api_key
+    if str(effective.get("api_key") or "").strip():
+        effective["enabled"] = True
     return effective
 
 
@@ -5435,6 +5843,10 @@ Also include `change_summary` as one or two short Korean sentences explaining wh
 `change_summary` must be a code-aware paraphrase, not a repetition or quotation of the user's message.
 Do not use a template such as "이번 수정은 {{사용자 원문}}을 반영해요."
 Do not include paths, code identifiers, commands, or developer terminology in `change_summary`.
+For `build` or `ask_confirmation`, inspect whether the latest change newly requires an external API key, provider account, billing, OAuth, backend or role authorization, a privileged Android setting, special hardware, exact background execution, sensitive-data policy, or an unavailable external data source.
+Put each material condition in `prebuild_requirements`. Use an empty array when the latest change adds none.
+Use the same stable ids as the initial spec flow when applicable: openai, google_maps_platform, firebase, supabase, google_oauth, weather, public_data_portal, email_delivery, sms_delivery, payments, kakao_platform, naver_platform, youtube_data.
+Never include an actual API key, password, token, or OAuth secret in your output. The server may separately recognize a participant key message and replace it with a registration marker before this context reaches you.
 If `previous_conversation_state.awaiting_confirmation` is true and the latest user message answers that pending question, merge the pending request and latest answer into `effective_user_prompt`.
 For `ask_confirmation`, include 1-5 short Korean `questions`.
 
@@ -5445,6 +5857,19 @@ Result JSON schema:
   "assistant_reply": "string",
   "change_summary": "string",
   "questions": ["string"],
+  "prebuild_requirements": [
+    {{
+      "id": "string",
+      "title": "string",
+      "type": "api_key | server_api_key | android_api_key | oauth | external_account | provider_account | payment_account | server_credential | cloud_project | backend | data_source | special_permission | hardware | background_execution | policy",
+      "reason": "string",
+      "blocking": true,
+      "execution_location": "string",
+      "setup_steps": ["string"],
+      "setup_url": "string",
+      "security_note": "string"
+    }}
+  ],
   "reason": "string",
   "referenced_files": ["string"]
 }}
@@ -5597,6 +6022,11 @@ Context:
             for item in parsed.get("questions", [])
             if normalize_whitespace(str(item))
         ]
+    parsed["prebuild_requirements"] = [
+        dict(item)
+        for item in (parsed.get("prebuild_requirements") or [])
+        if isinstance(item, dict)
+    ][:8]
 
     log_agent_output_event(
         db,
@@ -6014,6 +6444,35 @@ def current_task_package_name(task: dict[str, Any], conversation_state: Optional
     return ""
 
 
+def current_task_prebuild_requirements(task: dict[str, Any]) -> list[dict[str, Any]]:
+    state_payload = load_task_state_payload(task)
+    conversation_state = state_payload.get("conversation_state")
+    if not isinstance(conversation_state, dict):
+        conversation_state = {}
+    for value in (
+        state_payload.get("prebuild_requirements"),
+        conversation_state.get("latest_prebuild_requirements"),
+        conversation_state.get("pending_prebuild_requirements"),
+    ):
+        if not isinstance(value, list):
+            continue
+        requirements = [dict(item) for item in value if isinstance(item, dict)][:8]
+        if requirements:
+            return requirements
+    return []
+
+
+def merged_task_integration_environment(
+    db: Database,
+    task_id: str,
+    *,
+    base_environment: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
+    environment = dict(os.environ if base_environment is None else base_environment)
+    environment.update(db.task_integration_environment(task_id))
+    return environment
+
+
 def preserve_followup_task_identity(
     decision: IntentDecision,
     task: dict[str, Any],
@@ -6249,6 +6708,11 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
     latest_stored_data = decision.stored_data or normalize_context_list(
         previous_conversation_state.get("latest_stored_data")
     )
+    latest_prebuild_requirements = decision.prebuild_requirements or [
+        dict(item)
+        for item in (previous_conversation_state.get("latest_prebuild_requirements") or [])
+        if isinstance(item, dict)
+    ][:8]
     latest_summary = decision.summary or str(previous_conversation_state.get("latest_summary") or "")
     return {
         "status": decision.status,
@@ -6270,6 +6734,7 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
         "key_screens": decision.key_screens,
         "storage_mode": decision.storage_mode,
         "stored_data": decision.stored_data,
+        "prebuild_requirements": decision.prebuild_requirements,
         "confirmation_action": decision.confirmation_action,
         "confirmation_payload": decision.confirmation_payload,
         "image_reference_summary": decision.image_reference_summary,
@@ -6295,6 +6760,7 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "latest_key_screens": latest_key_screens,
             "latest_storage_mode": latest_storage_mode,
             "latest_stored_data": latest_stored_data,
+            "latest_prebuild_requirements": latest_prebuild_requirements,
             "awaiting_confirmation": decision.mode == "ask_confirmation",
             "awaiting_prompt_review": awaiting_prompt_review,
             "confirmation_action": decision.confirmation_action,
@@ -6312,6 +6778,7 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "pending_key_screens": decision.key_screens if decision.mode == "ask_confirmation" else [],
             "pending_storage_mode": decision.storage_mode if decision.mode == "ask_confirmation" else "unspecified",
             "pending_stored_data": decision.stored_data if decision.mode == "ask_confirmation" else [],
+            "pending_prebuild_requirements": decision.prebuild_requirements if decision.mode == "ask_confirmation" else [],
             "used_previous_pending_prompt": decision.used_previous_pending_prompt,
             "request_scope": state_request_scope,
             "requires_existing_task_context": decision.requires_existing_task_context,
@@ -6381,6 +6848,7 @@ def build_assistant_response_payload(decision: IntentDecision) -> dict[str, Any]
         "key_screens": decision.key_screens,
         "storage_mode": decision.storage_mode,
         "stored_data": decision.stored_data,
+        "prebuild_requirements": decision.prebuild_requirements,
         "confirmation_action": decision.confirmation_action,
         "confirmation_payload": decision.confirmation_payload,
         "image_reference_summary": decision.image_reference_summary,
@@ -6552,9 +7020,13 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, Any]
         render_mode = str(payload.get("render_mode") or "")
         confirmation_action = str(payload.get("confirmation_action") or "")
         prepared_prompt = sanitize_user_visible_text(str(payload.get("prepared_prompt") or ""))
-        kind = "confirmation" if render_mode == "prompt_review_bubble" and confirmation_action == "submit_initial_prompt" else "assistant"
+        kind = (
+            "confirmation"
+            if confirmation_action and render_mode in {"prompt_review_bubble", "confirmation_bubble"}
+            else "assistant"
+        )
         title = "AI"
-        body = prepared_prompt if kind == "confirmation" and prepared_prompt else message_text
+        body = prepared_prompt if confirmation_action == "submit_initial_prompt" and prepared_prompt else message_text
     elif event_type == "task_branched":
         kind = "assistant"
         title = "AI"
@@ -7379,6 +7851,8 @@ class CodexTaskRunner:
         workspace_path: Path,
         *,
         include_signing: bool = False,
+        include_client_integrations: bool = False,
+        task_id: str = "",
     ) -> dict[str, str]:
         tool_cache_root = self.settings.build_cache_root if self.settings.shared_build_cache_enabled else workspace_path / ".tooling"
         gradle_home_path = tool_cache_root / "gradle"
@@ -7399,6 +7873,14 @@ class CodexTaskRunner:
             for key, value in signing_values.items():
                 if value:
                     env[key] = value
+        if include_client_integrations and task_id:
+            task = self.db.get_task(task_id) or {}
+            env.update(
+                client_build_environment_for_requirements(
+                    current_task_prebuild_requirements(task),
+                    environment=merged_task_integration_environment(self.db, task_id),
+                )
+            )
         return env
 
     def require_release_signing(self) -> None:
@@ -7503,15 +7985,28 @@ class CodexTaskRunner:
         current_apk_path: Path,
     ) -> Path:
         version_changed = ensure_project_revision_version(project_path)
-        env = self.build_task_env(workspace_path, include_signing=True)
-        existing_optimized_apk = self.find_existing_optimized_download_apk(
+        task = self.db.get_task(task_id) or {}
+        integration_env = client_build_environment_for_requirements(
+            current_task_prebuild_requirements(task),
+            environment=merged_task_integration_environment(self.db, task_id),
+        )
+        env = self.build_task_env(
             workspace_path,
-            project_path,
-            current_apk_path,
+            include_signing=True,
+            include_client_integrations=True,
+            task_id=task_id,
+        )
+        existing_optimized_apk = (
+            None
+            if integration_env
+            else self.find_existing_optimized_download_apk(
+                workspace_path,
+                project_path,
+                current_apk_path,
+            )
         )
         if existing_optimized_apk is not None and not version_changed:
             try:
-                task = self.db.get_task(task_id) or {}
                 validate_built_apk_install_contract(
                     project_path,
                     existing_optimized_apk,
@@ -7612,18 +8107,31 @@ class CodexTaskRunner:
             if identity_issues:
                 raise RuntimeError("Android 앱 식별 정보를 복원하지 못했습니다.")
             version_changed = ensure_project_revision_version(project_path)
+            revision_integration_env = client_build_environment_for_requirements(
+                current_task_prebuild_requirements(task),
+                environment=merged_task_integration_environment(
+                    self.db,
+                    str(task["task_id"]),
+                ),
+            )
             existing_apk = find_revision_apk(workspace_path, project_path, task)
             if (
                 existing_apk is not None
                 and not identity_changed
                 and not version_changed
+                and not revision_integration_env
             ):
                 try:
                     validate_built_apk_install_contract(
                         project_path,
                         existing_apk,
                         expected_package_name,
-                        env=self.build_task_env(workspace_path, include_signing=True),
+                        env=self.build_task_env(
+                            workspace_path,
+                            include_signing=True,
+                            include_client_integrations=True,
+                            task_id=str(task["task_id"]),
+                        ),
                     )
                     return existing_apk
                 except RuntimeError:
@@ -7631,7 +8139,12 @@ class CodexTaskRunner:
 
             build_log_path = workspace_path / "logs" / "revision_download_build.log"
             self.require_release_signing()
-            env = self.build_task_env(workspace_path, include_signing=True)
+            env = self.build_task_env(
+                workspace_path,
+                include_signing=True,
+                include_client_integrations=True,
+                task_id=str(task["task_id"]),
+            )
             for build_step in native_android_project_builder.build_steps(project_path):
                 exit_code, timed_out, _ = self.run_logged_command(
                     list(build_step.command),
@@ -7734,7 +8247,12 @@ class CodexTaskRunner:
                 return
         ensure_project_revision_version(project_path)
         build_log_path = workspace_path / "logs" / "build.log"
-        env = self.build_task_env(workspace_path, include_signing=True)
+        env = self.build_task_env(
+            workspace_path,
+            include_signing=True,
+            include_client_integrations=True,
+            task_id=task_id,
+        )
         try:
             self.require_release_signing()
         except RuntimeError as exc:
@@ -9107,6 +9625,52 @@ def create_app() -> FastAPI:
             previous_conversation_state = build_task_conversation_state(previous_task_for_context)
             existing_workspace_ready = bool(previous_task_for_context.get("workspace_path") and previous_task_for_context.get("project_path"))
             is_initial_prompt_submission = request_action == "submit_initial_prompt"
+            is_prebuild_requirements_review = request_action in {
+                "confirm_prebuild_requirements",
+                "recheck_prebuild_requirements",
+            }
+            task_integration_environment = merged_task_integration_environment(db, followup_task_id)
+            stored_prebuild_requirements = [
+                dict(item)
+                for item in (
+                    previous_conversation_state.get("pending_prebuild_requirements")
+                    or previous_conversation_state.get("latest_prebuild_requirements")
+                    or []
+                )
+                if isinstance(item, dict)
+            ][:8]
+            resolved_stored_requirements = resolve_prebuild_requirements(
+                str(
+                    previous_conversation_state.get("pending_user_prompt")
+                    or previous_conversation_state.get("latest_effective_user_prompt")
+                    or previous_conversation_state.get("initial_user_prompt")
+                    or ""
+                ),
+                stored_prebuild_requirements,
+                environment=task_integration_environment,
+                package_name=current_task_package_name(task, previous_conversation_state),
+            )
+            participant_credential_requirement = (
+                pending_participant_credential_requirement(resolved_stored_requirements)
+                if not request_action
+                and previous_conversation_state.get("confirmation_action")
+                == "recheck_prebuild_requirements"
+                and not requested_reference_attachments
+                else None
+            )
+            participant_credential_value = (
+                extract_participant_credential(request.prompt, participant_credential_requirement)
+                if participant_credential_requirement
+                else ""
+            )
+            is_participant_credential_submission = bool(participant_credential_value)
+            is_participant_credential_attempt = bool(
+                participant_credential_requirement
+                and (
+                    is_participant_credential_submission
+                    or re.fullmatch(r"\S{8,4096}", request.prompt.strip())
+                )
+            )
             selected_ui_editor_drafts: list[dict[str, Any]] = []
             selected_ui_base_revision_label = ""
             if is_initial_prompt_submission and (
@@ -9115,6 +9679,11 @@ def create_app() -> FastAPI:
                 or previous_conversation_state.get("confirmation_action") != "submit_initial_prompt"
             ):
                 raise HTTPException(status_code=409, detail="task is not waiting for initial prompt review")
+            if is_prebuild_requirements_review and (
+                previous_conversation_state.get("confirmation_action")
+                not in {"confirm_prebuild_requirements", "recheck_prebuild_requirements"}
+            ):
+                raise HTTPException(status_code=409, detail="task is not waiting for prebuild requirements review")
             if request.use_ui_editor_draft:
                 current_project_value = normalize_whitespace(str(task.get("project_path") or ""))
                 if not current_project_value or not Path(current_project_value).is_dir():
@@ -9165,11 +9734,67 @@ def create_app() -> FastAPI:
                         str(draft.get("draft_id") or "") for draft in selected_ui_editor_drafts
                     ],
                     "attachment_count": len(requested_reference_attachments),
+                    "external_credential_submission": is_participant_credential_attempt,
+                    "credential_registration_succeeded": is_participant_credential_submission,
+                    "credential_requirement_id": (
+                        str(participant_credential_requirement.get("id") or "")
+                        if participant_credential_requirement
+                        else ""
+                    ),
+                    "credential_requirement_title": (
+                        str(participant_credential_requirement.get("title") or "")
+                        if participant_credential_requirement
+                        else ""
+                    ),
                     "attachments": [
                         reference_attachment_event_payload(attachment)
                         for attachment in requested_reference_attachments
                     ],
                 },
+            )
+            if is_participant_credential_submission and participant_credential_requirement:
+                credential_name = normalize_whitespace(
+                    str(participant_credential_requirement.get("participant_credential_environment") or "")
+                )
+                requirement_id = normalize_whitespace(
+                    str(participant_credential_requirement.get("id") or "")
+                )
+                db.upsert_task_integration_credential(
+                    task_id=followup_task_id,
+                    requirement_id=requirement_id,
+                    credential_name=credential_name,
+                    credential_value=participant_credential_value,
+                    source_event_id=user_event_id,
+                )
+                task_integration_environment = merged_task_integration_environment(db, followup_task_id)
+                db.log_event(
+                    followup_task_id,
+                    actor="system",
+                    event_type="external_credential_registered",
+                    message_text=(
+                        f"{participant_credential_requirement.get('title') or '외부 서비스'} 키가 등록되었습니다."
+                        if str(participant_credential_requirement.get("title") or "").lower().endswith("api")
+                        else f"{participant_credential_requirement.get('title') or '외부 서비스'} API 키가 등록되었습니다."
+                    ),
+                    payload={
+                        "requirement_id": requirement_id,
+                        "credential_name": credential_name,
+                        "source_event_id": user_event_id,
+                        "credential_length": len(participant_credential_value),
+                    },
+                )
+            credential_history_placeholder = (
+                (
+                    (
+                        f"[{participant_credential_requirement.get('title') or '외부 서비스'} 키 등록 완료]"
+                        if str(participant_credential_requirement.get("title") or "").lower().endswith("api")
+                        else f"[{participant_credential_requirement.get('title') or '외부 서비스'} API 키 등록 완료]"
+                    )
+                    if is_participant_credential_submission
+                    else "[API 키 형식 확인 필요]"
+                )
+                if is_participant_credential_attempt and participant_credential_requirement
+                else request.prompt
             )
             if requested_reference_attachments:
                 try:
@@ -9237,6 +9862,12 @@ def create_app() -> FastAPI:
                     "confirmation_action": "",
                     "confirmation_payload": "",
                 }
+            elif is_prebuild_requirements_review or is_participant_credential_attempt:
+                decision = build_prebuild_recheck_decision(
+                    task_id=followup_task_id,
+                    previous_conversation_state=previous_conversation_state,
+                    existing_workspace_ready=existing_workspace_ready,
+                )
             elif selected_ui_editor_drafts:
                 current_app_name = current_task_app_name(task, previous_conversation_state)
                 decision = build_intent_decision(
@@ -9325,6 +9956,11 @@ def create_app() -> FastAPI:
                             str((codex_followup_payload or {}).get("effective_user_prompt") or request.prompt)
                         ),
                         questions=codex_questions or build_clarification_questions(request.prompt),
+                        prebuild_requirements=[
+                            dict(item)
+                            for item in (codex_followup_payload or {}).get("prebuild_requirements", [])
+                            if isinstance(item, dict)
+                        ][:8],
                         reason=korean_text_or_fallback(
                             str((codex_followup_payload or {}).get("reason") or ""),
                             "기존 앱 코드를 확인했지만 수정 전에 막히는 세부사항이 있어요.",
@@ -9364,6 +10000,11 @@ def create_app() -> FastAPI:
                         acceptance_criteria=normalize_acceptance_criteria(
                             previous_conversation_state.get("latest_acceptance_criteria")
                         ),
+                        prebuild_requirements=[
+                            dict(item)
+                            for item in (codex_followup_payload or {}).get("prebuild_requirements", [])
+                            if isinstance(item, dict)
+                        ][:8],
                         user_visible_summary=codex_change_summary,
                     )
             else:
@@ -9390,8 +10031,53 @@ def create_app() -> FastAPI:
                     or build_reference_image_summary(effective_reference_image_name),
                 )
             decision = preserve_followup_task_identity(decision, task, previous_conversation_state)
+            prebuild_prerequisite_reviewed = (
+                is_prebuild_requirements_review or is_participant_credential_submission
+            )
             if not existing_workspace_ready and not is_initial_prompt_submission:
-                decision = build_initial_prompt_review_decision(decision)
+                decision = build_initial_prompt_review_decision(
+                    decision,
+                    prerequisite_reviewed=prebuild_prerequisite_reviewed,
+                    environment=task_integration_environment,
+                )
+            elif existing_workspace_ready and not is_initial_prompt_submission:
+                known_requirement_ids = {
+                    normalize_whitespace(str(item.get("id") or ""))
+                    for item in previous_conversation_state.get("latest_prebuild_requirements", [])
+                    if isinstance(item, dict) and normalize_whitespace(str(item.get("id") or ""))
+                }
+                decision = build_prebuild_requirements_review_decision(
+                    decision,
+                    prerequisite_reviewed=prebuild_prerequisite_reviewed,
+                    known_requirement_ids=known_requirement_ids,
+                    environment=task_integration_environment,
+                )
+            if is_participant_credential_submission:
+                if decision.confirmation_action == "submit_initial_prompt":
+                    decision = replace(
+                        decision,
+                        message="API 키를 등록했어요. 앱 생성 프롬프트를 확인하거나 수정한 뒤 전송해 주세요.",
+                        summary="API 키 등록이 완료되어 생성 프롬프트를 준비했어요.",
+                    )
+                elif decision.mode == "build":
+                    decision = replace(
+                        decision,
+                        message=f"API 키를 등록했어요. {decision.message}",
+                    )
+            elif is_participant_credential_attempt:
+                credential_format_error = (
+                    "입력한 값이 안내된 API 키 형식과 맞지 않아요. "
+                    "발급 페이지에서 키 전체를 다시 확인해 주세요."
+                )
+                decision = replace(
+                    decision,
+                    message=f"{credential_format_error}\n\n{decision.message}",
+                    summary=credential_format_error,
+                    questions=[
+                        f"{credential_format_error}\n\n{question}"
+                        for question in decision.questions
+                    ] or [credential_format_error],
+                )
             if decision.used_previous_pending_prompt:
                 db.log_event(
                     followup_task_id,
@@ -9431,7 +10117,7 @@ def create_app() -> FastAPI:
                                 "conversation_state_override": previous_conversation_state,
                             },
                             persisted_decision,
-                            request.prompt,
+                            credential_history_placeholder,
                         ),
                         ensure_ascii=False,
                     ),
@@ -9526,7 +10212,11 @@ def create_app() -> FastAPI:
                 apply_project_defaults(project_path_obj, followup_task_id, resolved_app_name, resolved_package_name)
                 append_followup_prompt(
                     workspace_path_obj,
-                    request.prompt,
+                    (
+                        decision.effective_user_prompt
+                        if is_participant_credential_submission
+                        else request.prompt
+                    ),
                     effective_user_prompt=decision.effective_user_prompt,
                     normalized_prompt=decision.normalized_prompt,
                     reference_image_name=effective_reference_image_name,
@@ -9585,9 +10275,9 @@ def create_app() -> FastAPI:
                             "reference_image_workspace_path": reference_image_workspace_path or previous_conversation_state.get("reference_image_workspace_path") or "",
                             "reference_attachments": saved_reference_attachments or effective_reference_attachments,
                             "conversation_state_override": previous_conversation_state,
-                        },
-                        decision,
-                        request.prompt,
+                            },
+                            decision,
+                            credential_history_placeholder,
                     ),
                     ensure_ascii=False,
                 ),
@@ -10012,10 +10702,17 @@ def create_app() -> FastAPI:
             config = db.get_app_llm_config(task_id)
         if not config:
             raise HTTPException(status_code=404, detail="llm config not found")
-        effective_config = app_llm_config_with_environment_key(config, settings)
+        effective_config = app_llm_config_with_environment_key(
+            config,
+            settings,
+            task_api_key=db.task_integration_environment(task_id).get(
+                "APP_RUNTIME_OPENAI_API_KEY",
+                "",
+            ),
+        )
         return {
             "task_id": task_id,
-            "enabled": bool(config.get("enabled")),
+            "enabled": bool(effective_config.get("enabled")),
             "provider": config.get("provider") or "openai",
             "model": config.get("model") or "",
             "base_url": config.get("base_url") or "",
@@ -10079,9 +10776,18 @@ def create_app() -> FastAPI:
         if not config:
             ensure_default_app_llm_config(db, settings, task_id)
             config = db.get_app_llm_config(task_id)
-        if not config or not bool(config.get("enabled")):
+        if not config:
             raise HTTPException(status_code=403, detail="app llm runtime disabled")
-        config = app_llm_config_with_environment_key(config, settings)
+        config = app_llm_config_with_environment_key(
+            config,
+            settings,
+            task_api_key=db.task_integration_environment(task_id).get(
+                "APP_RUNTIME_OPENAI_API_KEY",
+                "",
+            ),
+        )
+        if not bool(config.get("enabled")):
+            raise HTTPException(status_code=403, detail="app llm runtime disabled")
 
         expected_package_name = str(task.get("package_name") or "").strip()
         if expected_package_name and request.package_name.strip() != expected_package_name:
@@ -11504,6 +12210,12 @@ def create_app() -> FastAPI:
             f"{version_name} 버전에서 새 Task를 만들었어요. "
             "선택한 버전을 복사하고 APK를 준비하고 있어요."
         )
+        source_conversation_state = build_task_conversation_state(source_task)
+        inherited_prebuild_requirements = [
+            dict(item)
+            for item in source_conversation_state.get("latest_prebuild_requirements", [])
+            if isinstance(item, dict)
+        ][:8]
         branch_state = {
             "status": "queued",
             "tool": "build",
@@ -11523,7 +12235,9 @@ def create_app() -> FastAPI:
                 "awaiting_prompt_review": False,
                 "suppress_initial_prompt_bubble": True,
                 "branch_origin": branch_origin,
+                "latest_prebuild_requirements": inherited_prebuild_requirements,
             },
+            "prebuild_requirements": inherited_prebuild_requirements,
             "recent_messages": [],
         }
 
@@ -11568,6 +12282,15 @@ def create_app() -> FastAPI:
             )
         else:
             ensure_default_app_llm_config(db, settings, branched_task_id)
+        inherited_credentials = db.list_task_integration_credentials(task_id)
+        for credential in inherited_credentials:
+            db.upsert_task_integration_credential(
+                task_id=branched_task_id,
+                requirement_id=str(credential.get("requirement_id") or ""),
+                credential_name=str(credential.get("credential_name") or ""),
+                credential_value=str(credential.get("credential_value") or ""),
+                source_event_id=None,
+            )
         db.log_event(
             branched_task_id,
             actor="system",
@@ -11579,6 +12302,7 @@ def create_app() -> FastAPI:
                 "copied_conversation_history": False,
                 "copied_attachments": False,
                 "copied_app_data": False,
+                "copied_integration_credentials": len(inherited_credentials),
             },
         )
         db.log_event(

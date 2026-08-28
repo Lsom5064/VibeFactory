@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
+try:
+    from .prebuild_requirements import EXTERNAL_CREDENTIAL_ENV_KEYS
+except ImportError:
+    from prebuild_requirements import EXTERNAL_CREDENTIAL_ENV_KEYS  # type: ignore[no-redef]
+
 
 GENERATED_APP_SIGNING_ENV_KEYS = (
     "GENERATED_APP_KEYSTORE_PATH",
@@ -16,7 +21,7 @@ GENERATED_APP_SIGNING_ENV_KEYS = (
 )
 SUBPROCESS_SECRET_ENV_KEYS = (
     *GENERATED_APP_SIGNING_ENV_KEYS,
-    "APP_RUNTIME_OPENAI_API_KEY",
+    *EXTERNAL_CREDENTIAL_ENV_KEYS,
     "ADMIN_API_TOKEN",
 )
 

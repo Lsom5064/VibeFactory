@@ -79,9 +79,11 @@ GENERATED_APP_KEY_PASSWORD
 
 ```text
 ~/.vibefactory/signing/generated-app-signing.env
+~/.vibefactory/integrations.env
 ```
 
 서명키와 비밀번호는 Git에 추가하지 않는다. 실제 빌드에서 서명 설정이 없거나 keystore 파일을 찾을 수 없으면 서버는 Task를 명확한 build 실패로 종료한다.
+관리자 소유 외부 API 키와 OAuth 비밀 값은 Git, 채팅, Task DB에 넣지 않고 `integrations.env`에만 등록한다. 참가자 발급형으로 분류된 연구용 API 키는 채팅 원문과 Task 연동 설정에 기록하되 Agent·Codex 입력에서는 등록 완료 표기로 치환한다. 지원 제공자, 역할 구분과 발급 절차는 `EXTERNAL_INTEGRATIONS.md`를 따른다.
 
 Codex는 기본적으로 `workspace-write` sandbox에서 Task workspace와 공유 Gradle
 cache만 수정한다. 외부 격리 환경이 별도로 검증된 경우가 아니면
@@ -136,7 +138,7 @@ Native 템플릿은 다음 Kotlin client를 제공한다.
 
 package name은 `applicationContext.packageName`, Task ID는 `BuildConfig.VIBE_TASK_ID`, 빌드 대상 서버 주소는 `BuildConfig.VIBE_SERVER_BASE_URL`을 사용한다. 서버는 LLM 입력, system prompt, context, 이미지 메타데이터, raw response, parsed response, 오류 응답을 축약하지 않고 기록한다.
 
-Codex와 사용량 조회 subprocess에는 keystore 비밀번호, 런타임 API 키, 관리자 토큰을 전달하지 않는다. release Gradle subprocess에만 서명 환경변수 4개를 제한적으로 전달한다.
+Codex와 사용량 조회 subprocess에는 keystore 비밀번호, 런타임 API 키, 외부 API 자격증명, 관리자 토큰을 전달하지 않는다. release Gradle subprocess에는 서명 환경변수와 해당 Task에서 확인된 Android 클라이언트 키만 제한적으로 전달한다.
 Uvicorn access log는 endpoint와 상태 코드는 유지하되 전화번호·device ID가 들어 있는
 query string을 출력하지 않는다.
 

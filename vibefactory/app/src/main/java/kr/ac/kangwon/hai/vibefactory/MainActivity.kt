@@ -1565,6 +1565,13 @@ class MainActivity : AppCompatActivity() {
             }
             "continue_generate" -> continueClarification(taskId, payload, appendUserMessage = false)
             "generate_confirm" -> continueClarification(taskId, payload.ifBlank { "네" }, appendUserMessage = false)
+            "confirm_prebuild_requirements", "recheck_prebuild_requirements" -> continueClarification(
+                taskId = taskId,
+                prompt = payload.ifBlank { "필수 준비사항의 등록 상태를 다시 확인해 주세요." },
+                appendUserMessage = false,
+                displayPrompt = payload.ifBlank { "필수 준비사항을 확인했어요." },
+                requestAction = message.confirmAction
+            )
             "route_confirm" -> dispatchLatestTaskFeedback(taskId, payload.ifBlank { "계속 진행해줘" })
         }
         renderState()
@@ -2016,6 +2023,10 @@ class MainActivity : AppCompatActivity() {
                         confirmAction = confirmationAction,
                         confirmTaskId = taskId,
                         confirmPayload = confirmationPayload
+                    ),
+                    allowDuplicateContent = confirmationAction in setOf(
+                        "confirm_prebuild_requirements",
+                        "recheck_prebuild_requirements"
                     )
                 )
                 val confirmationDetail = summary.ifBlank {

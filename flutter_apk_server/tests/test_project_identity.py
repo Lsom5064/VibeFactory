@@ -71,6 +71,9 @@ class ProjectIdentityTests(unittest.TestCase):
             "GENERATED_APP_KEY_ALIAS": "generated",
             "GENERATED_APP_KEY_PASSWORD": "key-secret",
             "APP_RUNTIME_OPENAI_API_KEY": "runtime-secret",
+            "GOOGLE_MAPS_API_KEY": "maps-secret",
+            "GOOGLE_MAPS_ALLOWED_PACKAGES": "kr.example.maps",
+            "TOSS_PAYMENTS_SECRET_KEY": "payment-secret",
             "ADMIN_API_TOKEN": "admin-secret",
         }
 

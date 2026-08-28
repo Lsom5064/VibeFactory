@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 
 from flutter_apk_server.server import (
     build_intent_decision,
+    build_initial_prompt_review_decision,
+    build_prebuild_requirements_review_decision,
     build_prepared_generation_prompt,
     contains_conversation_placeholder,
     create_app,
@@ -21,6 +23,181 @@ from flutter_apk_server.server import (
 
 
 class DynamicPromptPreparationTests(unittest.TestCase):
+    def test_generate_endpoint_rechecks_requirements_before_prompt_review(self) -> None:
+        decision = build_intent_decision(
+            mode="build",
+            task_id="placeholder",
+            existing_task=False,
+            user_prompt="Google Maps와 Places API로 주변 카페를 보여주는 앱",
+            effective_user_prompt="Google Maps와 Places API로 현재 위치 주변 카페를 지도에 표시한다.",
+            suggested_app_name="카페맵",
+            primary_user_flow="현재 위치 주변 카페를 지도에서 확인한다.",
+            core_features=["현재 위치 지도", "주변 카페 검색"],
+            secondary_scope_confirmed=True,
+            storage_mode="none",
+        )
+        repository_root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment = {
+                "BASE_PROJECT_PATH": str(repository_root / "BaseProject"),
+                "WORKSPACES_ROOT": str(Path(temp_dir) / "workspaces"),
+                "BUILD_CACHE_ROOT": str(Path(temp_dir) / "cache"),
+                "DB_PATH": str(Path(temp_dir) / "tasks.db"),
+                "APP_DATA_DB_PATH": str(Path(temp_dir) / "app_data.db"),
+                "MOCK_CODEX": "1",
+                "INTENT_AGENT_ENABLED": "0",
+            }
+            with patch.dict(os.environ, environment, clear=False), patch(
+                "flutter_apk_server.server.decide_intent",
+                return_value=decision,
+            ):
+                app = create_app()
+                with TestClient(app) as client:
+                    initial = client.post(
+                        "/generate",
+                        json={
+                            "device_id": "maps-device",
+                            "prompt": "Google Maps와 Places API로 주변 카페를 보여주는 앱",
+                        },
+                    )
+                    self.assertEqual(200, initial.status_code, initial.text)
+                    task_id = initial.json()["task_id"]
+                    self.assertEqual(
+                        "recheck_prebuild_requirements",
+                        initial.json()["confirmation_action"],
+                    )
+                    self.assertEqual("", initial.json()["prepared_prompt"])
+
+                    still_missing = client.post(
+                        "/generate",
+                        json={
+                            "task_id": task_id,
+                            "device_id": "maps-device",
+                            "prompt": "필수 준비사항의 등록 상태를 다시 확인해 주세요.",
+                            "request_action": "recheck_prebuild_requirements",
+                        },
+                    )
+                    self.assertEqual(200, still_missing.status_code, still_missing.text)
+                    self.assertEqual(
+                        "recheck_prebuild_requirements",
+                        still_missing.json()["confirmation_action"],
+                    )
+
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "GOOGLE_MAPS_API_KEY": "secret",
+                            "GOOGLE_MAPS_ALLOWED_PACKAGES": decision.package_name,
+                        },
+                        clear=False,
+                    ):
+                        ready = client.post(
+                            "/generate",
+                            json={
+                                "task_id": task_id,
+                                "device_id": "maps-device",
+                                "prompt": "필수 준비사항의 등록 상태를 다시 확인해 주세요.",
+                                "request_action": "recheck_prebuild_requirements",
+                            },
+                        )
+                    self.assertEqual(200, ready.status_code, ready.text)
+                    self.assertEqual("submit_initial_prompt", ready.json()["confirmation_action"])
+                    self.assertIn("## 외부 연동 및 필수 조건", ready.json()["prepared_prompt"])
+                    self.assertNotIn("secret", ready.json()["prepared_prompt"])
+
+    def test_initial_prompt_waits_for_prebuild_requirement_review(self) -> None:
+        decision = build_intent_decision(
+            mode="build",
+            task_id="maps-task",
+            existing_task=False,
+            user_prompt="Google Maps와 Places API로 주변 카페를 보여주는 앱을 만들어줘",
+            suggested_app_name="카페맵",
+            primary_user_flow="현재 위치 주변 카페를 지도에서 확인한다.",
+            core_features=["현재 위치 지도", "주변 카페 검색"],
+            secondary_scope_confirmed=True,
+            storage_mode="none",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            missing = build_initial_prompt_review_decision(decision)
+        self.assertEqual("recheck_prebuild_requirements", missing.confirmation_action)
+        self.assertIn("담당 연구원에게 문의", missing.questions[0])
+        self.assertNotIn("배포 서명", missing.questions[0])
+
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_MAPS_API_KEY": "secret",
+                "GOOGLE_MAPS_ALLOWED_PACKAGES": decision.package_name,
+            },
+            clear=True,
+        ):
+            confirmation = build_initial_prompt_review_decision(decision)
+            reviewed = build_initial_prompt_review_decision(
+                decision,
+                prerequisite_reviewed=True,
+            )
+        self.assertEqual("confirm_prebuild_requirements", confirmation.confirmation_action)
+        self.assertEqual("submit_initial_prompt", reviewed.confirmation_action)
+        self.assertIn("## 외부 연동 및 필수 조건", reviewed.prepared_prompt)
+        self.assertNotIn("secret", reviewed.prepared_prompt)
+
+    def test_prebuild_check_does_not_replace_spec_clarification(self) -> None:
+        decision = build_intent_decision(
+            mode="ask_confirmation",
+            task_id="maps-question-task",
+            existing_task=False,
+            user_prompt="주변 장소를 구글 지도에서 보여주는 앱",
+            questions=["장소를 목록과 지도 중 어디에 먼저 보여드릴까요?"],
+            suggested_app_name="주변장소",
+            secondary_scope_confirmed=False,
+            prebuild_requirements=[
+                {
+                    "id": "google_maps_platform",
+                    "title": "Google Maps Platform",
+                    "type": "android_api_key",
+                    "reason": "실제 지도 표시가 필요합니다.",
+                    "blocking": True,
+                }
+            ],
+        )
+
+        reviewed = build_initial_prompt_review_decision(decision)
+
+        self.assertEqual("ask_confirmation", reviewed.mode)
+        self.assertEqual(decision.questions, reviewed.questions)
+        self.assertEqual("", reviewed.confirmation_action)
+
+    def test_existing_app_checks_only_new_or_missing_requirements(self) -> None:
+        decision = build_intent_decision(
+            mode="build",
+            task_id="existing-maps-task",
+            existing_task=True,
+            existing_workspace_ready=True,
+            user_prompt="기존 앱에 Google Maps 지도를 추가해줘",
+            request_scope="existing_app_modification",
+            suggested_app_name="기존앱",
+        )
+        environment = {
+            "GOOGLE_MAPS_API_KEY": "secret",
+            "GOOGLE_MAPS_ALLOWED_PACKAGES": decision.package_name,
+        }
+
+        with patch.dict(os.environ, environment, clear=True):
+            first_review = build_prebuild_requirements_review_decision(decision)
+            already_reviewed = build_prebuild_requirements_review_decision(
+                decision,
+                known_requirement_ids={"google_maps_platform"},
+            )
+            accepted = build_prebuild_requirements_review_decision(
+                decision,
+                prerequisite_reviewed=True,
+            )
+
+        self.assertEqual("confirm_prebuild_requirements", first_review.confirmation_action)
+        self.assertEqual("build", already_reviewed.mode)
+        self.assertEqual("build", accepted.mode)
+
     def test_followup_answer_preserves_requested_literal_marker(self) -> None:
         self.assertEqual(
             "SCROLL_OK",
@@ -357,6 +534,134 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                         edited_prompt,
                     )
                     self.assertNotEqual(submitted_result.get("confirmation_action"), "submit_initial_prompt")
+
+    def test_participant_api_key_is_logged_registered_and_excluded_from_agent_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            environment = {
+                "BASE_PROJECT_PATH": str(root / "base"),
+                "WORKSPACES_ROOT": str(root / "workspaces"),
+                "DB_PATH": str(root / "tasks.db"),
+                "APP_DATA_DB_PATH": str(root / "app_data.db"),
+                "MOCK_CODEX": "1",
+                "INTENT_AGENT_ENABLED": "1",
+                "OPENAI_API_KEY": "agent-test-key",
+                "APP_RUNTIME_OPENAI_API_KEY": "",
+            }
+            agent_result = {
+                "mode": "build",
+                "request_scope": "new_app",
+                "app_name": "AI 상담",
+                "effective_user_prompt": "OpenAI API를 사용해 질문에 답하는 AI 상담 앱을 만든다.",
+                "primary_user_flow": "질문을 입력하고 AI 답변을 확인한다.",
+                "target_users": [],
+                "key_screens": ["상담 화면"],
+                "core_features": ["AI 상담"],
+                "secondary_requirements": [],
+                "secondary_scope_confirmed": True,
+                "storage_mode": "none",
+                "stored_data": [],
+                "acceptance_criteria": ["실제 AI 답변이 표시되어야 한다."],
+                "prebuild_requirements": [
+                    {
+                        "id": "openai",
+                        "title": "OpenAI API",
+                        "type": "server_api_key",
+                        "reason": "실제 AI 답변을 생성해야 합니다.",
+                        "blocking": True,
+                    }
+                ],
+                "use_previous_pending_request": False,
+                "requires_existing_task_context": False,
+                "reason": "앱 명세가 충분합니다.",
+                "questions": [],
+                "assistant_reply": "",
+            }
+            secret = "sk-test_1234567890"
+
+            def fake_workspace(_settings, task):
+                workspace = root / "workspaces" / str(task["task_id"])
+                project = workspace / "revisions" / "rev_0001" / "project"
+                project.mkdir(parents=True, exist_ok=True)
+                (workspace / "prompt.md").write_text(
+                    render_prompt_md(task, _settings),
+                    encoding="utf-8",
+                )
+                return workspace, project
+
+            with patch.dict(os.environ, environment, clear=False), patch(
+                "flutter_apk_server.server.run_spec_clarification_agent",
+                return_value=agent_result,
+            ), patch(
+                "flutter_apk_server.server.build_task_workspace",
+                side_effect=fake_workspace,
+            ):
+                app = create_app()
+                with TestClient(app) as client:
+                    first = client.post(
+                        "/generate",
+                        json={
+                            "device_id": "credential-device",
+                            "prompt": "OpenAI API로 AI 상담 앱을 만들어줘",
+                        },
+                    )
+                    self.assertEqual(first.status_code, 200, first.text)
+                    self.assertEqual("recheck_prebuild_requirements", first.json()["confirmation_action"])
+                    self.assertIn("이 채팅에 입력", first.json()["message"])
+                    task_id = first.json()["task_id"]
+
+                    invalid = client.post(
+                        "/generate",
+                        json={
+                            "task_id": task_id,
+                            "device_id": "credential-device",
+                            "prompt": "sk-short",
+                        },
+                    )
+                    self.assertEqual(invalid.status_code, 200, invalid.text)
+                    self.assertEqual("recheck_prebuild_requirements", invalid.json()["confirmation_action"])
+                    self.assertIn("API 키 형식과 맞지 않아요", invalid.json()["summary"])
+                    self.assertIn("API 키 형식과 맞지 않아요", invalid.json()["questions"][0])
+
+                    registered = client.post(
+                        "/generate",
+                        json={
+                            "task_id": task_id,
+                            "device_id": "credential-device",
+                            "prompt": secret,
+                        },
+                    )
+
+                    self.assertEqual(registered.status_code, 200, registered.text)
+                    self.assertEqual("submit_initial_prompt", registered.json()["confirmation_action"])
+                    self.assertNotIn(secret, registered.text)
+                    credentials = app.state.db.list_task_integration_credentials(task_id)
+                    self.assertEqual(1, len(credentials))
+                    self.assertEqual(secret, credentials[0]["credential_value"])
+                    user_events = [
+                        event
+                        for event in app.state.db.list_events(task_id)
+                        if event["actor"] == "user" and event["event_type"] == "user_message"
+                    ]
+                    self.assertEqual(secret, user_events[-1]["message_text"])
+                    saved_task = app.state.db.get_task(task_id)
+                    self.assertNotIn(secret, saved_task["codex_result_json"])
+                    submitted = client.post(
+                        "/generate",
+                        json={
+                            "task_id": task_id,
+                            "device_id": "credential-device",
+                            "prompt": registered.json()["prepared_prompt"],
+                            "request_action": "submit_initial_prompt",
+                        },
+                    )
+                    self.assertEqual(submitted.status_code, 200, submitted.text)
+                    submitted_task = app.state.db.get_task(task_id)
+                    codex_prompt = (Path(submitted_task["workspace_path"]) / "prompt.md").read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertNotIn(secret, codex_prompt)
+                    self.assertIn("runtime_available: yes", codex_prompt)
 
 
 if __name__ == "__main__":

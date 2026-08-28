@@ -636,7 +636,12 @@ class ChatMessageAdapter(
             }
             btnConfirmationDismiss.visibility = if (isPromptReview) View.GONE else View.VISIBLE
             btnConfirmationAccept.text = itemView.context.getString(
-                if (isPromptReview) R.string.prompt_review_open else R.string.confirmation_accept
+                when {
+                    isPromptReview -> R.string.prompt_review_open
+                    item.confirmAction == "confirm_prebuild_requirements" -> R.string.prebuild_requirements_confirm
+                    item.confirmAction == "recheck_prebuild_requirements" -> R.string.prebuild_requirements_recheck
+                    else -> R.string.confirmation_accept
+                }
             )
             btnConfirmationDismiss.text = itemView.context.getString(R.string.confirmation_cancel)
             btnConfirmationAccept.isEnabled = !handled

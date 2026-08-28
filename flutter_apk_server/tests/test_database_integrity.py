@@ -4,7 +4,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from flutter_apk_server.server import AppDataDatabase, Database, utc_now_iso
+from flutter_apk_server.server import (
+    AppDataDatabase,
+    Database,
+    build_agent_conversation_history,
+    merged_task_integration_environment,
+    utc_now_iso,
+)
 
 
 def task_payload(task_id: str) -> dict[str, object]:
@@ -22,6 +28,47 @@ def task_payload(task_id: str) -> dict[str, object]:
 
 
 class DatabaseIntegrityTests(unittest.TestCase):
+    def test_task_integration_credential_keeps_raw_chat_but_redacts_agent_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "tasks.db")
+            database.init_db()
+            database.create_task(task_payload("task-key"))
+            secret = "sk-test_1234567890"
+            event_id = database.log_event(
+                "task-key",
+                actor="user",
+                event_type="user_message",
+                message_text=secret,
+                payload={
+                    "external_credential_submission": True,
+                    "credential_requirement_title": "OpenAI API",
+                },
+            )
+
+            database.upsert_task_integration_credential(
+                task_id="task-key",
+                requirement_id="openai",
+                credential_name="APP_RUNTIME_OPENAI_API_KEY",
+                credential_value=secret,
+                source_event_id=event_id,
+            )
+
+            stored_event = database.list_events("task-key")[0]
+            self.assertEqual(secret, stored_event["message_text"])
+            self.assertEqual(
+                secret,
+                merged_task_integration_environment(
+                    database,
+                    "task-key",
+                    base_environment={},
+                )["APP_RUNTIME_OPENAI_API_KEY"],
+            )
+            history = build_agent_conversation_history(database, "task-key")
+            self.assertEqual("[OpenAI API 키 등록 완료]", history[0]["content"])
+            self.assertNotIn(secret, str(history))
+            with database.connect() as connection:
+                self.assertEqual([], connection.execute("PRAGMA foreign_key_check").fetchall())
+
     def test_connections_enable_foreign_keys_and_invalid_relations_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Database(Path(temp_dir) / "tasks.db")
