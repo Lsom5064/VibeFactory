@@ -194,6 +194,7 @@ class AndroidXmlDocument private constructor(
             "MaterialTextView",
             "Button",
             "MaterialButton",
+            "MaterialButtonToggleGroup",
             "EditText",
             "TextInputLayout",
             "TextInputEditText",

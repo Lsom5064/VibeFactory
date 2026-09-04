@@ -6,5 +6,6 @@ class GeneratedApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         VibeCrashReporter.initialize(this)
+        UiGuideController.initialize(this)
     }
 }

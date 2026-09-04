@@ -176,6 +176,7 @@ class NativeBuildPipelineTests(unittest.TestCase):
                 workspace_path=str(workspace_path),
                 project_path=str(project_path),
             )
+            (workspace_path / "AGENTS.md").write_text("stale task instructions\n", encoding="utf-8")
 
             runner = CodexTaskRunner(settings, database)
             def write_test_apk(
@@ -229,6 +230,14 @@ class NativeBuildPipelineTests(unittest.TestCase):
                 ).is_file()
             )
             self.assertTrue((project_path / "app/src/main/res/layout/activity_main.xml").is_file())
+            self.assertIn(
+                "vf_ui_catalog.xml",
+                (workspace_path / "AGENTS.md").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "`revisions`를 `project` 안으로 복사",
+                (workspace_path / "AGENTS.md").read_text(encoding="utf-8"),
+            )
             self.assertFalse((project_path / "pubspec.yaml").exists())
 
     def test_gradle_failure_becomes_task_failure_message(self) -> None:
@@ -291,6 +300,73 @@ class NativeBuildPipelineTests(unittest.TestCase):
             failed = database.get_task(task["task_id"])
             self.assertEqual("Failed", failed["status"])
             self.assertIn("Android lint", failed["message"])
+
+    def test_unrecoverable_ui_catalog_failure_is_visible_and_skips_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = replace(
+                load_settings(),
+                base_project_path=REPOSITORY_ROOT / "BaseProject",
+                workspaces_root=root / "native_workspaces",
+                build_cache_root=root / ".native_tooling",
+                db_path=root / "native_tasks.db",
+                app_data_db_path=root / "native_app_data.db",
+                mock_codex=False,
+                intent_agent_enabled=False,
+            )
+            database = Database(settings.db_path)
+            database.init_db()
+            now = utc_now_iso()
+            task = {
+                "task_id": "ui-catalog-failure",
+                "user_id": "test-user",
+                "device_id": "test-device",
+                "prompt": "UI catalog 실패 전달 검증",
+                "status": "Running",
+                "message": "검증 중",
+                "app_name": "Catalog 실패 검증",
+                "package_name": "kr.ac.kangwon.hai.generated.catalogfailure",
+                "created_at": now,
+                "updated_at": now,
+            }
+            database.create_task(task)
+            workspace_path = root / "native_workspaces/user_test/task_catalog_failure"
+            project_path = workspace_path / "revisions/rev_0001/project"
+            project_path.parent.mkdir(parents=True)
+            shutil.copytree(REPOSITORY_ROOT / "BaseProject", project_path)
+            (project_path / "app/src/main/res/layout/activity_unknown.xml").write_text(
+                '<TextView xmlns:android="http://schemas.android.com/apk/res/android" '
+                'android:id="@+id/unknownTitle" android:layout_width="match_parent" '
+                'android:layout_height="wrap_content" android:text="알 수 없는 화면" />',
+                encoding="utf-8",
+            )
+            (workspace_path / "logs").mkdir(parents=True)
+            (workspace_path / ".codex_result").mkdir(parents=True)
+            database.update_task(
+                task["task_id"],
+                workspace_path=str(workspace_path),
+                project_path=str(project_path),
+            )
+            runner = CodexTaskRunner(settings, database)
+            result_path = workspace_path / ".codex_result/task_result.json"
+
+            with patch.object(runner, "run_logged_command") as build_command:
+                runner.attempt_server_side_build(
+                    task["task_id"], workspace_path, result_path, codex_exit_code=0
+                )
+
+            build_command.assert_not_called()
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("ui_catalog", result["error_stage"])
+            runner.finalize_task(task["task_id"], workspace_path, result_path, 0, False)
+            failed = database.get_task(task["task_id"])
+            self.assertEqual("Failed", failed["status"])
+            self.assertIn("화면 이름과 사용 설명", failed["message"])
+            self.assertIn(
+                "ui_catalog_validation_failed",
+                [event["event_type"] for event in database.list_events(task["task_id"])],
+            )
 
 
 if __name__ == "__main__":

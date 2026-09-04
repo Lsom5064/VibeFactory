@@ -412,9 +412,16 @@ class ProjectIdentityTests(unittest.TestCase):
                 workspace,
                 BASE_PROJECT,
             )
+            expected_catalog = (
+                BASE_PROJECT / "app/src/main/res/xml/vf_ui_catalog.xml"
+            ).read_bytes()
 
             for expected_revision in range(1, 7):
                 self.assertEqual(f"rev_{expected_revision:04d}", revision_label)
+                self.assertEqual(
+                    expected_catalog,
+                    (project_root / "app/src/main/res/xml/vf_ui_catalog.xml").read_bytes(),
+                )
                 apply_project_defaults(
                     project_root,
                     task_id,

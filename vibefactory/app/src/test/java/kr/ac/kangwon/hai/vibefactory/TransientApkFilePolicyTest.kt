@@ -7,6 +7,12 @@ import org.junit.Test
 
 class TransientApkFilePolicyTest {
     @Test
+    fun `open action launches an installed artifact without downloading it again`() {
+        assertTrue(ApkArtifactActionHandler.shouldLaunchInstalledArtifact(packageInstalled = true))
+        assertFalse(ApkArtifactActionHandler.shouldLaunchInstalledArtifact(packageInstalled = false))
+    }
+
+    @Test
     fun `one stable file name is used for a task artifact`() {
         assertEquals(
             "generated_app_abc123.apk",

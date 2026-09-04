@@ -337,6 +337,10 @@ class HostApiContractTests(unittest.TestCase):
         properties = (copied_project / "gradle.properties").read_text(encoding="utf-8")
         self.assertIn(f"GENERATED_APP_TASK_ID={branched_task_id}", properties)
         self.assertNotIn(f"GENERATED_APP_TASK_ID={self.task_id}\n", properties)
+        self.assertEqual(
+            (base_project / "app/src/main/res/xml/vf_ui_catalog.xml").read_bytes(),
+            (copied_project / "app/src/main/res/xml/vf_ui_catalog.xml").read_bytes(),
+        )
         snapshot = self.db.get_project_snapshot(branched_task_id, "rev_0001")
         self.assertIsNotNone(snapshot)
         self.assertEqual(str(copied_project), snapshot["project_path"])

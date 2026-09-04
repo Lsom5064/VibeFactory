@@ -188,6 +188,7 @@ try:
         UiEditorXmlError,
         build_ui_editor_chat_context,
         build_ui_editor_codex_prompt,
+        linked_ui_annotation_images,
         collect_ui_editor_source_context,
         list_layout_documents,
         load_layout_document,
@@ -196,6 +197,7 @@ try:
         safe_layout_path,
         sha256_bytes,
         structural_xml_diff,
+        validate_ui_annotation_xml,
         validate_ui_draft_xml,
     )
 except ImportError:
@@ -206,6 +208,7 @@ except ImportError:
         UiEditorXmlError,
         build_ui_editor_chat_context,
         build_ui_editor_codex_prompt,
+        linked_ui_annotation_images,
         collect_ui_editor_source_context,
         list_layout_documents,
         load_layout_document,
@@ -214,8 +217,14 @@ except ImportError:
         safe_layout_path,
         sha256_bytes,
         structural_xml_diff,
+        validate_ui_annotation_xml,
         validate_ui_draft_xml,
     )
+
+try:
+    from .ui_catalog import catalog_prompt_contract, ensure_valid_ui_catalog
+except ImportError:
+    from ui_catalog import catalog_prompt_contract, ensure_valid_ui_catalog  # type: ignore[no-redef]
 
 
 PRIMARY_KEY_INSERT_MAX_ATTEMPTS = 4
@@ -3953,11 +3962,14 @@ class Database:
                     base_xml_sha256 TEXT NOT NULL,
                     original_xml TEXT NOT NULL,
                     edited_xml TEXT NOT NULL,
+                    annotation_xml TEXT NOT NULL DEFAULT '',
                     descriptions_json TEXT NOT NULL,
                     status TEXT NOT NULL,
                     version INTEGER NOT NULL,
                     is_new_layout INTEGER NOT NULL,
                     preview_workspace_path TEXT,
+                    preview_sha256 TEXT,
+                    preview_size_bytes INTEGER,
                     generated_revision_label TEXT,
                     confirmed_at TEXT,
                     created_at TEXT NOT NULL,
@@ -3968,6 +3980,9 @@ class Database:
                 """
             )
             self.ensure_column(connection, "ui_editor_drafts", "confirmed_at", "TEXT")
+            self.ensure_column(connection, "ui_editor_drafts", "annotation_xml", "TEXT NOT NULL DEFAULT ''")
+            self.ensure_column(connection, "ui_editor_drafts", "preview_sha256", "TEXT")
+            self.ensure_column(connection, "ui_editor_drafts", "preview_size_bytes", "INTEGER")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_ui_editor_drafts_scope
@@ -4641,7 +4656,7 @@ class Database:
                 """
                 SELECT * FROM ui_editor_drafts
                 WHERE task_id = ? AND base_revision_label = ? AND layout_name = ?
-                  AND configuration = ? AND status = 'draft'
+                  AND configuration = ? AND status = 'draft' AND annotation_xml <> ''
                 ORDER BY rowid DESC
                 LIMIT 1
                 """,
@@ -4659,6 +4674,7 @@ class Database:
         base_xml_sha256: str,
         original_xml: str,
         edited_xml: str,
+        annotation_xml: str,
         descriptions: dict[str, str],
         is_new_layout: bool,
         draft_id: Optional[str],
@@ -4685,6 +4701,18 @@ class Database:
                     """,
                     (task_id, base_revision_label, layout_name, configuration),
                 ).fetchone()
+                if active is not None and not str(active["annotation_xml"] or "").strip():
+                    # Keep pre-annotation editor drafts as history, but do not let a
+                    # legacy direct-XML draft block the replacement read-only flow.
+                    connection.execute(
+                        """
+                        UPDATE ui_editor_drafts
+                        SET status = 'superseded', updated_at = ?
+                        WHERE draft_id = ? AND status = 'draft'
+                        """,
+                        (now, str(active["draft_id"])),
+                    )
+                    active = None
                 if active is not None:
                     connection.rollback()
                     raise UiEditorDraftConflictError(self.serialize_ui_editor_draft(active))
@@ -4697,10 +4725,10 @@ class Database:
                         """
                         INSERT INTO ui_editor_drafts (
                             draft_id, task_id, base_revision_label, layout_name, configuration,
-                            base_xml_sha256, original_xml, edited_xml, descriptions_json,
+                            base_xml_sha256, original_xml, edited_xml, annotation_xml, descriptions_json,
                             status, version, is_new_layout, preview_workspace_path,
                             generated_revision_label, confirmed_at, created_at, updated_at, submitted_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, NULL, NULL, NULL, ?, ?, NULL)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, NULL, NULL, NULL, ?, ?, NULL)
                         """,
                         (
                             allocated_id,
@@ -4711,6 +4739,7 @@ class Database:
                             base_xml_sha256,
                             original_xml,
                             edited_xml,
+                            annotation_xml,
                             descriptions_json,
                             int(is_new_layout),
                             now,
@@ -4760,17 +4789,18 @@ class Database:
                 raise UiEditorDraftConflictError(current)
             material_changed = (
                 str(current.get("edited_xml") or "") != edited_xml
+                or str(current.get("annotation_xml") or "") != annotation_xml
                 or current.get("descriptions") != descriptions
             )
             confirmed_at = None if material_changed else current.get("confirmed_at")
             cursor = connection.execute(
                 """
                 UPDATE ui_editor_drafts
-                SET edited_xml = ?, descriptions_json = ?, confirmed_at = ?,
+                SET edited_xml = ?, annotation_xml = ?, descriptions_json = ?, confirmed_at = ?,
                     version = version + 1, updated_at = ?
                 WHERE draft_id = ? AND version = ? AND status = 'draft'
                 """,
-                (edited_xml, descriptions_json, confirmed_at, now, draft_id, expected_version),
+                (edited_xml, annotation_xml, descriptions_json, confirmed_at, now, draft_id, expected_version),
             )
             if cursor.rowcount != 1:
                 latest = connection.execute(
@@ -4799,6 +4829,7 @@ class Database:
                 SELECT * FROM ui_editor_drafts
                 WHERE task_id = ? AND base_revision_label = ?
                   AND status = 'draft' AND confirmed_at IS NOT NULL
+                  AND annotation_xml <> ''
                 ORDER BY updated_at ASC, rowid ASC
                 """,
                 (task_id, base_revision_label),
@@ -4811,16 +4842,27 @@ class Database:
         *,
         expected_version: int,
         preview_workspace_path: str,
+        preview_sha256: str,
+        preview_size_bytes: int,
     ) -> bool:
         now = utc_now_iso()
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE ui_editor_drafts
-                SET confirmed_at = ?, preview_workspace_path = ?, updated_at = ?
+                SET confirmed_at = ?, preview_workspace_path = ?, preview_sha256 = ?,
+                    preview_size_bytes = ?, updated_at = ?
                 WHERE draft_id = ? AND version = ? AND status = 'draft'
                 """,
-                (now, preview_workspace_path, now, draft_id, expected_version),
+                (
+                    now,
+                    preview_workspace_path,
+                    preview_sha256,
+                    preview_size_bytes,
+                    now,
+                    draft_id,
+                    expected_version,
+                ),
             )
             connection.commit()
             return cursor.rowcount == 1
@@ -4914,6 +4956,8 @@ class Database:
         status: str,
         expected_version: Optional[int] = None,
         preview_workspace_path: Optional[str] = None,
+        preview_sha256: Optional[str] = None,
+        preview_size_bytes: Optional[int] = None,
         generated_revision_label: Optional[str] = None,
         submitted_at: Optional[str] = None,
     ) -> bool:
@@ -4921,6 +4965,8 @@ class Database:
         values: list[Any] = [status, utc_now_iso()]
         for column, value in (
             ("preview_workspace_path", preview_workspace_path),
+            ("preview_sha256", preview_sha256),
+            ("preview_size_bytes", preview_size_bytes),
             ("generated_revision_label", generated_revision_label),
             ("submitted_at", submitted_at),
         ):
@@ -4939,6 +4985,39 @@ class Database:
             )
             connection.commit()
             return cursor.rowcount == 1
+
+    def mark_ui_editor_drafts_submitting(
+        self,
+        drafts: list[dict[str, Any]],
+        *,
+        generated_revision_label: str,
+    ) -> bool:
+        if not drafts:
+            return True
+        now = utc_now_iso()
+        with self.connect() as connection:
+            for draft in drafts:
+                cursor = connection.execute(
+                    """
+                    UPDATE ui_editor_drafts
+                    SET status = 'submitting', generated_revision_label = ?,
+                        submitted_at = ?, updated_at = ?
+                    WHERE draft_id = ? AND version = ? AND status = 'draft'
+                      AND confirmed_at IS NOT NULL
+                    """,
+                    (
+                        generated_revision_label,
+                        now,
+                        now,
+                        str(draft.get("draft_id") or ""),
+                        int(draft.get("version") or 0),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return False
+            connection.commit()
+        return True
 
     def list_tasks(self, user_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -5098,13 +5177,16 @@ def persist_reference_attachments_for_task(
 
 
 def render_task_agents_md(task_id: str) -> str:
+    ui_catalog_rules = catalog_prompt_contract()
     return f"""# Task Workspace Instructions
 
 - Android 전용 네이티브 앱만 만든다. Flutter, Dart, iOS, Xcode, Jetpack Compose는 사용하지 않는다.
 - Kotlin과 Android Views/XML을 사용해 `project` 폴더의 앱을 수정한다.
+- workspace의 `project`는 서버가 현재 revision을 가리키도록 관리하는 작업 경로다. `revisions`를 `project` 안으로 복사하거나 `project`를 이동·교체하지 않는다.
+- 파일을 확인할 때는 `rg --files project`처럼 `project`를 명시하고, 모든 변경과 Gradle 명령은 `project` 경로에서 직접 수행한다.
 - `app/src/main/kotlin/kr/ac/kangwon/hai/generated/MainActivity.kt`와 `app/src/main/res/layout/activity_main.xml`을 유지한다.
 - 서버가 관리하는 `gradle.properties`의 Task ID, application ID, version code와 `app/build.gradle.kts`의 namespace·BuildConfig·release signing 설정을 변경하지 않는다.
-- `GeneratedApplication.kt`, `VibeCrashReporter.kt`, `VibeHttpClient.kt`, `VibeLlmClient.kt`, `VibeDataClient.kt`의 런타임 계약을 제거하거나 바꾸지 않는다.
+- `GeneratedApplication.kt`, `UiGuideController.kt`, `VibeCrashReporter.kt`, `VibeHttpClient.kt`, `VibeLlmClient.kt`, `VibeDataClient.kt`의 런타임 계약을 제거하거나 바꾸지 않는다.
 - 앱 이름을 바꿔야 하면 서버가 관리하는 metadata를 임의 변경하지 말고 구현 결과의 `app_name`에 제안값을 기록한다.
 - 런타임 package name은 하드코딩하지 말고 `applicationContext.packageName`을 사용한다.
 - 런타임 Task ID는 `BuildConfig.VIBE_TASK_ID`를 사용한다.
@@ -5133,6 +5215,8 @@ def render_task_agents_md(task_id: str) -> str:
 - 긴 화면은 `NestedScrollView` 또는 `RecyclerView`를 사용하고, 큰 목록을 `ScrollView` 안에 중첩하지 않는다.
 - `ConstraintLayout`의 양쪽 constraint와 `0dp` match constraint를 사용해 긴 제목과 버튼이 화면 밖으로 넘치지 않게 한다.
 - 빌드 전에 작은 화면 기준으로 레이아웃을 점검하고, overflow 가능성이 있으면 성공으로 보고하지 않는다.
+- 생성하거나 수정한 모든 XML UI는 아래 UI catalog 계약을 함께 갱신한다.
+{ui_catalog_rules}
 - 구현이 어려워 일부 요구사항을 못 지켰다면 숨기지 말고 실패 처리하거나 `known_limitations`에 명시한다.
 - 빌드 성공 시 반드시 `.codex_result/task_result.json`을 valid JSON으로 작성한다.
 - 빌드 실패 시에도 반드시 `.codex_result/task_result.json`을 valid JSON으로 작성한다.
@@ -5206,6 +5290,7 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
     build_request_prompt = task.get("build_request_prompt") or task["prompt"]
     runtime_meta = build_app_runtime_metadata(task, settings)
     data_meta = build_app_data_runtime_metadata(task, settings)
+    ui_catalog_rules = catalog_prompt_contract()
     state_payload = load_task_state_payload(task)
     raw_conversation_state = state_payload.get("conversation_state")
     conversation_state: dict[str, Any] = (
@@ -5364,6 +5449,12 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
 - 예를 들어 방 정리 조언 앱이라면 사진 속 공간 상태를 관찰하고, 우선순위와 실행 순서를 조언하는 방향이 드러나야 한다.
 - 화면 레이아웃은 작은 Android 화면, 화면 회전, 키보드 표시 상태에서도 잘리거나 겹치지 않게 구현한다. 긴 콘텐츠는 `NestedScrollView` 또는 `RecyclerView`를 사용하고, 긴 자식은 양쪽 constraint와 `0dp` match constraint를 사용한다.
 - 현재 사용자 기기 정보가 제공되면, UI 크기·Android 버전·센서/웨어러블 가능성 같은 구현 판단에 실제로 반영한다.
+
+## UI 이름과 사용 설명 계약
+
+{ui_catalog_rules}
+- 사용 설명은 실제 layout에 안내용 TextView로 삽입하지 않는다. `UiGuideController`가 catalog를 읽어 앱 위에 최초 한 번 표시한다.
+- 최초 생성뿐 아니라 모든 수정, 오류 복구, 이미지 기반 수정에서도 현재 코드와 일치하도록 catalog를 갱신한다.
 """
 
 
@@ -6097,6 +6188,18 @@ def ensure_project_revision_version(project_root: Path, revision_label: Optional
     return native_android_project_builder.ensure_version(project_root)
 
 
+def ensure_project_ui_catalog(project_root: Path) -> dict[str, Any]:
+    revision_label = current_revision_label(project_root)
+    report = ensure_valid_ui_catalog(project_root, guide_version=revision_label)
+    if not report.get("valid"):
+        issues = [normalize_whitespace(str(item)) for item in report.get("issues") or []]
+        raise RuntimeError(
+            "UI 사용 설명 구성을 확인하지 못했습니다. "
+            + ("; ".join(item for item in issues if item) or "catalog validation failed")
+        )
+    return report
+
+
 def validate_built_apk_install_contract(
     project_root: Path,
     apk_path: Path,
@@ -6389,6 +6492,20 @@ def load_task_state_payload(task: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def ui_editor_draft_ids_from_task_state(task_state: dict[str, Any]) -> list[str]:
+    values = task_state.get("ui_editor_draft_ids")
+    candidates = values if isinstance(values, list) else []
+    singular = normalize_whitespace(str(task_state.get("ui_editor_draft_id") or ""))
+    if singular:
+        candidates = [singular, *candidates]
+    result: list[str] = []
+    for value in candidates:
+        draft_id = normalize_whitespace(str(value or ""))
+        if draft_id and draft_id not in result:
+            result.append(draft_id)
+    return result
 
 
 def update_task_state_app_name(task: dict[str, Any], app_name: str) -> Optional[str]:
@@ -7461,14 +7578,12 @@ class CodexTaskRunner:
         )
         if not did_cancel:
             return self.db.get_task(task_id) or task
-        if task_state.get("task_operation") == "ui_editor_revision":
-            draft_id = normalize_whitespace(str(task_state.get("ui_editor_draft_id") or ""))
-            if draft_id:
-                self.db.transition_ui_editor_draft(
-                    draft_id,
-                    expected_status="submitting",
-                    status="cancelled",
-                )
+        for draft_id in ui_editor_draft_ids_from_task_state(task_state):
+            self.db.transition_ui_editor_draft(
+                draft_id,
+                expected_status="submitting",
+                status="cancelled",
+            )
         updated_task = self.db.get_task(task_id) or task
         log_task_status_event(self.db, updated_task, event_type="task_cancelled")
         log_build_stage_event(
@@ -7681,6 +7796,10 @@ class CodexTaskRunner:
         result_path = workspace_path / ".codex_result" / "task_result.json"
         stdout_path = workspace_path / "logs" / "codex_stdout.log"
         stderr_path = workspace_path / "logs" / "codex_stderr.log"
+        (workspace_path / "AGENTS.md").write_text(
+            render_task_agents_md(task_id),
+            encoding="utf-8",
+        )
         clear_previous_run_artifacts(workspace_path)
 
         if is_branch_rebuild:
@@ -7984,7 +8103,12 @@ class CodexTaskRunner:
         project_path: Path,
         current_apk_path: Path,
     ) -> Path:
+        runtime_changed = bool(
+            restore_project_runtime_contracts(project_path, self.settings.base_project_path)
+        )
+        catalog_report = ensure_project_ui_catalog(project_path)
         version_changed = ensure_project_revision_version(project_path)
+        project_changed = runtime_changed or bool(catalog_report.get("repaired")) or version_changed
         task = self.db.get_task(task_id) or {}
         integration_env = client_build_environment_for_requirements(
             current_task_prebuild_requirements(task),
@@ -8005,7 +8129,7 @@ class CodexTaskRunner:
                 current_apk_path,
             )
         )
-        if existing_optimized_apk is not None and not version_changed:
+        if existing_optimized_apk is not None and not project_changed:
             try:
                 validate_built_apk_install_contract(
                     project_path,
@@ -8093,6 +8217,9 @@ class CodexTaskRunner:
             raise RuntimeError("Task 앱 식별 정보가 없습니다.")
 
         with self.sideload_build_lock:
+            runtime_changed = bool(
+                restore_project_runtime_contracts(project_path, self.settings.base_project_path)
+            )
             identity_changed = apply_project_defaults(
                 project_path,
                 str(task["task_id"]),
@@ -8106,7 +8233,14 @@ class CodexTaskRunner:
             )
             if identity_issues:
                 raise RuntimeError("Android 앱 식별 정보를 복원하지 못했습니다.")
+            catalog_report = ensure_project_ui_catalog(project_path)
             version_changed = ensure_project_revision_version(project_path)
+            project_changed = (
+                runtime_changed
+                or identity_changed
+                or bool(catalog_report.get("repaired"))
+                or version_changed
+            )
             revision_integration_env = client_build_environment_for_requirements(
                 current_task_prebuild_requirements(task),
                 environment=merged_task_integration_environment(
@@ -8117,8 +8251,7 @@ class CodexTaskRunner:
             existing_apk = find_revision_apk(workspace_path, project_path, task)
             if (
                 existing_apk is not None
-                and not identity_changed
-                and not version_changed
+                and not project_changed
                 and not revision_integration_env
             ):
                 try:
@@ -8246,6 +8379,44 @@ class CodexTaskRunner:
                 )
                 return
         ensure_project_revision_version(project_path)
+        try:
+            catalog_report = ensure_project_ui_catalog(project_path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            message = (
+                "화면 이름과 사용 설명 구성을 완성하지 못해 빌드를 시작하지 못했어요. "
+                "요청 내용은 보존되어 있으니 다시 시도해 주세요."
+            )
+            self.db.log_event(
+                task_id,
+                actor="system",
+                event_type="ui_catalog_validation_failed",
+                message_text=message,
+                payload={"error": str(exc)},
+            )
+            write_result_json(
+                result_path,
+                {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error_stage": "ui_catalog",
+                    "message": message,
+                    "build_log_path": "logs/build.log",
+                },
+            )
+            return
+        catalog = catalog_report.get("catalog") or {}
+        self.db.log_event(
+            task_id,
+            actor="system",
+            event_type="ui_catalog_validated",
+            message_text="화면 이름과 사용 설명 구성을 확인했어요.",
+            payload={
+                "guide_version": catalog.get("guide_version") or "",
+                "layout_count": len(catalog.get("layouts") or []),
+                "repaired": bool(catalog_report.get("repaired")),
+                "repaired_layouts": list(catalog_report.get("repaired_layouts") or []),
+            },
+        )
         build_log_path = workspace_path / "logs" / "build.log"
         env = self.build_task_env(
             workspace_path,
@@ -8567,17 +8738,19 @@ class CodexTaskRunner:
     def finalize_ui_editor_draft(self, task_id: str, status: str) -> None:
         task = self.db.get_task(task_id) or {}
         task_state = load_task_state_payload(task)
-        if task_state.get("task_operation") != "ui_editor_revision":
+        draft_ids = ui_editor_draft_ids_from_task_state(task_state)
+        if not draft_ids:
             return
-        draft_id = normalize_whitespace(str(task_state.get("ui_editor_draft_id") or ""))
-        if not draft_id:
-            return
-        changed = self.db.transition_ui_editor_draft(
-            draft_id,
-            expected_status="submitting",
-            status=status,
-        )
-        if changed:
+        changed_ids = [
+            draft_id
+            for draft_id in draft_ids
+            if self.db.transition_ui_editor_draft(
+                draft_id,
+                expected_status="submitting",
+                status=status,
+            )
+        ]
+        if changed_ids:
             self.db.log_event(
                 task_id,
                 actor="system",
@@ -8587,7 +8760,7 @@ class CodexTaskRunner:
                     if status == "succeeded"
                     else "UI 편집 Revision 생성에 실패했습니다."
                 ),
-                payload={"draft_id": draft_id, "status": status},
+                payload={"draft_ids": changed_ids, "status": status},
             )
 
     def log_ui_editor_codex_completion(
@@ -8602,7 +8775,8 @@ class CodexTaskRunner:
     ) -> None:
         task = self.db.get_task(task_id) or {}
         task_state = load_task_state_payload(task)
-        if task_state.get("task_operation") != "ui_editor_revision":
+        draft_ids = ui_editor_draft_ids_from_task_state(task_state)
+        if not draft_ids:
             return
 
         def read_full(path: Path) -> str:
@@ -8617,7 +8791,7 @@ class CodexTaskRunner:
             event_type="ui_editor_codex_output",
             message_text="UI 편집 Codex 실행 결과를 기록했습니다.",
             payload={
-                "draft_id": task_state.get("ui_editor_draft_id"),
+                "draft_ids": draft_ids,
                 "base_revision_label": task_state.get("ui_editor_base_revision"),
                 "generated_revision_label": task_state.get("ui_editor_generated_revision"),
                 "exit_code": exit_code,
@@ -8862,7 +9036,7 @@ class CodexTaskRunner:
                 "선택한 버전에서 새 Task를 만들었어요."
                 if task_state.get("task_operation") == "branch_rebuild"
                 else "UI 편집을 반영한 새 버전이 준비되었어요."
-                if task_state.get("task_operation") == "ui_editor_revision"
+                if ui_editor_draft_ids_from_task_state(task_state)
                 else "APK 빌드가 완료되었어요."
             )
             self.finalize_ui_editor_draft(task_id, "succeeded")
@@ -10252,6 +10426,41 @@ def create_app() -> FastAPI:
             cancelled_task = db.get_task(followup_task_id)
             if cancelled_task and is_cancelled_task_status(str(cancelled_task.get("status") or "")):
                 return serialize_task_for_status(db, cancelled_task, settings.status_log_line_limit)
+            queued_state = make_decision_state(
+                {
+                    **task,
+                    "device_info": request_device_info or previous_conversation_state.get("device_info") or {},
+                    "reference_image_name": effective_reference_image_name,
+                    "reference_image_base64": effective_reference_image_base64,
+                    "reference_image_workspace_path": reference_image_workspace_path
+                    or previous_conversation_state.get("reference_image_workspace_path")
+                    or "",
+                    "reference_attachments": saved_reference_attachments or effective_reference_attachments,
+                    "conversation_state_override": previous_conversation_state,
+                },
+                decision,
+                credential_history_placeholder,
+            )
+            if selected_ui_editor_drafts:
+                selected_draft_ids = [
+                    str(draft.get("draft_id") or "")
+                    for draft in selected_ui_editor_drafts
+                    if str(draft.get("draft_id") or "")
+                ]
+                if not db.mark_ui_editor_drafts_submitting(
+                    selected_ui_editor_drafts,
+                    generated_revision_label=revision_label,
+                ):
+                    raise HTTPException(status_code=409, detail="saved UI changed before submission")
+                queued_state.update(
+                    {
+                        "task_operation": "ui_editor_revision",
+                        "ui_editor_draft_id": selected_draft_ids[0] if selected_draft_ids else "",
+                        "ui_editor_draft_ids": selected_draft_ids,
+                        "ui_editor_base_revision": selected_ui_base_revision_label,
+                        "ui_editor_generated_revision": revision_label,
+                    }
+                )
             db.update_task(
                 followup_task_id,
                 status="Queued",
@@ -10265,22 +10474,7 @@ def create_app() -> FastAPI:
                 apk_url=None,
                 normalized_prompt=decision.normalized_prompt,
                 build_request_prompt=decision.effective_user_prompt,
-                codex_result_json=json.dumps(
-                    make_decision_state(
-                        {
-                            **task,
-                            "device_info": request_device_info or previous_conversation_state.get("device_info") or {},
-                            "reference_image_name": effective_reference_image_name,
-                            "reference_image_base64": effective_reference_image_base64,
-                            "reference_image_workspace_path": reference_image_workspace_path or previous_conversation_state.get("reference_image_workspace_path") or "",
-                            "reference_attachments": saved_reference_attachments or effective_reference_attachments,
-                            "conversation_state_override": previous_conversation_state,
-                            },
-                            decision,
-                            credential_history_placeholder,
-                    ),
-                    ensure_ascii=False,
-                ),
+                codex_result_json=json.dumps(queued_state, ensure_ascii=False),
                 log=None,
                 input_tokens=None,
                 cached_input_tokens=None,
@@ -11213,26 +11407,34 @@ def create_app() -> FastAPI:
             base_revision_label=revision_label,
         ):
             if bool(draft["is_new_layout"]):
-                layout_path = safe_layout_path(
+                raise HTTPException(status_code=409, detail="legacy editable UI draft is not supported")
+            try:
+                current_layout = load_layout_document(
                     source.project_root,
-                    str(draft["layout_name"]),
-                    str(draft["configuration"]),
+                    layout_name=str(draft["layout_name"]),
+                    configuration=str(draft["configuration"]),
                 )
-                if layout_path.exists():
-                    raise HTTPException(status_code=409, detail="saved UI base layout has changed")
-                base_sha = sha256_bytes(str(draft["original_xml"]).encode("utf-8"))
-            else:
-                try:
-                    current_layout = load_layout_document(
-                        source.project_root,
-                        layout_name=str(draft["layout_name"]),
-                        configuration=str(draft["configuration"]),
-                    )
-                except FileNotFoundError as exc:
-                    raise HTTPException(status_code=409, detail="saved UI base layout is unavailable") from exc
-                base_sha = str(current_layout["sha256"])
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=409, detail="saved UI base layout is unavailable") from exc
+            base_sha = str(current_layout["sha256"])
             if base_sha.lower() != str(draft["base_xml_sha256"]).lower():
                 raise HTTPException(status_code=409, detail="saved UI is based on an older revision")
+            if (
+                str(draft.get("original_xml") or "") != str(current_layout["xml"])
+                or str(draft.get("edited_xml") or "") != str(current_layout["xml"])
+            ):
+                raise HTTPException(status_code=409, detail="saved UI attempted to modify source XML")
+            try:
+                annotations = validate_ui_annotation_xml(
+                    str(draft.get("annotation_xml") or ""),
+                    task_id=str(task.get("task_id") or ""),
+                    revision_label=revision_label,
+                    layout_name=str(draft["layout_name"]),
+                    configuration=str(draft["configuration"]),
+                    base_xml_sha256=base_sha,
+                )
+            except (UiEditorInputError, UiEditorSecurityError, UiEditorFileTooLargeError, UiEditorXmlError) as exc:
+                raise ui_editor_http_exception(exc) from exc
 
             images = db.list_ui_editor_images(str(draft["draft_id"]))
             for image in images:
@@ -11243,7 +11445,11 @@ def create_app() -> FastAPI:
                     or hashlib.sha256(image_path.read_bytes()).hexdigest() != str(image["sha256"])
                 ):
                     raise HTTPException(status_code=409, detail="saved UI image is missing or changed")
-            validated.append({**draft, "images": images})
+            try:
+                linked_images = linked_ui_annotation_images(annotations, images)
+            except UiEditorInputError as exc:
+                raise ui_editor_http_exception(exc) from exc
+            validated.append({**draft, "annotations": annotations, "images": linked_images})
         return validated
 
     def save_ui_editor_preview(
@@ -11251,11 +11457,11 @@ def create_app() -> FastAPI:
         task: dict[str, Any],
         draft_id: str,
         preview_image_base64: Optional[str],
-    ) -> str:
+    ) -> dict[str, Any]:
         settings: Settings = app.state.settings
         preview_base64 = normalize_reference_image_base64(preview_image_base64)
         if not preview_base64:
-            return ""
+            return {"workspace_path": "", "sha256": "", "size_bytes": 0}
         if len(preview_base64) > (REFERENCE_IMAGE_MAX_SOURCE_BYTES * 4 // 3) + 16:
             raise UiEditorFileTooLargeError("preview image exceeds source size limit")
         try:
@@ -11273,8 +11479,13 @@ def create_app() -> FastAPI:
         if not ensure_within_root(preview_target, workspace):
             raise UiEditorSecurityError("unsafe preview path")
         preview_target.parent.mkdir(parents=True, exist_ok=True)
-        preview_target.write_bytes(cast(bytes, preview_optimized["data"]))
-        return preview_relative.as_posix()
+        optimized_bytes = cast(bytes, preview_optimized["data"])
+        preview_target.write_bytes(optimized_bytes)
+        return {
+            "workspace_path": preview_relative.as_posix(),
+            "sha256": hashlib.sha256(optimized_bytes).hexdigest(),
+            "size_bytes": len(optimized_bytes),
+        }
 
     @app.get("/tasks/{task_id}/ui/editor-context")
     def get_task_ui_editor_context(
@@ -11323,7 +11534,7 @@ def create_app() -> FastAPI:
         revision_label: str,
         layout_name: str,
         request: UiEditorDraftRequest,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list[dict[str, Any]]]:
         settings: Settings = app.state.settings
         source = resolve_revision_source(
             workspaces_root=settings.workspaces_root,
@@ -11359,27 +11570,36 @@ def create_app() -> FastAPI:
             raise ui_editor_http_exception(exc) from exc
 
         if request.is_new_layout:
-            if layout_path.exists():
-                raise HTTPException(status_code=409, detail="layout already exists in base revision")
-            authoritative_original = request.original_xml
-            authoritative_sha = sha256_bytes(original_bytes)
-        else:
-            try:
-                authoritative = load_layout_document(
-                    source.project_root,
-                    layout_name=layout_name,
-                    configuration=request.configuration,
-                )
-            except FileNotFoundError as exc:
-                raise HTTPException(status_code=404, detail="layout not found") from exc
-            authoritative_original = str(authoritative["xml"])
-            authoritative_sha = str(authoritative["sha256"])
-            if sha256_bytes(original_bytes) != authoritative_sha:
-                raise HTTPException(status_code=409, detail="original XML does not match base revision")
+            raise HTTPException(status_code=422, detail="visual annotations require an existing layout")
+        try:
+            authoritative = load_layout_document(
+                source.project_root,
+                layout_name=layout_name,
+                configuration=request.configuration,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="layout not found") from exc
+        authoritative_original = str(authoritative["xml"])
+        authoritative_sha = str(authoritative["sha256"])
+        if sha256_bytes(original_bytes) != authoritative_sha:
+            raise HTTPException(status_code=409, detail="original XML does not match base revision")
 
         if request.base_xml_sha256.lower() != authoritative_sha.lower():
             raise HTTPException(status_code=409, detail="base XML changed; reload the revision")
-        return authoritative_original, authoritative_sha
+        if request.original_xml != authoritative_original or request.edited_xml != authoritative_original:
+            raise HTTPException(status_code=422, detail="visual annotation editor cannot modify source XML")
+        try:
+            annotations = validate_ui_annotation_xml(
+                request.annotation_xml,
+                task_id=str(task.get("task_id") or ""),
+                revision_label=revision_label,
+                layout_name=layout_name,
+                configuration=request.configuration,
+                base_xml_sha256=authoritative_sha,
+            )
+        except (UiEditorInputError, UiEditorSecurityError, UiEditorFileTooLargeError, UiEditorXmlError) as exc:
+            raise ui_editor_http_exception(exc) from exc
+        return authoritative_original, authoritative_sha, annotations
 
     @app.get("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{layout_name}")
     def get_ui_editor_draft_endpoint(
@@ -11427,7 +11647,7 @@ def create_app() -> FastAPI:
             device_id=device_id,
             phone_number=phone_number,
         )
-        authoritative_original, authoritative_sha = validate_ui_editor_draft_request(
+        authoritative_original, authoritative_sha, annotations = validate_ui_editor_draft_request(
             task=task,
             snapshot=snapshot,
             revision_label=revision_label,
@@ -11444,7 +11664,8 @@ def create_app() -> FastAPI:
                 configuration=request.configuration,
                 base_xml_sha256=authoritative_sha,
                 original_xml=authoritative_original,
-                edited_xml=request.edited_xml,
+                edited_xml=authoritative_original,
+                annotation_xml=request.annotation_xml,
                 descriptions=request.descriptions,
                 is_new_layout=request.is_new_layout,
                 draft_id=request.draft_id,
@@ -11458,22 +11679,22 @@ def create_app() -> FastAPI:
         except UiEditorDraftStateError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-        diff = structural_xml_diff(authoritative_original, request.edited_xml)
         db.log_event(
             task_id,
             actor="user",
             event_type="ui_editor_draft_created" if created else "ui_editor_draft_saved",
             message_text=(
-                "UI 편집 초안을 시작했습니다."
+                "UI 변경 표시를 저장했습니다."
                 if created
-                else "UI 편집 초안을 자동 저장했습니다."
+                else "UI 변경 표시를 갱신했습니다."
             ),
             payload={
                 "draft": draft,
                 "original_xml": authoritative_original,
-                "edited_xml": request.edited_xml,
+                "edited_xml": authoritative_original,
+                "annotation_xml": request.annotation_xml,
+                "annotations": annotations,
                 "descriptions": request.descriptions,
-                "structural_diff": diff,
             },
         )
         return ui_editor_draft_response(db, draft)
@@ -11546,7 +11767,8 @@ def create_app() -> FastAPI:
             if base_sha.lower() != str(draft["base_xml_sha256"]).lower():
                 raise HTTPException(status_code=409, detail="base XML changed; reload the revision")
             workspace = Path(str(task.get("workspace_path") or "")).resolve()
-            for image in db.list_ui_editor_images(draft_id):
+            images = db.list_ui_editor_images(draft_id)
+            for image in images:
                 image_path = (workspace / str(image["workspace_path"])).resolve()
                 if (
                     not ensure_within_root(image_path, workspace)
@@ -11554,8 +11776,20 @@ def create_app() -> FastAPI:
                     or hashlib.sha256(image_path.read_bytes()).hexdigest() != str(image["sha256"])
                 ):
                     raise HTTPException(status_code=409, detail="UI editor image is missing or changed")
+            try:
+                draft_annotations = validate_ui_annotation_xml(
+                    str(draft["annotation_xml"]),
+                    task_id=task_id,
+                    revision_label=revision_label,
+                    layout_name=str(draft["layout_name"]),
+                    configuration=str(draft["configuration"]),
+                    base_xml_sha256=str(draft["base_xml_sha256"]),
+                )
+                linked_ui_annotation_images(draft_annotations, images)
+            except (UiEditorInputError, UiEditorSecurityError, UiEditorFileTooLargeError, UiEditorXmlError) as exc:
+                raise ui_editor_http_exception(exc) from exc
         try:
-            preview_workspace_path = save_ui_editor_preview(
+            preview = save_ui_editor_preview(
                 task=task,
                 draft_id=draft_id,
                 preview_image_base64=request.preview_image_base64,
@@ -11565,7 +11799,9 @@ def create_app() -> FastAPI:
         if not db.confirm_ui_editor_draft(
             draft_id,
             expected_version=request.expected_version,
-            preview_workspace_path=preview_workspace_path,
+            preview_workspace_path=str(preview["workspace_path"]),
+            preview_sha256=str(preview["sha256"]),
+            preview_size_bytes=int(preview["size_bytes"]),
         ):
             latest = db.get_ui_editor_draft(draft_id)
             raise HTTPException(
@@ -11580,10 +11816,21 @@ def create_app() -> FastAPI:
             message_text="UI 편집 내용을 저장했습니다.",
             payload={
                 "draft": confirmed,
-                "edited_xml": confirmed["edited_xml"],
+                "original_xml": confirmed["original_xml"],
+                "annotation_xml": confirmed["annotation_xml"],
+                "annotations": validate_ui_annotation_xml(
+                    str(confirmed["annotation_xml"]),
+                    task_id=task_id,
+                    revision_label=revision_label,
+                    layout_name=str(confirmed["layout_name"]),
+                    configuration=str(confirmed["configuration"]),
+                    base_xml_sha256=str(confirmed["base_xml_sha256"]),
+                ),
                 "descriptions": confirmed["descriptions"],
                 "images": db.list_ui_editor_images(draft_id),
-                "preview_workspace_path": preview_workspace_path,
+                "preview_workspace_path": preview["workspace_path"],
+                "preview_sha256": preview["sha256"],
+                "preview_size_bytes": preview["size_bytes"],
             },
         )
         return {
@@ -11850,11 +12097,12 @@ def create_app() -> FastAPI:
         workspace = Path(str(task.get("workspace_path") or "")).resolve()
         submission_committed = False
         try:
-            preview_workspace_path = save_ui_editor_preview(
+            preview = save_ui_editor_preview(
                 task=task,
                 draft_id=draft_id,
                 preview_image_base64=request.preview_image_base64,
             )
+            preview_workspace_path = str(preview["workspace_path"])
 
             images = db.list_ui_editor_images(draft_id)
             for image in images:
@@ -11866,6 +12114,15 @@ def create_app() -> FastAPI:
                 ):
                     raise UiEditorDraftStateError("UI editor image is missing or changed")
             source_context = collect_ui_editor_source_context(source.project_root)
+            annotations = validate_ui_annotation_xml(
+                str(draft["annotation_xml"]),
+                task_id=task_id,
+                revision_label=revision_label,
+                layout_name=str(draft["layout_name"]),
+                configuration=str(draft["configuration"]),
+                base_xml_sha256=str(draft["base_xml_sha256"]),
+            )
+            linked_images = linked_ui_annotation_images(annotations, images)
             project_path, generated_revision_label = create_followup_project_revision(
                 workspace,
                 source.project_root,
@@ -11881,13 +12138,13 @@ def create_app() -> FastAPI:
                 layout_name=str(draft["layout_name"]),
                 configuration=str(draft["configuration"]),
                 original_xml=str(draft["original_xml"]),
-                edited_xml=str(draft["edited_xml"]),
-                descriptions=cast(dict[str, str], draft["descriptions"]),
-                images=images,
+                annotation_xml=str(draft["annotation_xml"]),
+                annotations=annotations,
                 preview_workspace_path=preview_workspace_path,
                 package_name=package_name,
                 app_name=app_name,
                 source_context=source_context,
+                images=linked_images,
             )
             with (workspace / "prompt.md").open("a", encoding="utf-8") as prompt_file:
                 prompt_file.write("\n\n" + codex_prompt)
@@ -11913,6 +12170,8 @@ def create_app() -> FastAPI:
                 expected_status="preparing",
                 status="submitting",
                 preview_workspace_path=preview_workspace_path,
+                preview_sha256=str(preview["sha256"]),
+                preview_size_bytes=int(preview["size_bytes"]),
                 generated_revision_label=generated_revision_label,
                 submitted_at=utc_now_iso(),
             ):
@@ -11927,10 +12186,12 @@ def create_app() -> FastAPI:
                     "version": request.expected_version,
                     "base_revision_label": revision_label,
                     "generated_revision_label": generated_revision_label,
-                    "edited_xml": draft["edited_xml"],
-                    "descriptions": draft["descriptions"],
-                    "images": images,
+                    "original_xml": draft["original_xml"],
+                    "annotation_xml": draft["annotation_xml"],
+                    "annotations": annotations,
                     "preview_workspace_path": preview_workspace_path,
+                    "preview_sha256": preview["sha256"],
+                    "preview_size_bytes": preview["size_bytes"],
                 },
             )
             db.log_event(

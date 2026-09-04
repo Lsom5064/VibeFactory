@@ -564,7 +564,7 @@ class UiEditorActivity : AppCompatActivity() {
                     showError(response.unavailable_reason.ifBlank { getString(R.string.ui_editor_source_unavailable) })
                     return@onSuccess
                 }
-                viewModel.layouts = response.layouts
+                viewModel.setLayouts(response.layouts)
                 if (viewModel.layouts.isEmpty()) {
                     showError(getString(R.string.ui_editor_no_layouts))
                     return@onSuccess
@@ -584,16 +584,23 @@ class UiEditorActivity : AppCompatActivity() {
     private fun showLayoutMenu(anchor: View) {
         if (viewModel.layouts.isEmpty()) return
         PopupMenu(this, anchor).apply {
-            viewModel.layouts.forEachIndexed { index, layout ->
-                menu.add(0, index, index, layoutDisplayName(layout))
+            val layoutsByItemId = mutableMapOf<Int, UiLayoutSummaryDto>()
+            var itemId = 1
+            viewModel.layoutMenuGroups.forEach { group ->
+                val subMenu = menu.addSubMenu(group.label)
+                group.layouts.forEach { layout ->
+                    layoutsByItemId[itemId] = layout
+                    subMenu.add(0, itemId, itemId, layoutDisplayName(layout))
+                    itemId += 1
+                }
             }
-            menu.add(0, MENU_NEW_LAYOUT, viewModel.layouts.size, getString(R.string.ui_editor_new_layout))
+            menu.add(0, MENU_NEW_LAYOUT, itemId, getString(R.string.ui_editor_new_layout))
             setOnMenuItemClickListener { item ->
                 if (item.itemId == MENU_NEW_LAYOUT) {
                     showNewLayoutDialog()
                     true
                 } else {
-                    viewModel.layouts.getOrNull(item.itemId)?.let(::loadLayout) != null
+                    layoutsByItemId[item.itemId]?.let(::loadLayout) != null
                 }
             }
             show()
@@ -1505,8 +1512,7 @@ class UiEditorActivity : AppCompatActivity() {
     }
 
     private fun layoutDisplayName(layout: UiLayoutSummaryDto): String =
-        if (layout.configuration == "layout") layout.layout_name
-        else "${layout.layout_name} · ${layout.configuration.removePrefix("layout-")}"
+        UiLayoutPresentation.displayName(layout)
 
     private fun resolveDragPlacement(
         stableId: String,

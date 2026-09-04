@@ -79,7 +79,7 @@
             android:exported="false" />
 
         <activity
-            android:name=".ui_editor.UiEditorActivity"
+            android:name=".ui_editor.UiAnnotationEditorActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
 

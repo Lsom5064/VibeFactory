@@ -25,6 +25,7 @@ CACHE_DIRECTORY_NAMES = {
 PROJECT_ROOT_RUNNER_DIRECTORY_NAMES = {".codex_result", "logs"}
 RUNTIME_CONTRACT_RELATIVE_PATHS = (
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedApplication.kt"),
+    Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/UiGuideController.kt"),
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeCrashReporter.kt"),
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeDataClient.kt"),
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeHttpClient.kt"),
@@ -251,6 +252,12 @@ class NativeAndroidProjectBuilder:
         runtime_contracts = {
             "app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedApplication.kt": (
                 "VibeCrashReporter.initialize(this)",
+                "UiGuideController.initialize(this)",
+            ),
+            "app/src/main/kotlin/kr/ac/kangwon/hai/generated/UiGuideController.kt": (
+                'CATALOG_RESOURCE = "vf_ui_catalog"',
+                "BuildConfig.VERSION_CODE",
+                'contentDescription = "사용법 다시 보기"',
             ),
             "app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeCrashReporter.kt": (
                 "kr.ac.kangwon.hai.action.CRASH_REPORT",

@@ -29,6 +29,10 @@ import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.widget.NestedScrollView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import kr.ac.kangwon.hai.vibefactory.UiPreviewChildDto
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 data class UiPreviewRenderResult(
     val rootView: View,
@@ -43,15 +47,27 @@ class UiPreviewRenderer(private val context: Context) {
     private val warnings = mutableListOf<String>()
     private var resources = ResolvedUiResources.EMPTY
     private var imageBitmaps: Map<String, Bitmap> = emptyMap()
+    private var previewChildrenByContainer: Map<String, List<UiPreviewChildDto>> = emptyMap()
+    private var dynamicTextViewIds: Set<String> = emptySet()
+    private var hiddenViewIds: Set<String> = emptySet()
+    private var representativeContent = false
 
     fun render(
         document: AndroidXmlDocument,
         resources: ResolvedUiResources,
         canvas: FrameLayout,
-        imageBitmaps: Map<String, Bitmap> = emptyMap()
+        imageBitmaps: Map<String, Bitmap> = emptyMap(),
+        previewChildren: List<UiPreviewChildDto> = emptyList(),
+        dynamicTextViewIds: Set<String> = emptySet(),
+        hiddenViewIds: Set<String> = emptySet(),
+        representativeContent: Boolean = false
     ): UiPreviewRenderResult {
         this.resources = resources
         this.imageBitmaps = imageBitmaps
+        previewChildrenByContainer = previewChildren.groupBy(UiPreviewChildDto::container_id)
+        this.dynamicTextViewIds = dynamicTextViewIds
+        this.hiddenViewIds = hiddenViewIds
+        this.representativeContent = representativeContent
         nodeViews.clear()
         androidIds.clear()
         warnings.clear()
@@ -94,6 +110,7 @@ class UiPreviewRenderer(private val context: Context) {
                 }
                 view.addView(childView)
             }
+            addPreviewChildren(view, node)
             decorateEmptyContainer(view, node)
         } else if (node.children.isNotEmpty()) {
             warnings += "${node.tagName} child hierarchy is preserved but locked in preview"
@@ -105,10 +122,11 @@ class UiPreviewRenderer(private val context: Context) {
         "ConstraintLayout" -> ConstraintLayout(context)
         "CoordinatorLayout" -> FrameLayout(context)
         "LinearLayout" -> LinearLayout(context).apply {
-            orientation = if (previewAndroidValue(node, "orientation") == "horizontal") {
-                LinearLayout.HORIZONTAL
-            } else {
+            // Android LinearLayout defaults to horizontal when orientation is omitted.
+            orientation = if (previewAndroidValue(node, "orientation") == "vertical") {
                 LinearLayout.VERTICAL
+            } else {
+                LinearLayout.HORIZONTAL
             }
         }
         "FrameLayout" -> FrameLayout(context)
@@ -120,6 +138,9 @@ class UiPreviewRenderer(private val context: Context) {
         "MaterialTextView" -> TextView(context)
         "Button" -> Button(context)
         "MaterialButton" -> Button(context)
+        "MaterialButtonToggleGroup" -> LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
         "EditText" -> EditText(context)
         "TextInputLayout" -> LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -223,6 +244,12 @@ class UiPreviewRenderer(private val context: Context) {
                 "bold|italic", "italic|bold" -> view.setTypeface(view.typeface, Typeface.BOLD_ITALIC)
             }
             previewAndroidValue(node, "maxLines")?.toIntOrNull()?.let { view.maxLines = it.coerceAtLeast(1) }
+            val resourceName = resourceIdName(node.androidAttribute("id"))
+            if (view.text.isNullOrBlank() && resourceName in dynamicTextViewIds) {
+                view.text = dynamicPreviewText(resourceName.orEmpty())
+            } else if (view.text.isNullOrBlank() && representativeContent && view is CompoundButton) {
+                view.text = "예시 항목"
+            }
         }
         if (view is CompoundButton) {
             previewAndroidValue(node, "checked")?.toBooleanStrictOrNull()?.let { view.isChecked = it }
@@ -238,6 +265,43 @@ class UiPreviewRenderer(private val context: Context) {
         }
         if (view is LinearLayout) {
             parseGravity(previewAndroidValue(node, "gravity"))?.let { view.gravity = it }
+        }
+        val resourceName = resourceIdName(node.androidAttribute("id"))
+        if (resourceName in hiddenViewIds) view.visibility = View.GONE
+    }
+
+    private fun addPreviewChildren(parent: ViewGroup, node: UiNode) {
+        val containerId = resourceIdName(node.androidAttribute("id")) ?: return
+        previewChildrenByContainer[containerId].orEmpty().forEach { hint ->
+            val sampleXml = resources.layout("@layout/${hint.layout_name}") ?: return@forEach
+            val sampleDocument = runCatching { AndroidXmlDocument.parse(sampleXml) }.getOrNull()
+                ?: return@forEach
+            repeat(hint.sample_count.coerceIn(1, MAX_PREVIEW_LIST_ITEMS)) {
+                val holder = FrameLayout(context)
+                UiPreviewRenderer(context).render(
+                    document = sampleDocument,
+                    resources = resources,
+                    canvas = holder,
+                    imageBitmaps = imageBitmaps,
+                    representativeContent = true
+                )
+                val sample = holder.getChildAt(0) ?: return@repeat
+                holder.removeView(sample)
+                sample.layoutParams = layoutParamsFor(parent, sampleDocument.root)
+                parent.addView(sample)
+            }
+        }
+    }
+
+    private fun dynamicPreviewText(resourceName: String): String {
+        val normalized = resourceName.lowercase(Locale.ROOT)
+        return when {
+            "date" in normalized || "day" in normalized -> LocalDate.now().format(
+                DateTimeFormatter.ofPattern("M월 d일 EEEE", Locale.KOREAN)
+            )
+            "count" in normalized -> "0개"
+            "progress" in normalized || "summary" in normalized -> "진행 상황 미리보기"
+            else -> "동적으로 표시되는 내용"
         }
     }
 

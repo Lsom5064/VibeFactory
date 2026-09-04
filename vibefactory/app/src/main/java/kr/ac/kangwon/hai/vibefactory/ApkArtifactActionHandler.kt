@@ -30,6 +30,8 @@ internal object ApkArtifactActionHandler {
     private const val INSTALLED_ARTIFACT_PREFS = "generated_app_installed_artifacts"
     private val downloadFileMutex = Mutex()
 
+    internal fun shouldLaunchInstalledArtifact(packageInstalled: Boolean): Boolean = packageInstalled
+
     fun localApkFile(
         context: Context,
         taskId: String,

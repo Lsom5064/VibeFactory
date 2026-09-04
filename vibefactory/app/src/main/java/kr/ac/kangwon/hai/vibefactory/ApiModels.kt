@@ -186,7 +186,11 @@ data class UiLayoutSummaryDto(
     val resource_path: String = "",
     val root_tag: String = "",
     val sha256: String = "",
-    val size_bytes: Long = 0
+    val size_bytes: Long = 0,
+    val display_name: String = "",
+    val layout_kind: String = "",
+    val guide_available: Boolean = false,
+    val guide_element_count: Int = 0
 )
 
 data class UiLayoutsResponse(
@@ -211,6 +215,12 @@ data class UiResourceFileDto(
     val content: String? = null
 )
 
+data class UiPreviewChildDto(
+    val container_id: String = "",
+    val layout_name: String = "",
+    val sample_count: Int = 1
+)
+
 data class UiLayoutDocumentResponse(
     val task_id: String = "",
     val revision_label: String = "",
@@ -222,9 +232,16 @@ data class UiLayoutDocumentResponse(
     val xml: String = "",
     val sha256: String = "",
     val size_bytes: Long = 0,
+    val display_name: String = "",
+    val layout_kind: String = "",
+    val guide_available: Boolean = false,
+    val guide_element_count: Int = 0,
     val resource_references: List<UiResourceReferenceDto> = emptyList(),
     val resource_files: List<UiResourceFileDto> = emptyList(),
-    val unresolved_resources: List<UiResourceReferenceDto> = emptyList()
+    val unresolved_resources: List<UiResourceReferenceDto> = emptyList(),
+    val preview_children: List<UiPreviewChildDto> = emptyList(),
+    val preview_dynamic_text_view_ids: List<String> = emptyList(),
+    val preview_hidden_view_ids: List<String> = emptyList()
 )
 
 data class UiEditorImageMetadataDto(
@@ -261,11 +278,14 @@ data class UiEditorDraftDto(
     val base_xml_sha256: String = "",
     val original_xml: String = "",
     val edited_xml: String = "",
+    val annotation_xml: String = "",
     val descriptions: Map<String, String> = emptyMap(),
     val status: String = "draft",
     val version: Int = 0,
     val is_new_layout: Boolean = false,
     val preview_workspace_path: String? = null,
+    val preview_sha256: String? = null,
+    val preview_size_bytes: Long? = null,
     val generated_revision_label: String? = null,
     val confirmed_at: String? = null,
     val created_at: String = "",
@@ -280,6 +300,7 @@ data class UiEditorDraftRequestDto(
     val base_xml_sha256: String,
     val original_xml: String,
     val edited_xml: String,
+    val annotation_xml: String = "",
     val descriptions: Map<String, String>,
     val expected_version: Int? = null,
     val is_new_layout: Boolean

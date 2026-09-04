@@ -62,7 +62,7 @@ import com.google.gson.GsonBuilder
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.android.material.bottomsheet.BottomSheetDialog
-import kr.ac.kangwon.hai.vibefactory.ui_editor.UiEditorActivity
+import kr.ac.kangwon.hai.vibefactory.ui_editor.UiAnnotationEditorActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -338,7 +338,7 @@ class MainActivity : AppCompatActivity() {
     private val uiEditorLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
-            val taskId = result.data?.getStringExtra(UiEditorActivity.EXTRA_TASK_ID)
+            val taskId = result.data?.getStringExtra(UiAnnotationEditorActivity.EXTRA_TASK_ID)
                 ?.trim()
                 ?.takeIf { it.isNotBlank() }
                 ?: screenState.selectedTaskId
@@ -963,11 +963,11 @@ class MainActivity : AppCompatActivity() {
                 if (openEditorAfterLoad) {
                     if (context.source_available && context.revision_label.isNotBlank()) {
                         uiEditorLauncher.launch(
-                            Intent(this@MainActivity, UiEditorActivity::class.java)
-                                .putExtra(UiEditorActivity.EXTRA_TASK_ID, apiTaskId)
-                                .putExtra(UiEditorActivity.EXTRA_REVISION_LABEL, context.revision_label)
+                            Intent(this@MainActivity, UiAnnotationEditorActivity::class.java)
+                                .putExtra(UiAnnotationEditorActivity.EXTRA_TASK_ID, apiTaskId)
+                                .putExtra(UiAnnotationEditorActivity.EXTRA_REVISION_LABEL, context.revision_label)
                                 .putExtra(
-                                    UiEditorActivity.EXTRA_APP_NAME,
+                                    UiAnnotationEditorActivity.EXTRA_APP_NAME,
                                     taskSummaryById[apiTaskId]?.appName ?: screenState.displayedAppName.orEmpty()
                                 )
                         )
@@ -4325,6 +4325,16 @@ ${record.stackTrace}
         if (isDownloadingApk) return
         val taskId = message.artifactTaskId?.trim().orEmpty()
         if (taskId.isBlank()) return
+        val packageName = message.artifactPackageName?.trim()?.takeIf { it.isNotBlank() }
+        if (
+            packageName != null &&
+            ApkArtifactActionHandler.shouldLaunchInstalledArtifact(
+                packageInstalled = isPackageInstalled(packageName)
+            )
+        ) {
+            launchGeneratedApp(packageName)
+            return
+        }
         val artifactPath = message.artifactApkPath?.trim()?.takeIf { it.isNotBlank() }
         val artifactUrl = message.artifactApkUrl?.trim()?.takeIf { it.isNotBlank() }
         val apkUrl = artifactUrl ?: persistedApkUrlForTask(taskId)

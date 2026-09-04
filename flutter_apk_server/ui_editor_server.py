@@ -10,6 +10,19 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Optional
 
+try:
+    from .ui_catalog import (
+        catalog_layout_metadata,
+        fallback_display_name,
+        fallback_layout_kind,
+    )
+except ImportError:
+    from ui_catalog import (  # type: ignore[no-redef]
+        catalog_layout_metadata,
+        fallback_display_name,
+        fallback_layout_kind,
+    )
+
 
 REVISION_LABEL_PATTERN = re.compile(r"^rev_\d{4}$")
 LAYOUT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -28,6 +41,11 @@ MAX_RESOURCE_DISCOVERY_DEPTH = 8
 MAX_CODEX_CONTEXT_BYTES = 16 * 1024 * 1024
 ALLOWED_BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
+UI_ANNOTATION_NAMESPACE = "urn:vibefactory:ui-annotations"
+UI_ANNOTATION_SCHEMA_VERSION = "1"
+UI_ANNOTATION_ACTIONS = {"delete", "move", "behavior"}
+MAX_UI_ANNOTATIONS = 500
+MAX_UI_ANNOTATION_IMAGES = 5
 
 
 class UiEditorInputError(ValueError):
@@ -123,6 +141,7 @@ def list_layout_documents(project_root: Path) -> list[dict[str, Any]]:
     if not resource_root.is_dir():
         return []
 
+    catalog_metadata = catalog_layout_metadata(project_root)
     layouts: list[dict[str, Any]] = []
     for configuration_dir in sorted(resource_root.glob("layout*"), key=lambda item: item.name):
         if not configuration_dir.is_dir() or not LAYOUT_CONFIGURATION_PATTERN.fullmatch(configuration_dir.name):
@@ -136,10 +155,19 @@ def list_layout_documents(project_root: Path) -> list[dict[str, Any]]:
                 continue
             content = resolved_layout.read_bytes()
             root = parse_android_xml(content, source_name=layout_path.name)
+            metadata = catalog_metadata.get((layout_path.stem, configuration_dir.name), {})
+            layout_kind = str(metadata.get("layout_kind") or fallback_layout_kind(layout_path.stem))
             layouts.append(
                 {
                     "layout_name": layout_path.stem,
                     "configuration": configuration_dir.name,
+                    "display_name": str(
+                        metadata.get("display_name")
+                        or fallback_display_name(layout_path.stem, layout_kind)
+                    ),
+                    "layout_kind": layout_kind,
+                    "guide_available": bool(metadata.get("guide_available")),
+                    "guide_element_count": int(metadata.get("guide_element_count") or 0),
                     "resource_path": f"res/{configuration_dir.name}/{layout_path.name}",
                     "root_tag": local_name(root.tag),
                     "sha256": sha256_bytes(content),
@@ -263,6 +291,63 @@ def discover_resource_files(
     return [found_files[key] for key in sorted(found_files)], unresolved
 
 
+def infer_layout_preview_hints(
+    project_root: Path,
+    layout_xml: bytes,
+) -> dict[str, Any]:
+    root = parse_android_xml(layout_xml, source_name="preview-layout.xml")
+    android_id_key = f"{{{ANDROID_NAMESPACE}}}id"
+    layout_ids = {
+        value.rsplit("/", 1)[-1]
+        for element in root.iter()
+        if (value := str(element.attrib.get(android_id_key) or ""))
+    }
+    preview_children: dict[tuple[str, str], dict[str, Any]] = {}
+    dynamic_text_ids: set[str] = set()
+    conditional_empty_ids: set[str] = set()
+    source_root = (project_root / "app" / "src" / "main").resolve()
+    if not source_root.is_dir() or not is_within(source_root, project_root.resolve()):
+        return {
+            "preview_children": [],
+            "preview_dynamic_text_view_ids": [],
+            "preview_hidden_view_ids": [],
+        }
+
+    inflate_pattern = re.compile(
+        r"layoutInflater\s*\.\s*inflate\(\s*R\.layout\.([A-Za-z0-9_]+)\s*,\s*binding\.([A-Za-z0-9_]+)\s*,\s*false",
+        re.MULTILINE,
+    )
+    text_pattern = re.compile(r"binding\.([A-Za-z0-9_]+)\.text\s*=", re.MULTILINE)
+    empty_visibility_pattern = re.compile(
+        r"binding\.([A-Za-z0-9_]+)\.visibility\s*=\s*if\s*\([^\n]*?\.isEmpty\(\)[^\n]*?\)\s*View\.VISIBLE\s*else\s*View\.GONE",
+        re.MULTILINE,
+    )
+    for source_file in sorted(source_root.rglob("*")):
+        if not source_file.is_file() or source_file.is_symlink() or source_file.suffix.lower() not in {".kt", ".java"}:
+            continue
+        if source_file.stat().st_size > 2 * 1024 * 1024:
+            continue
+        source = source_file.read_text(encoding="utf-8", errors="replace")
+        for item_layout, container_id in inflate_pattern.findall(source):
+            if container_id not in layout_ids:
+                continue
+            item_path = project_root / "app" / "src" / "main" / "res" / "layout" / f"{item_layout}.xml"
+            if item_path.is_file():
+                preview_children[(container_id, item_layout)] = {
+                    "container_id": container_id,
+                    "layout_name": item_layout,
+                    "sample_count": 1,
+                }
+        dynamic_text_ids.update(item for item in text_pattern.findall(source) if item in layout_ids)
+        conditional_empty_ids.update(item for item in empty_visibility_pattern.findall(source) if item in layout_ids)
+
+    return {
+        "preview_children": list(preview_children.values()),
+        "preview_dynamic_text_view_ids": sorted(dynamic_text_ids),
+        "preview_hidden_view_ids": sorted(conditional_empty_ids) if preview_children else [],
+    }
+
+
 def load_layout_document(
     project_root: Path,
     *,
@@ -275,10 +360,23 @@ def load_layout_document(
     content = layout_path.read_bytes()
     root = parse_android_xml(content, source_name=layout_path.name)
     references = extract_resource_references([content])
+    preview_hints = infer_layout_preview_hints(project_root, content)
+    metadata = catalog_layout_metadata(project_root).get((layout_name, configuration), {})
+    layout_kind = str(metadata.get("layout_kind") or fallback_layout_kind(layout_name))
+    references.update(
+        ("layout", str(item["layout_name"]))
+        for item in preview_hints["preview_children"]
+    )
     resources, unresolved = discover_resource_files(project_root, references)
     return {
         "layout_name": layout_name,
         "configuration": configuration,
+        "display_name": str(
+            metadata.get("display_name") or fallback_display_name(layout_name, layout_kind)
+        ),
+        "layout_kind": layout_kind,
+        "guide_available": bool(metadata.get("guide_available")),
+        "guide_element_count": int(metadata.get("guide_element_count") or 0),
         "resource_path": f"res/{configuration}/{layout_name}.xml",
         "root_tag": local_name(root.tag),
         "xml": content.decode("utf-8"),
@@ -290,6 +388,7 @@ def load_layout_document(
         ],
         "resource_files": resources,
         "unresolved_resources": unresolved,
+        **preview_hints,
     }
 
 
@@ -330,6 +429,145 @@ def validate_ui_draft_xml(xml_text: str, *, source_name: str) -> bytes:
     content = xml_text.encode("utf-8")
     parse_android_xml(content, source_name=source_name)
     return content
+
+
+def validate_ui_annotation_xml(
+    xml_text: str,
+    *,
+    task_id: str,
+    revision_label: str,
+    layout_name: str,
+    configuration: str,
+    base_xml_sha256: str,
+) -> list[dict[str, Any]]:
+    content = xml_text.encode("utf-8")
+    root = parse_android_xml(content, source_name=f"{layout_name}.annotations.xml")
+    expected_root = f"{{{UI_ANNOTATION_NAMESPACE}}}ui-annotations"
+    if root.tag != expected_root or root.attrib.get("schemaVersion") != UI_ANNOTATION_SCHEMA_VERSION:
+        raise UiEditorInputError("unsupported UI annotation document")
+    expected_metadata = {
+        "taskId": task_id,
+        "revisionLabel": revision_label,
+        "layoutName": layout_name,
+        "configuration": configuration,
+        "baseXmlSha256": base_xml_sha256,
+    }
+    for key, expected in expected_metadata.items():
+        if root.attrib.get(key) != expected:
+            raise UiEditorInputError(f"UI annotation {key} does not match its revision")
+
+    annotation_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}annotation"
+    target_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}target"
+    destination_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}destination"
+    point_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}destination-point"
+    instruction_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}instruction"
+    image_ref_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}image-ref"
+    parsed: list[dict[str, Any]] = []
+    annotation_ids: set[str] = set()
+    children = list(root)
+    if len(children) > MAX_UI_ANNOTATIONS:
+        raise UiEditorFileTooLargeError(f"UI annotations exceed {MAX_UI_ANNOTATIONS} entries")
+    for annotation in children:
+        if annotation.tag != annotation_tag:
+            raise UiEditorInputError("unexpected element in UI annotation document")
+        annotation_id = str(annotation.attrib.get("id") or "")
+        action = str(annotation.attrib.get("action") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", annotation_id) or annotation_id in annotation_ids:
+            raise UiEditorInputError("invalid or duplicate UI annotation ID")
+        if action not in UI_ANNOTATION_ACTIONS:
+            raise UiEditorInputError("invalid UI annotation action")
+        annotation_ids.add(annotation_id)
+        targets = [child for child in annotation if child.tag == target_tag]
+        destinations = [child for child in annotation if child.tag == destination_tag]
+        points = [child for child in annotation if child.tag == point_tag]
+        instructions = [child for child in annotation if child.tag == instruction_tag]
+        image_refs = [child for child in annotation if child.tag == image_ref_tag]
+        if len(targets) != 1 or len(destinations) > 1 or len(points) > 1 or len(instructions) != 1:
+            raise UiEditorInputError("invalid UI annotation structure")
+        if len(image_refs) > MAX_UI_ANNOTATION_IMAGES:
+            raise UiEditorFileTooLargeError(
+                f"UI annotation images exceed {MAX_UI_ANNOTATION_IMAGES} entries"
+            )
+        image_ids = [str(image.attrib.get("id") or "") for image in image_refs]
+        if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", image_id) for image_id in image_ids):
+            raise UiEditorInputError("invalid UI annotation image reference")
+        if len(set(image_ids)) != len(image_ids):
+            raise UiEditorInputError("duplicate UI annotation image reference")
+        allowed_children = {target_tag, destination_tag, point_tag, instruction_tag, image_ref_tag}
+        if any(child.tag not in allowed_children for child in annotation):
+            raise UiEditorInputError("unexpected UI annotation child")
+        if action == "move" and not destinations and not points:
+            raise UiEditorInputError("move annotation requires a destination")
+        if action != "move" and (destinations or points):
+            raise UiEditorInputError("only move annotations may include a destination")
+        instruction = instructions[0].text or ""
+        if len(instruction.encode("utf-8")) > 16 * 1024:
+            raise UiEditorFileTooLargeError("UI annotation instruction is too large")
+        if action == "behavior" and not instruction.strip():
+            raise UiEditorInputError("behavior annotation requires an instruction")
+
+        def target_payload(element: ElementTree.Element) -> dict[str, Any]:
+            fields = {
+                key: str(element.attrib.get(key) or "")
+                for key in (
+                    "stableId", "resourceId", "hierarchyPath", "className", "text",
+                    "contentDescription", "previousSibling", "nextSibling",
+                )
+            }
+            if not fields["stableId"] or len(fields["stableId"]) > 500:
+                raise UiEditorInputError("invalid UI annotation target")
+            coordinates: dict[str, float] = {}
+            for key in ("left", "top", "right", "bottom"):
+                try:
+                    value = float(element.attrib[key])
+                except (KeyError, ValueError) as exc:
+                    raise UiEditorInputError("invalid UI annotation bounds") from exc
+                if not 0.0 <= value <= 1.0:
+                    raise UiEditorInputError("UI annotation bounds are outside the screen")
+                coordinates[key] = value
+            if coordinates["right"] < coordinates["left"] or coordinates["bottom"] < coordinates["top"]:
+                raise UiEditorInputError("invalid UI annotation bounds")
+            return {**fields, "bounds": coordinates}
+
+        destination_point: Optional[dict[str, float]] = None
+        if points:
+            try:
+                destination_point = {key: float(points[0].attrib[key]) for key in ("x", "y")}
+            except (KeyError, ValueError) as exc:
+                raise UiEditorInputError("invalid UI annotation destination") from exc
+            if any(not 0.0 <= value <= 1.0 for value in destination_point.values()):
+                raise UiEditorInputError("UI annotation destination is outside the screen")
+        parsed.append(
+            {
+                "annotation_id": annotation_id,
+                "action": action,
+                "created_at": str(annotation.attrib.get("createdAt") or ""),
+                "target": target_payload(targets[0]),
+                "destination": target_payload(destinations[0]) if destinations else None,
+                "destination_point": destination_point,
+                "instruction": instruction,
+                "image_ids": image_ids,
+            }
+        )
+    return parsed
+
+
+def linked_ui_annotation_images(
+    annotations: list[dict[str, Any]],
+    images: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    image_by_id = {str(image.get("image_id") or ""): image for image in images}
+    linked: list[dict[str, Any]] = []
+    for annotation in annotations:
+        annotation_id = str(annotation.get("annotation_id") or "")
+        for image_id in annotation.get("image_ids") or []:
+            image = image_by_id.get(str(image_id))
+            if image is None:
+                raise UiEditorInputError("referenced UI annotation image is missing")
+            if str(image.get("element_stable_id") or "") != annotation_id:
+                raise UiEditorInputError("UI annotation image belongs to a different change marker")
+            linked.append({**image, "annotation_id": annotation_id})
+    return linked
 
 
 def _element_identity(element: ElementTree.Element, path: str) -> str:
@@ -446,32 +684,23 @@ def build_ui_editor_codex_prompt(
     layout_name: str,
     configuration: str,
     original_xml: str,
-    edited_xml: str,
-    descriptions: dict[str, str],
-    images: list[dict[str, Any]],
+    annotation_xml: str,
+    annotations: list[dict[str, Any]],
     preview_workspace_path: str,
     package_name: str,
     app_name: str,
     source_context: list[dict[str, str]],
+    images: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str, dict[str, Any]]:
-    diff = structural_xml_diff(original_xml, edited_xml)
+    linked_images = list(images or [])
     source_sections = "\n\n".join(
         f"### `{entry['path']}`\n\n```{Path(entry['path']).suffix.lstrip('.')}\n{entry['content']}\n```"
         for entry in source_context
     )
-    image_lines = "\n".join(
-        "- element `{element}`: `{path}` (resource `{resource}`, SHA-256 `{sha}`)".format(
-            element=image.get("element_stable_id") or "",
-            path=image.get("workspace_path") or "",
-            resource=image.get("resource_name") or "",
-            sha=image.get("sha256") or "",
-        )
-        for image in images
-    ) or "- 없음"
     prompt = f"""
-## XML UI 편집 Revision 요청
+## 시각적 UI 변경 표시 Revision 요청
 
-이 요청은 사용자가 호스트 앱의 XML UI 편집기에서 확정한 변경이다. 단순 변경이라도 반드시 실제 프로젝트 코드를 수정한다.
+사용자는 실행 화면을 직접 편집하지 않고 원본 화면 위에 변경 의도를 표시했다. 원본 XML, 주석 전용 XML, 주석이 보이는 스크린샷을 함께 해석해 실제 프로젝트 코드를 수정한다.
 
 ### 고정 계약
 
@@ -481,13 +710,19 @@ def build_ui_editor_codex_prompt(
 - 대상 layout: `app/src/main/res/{configuration}/{layout_name}.xml`
 - 앱 이름: `{app_name}`
 - package name: `{package_name}`
-- 편집 후 XML을 UI 의도의 최우선 기준으로 사용한다.
+- 원본 XML은 사용자가 수정한 결과물이 아니다. 주석 전용 XML의 `delete`, `move`, `behavior` 표시와 사용자 설명을 변경 의도의 최우선 기준으로 사용한다.
+- 대상은 View ID만으로 판단하지 않는다. `stableId`, `resourceId`, `hierarchyPath`, View class, 표시 텍스트, 정규화 좌표, 앞뒤 형제 정보를 함께 사용한다.
+- `delete`는 대상을 제거하고 관련 Kotlin/Java 참조와 이벤트를 안전하게 정리한다.
+- `move`의 `destination_point`는 사용자가 화살표 끝을 놓은 정확한 정규화 좌표이며 이동 위치의 최우선 기준이다.
+- 이동 후 대상 View의 중심이 `destination_point`와 일치하도록 배치한다. `destination` View 정보는 주변 구조와 제약을 파악하기 위한 참고일 뿐이며, 그 View의 중심으로 좌표를 바꾸지 않는다.
+- 절대 좌표에 고정하지 말고 ConstraintLayout 제약, 형제 순서, margin 등을 사용해 표시된 위치와 방향을 다양한 화면 크기에서도 최대한 유지한다.
+- `behavior`는 UI 모양만 바꾸지 말고 설명에 적힌 실제 동작과 상태 처리를 구현한다.
 - 사용자가 요구하지 않은 재디자인을 하지 않는다.
 - 기준 Revision은 수정하지 않는다. 현재 `project` 디렉터리만 수정한다.
 - 기존 View ID와 Kotlin 동작, package name, Task ID, 런타임 LLM·데이터 API·오류 보고 계약을 유지한다.
-- 편집 후 구조가 다양한 Android 화면 크기, 회전, 키보드, 긴 텍스트에서 깨지지 않도록 constraint와 scroll 구조를 보정한다.
-- 요소 추가·삭제에 맞춰 Kotlin 참조와 이벤트를 갱신한다.
-- 첨부 이미지는 아래 workspace 상대 경로에서 읽어 적절한 Android drawable 리소스로 복사한다.
+- 변경 구조가 다양한 Android 화면 크기, 회전, 키보드, 긴 텍스트에서 깨지지 않도록 constraint와 scroll 구조를 보정한다.
+- 주석 스크린샷은 위치 확인용 근거이며 원본 화면의 픽셀을 앱 리소스로 복사하지 않는다.
+- 주석이 모호하거나 서로 충돌하면 사용자 설명을 우선하고, 임의로 기능을 제거하지 않는다.
 - 변경을 마치면 XML parse/resource linking, Kotlin compile, lint와 release APK build가 통과해야 한다.
 - 결과와 제한을 `.codex_result/task_result.json`에 전문 기록한다.
 
@@ -497,37 +732,29 @@ def build_ui_editor_codex_prompt(
 {original_xml}
 ```
 
-### 사용자가 편집한 XML 전문
+### 주석 전용 XML 전문
 
 ```xml
-{edited_xml}
+{annotation_xml}
 ```
 
-### 구조적 XML diff
+### 검증된 주석 데이터
 
 ```json
-{json.dumps(diff['operations'], ensure_ascii=False, indent=2)}
+{json.dumps(annotations, ensure_ascii=False, indent=2)}
 ```
 
-### Unified diff
+### 부연 설명에 첨부된 참고 이미지
 
-```diff
-{diff['unified_diff']}
-```
-
-### 요소별 설명 전문
+각 항목의 `annotation_id`를 주석 데이터와 연결해 해석한다. 이미지는 요구사항의 근거이며 앱 리소스로 그대로 복사하라는 의미가 아니다.
 
 ```json
-{json.dumps(descriptions, ensure_ascii=False, indent=2, sort_keys=True)}
+{json.dumps(linked_images, ensure_ascii=False, indent=2)}
 ```
 
-### 편집 화면 미리보기
+### 주석이 표시된 전체 화면 스크린샷
 
 `{preview_workspace_path or '(없음)'}`
-
-### 추가 이미지
-
-{image_lines}
 
 ## 현재 Kotlin/Java/XML 소스 전문
 
@@ -540,10 +767,9 @@ def build_ui_editor_codex_prompt(
         "layout_name": layout_name,
         "configuration": configuration,
         "original_xml": original_xml,
-        "edited_xml": edited_xml,
-        "diff": diff,
-        "descriptions": descriptions,
-        "images": images,
+        "annotation_xml": annotation_xml,
+        "annotations": annotations,
+        "images": linked_images,
         "preview_workspace_path": preview_workspace_path,
         "package_name": package_name,
         "app_name": app_name,
@@ -565,52 +791,44 @@ def build_ui_editor_chat_context(
     sections: list[str] = []
     for index, draft in enumerate(drafts, start=1):
         original_xml = str(draft.get("original_xml") or "")
-        edited_xml = str(draft.get("edited_xml") or "")
-        descriptions = draft.get("descriptions")
-        if not isinstance(descriptions, dict):
-            descriptions = {}
+        annotation_xml = str(draft.get("annotation_xml") or "")
+        annotations = draft.get("annotations")
+        if not isinstance(annotations, list):
+            annotations = []
         images = draft.get("images")
         if not isinstance(images, list):
             images = []
-        diff = structural_xml_diff(original_xml, edited_xml)
-        image_lines = "\n".join(
-            "- element `{element}`: `{path}` (resource `{resource}`, SHA-256 `{sha}`)".format(
-                element=image.get("element_stable_id") or "",
-                path=image.get("workspace_path") or "",
-                resource=image.get("resource_name") or "",
-                sha=image.get("sha256") or "",
-            )
-            for image in images
-            if isinstance(image, dict)
-        ) or "- 없음"
         sections.append(
-            f"""### 저장 UI {index}: `app/src/main/res/{draft.get('configuration') or 'layout'}/{draft.get('layout_name') or ''}.xml`
+            f"""### 저장된 UI 변경 표시 {index}: `app/src/main/res/{draft.get('configuration') or 'layout'}/{draft.get('layout_name') or ''}.xml`
 
-#### 사용자가 저장한 XML 전문
+#### 원본 XML 전문
 
 ```xml
-{edited_xml}
+{original_xml}
 ```
 
-#### 기준 XML과의 구조적 차이
+#### 주석 전용 XML 전문
+
+```xml
+{annotation_xml}
+```
+
+#### 검증된 변경 표시
 
 ```json
-{json.dumps(diff['operations'], ensure_ascii=False, indent=2)}
+{json.dumps(annotations, ensure_ascii=False, indent=2)}
 ```
 
-#### 요소별 설명
+#### 부연 설명에 첨부된 참고 이미지
 
 ```json
-{json.dumps(descriptions, ensure_ascii=False, indent=2, sort_keys=True)}
+{json.dumps(images, ensure_ascii=False, indent=2)}
 ```
 
-#### 편집 화면 미리보기
+#### 주석이 표시된 화면
 
 `{draft.get('preview_workspace_path') or '(없음)'}`
-
-#### UI 편집에 첨부된 이미지
-
-{image_lines}"""
+"""
         )
         draft_payloads.append(
             {
@@ -619,9 +837,8 @@ def build_ui_editor_chat_context(
                 "layout_name": draft.get("layout_name") or "",
                 "configuration": draft.get("configuration") or "layout",
                 "original_xml": original_xml,
-                "edited_xml": edited_xml,
-                "diff": diff,
-                "descriptions": descriptions,
+                "annotation_xml": annotation_xml,
+                "annotations": annotations,
                 "images": images,
                 "preview_workspace_path": draft.get("preview_workspace_path") or "",
                 "confirmed_at": draft.get("confirmed_at") or "",
@@ -630,17 +847,19 @@ def build_ui_editor_chat_context(
 
     prompt = f"""## 채팅 요청에 선택된 저장 UI
 
-사용자가 아래 UI 편집 내용을 현재 채팅 요청의 시각적 기준으로 선택했다.
+사용자가 아래 시각적 변경 표시를 현재 채팅 요청의 UI 기준으로 선택했다.
 
 - Task ID: `{task_id}`
 - 기준 Revision: `{base_revision_label}`
 - 작업 Revision: `{generated_revision_label}`
 - 최신 채팅 요청: {user_prompt.strip()}
-- 저장된 UI 구조와 요소 설명을 실제 앱 코드에 반영한다.
+- 원본 XML을 직접 편집한 결과로 취급하지 말고, 주석 XML과 스크린샷을 해석해 실제 앱 코드에 반영한다.
+- delete는 빨강, move는 파랑, behavior는 보라 표시이며 대상 식별 정보와 사용자 설명을 모두 사용한다.
+- move의 `destination_point`는 사용자가 지정한 화살표 끝의 정확한 이동 위치다. 대상 View의 중심을 이 좌표에 맞추고, 함께 기록된 `destination` View의 중심으로 대체하지 않는다.
+- 이동 결과는 고정 픽셀 좌표 대신 제약, 형제 순서와 margin으로 표현해 화면 크기가 바뀌어도 사용자가 지정한 방향과 상대 위치를 유지한다.
 - 최신 채팅 요청은 기능과 세부 동작을 설명하며, 명시적으로 충돌하는 경우 최신 채팅 요청을 우선한다.
 - 기존 View ID, Kotlin 동작, package name, Task ID, 런타임 API와 오류 보고 계약을 유지한다.
-- 요소 추가·삭제·이동에 맞춰 Kotlin 참조와 이벤트 처리를 함께 수정한다.
-- UI 편집 이미지는 명시된 workspace 상대 경로에서 읽어 Android 리소스로 반영한다.
+- 삭제·이동·동작 변경에 맞춰 XML, Kotlin/Java 참조와 이벤트 처리를 함께 수정한다.
 - 이 섹션이 없는 후속 요청에서는 저장 UI 초안을 새 입력으로 간주하지 않는다.
 
 {chr(10).join(sections)}

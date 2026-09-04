@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ui-catalog schemaVersion="1" guideVersion="rev_0001">
+    <layout
+        layoutName="activity_main"
+        configuration="layout"
+        displayName="메인 화면"
+        kind="screen"
+        activityClass="kr.ac.kangwon.hai.generated.MainActivity">
+        <element
+            viewId="templateTitle"
+            title="앱 제목"
+            description="현재 앱의 이름을 확인하는 영역입니다."
+            order="1" />
+        <element
+            viewId="templateBody"
+            title="화면 안내"
+            description="이 화면에서 할 수 있는 일을 확인하는 영역입니다."
+            order="2" />
+    </layout>
+</ui-catalog>

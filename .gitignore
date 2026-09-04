@@ -101,3 +101,7 @@ pnpm-debug.log*
 *.log
 *.tmp
 *.temp
+.~lock.*#
+
+# Local research exports may contain participant data and generated evidence.
+/exports/

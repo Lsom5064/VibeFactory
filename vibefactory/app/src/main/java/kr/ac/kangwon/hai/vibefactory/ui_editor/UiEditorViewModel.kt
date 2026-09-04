@@ -46,8 +46,16 @@ data class UiEditorSession(
 class UiEditorViewModel : ViewModel() {
     var session: UiEditorSession? = null
     var layouts: List<UiLayoutSummaryDto> = emptyList()
+        private set
+    var layoutMenuGroups: List<UiLayoutMenuGroup> = emptyList()
+        private set
     var loadGeneration: Int = 0
     val serverDraftMutex = Mutex()
+
+    fun setLayouts(value: List<UiLayoutSummaryDto>) {
+        layouts = value
+        layoutMenuGroups = UiLayoutPresentation.groups(value)
+    }
 
     fun initialize(
         taskId: String,

@@ -41,6 +41,7 @@ class UiEditorDraftRequest(BaseModel):
     base_xml_sha256: str = Field(..., min_length=64, max_length=64)
     original_xml: str = Field(..., min_length=1)
     edited_xml: str = Field(..., min_length=1)
+    annotation_xml: str = Field(..., min_length=1)
     descriptions: dict[str, str] = Field(default_factory=dict)
     expected_version: Optional[int] = Field(default=None, ge=1)
     is_new_layout: bool = False
