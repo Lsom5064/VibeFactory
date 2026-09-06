@@ -196,6 +196,7 @@ class FullLoggingAndImageStorageTests(unittest.TestCase):
             append_followup_prompt(
                 workspace,
                 "Use the attached PDF.",
+                revision_label="rev_0004",
                 reference_attachments=[
                     {
                         "type": "pdf",
@@ -209,6 +210,7 @@ class FullLoggingAndImageStorageTests(unittest.TestCase):
             prompt_text = (workspace / "prompt.md").read_text(encoding="utf-8")
             self.assertIn("종류: pdf", prompt_text)
             self.assertIn("reference_files/requirements.pdf", prompt_text)
+            self.assertIn("`guideVersion`을 반드시 `rev_0004`", prompt_text)
 
     def test_generate_accepts_image_without_prompt_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

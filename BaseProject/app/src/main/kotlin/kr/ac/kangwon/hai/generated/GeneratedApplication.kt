@@ -7,5 +7,6 @@ class GeneratedApplication : Application() {
         super.onCreate()
         VibeCrashReporter.initialize(this)
         UiGuideController.initialize(this)
+        GeneratedAppInitializer.initialize(this)
     }
 }

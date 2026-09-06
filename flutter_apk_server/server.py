@@ -5187,6 +5187,7 @@ def render_task_agents_md(task_id: str) -> str:
 - `app/src/main/kotlin/kr/ac/kangwon/hai/generated/MainActivity.kt`와 `app/src/main/res/layout/activity_main.xml`을 유지한다.
 - 서버가 관리하는 `gradle.properties`의 Task ID, application ID, version code와 `app/build.gradle.kts`의 namespace·BuildConfig·release signing 설정을 변경하지 않는다.
 - `GeneratedApplication.kt`, `UiGuideController.kt`, `VibeCrashReporter.kt`, `VibeHttpClient.kt`, `VibeLlmClient.kt`, `VibeDataClient.kt`의 런타임 계약을 제거하거나 바꾸지 않는다.
+- 앱 시작 시 한 번 실행해야 하는 알림 채널 생성, SDK 초기화 같은 앱별 코드는 `GeneratedApplication.kt`가 아니라 `GeneratedAppInitializer.initialize(application)`에 구현한다. 이 파일은 앱별 확장 지점이므로 수정할 수 있다.
 - 앱 이름을 바꿔야 하면 서버가 관리하는 metadata를 임의 변경하지 말고 구현 결과의 `app_name`에 제안값을 기록한다.
 - 런타임 package name은 하드코딩하지 말고 `applicationContext.packageName`을 사용한다.
 - 런타임 Task ID는 `BuildConfig.VIBE_TASK_ID`를 사용한다.
@@ -5197,7 +5198,11 @@ def render_task_agents_md(task_id: str) -> str:
 - 외부 API 키, OAuth 비밀 값, 비밀번호, 토큰을 소스 코드, 리소스, 로그, `task_result.json`에 하드코딩하지 않는다.
 - 작업 엔진 환경에 외부 자격증명이 보이지 않는 것은 정상이다. 사전 검사에서 연결됨으로 확인된 항목은 키가 없다고 실패 처리하지 말고 서버 최종 빌드 주입 계약을 따른다.
 - `VibeLlmClient` 호출 실패는 `VibeLlmRequestException.userMessage` 또는 예외의 사용자용 message를 화면에 표시한다. HTTP 응답 본문, endpoint, API 키, 내부 경로는 사용자에게 노출하지 않는다.
-- 코드 생성 중에는 `./gradlew :app:lintDebug`로 정적 오류를 검증한다.
+- 명령은 workspace 루트에서 실행하고 파일 경로는 항상 `project/...`로 지정한다.
+- 이 workspace는 Git 저장소가 아니므로 `git status`, `git diff`, `git log` 등 Git 명령을 실행하지 않는다.
+- 수정 후 정적 검증은 `./project/gradlew -p project :app:lintDebug --console=plain`을 한 번 실행한다. 환경 또는 socket 오류가 난 경우나 실제 소스 오류를 고친 경우에만 재시도한다.
+- 전체 lint 보고서를 출력하거나 복사하지 말고 터미널에 표시된 관련 오류만 확인한다.
+- 별도 `compileDebugKotlin`, `assembleDebug`, `test`, `assembleRelease`를 연달아 실행하지 않는다. 새 동작에 꼭 필요한 단위 테스트를 추가한 경우만 해당 테스트를 실행한다.
 - 최종 signed release APK 빌드는 서버가 수행하므로 `assembleRelease`를 직접 실행하지 않는다.
 - `task_result.json`의 `apk_path`는 `project/app/build/outputs/apk/release/app-release.apk`로 기록한다.
 - 사용자가 요청한 핵심 기능을 더 쉬운 대체 구현으로 바꾸지 않는다.
@@ -5213,6 +5218,7 @@ def render_task_agents_md(task_id: str) -> str:
 - 더미 데이터나 예시 문구는 UI 스켈레톤 확인용 보조로만 허용된다. 핵심 사용자 흐름을 더미 데이터만으로 완성 처리하면 안 된다.
 - 모든 화면 크기와 키보드·system inset·화면 회전 상태에서 UI가 잘리거나 겹치지 않게 만든다.
 - 긴 화면은 `NestedScrollView` 또는 `RecyclerView`를 사용하고, 큰 목록을 `ScrollView` 안에 중첩하지 않는다.
+- 사용자 데이터에 따라 계속 늘어나는 목록은 `LinearLayout`에 항목을 누적하지 말고 `RecyclerView`와 adapter로 구현한다.
 - `ConstraintLayout`의 양쪽 constraint와 `0dp` match constraint를 사용해 긴 제목과 버튼이 화면 밖으로 넘치지 않게 한다.
 - 빌드 전에 작은 화면 기준으로 레이아웃을 점검하고, overflow 가능성이 있으면 성공으로 보고하지 않는다.
 - 생성하거나 수정한 모든 XML UI는 아래 UI catalog 계약을 함께 갱신한다.
@@ -5290,7 +5296,7 @@ def render_prompt_md(task: dict[str, Any], settings: Settings) -> str:
     build_request_prompt = task.get("build_request_prompt") or task["prompt"]
     runtime_meta = build_app_runtime_metadata(task, settings)
     data_meta = build_app_data_runtime_metadata(task, settings)
-    ui_catalog_rules = catalog_prompt_contract()
+    ui_catalog_rules = catalog_prompt_contract(guide_version="rev_0001")
     state_payload = load_task_state_payload(task)
     raw_conversation_state = state_payload.get("conversation_state")
     conversation_state: dict[str, Any] = (
@@ -5467,6 +5473,7 @@ def append_followup_prompt(
     reference_image_name: Optional[str] = None,
     reference_image_workspace_path: Optional[str] = None,
     reference_attachments: Optional[list[dict[str, str]]] = None,
+    revision_label: Optional[str] = None,
 ) -> None:
     prompt_path = workspace_path / "prompt.md"
     timestamp = utc_now_iso()
@@ -5479,6 +5486,12 @@ def append_followup_prompt(
             handle.write(f"\n### 실제 반영할 요청\n\n{effective_prompt}\n")
         if normalized_prompt:
             handle.write(f"\n### 서버 정리 명세\n\n{normalized_prompt.strip()}\n")
+        normalized_revision = normalize_whitespace(str(revision_label or ""))
+        if normalized_revision:
+            handle.write(
+                "\n### 현재 UI 사용 설명 revision\n\n"
+                f"- `vf_ui_catalog.xml`의 `guideVersion`을 반드시 `{normalized_revision}`으로 기록한다.\n"
+            )
         normalized_attachments = normalize_reference_attachments(reference_attachments or [])
         normalized_image_name = normalize_reference_image_name(reference_image_name)
         normalized_image_path = normalize_whitespace(str(reference_image_workspace_path or ""))
@@ -7282,10 +7295,7 @@ def derive_current_build_stage(task: dict[str, Any], timeline_events: list[dict[
     status = str(task.get("status") or "")
     message = sanitize_user_visible_text(str(task.get("message") or ""))
     if status == "Running":
-        for event in reversed(timeline_events):
-            if event.get("event_type") == "build_stage_started":
-                return event.get("body") or "빌드 진행 중", event.get("detail") or message
-        return "빌드 진행 중", message
+        return message or "빌드 진행 중", ""
     if status == "Queued":
         return "작업 대기 중", message or status_display_text(status, message)
     if status == "Pending Decision":
@@ -10396,6 +10406,7 @@ def create_app() -> FastAPI:
                     reference_image_name=effective_reference_image_name,
                     reference_image_workspace_path=reference_image_workspace_path or previous_conversation_state.get("reference_image_workspace_path"),
                     reference_attachments=saved_reference_attachments or effective_reference_attachments,
+                    revision_label=revision_label,
                 )
                 if selected_ui_editor_drafts:
                     ui_context_prompt, ui_context_payload = build_ui_editor_chat_context(

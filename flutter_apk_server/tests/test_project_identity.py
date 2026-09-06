@@ -16,6 +16,7 @@ from flutter_apk_server.server import (
     build_intent_decision,
     create_followup_project_revision,
     create_initial_project_revision,
+    derive_current_build_stage,
     ensure_project_revision_version,
     project_android_identity_issues,
     render_task_agents_md,
@@ -138,14 +139,31 @@ class ProjectIdentityTests(unittest.TestCase):
             "activity_main.xml",
             "`BuildConfig.VIBE_TASK_ID`",
             "`BuildConfig.VIBE_SERVER_BASE_URL`",
+            "`GeneratedAppInitializer.initialize(application)`",
             "release signing",
-            "`./gradlew :app:lintDebug`",
+            "`./project/gradlew -p project :app:lintDebug --console=plain`",
             "`assembleRelease`를 직접 실행하지 않는다",
             "project/app/build/outputs/apk/release/app-release.apk",
             '"task_id": "test-task"',
         ):
             self.assertIn(required_text, instructions)
         self.assertNotIn("flutter build apk", instructions.lower())
+        self.assertIn("Git 명령을 실행하지 않는다", instructions)
+
+    def test_running_build_stage_uses_current_task_message_not_old_timeline(self) -> None:
+        stage, detail = derive_current_build_stage(
+            {"status": "Running", "message": "새 수정 요청을 분석하고 있어요."},
+            [
+                {
+                    "event_type": "build_stage_started",
+                    "body": "이전 APK를 빌드하고 있어요.",
+                    "detail": "이전 작업",
+                }
+            ],
+        )
+
+        self.assertEqual("새 수정 요청을 분석하고 있어요.", stage)
+        self.assertEqual("", detail)
 
     def test_database_has_owner_list_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -245,10 +263,26 @@ class ProjectIdentityTests(unittest.TestCase):
             activity_relative = Path(
                 "app/src/main/kotlin/kr/ac/kangwon/hai/generated/MainActivity.kt"
             )
+            initializer_relative = Path(
+                "app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedAppInitializer.kt"
+            )
             (project_root / llm_relative).write_text("// stale runtime client\n", encoding="utf-8")
             activity_text = (project_root / activity_relative).read_text(encoding="utf-8")
             customized_activity = activity_text + "\n// participant UI customization\n"
             (project_root / activity_relative).write_text(customized_activity, encoding="utf-8")
+            customized_initializer = (
+                "package kr.ac.kangwon.hai.generated\n"
+                "import android.app.Application\n"
+                "object GeneratedAppInitializer {\n"
+                "    fun initialize(application: Application) {\n"
+                "        // app-specific notification channel\n"
+                "    }\n"
+                "}\n"
+            )
+            (project_root / initializer_relative).write_text(
+                customized_initializer,
+                encoding="utf-8",
+            )
 
             restored = native_android_project_builder.restore_runtime_contracts(
                 BASE_PROJECT,
@@ -263,6 +297,22 @@ class ProjectIdentityTests(unittest.TestCase):
             self.assertEqual(
                 customized_activity,
                 (project_root / activity_relative).read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                customized_initializer,
+                (project_root / initializer_relative).read_text(encoding="utf-8"),
+            )
+            self.assertNotIn(initializer_relative.as_posix(), restored)
+
+            (project_root / initializer_relative).unlink()
+            restored_missing = native_android_project_builder.restore_runtime_contracts(
+                BASE_PROJECT,
+                project_root,
+            )
+            self.assertIn(initializer_relative.as_posix(), restored_missing)
+            self.assertEqual(
+                (BASE_PROJECT / initializer_relative).read_bytes(),
+                (project_root / initializer_relative).read_bytes(),
             )
 
     def test_native_identity_collapses_duplicate_managed_properties(self) -> None:

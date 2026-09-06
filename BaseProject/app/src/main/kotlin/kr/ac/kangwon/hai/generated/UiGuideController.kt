@@ -5,6 +5,7 @@ import android.app.Application
 import android.app.Dialog
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
@@ -16,6 +17,7 @@ import android.os.Bundle
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.Parcelable
 import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
@@ -145,24 +147,30 @@ object UiGuideController {
         if (catalog?.layouts.orEmpty().none { it.isAutomaticFor(activity) }) return
         val content = activity.findViewById<ViewGroup>(android.R.id.content) as? FrameLayout ?: return
         val button = TextView(activity).apply {
-            text = "?"
+            text = "사용법"
             gravity = Gravity.CENTER
-            textSize = 18f
+            textSize = 15f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(Color.WHITE)
             contentDescription = "사용법 다시 보기"
             isClickable = true
             isFocusable = true
+            minHeight = dp(activity, 48)
+            setPadding(dp(activity, 16), 0, dp(activity, 16), 0)
             elevation = dp(activity, 6).toFloat()
             background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
+                cornerRadius = dp(activity, 8).toFloat()
                 setColor(Color.rgb(24, 107, 77))
             }
             setOnClickListener { replay(activity) }
         }
-        val size = dp(activity, 48)
         content.addView(
             button,
-            FrameLayout.LayoutParams(size, size, Gravity.END or Gravity.BOTTOM).apply {
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp(activity, 48),
+                Gravity.END or Gravity.BOTTOM,
+            ).apply {
                 marginEnd = dp(activity, 16)
                 bottomMargin = dp(activity, 16)
             },
@@ -545,6 +553,8 @@ object UiGuideController {
             val backgroundColor = if (dark) Color.rgb(38, 42, 40) else Color.WHITE
             val primaryText = if (dark) Color.WHITE else Color.rgb(24, 31, 28)
             val secondaryText = if (dark) Color.rgb(210, 218, 214) else Color.rgb(82, 94, 88)
+            val secondaryButton = if (dark) Color.rgb(66, 73, 69) else Color.rgb(235, 240, 237)
+            val primaryButton = Color.rgb(24, 107, 77)
             card.isFillViewport = true
             card.elevation = dp(10).toFloat()
             card.background = GradientDrawable().apply {
@@ -561,12 +571,12 @@ object UiGuideController {
                 ),
             )
             stepText.setTextColor(secondaryText)
-            stepText.textSize = 12f
+            stepText.textSize = 14f
             titleText.setTextColor(primaryText)
-            titleText.textSize = 18f
+            titleText.textSize = 20f
             titleText.setTypeface(titleText.typeface, android.graphics.Typeface.BOLD)
             descriptionText.setTextColor(secondaryText)
-            descriptionText.textSize = 15f
+            descriptionText.textSize = 17f
             descriptionText.setLineSpacing(0f, 1.18f)
             cardContent.addView(stepText, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
             cardContent.addView(titleText, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
@@ -584,17 +594,23 @@ object UiGuideController {
                 text = "건너뛰기"
                 isAllCaps = false
                 minHeight = dp(48)
+                setTextColor(primaryText)
+                backgroundTintList = ColorStateList.valueOf(secondaryButton)
                 setOnClickListener { dismiss() }
             }
             previousButton.apply {
                 text = "이전"
                 isAllCaps = false
                 minHeight = dp(48)
+                setTextColor(primaryText)
+                backgroundTintList = ColorStateList.valueOf(secondaryButton)
                 setOnClickListener { showStep(index - 1) }
             }
             nextButton.apply {
                 isAllCaps = false
                 minHeight = dp(48)
+                setTextColor(Color.WHITE)
+                backgroundTintList = ColorStateList.valueOf(primaryButton)
                 setOnClickListener {
                     if (index == targets.lastIndex) dismiss() else showStep(index + 1)
                 }
@@ -617,7 +633,7 @@ object UiGuideController {
                 titleText.text = target.element.title
                 descriptionText.text = target.element.description
                 previousButton.isEnabled = index > 0
-                nextButton.text = if (index == targets.lastIndex) "닫기" else "다음"
+                nextButton.text = if (index == targets.lastIndex) "완료" else "다음"
                 refreshTargetPosition()
                 card.scrollTo(0, 0)
                 onStepChanged(index)
@@ -804,6 +820,9 @@ object UiGuideController {
             val top: Int,
             val right: Int,
             val bottom: Int,
+            val scrollX: Int,
+            val scrollY: Int,
+            val recyclerLayoutState: Parcelable?,
         ) {
             fun applyBottomInset(extraBottom: Int) {
                 view.setPadding(left, top, right, bottom + extraBottom)
@@ -811,6 +830,15 @@ object UiGuideController {
 
             fun restore() {
                 view.setPadding(left, top, right, bottom)
+                restoreScrollPosition()
+                view.post { restoreScrollPosition() }
+            }
+
+            private fun restoreScrollPosition() {
+                if (recyclerLayoutState != null && restoreRecyclerLayoutState(view, recyclerLayoutState)) {
+                    return
+                }
+                view.scrollTo(scrollX, scrollY)
             }
 
             companion object {
@@ -820,7 +848,31 @@ object UiGuideController {
                     top = view.paddingTop,
                     right = view.paddingRight,
                     bottom = view.paddingBottom,
+                    scrollX = view.scrollX,
+                    scrollY = view.scrollY,
+                    recyclerLayoutState = captureRecyclerLayoutState(view),
                 )
+
+                private fun captureRecyclerLayoutState(view: ViewGroup): Parcelable? {
+                    if (view.javaClass.name != "androidx.recyclerview.widget.RecyclerView") return null
+                    return runCatching {
+                        val manager = view.javaClass.getMethod("getLayoutManager").invoke(view)
+                            ?: return@runCatching null
+                        manager.javaClass.getMethod("onSaveInstanceState").invoke(manager) as? Parcelable
+                    }.getOrNull()
+                }
+
+                private fun restoreRecyclerLayoutState(view: ViewGroup, state: Parcelable): Boolean {
+                    if (view.javaClass.name != "androidx.recyclerview.widget.RecyclerView") return false
+                    return runCatching {
+                        val manager = view.javaClass.getMethod("getLayoutManager").invoke(view)
+                            ?: return@runCatching false
+                        manager.javaClass
+                            .getMethod("onRestoreInstanceState", Parcelable::class.java)
+                            .invoke(manager, state)
+                        true
+                    }.getOrDefault(false)
+                }
             }
         }
     }

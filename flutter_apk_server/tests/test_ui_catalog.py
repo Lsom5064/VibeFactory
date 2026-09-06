@@ -4,6 +4,7 @@ from pathlib import Path
 
 from flutter_apk_server.ui_catalog import (
     UI_CATALOG_RELATIVE_PATH,
+    catalog_prompt_contract,
     catalog_layout_metadata,
     ensure_valid_ui_catalog,
     fallback_display_name,
@@ -211,6 +212,12 @@ class MainActivity {
         metadata = catalog_layout_metadata(self.project)
         self.assertTrue(metadata[("activity_main", "layout")]["guide_available"])
         self.assertEqual("item", metadata[("item_result", "layout")]["layout_kind"])
+
+    def test_catalog_prompt_names_exact_revision_when_provided(self) -> None:
+        contract = catalog_prompt_contract(guide_version="rev_0012")
+
+        self.assertIn("현재 revision인 `rev_0012`", contract)
+        self.assertNotIn('guideVersion="..."', contract)
 
 
 if __name__ == "__main__":

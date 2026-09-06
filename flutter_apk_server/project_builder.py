@@ -31,6 +31,9 @@ RUNTIME_CONTRACT_RELATIVE_PATHS = (
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeHttpClient.kt"),
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeLlmClient.kt"),
 )
+APP_INITIALIZER_RELATIVE_PATH = Path(
+    "app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedAppInitializer.kt"
+)
 
 
 @dataclass(frozen=True)
@@ -197,6 +200,16 @@ class NativeAndroidProjectBuilder:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
             restored.append(relative_path.as_posix())
+        initializer_source = template_root / APP_INITIALIZER_RELATIVE_PATH
+        initializer_destination = project_root / APP_INITIALIZER_RELATIVE_PATH
+        if not initializer_source.is_file():
+            raise RuntimeError(
+                f"Native app initializer is missing from BaseProject: {APP_INITIALIZER_RELATIVE_PATH}"
+            )
+        if not initializer_destination.is_file():
+            initializer_destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(initializer_source, initializer_destination)
+            restored.append(APP_INITIALIZER_RELATIVE_PATH.as_posix())
         return tuple(restored)
 
     def apply_identity(
@@ -253,6 +266,11 @@ class NativeAndroidProjectBuilder:
             "app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedApplication.kt": (
                 "VibeCrashReporter.initialize(this)",
                 "UiGuideController.initialize(this)",
+                "GeneratedAppInitializer.initialize(this)",
+            ),
+            "app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedAppInitializer.kt": (
+                "object GeneratedAppInitializer",
+                "fun initialize(application: Application)",
             ),
             "app/src/main/kotlin/kr/ac/kangwon/hai/generated/UiGuideController.kt": (
                 'CATALOG_RESOURCE = "vf_ui_catalog"',

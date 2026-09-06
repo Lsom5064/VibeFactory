@@ -571,9 +571,14 @@ def ensure_valid_ui_catalog(project_root: Path, *, guide_version: str) -> dict[s
     return {**repaired, "repaired": True}
 
 
-def catalog_prompt_contract() -> str:
-    return """- 모든 `app/src/main/res/layout*/*.xml`을 `app/src/main/res/xml/vf_ui_catalog.xml`에 등록한다.
-- catalog root는 `<ui-catalog schemaVersion=\"1\" guideVersion=\"...\">` 형식을 사용한다.
+def catalog_prompt_contract(*, guide_version: str | None = None) -> str:
+    version_rule = (
+        f'- catalog root의 `guideVersion`은 반드시 현재 revision인 `{guide_version}`으로 기록한다.'
+        if guide_version
+        else '- catalog root는 `<ui-catalog schemaVersion="1" guideVersion="현재 revision">` 형식을 사용한다.'
+    )
+    return f"""- 모든 `app/src/main/res/layout*/*.xml`을 `app/src/main/res/xml/vf_ui_catalog.xml`에 등록한다.
+{version_rule}
 - 각 `<layout>`에는 `layoutName`, `configuration`, 자연스러운 한국어 `displayName`, `kind`를 기록한다.
 - 화면 layout의 kind는 `screen`이고 이를 표시하는 Activity 전체 클래스명을 `activityClass`에 기록한다.
 - 주요 버튼·입력창·선택 도구·탐색 요소에는 실제 XML에 존재하는 안정적인 ID를 부여하고 `<element viewId=\"...\" title=\"...\" description=\"...\" order=\"...\" />`로 설명한다.
