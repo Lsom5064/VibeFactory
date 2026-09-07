@@ -1,17 +1,17 @@
-# Generated App UI Guide 5x5 E2E Report
+# 생성 앱 UI 사용 설명 5x5 E2E 검증 보고서
 
-## Test scope
+## 검증 범위
 
-- Date: 2026-09-07 (Asia/Seoul)
-- Device: Samsung SM-S908N, Android API 36
-- Generation engine: actual Codex (`MOCK_CODEX=0`)
-- Persona: Android applications and development terminology are unfamiliar to a nondeveloper in their 50s
-- Passes: baseline 5 apps + 25 XML revisions, improved build 5 apps + 25 XML revisions
-- Required checks: APK build, update installation, launch, first-run guide, guide replay, XML change, package continuity, crash absence
+- 검증일: 2026-09-07 (Asia/Seoul)
+- 실기기: Samsung SM-S908N, Android API 36
+- 생성 엔진: 실제 Codex (`MOCK_CODEX=0`)
+- 사용자 가정: Android 앱과 개발 용어에 익숙하지 않은 50대 비개발자
+- 검증 회차: 개선 전 앱 5개 및 XML 수정 25회, 개선 후 앱 5개 및 XML 수정 25회
+- 필수 검증 항목: APK 빌드, 업데이트 설치, 앱 실행, 최초 실행 사용 설명, 사용 설명 다시 보기, XML 변경, 패키지 연속성, 크래시 발생 여부
 
-## Scenarios
+## 검증 시나리오
 
-| Key | App | Improved-pass task ID | Final revision |
+| 구분 | 앱 | 개선 후 Task ID | 최종 리비전 |
 | --- | --- | --- | --- |
 | medication | 복약체크 | `309682a22f98457c9ab08c4af016c194` | `rev_0006` |
 | shopping | 장보기메모 | `60b96832bb2b418e8f00628a2000b4fc` | `rev_0006` |
@@ -19,96 +19,96 @@
 | meeting | 모임일정판 | `8e3c78a7b2a24961b80be7b62024b40e` | `rev_0006` |
 | water | 물한잔 | `f022e29d7c464a9db6573b67a7cf4a75` | `rev_0006` |
 
-## Revision type counts
+## 수정 유형별 횟수
 
-Each Task received the same five revisions. This makes comparisons between apps and passes reproducible.
+앱 간 및 개선 전후 결과를 같은 조건으로 비교할 수 있도록 모든 Task에 동일한 수정 요청 5개를 적용했습니다.
 
-| Task | Title style | Move | Delete | Touch/accessibility | Readability/spacing | Total |
+| Task | 제목 스타일 | 위치 이동 | 요소 삭제 | 터치·접근성 | 가독성·여백 | 합계 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 복약체크 | 1 | 1 | 1 | 1 | 1 | 5 |
 | 장보기메모 | 1 | 1 | 1 | 1 | 1 | 5 |
 | 산책기록 | 1 | 1 | 1 | 1 | 1 | 5 |
 | 모임일정판 | 1 | 1 | 1 | 1 | 1 | 5 |
 | 물한잔 | 1 | 1 | 1 | 1 | 1 | 5 |
-| Total | 5 | 5 | 5 | 5 | 5 | 25 |
+| 전체 | 5 | 5 | 5 | 5 | 5 | 25 |
 
-The editor protocol groups these as `behavior` 3 times, `move` once, and `delete` once per Task. Across five Tasks this is `behavior` 15, `move` 5, and `delete` 5.
+UI 편집 프로토콜의 동작 유형을 기준으로 분류하면 각 Task에서 `behavior` 3회, `move` 1회, `delete` 1회가 수행됐습니다. 5개 Task 전체에서는 `behavior` 15회, `move` 5회, `delete` 5회입니다.
 
-## Baseline findings
+## 개선 전 발견 사항
 
-1. Closing the guide could change the user's scroll position.
-2. Guide text was small for the target persona and primary and secondary actions were not visually distinct.
-3. The replay control used an unexplained `?` symbol.
-4. Restoring protected runtime files could overwrite app-specific startup code placed in `GeneratedApplication`.
-5. Generated work repeatedly ran Git and overlapping Gradle checks, increasing elapsed time and token use.
-6. Revision prompts did not state the exact `guideVersion`, so server-side catalog repair was more likely.
-7. Running status could expose a stale build stage from an earlier timeline event.
-8. Growing lists were not explicitly required to use `RecyclerView`.
+1. 사용 설명을 닫으면 사용자가 보고 있던 화면의 스크롤 위치가 달라질 수 있었습니다.
+2. 목표 사용자에게 사용 설명의 글자가 작았으며, 주요 버튼과 보조 버튼이 시각적으로 명확하게 구분되지 않았습니다.
+3. 사용 설명 다시 보기 버튼이 의미를 알기 어려운 `?` 기호로 표시됐습니다.
+4. 서버가 보호 대상 런타임 파일을 복구할 때 `GeneratedApplication`에 작성된 앱별 초기화 코드가 덮어써질 수 있었습니다.
+5. 앱 생성 과정에서 불필요한 Git 명령과 서로 중복되는 Gradle 검증 명령이 반복되어 생성 시간과 토큰 사용량이 증가했습니다.
+6. 리비전 프롬프트에 정확한 `guideVersion`이 명시되지 않아 서버의 UI 카탈로그 자동 복구가 발생할 가능성이 높았습니다.
+7. 실행 중인 Task의 상태에 과거 타임라인 이벤트의 빌드 단계가 표시될 수 있었습니다.
+8. 데이터가 계속 늘어나는 목록에 `RecyclerView`를 사용하도록 명확하게 요구하지 않았습니다.
 
-## Changes
+## 적용한 개선 사항
 
-- The guide now restores scroll coordinates and RecyclerView layout state after dismissal.
-- Guide typography, button hierarchy, touch target sizes, and replay wording were improved.
-- Added `GeneratedAppInitializer` as the preserved app-specific startup extension point.
-- Generation instructions now prohibit irrelevant Git commands and redundant Gradle builds, and prescribe one lint command.
-- Initial and revision prompts now require the exact revision in `vf_ui_catalog.xml`.
-- Running status uses the current task message instead of stale timeline data.
-- Growing lists explicitly require `RecyclerView` and an adapter.
-- Unit and connected-device tests cover these contracts.
+- 사용 설명을 닫은 뒤 기존 스크롤 좌표와 `RecyclerView` 레이아웃 상태를 복원하도록 수정했습니다.
+- 사용 설명의 글자 크기, 버튼 위계, 터치 영역 및 다시 보기 버튼 문구를 개선했습니다.
+- 앱별 초기화 코드를 보존하기 위한 확장 지점인 `GeneratedAppInitializer`를 추가했습니다.
+- 앱 생성 지침에서 불필요한 Git 명령과 중복 Gradle 빌드를 금지하고, 한 번의 lint 명령으로 검증하도록 변경했습니다.
+- 최초 생성 및 리비전 프롬프트에서 `vf_ui_catalog.xml`에 정확한 리비전을 기록하도록 변경했습니다.
+- 실행 상태는 과거 타임라인이 아닌 현재 Task 메시지를 사용하도록 수정했습니다.
+- 데이터가 계속 늘어나는 목록은 `RecyclerView`와 adapter를 사용하도록 명시했습니다.
+- 위 계약을 검증하는 단위 테스트와 실기기 테스트를 추가했습니다.
 
-## Improved-pass result
+## 개선 후 검증 결과
 
-All five initial generations and all 25 XML revisions passed. Every revision produced an APK, retained the Task package name, installed as an update, launched, displayed and completed the guide, retained the replay control, applied the intended XML change, and produced no fatal crash.
+최초 생성 5회와 XML 수정 25회가 모두 통과했습니다. 모든 리비전에서 APK가 생성됐고, 동일 Task의 패키지 이름을 유지했으며, 기존 앱 위에 업데이트 방식으로 설치됐습니다. 설치 후 앱 실행, 사용 설명 표시 및 완료, 다시 보기 버튼 유지, 의도한 XML 변경과 치명적 크래시 미발생도 확인했습니다.
 
-| Check | Result |
+| 검증 항목 | 결과 |
 | --- | ---: |
-| Initial generations | 5/5 |
-| XML revisions | 25/25 |
-| APK download/install/launch | 30/30 |
-| First-run guide and completion | 30/30 |
-| Guide replay control | 30/30 |
-| Intended XML change | 25/25 |
-| Stable package per Task | 25/25 revisions |
-| Fatal crashes | 0 |
+| 최초 앱 생성 | 5/5 |
+| XML 기반 수정 | 25/25 |
+| APK 다운로드·설치·실행 | 30/30 |
+| 최초 실행 사용 설명 및 완료 | 30/30 |
+| 사용 설명 다시 보기 버튼 | 30/30 |
+| 의도한 XML 변경 | 25/25 |
+| Task별 패키지 이름 유지 | 리비전 25/25 |
+| 치명적 크래시 | 0건 |
 
-Three intermediate records marked failed were verifier false positives: one selected a `gone` catalog element and two retried an already acknowledged guide version. The verifier was corrected to select a visible catalog target and the complete rerun passed; these were not application failures.
+중간 검증 기록 중 실패로 표시된 3건은 검증 도구의 오탐이었습니다. 1건은 화면에서 숨김 상태인 `gone` 카탈로그 요소를 선택했고, 2건은 이미 확인 완료된 `guideVersion`을 다시 검증하면서 발생했습니다. 검증 도구가 실제로 표시되는 카탈로그 요소를 선택하도록 수정한 후 전체 재검증에 통과했으므로 앱 자체의 실패는 아닙니다.
 
-## Performance
+## 성능 비교
 
-`total_tokens` includes cached input tokens and should not be interpreted directly as API cost.
+`total_tokens`에는 캐시된 입력 토큰도 포함되므로 API 비용으로 직접 해석하면 안 됩니다.
 
-| Scope | Metric | Baseline | Improved | Change |
+| 범위 | 지표 | 개선 전 | 개선 후 | 변화 |
 | --- | --- | ---: | ---: | ---: |
-| Initial generation, n=5 | Mean elapsed time | 669.8 s | 545.2 s | -18.6% |
-| Initial generation, n=5 | Mean total tokens | 1,935,079 | 951,131 | -50.8% |
-| Initial generation, n=5 | Mean uncached input | 60,852 | 41,956 | -31.1% |
-| Initial generation, n=5 | Mean output | 26,060 | 21,674 | -16.8% |
-| Revision, n=25 | Mean elapsed time | 180.1 s | 167.1 s | -7.2% |
-| Revision, n=25 | Mean total tokens | 782,390 | 572,651 | -26.8% |
-| Revision, n=25 | Mean uncached input | 44,563 | 34,098 | -23.5% |
-| Revision, n=25 | Mean output | 4,904 | 4,297 | -12.4% |
-| All artifacts, n=30 | Mean elapsed time | 261.7 s | 230.1 s | -12.1% |
-| All artifacts, n=30 | Mean total tokens | 974,505 | 635,731 | -34.8% |
+| 최초 생성 5회 | 평균 소요 시간 | 669.8초 | 545.2초 | -18.6% |
+| 최초 생성 5회 | 평균 전체 토큰 | 1,935,079 | 951,131 | -50.8% |
+| 최초 생성 5회 | 평균 비캐시 입력 토큰 | 60,852 | 41,956 | -31.1% |
+| 최초 생성 5회 | 평균 출력 토큰 | 26,060 | 21,674 | -16.8% |
+| 수정 25회 | 평균 소요 시간 | 180.1초 | 167.1초 | -7.2% |
+| 수정 25회 | 평균 전체 토큰 | 782,390 | 572,651 | -26.8% |
+| 수정 25회 | 평균 비캐시 입력 토큰 | 44,563 | 34,098 | -23.5% |
+| 수정 25회 | 평균 출력 토큰 | 4,904 | 4,297 | -12.4% |
+| 전체 산출물 30개 | 평균 소요 시간 | 261.7초 | 230.1초 | -12.1% |
+| 전체 산출물 30개 | 평균 전체 토큰 | 974,505 | 635,731 | -34.8% |
 
-Improved initial generation ranged from 429 to 666 seconds. Improved revisions ranged from 139 to 296 seconds.
+개선 후 최초 생성 시간은 최소 429초, 최대 666초였습니다. 수정 시간은 최소 139초, 최대 296초였습니다.
 
-## Automated verification
+## 자동화 검증
 
-- Server tests: 111 passed.
-- BaseProject lint, unit tests, debug build, and Android-test compilation: passed.
-- Connected Android test on SM-S908N: 1 passed.
-- Python syntax compilation and Git whitespace checks: passed.
+- 서버 테스트: 111개 통과
+- BaseProject lint, 단위 테스트, debug 빌드 및 Android 테스트 컴파일: 통과
+- SM-S908N 연결 실기기 테스트: 1개 통과
+- Python 문법 컴파일 및 Git 공백 검사: 통과
 
-## Evidence
+## 검증 자료
 
-- Baseline structured results: `/private/tmp/vf_guide_e2e_20260907/e2e_results.jsonl`
-- Improved structured results: `/private/tmp/vf_guide_e2e_after_20260907/e2e_results.jsonl`
-- Improved screenshots and device evidence: `/private/tmp/vf_guide_e2e_after_20260907/evidence/`
+- 개선 전 구조화 결과: `/private/tmp/vf_guide_e2e_20260907/e2e_results.jsonl`
+- 개선 후 구조화 결과: `/private/tmp/vf_guide_e2e_after_20260907/e2e_results.jsonl`
+- 개선 후 스크린샷 및 실기기 검증 자료: `/private/tmp/vf_guide_e2e_after_20260907/evidence/`
 
-## Remaining noncritical observations
+## 남아 있는 비핵심 개선 사항
 
-- 물한잔 generated its own top-level `사용법 다시 보기` action in addition to the common floating `사용법` control. This is redundant but does not block the guide.
-- Four initial generations needed automatic catalog repair for dynamic item layouts; all 25 subsequent revisions authored valid catalogs without repair.
-- Some generated layouts use tight outer margins. They remain readable and functional, but a future visual-quality rule could enforce a minimum page gutter.
+- 물한잔 앱에는 공통 플로팅 `사용법` 버튼 외에 앱에서 자체 생성한 상단 `사용법 다시 보기` 버튼도 존재합니다. 기능을 막지는 않지만 같은 기능이 중복으로 표시됩니다.
+- 최초 생성 5건 중 4건은 동적 항목 레이아웃의 UI 카탈로그가 서버에서 자동 복구됐습니다. 이후 수정 25건은 모두 자동 복구 없이 올바른 카탈로그를 생성했습니다.
+- 일부 생성 앱은 화면 바깥쪽 여백이 좁습니다. 가독성과 기능에는 문제가 없지만, 향후 시각 품질 규칙에 최소 화면 여백을 추가할 수 있습니다.
 
-No critical guide, XML-revision, installation, package-continuity, crash, or interaction-delay defect remained after the second full pass.
+두 번째 전체 검증 후에는 UI 사용 설명, XML 수정, 설치, 패키지 연속성, 크래시 및 상호작용 지연과 관련된 핵심 결함이 남아 있지 않았습니다.

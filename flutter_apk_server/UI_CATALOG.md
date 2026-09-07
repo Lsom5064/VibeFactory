@@ -44,9 +44,12 @@ UiGuideController.show(activity, "item_result", itemView)
 UiGuideController.show(activity, "component_summary", summaryView)
 ```
 
-Use `UiGuideController.replay(activity)` from an app menu or settings action. The runtime fallback replay control remains available when an app has no menu.
+Replay is provided exclusively by the floating control installed by `UiGuideController`.
 
 The guide is an overlay. Never add guide copy to the product layout itself.
+`UiGuideController` supplies the single shared floating replay button. Generated app layouts,
+toolbars, menus, settings, and app-specific Kotlin code must not add another guide/help control
+or call `UiGuideController.replay(activity)` themselves.
 
 ## Server Validation
 

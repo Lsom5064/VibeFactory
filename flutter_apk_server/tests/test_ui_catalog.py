@@ -219,6 +219,14 @@ class MainActivity {
         self.assertIn("현재 revision인 `rev_0012`", contract)
         self.assertNotIn('guideVersion="..."', contract)
 
+    def test_catalog_prompt_forbids_app_specific_guide_buttons(self) -> None:
+        contract = catalog_prompt_contract()
+
+        self.assertIn("공통 플로팅 `사용법` 버튼", contract)
+        self.assertIn("별도 버튼이나 메뉴 항목을 만들지 않는다", contract)
+        self.assertIn("앱이 자체 생성한 사용법 버튼·메뉴", contract)
+        self.assertNotIn("`사용법 다시 보기` 항목을 제공하고", contract)
+
 
 if __name__ == "__main__":
     unittest.main()

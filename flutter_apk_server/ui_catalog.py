@@ -585,6 +585,7 @@ def catalog_prompt_contract(*, guide_version: str | None = None) -> str:
 - 장식용 View와 의미 없는 반복 View는 설명하지 않는다. 파일 경로, 변수명, View ID, API 키 같은 내부 정보는 사용자 설명에 쓰지 않는다.
 - layout이나 View ID를 변경하면 catalog도 같은 작업에서 반드시 갱신한다.
 - Activity 전체 화면은 런타임이 자동 감지한다. Dialog는 표시된 뒤 `UiGuideController.show(dialog, "layout_name")`, RecyclerView 항목이나 동적으로 삽입한 구성요소는 `UiGuideController.show(activity, "layout_name", rootView)`를 호출한다.
-- 앱에 메뉴나 설정 화면이 있으면 `사용법 다시 보기` 항목을 제공하고 `UiGuideController.replay(activity)`를 호출한다.
+- `UiGuideController`가 모든 화면에 공통 플로팅 `사용법` 버튼을 자동으로 제공한다. 앱의 Toolbar, 상단 영역, 메뉴, 설정, 본문에 `사용법`, `사용법 다시 보기`, 도움말 등 같은 안내를 여는 별도 버튼이나 메뉴 항목을 만들지 않는다.
+- 기존 프로젝트를 수정할 때 앱이 자체 생성한 사용법 버튼·메뉴와 `UiGuideController.replay(activity)` 연결이 있으면 제거하고, 공통 플로팅 버튼은 수정하거나 복제하지 않는다.
 - 안내 문구를 실제 화면 TextView로 추가하지 않는다. 안내는 `UiGuideController` 오버레이로만 표시한다.
 - `UiGuideController.kt`와 `GeneratedApplication.kt`의 사용 설명 런타임 계약을 제거하거나 우회하지 않는다."""
