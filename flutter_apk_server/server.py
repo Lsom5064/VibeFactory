@@ -5186,7 +5186,7 @@ def render_task_agents_md(task_id: str) -> str:
 - 파일을 확인할 때는 `rg --files project`처럼 `project`를 명시하고, 모든 변경과 Gradle 명령은 `project` 경로에서 직접 수행한다.
 - `app/src/main/kotlin/kr/ac/kangwon/hai/generated/MainActivity.kt`와 `app/src/main/res/layout/activity_main.xml`을 유지한다.
 - 서버가 관리하는 `gradle.properties`의 Task ID, application ID, version code와 `app/build.gradle.kts`의 namespace·BuildConfig·release signing 설정을 변경하지 않는다.
-- `GeneratedApplication.kt`, `UiGuideController.kt`, `VibeCrashReporter.kt`, `VibeHttpClient.kt`, `VibeLlmClient.kt`, `VibeDataClient.kt`의 런타임 계약을 제거하거나 바꾸지 않는다.
+- `GeneratedApplication.kt`, `UiGuideController.kt`, `UiGuideHelpTab.kt`, `VibeCrashReporter.kt`, `VibeHttpClient.kt`, `VibeLlmClient.kt`, `VibeDataClient.kt`의 런타임 계약을 제거하거나 바꾸지 않는다.
 - 앱 시작 시 한 번 실행해야 하는 알림 채널 생성, SDK 초기화 같은 앱별 코드는 `GeneratedApplication.kt`가 아니라 `GeneratedAppInitializer.initialize(application)`에 구현한다. 이 파일은 앱별 확장 지점이므로 수정할 수 있다.
 - 앱 이름을 바꿔야 하면 서버가 관리하는 metadata를 임의 변경하지 말고 구현 결과의 `app_name`에 제안값을 기록한다.
 - 런타임 package name은 하드코딩하지 말고 `applicationContext.packageName`을 사용한다.

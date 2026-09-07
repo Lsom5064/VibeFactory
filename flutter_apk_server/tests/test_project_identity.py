@@ -140,6 +140,7 @@ class ProjectIdentityTests(unittest.TestCase):
             "`BuildConfig.VIBE_TASK_ID`",
             "`BuildConfig.VIBE_SERVER_BASE_URL`",
             "`GeneratedAppInitializer.initialize(application)`",
+            "`UiGuideHelpTab.kt`",
             "release signing",
             "`./project/gradlew -p project :app:lintDebug --console=plain`",
             "`assembleRelease`를 직접 실행하지 않는다",
@@ -260,6 +261,9 @@ class ProjectIdentityTests(unittest.TestCase):
             llm_relative = Path(
                 "app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeLlmClient.kt"
             )
+            help_tab_relative = Path(
+                "app/src/main/kotlin/kr/ac/kangwon/hai/generated/UiGuideHelpTab.kt"
+            )
             activity_relative = Path(
                 "app/src/main/kotlin/kr/ac/kangwon/hai/generated/MainActivity.kt"
             )
@@ -267,6 +271,7 @@ class ProjectIdentityTests(unittest.TestCase):
                 "app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedAppInitializer.kt"
             )
             (project_root / llm_relative).write_text("// stale runtime client\n", encoding="utf-8")
+            (project_root / help_tab_relative).unlink()
             activity_text = (project_root / activity_relative).read_text(encoding="utf-8")
             customized_activity = activity_text + "\n// participant UI customization\n"
             (project_root / activity_relative).write_text(customized_activity, encoding="utf-8")
@@ -290,9 +295,14 @@ class ProjectIdentityTests(unittest.TestCase):
             )
 
             self.assertIn(llm_relative.as_posix(), restored)
+            self.assertIn(help_tab_relative.as_posix(), restored)
             self.assertEqual(
                 (BASE_PROJECT / llm_relative).read_bytes(),
                 (project_root / llm_relative).read_bytes(),
+            )
+            self.assertEqual(
+                (BASE_PROJECT / help_tab_relative).read_bytes(),
+                (project_root / help_tab_relative).read_bytes(),
             )
             self.assertEqual(
                 customized_activity,

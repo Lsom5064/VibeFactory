@@ -222,9 +222,13 @@ class MainActivity {
     def test_catalog_prompt_forbids_app_specific_guide_buttons(self) -> None:
         contract = catalog_prompt_contract()
 
-        self.assertIn("공통 플로팅 `사용법` 버튼", contract)
+        self.assertIn(
+            "짧게 누르면 안내가 열리고 길게 누른 뒤 드래그하면 이동하는 공통 가장자리 도움말 탭",
+            contract,
+        )
         self.assertIn("별도 버튼이나 메뉴 항목을 만들지 않는다", contract)
         self.assertIn("앱이 자체 생성한 사용법 버튼·메뉴", contract)
+        self.assertIn("`UiGuideHelpTab.kt`", contract)
         self.assertNotIn("`사용법 다시 보기` 항목을 제공하고", contract)
 
 

@@ -44,12 +44,15 @@ UiGuideController.show(activity, "item_result", itemView)
 UiGuideController.show(activity, "component_summary", summaryView)
 ```
 
-Replay is provided exclusively by the floating control installed by `UiGuideController`.
+Replay is provided exclusively by the movable edge help tab installed by `UiGuideController`.
 
 The guide is an overlay. Never add guide copy to the product layout itself.
-`UiGuideController` supplies the single shared floating replay button. Generated app layouts,
-toolbars, menus, settings, and app-specific Kotlin code must not add another guide/help control
-or call `UiGuideController.replay(activity)` themselves.
+`UiGuideController` and `UiGuideHelpTab` supply one shared icon-only replay control. A tap replays
+the guide, while a long press followed by a drag moves the control. It snaps to an edge, remembers
+portrait and landscape positions separately, avoids interactive controls, and shrinks while
+scrolling or while the keyboard is visible. Generated app layouts, toolbars, menus, settings, and
+app-specific Kotlin code must not add another guide/help control or call
+`UiGuideController.replay(activity)` themselves.
 
 ## Server Validation
 

@@ -26,6 +26,7 @@ PROJECT_ROOT_RUNNER_DIRECTORY_NAMES = {".codex_result", "logs"}
 RUNTIME_CONTRACT_RELATIVE_PATHS = (
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/GeneratedApplication.kt"),
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/UiGuideController.kt"),
+    Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/UiGuideHelpTab.kt"),
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeCrashReporter.kt"),
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeDataClient.kt"),
     Path("app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeHttpClient.kt"),
@@ -275,7 +276,12 @@ class NativeAndroidProjectBuilder:
             "app/src/main/kotlin/kr/ac/kangwon/hai/generated/UiGuideController.kt": (
                 'CATALOG_RESOURCE = "vf_ui_catalog"',
                 "BuildConfig.VERSION_CODE",
-                'contentDescription = "사용법 다시 보기"',
+                "UiGuideHelpTab(",
+            ),
+            "app/src/main/kotlin/kr/ac/kangwon/hai/generated/UiGuideHelpTab.kt": (
+                "class UiGuideHelpTab",
+                'HELP_CONTENT_DESCRIPTION = "사용법 다시 보기"',
+                "WindowInsetsCompat.Type.ime()",
             ),
             "app/src/main/kotlin/kr/ac/kangwon/hai/generated/VibeCrashReporter.kt": (
                 "kr.ac.kangwon.hai.action.CRASH_REPORT",

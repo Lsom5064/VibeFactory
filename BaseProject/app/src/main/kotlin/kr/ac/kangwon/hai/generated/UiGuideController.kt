@@ -96,7 +96,7 @@ object UiGuideController {
         val selected = bestLayout(activity, includeSeen = true) ?: return
         clearProgress(activity, selected)
         show(activity, selected, force = true)
-        state.helpButton?.visibility = View.GONE
+        state.helpTab?.hideTab()
     }
 
     fun show(activity: Activity, layoutName: String) {
@@ -127,11 +127,13 @@ object UiGuideController {
         if (activity.isFinishing || activity.isDestroyed) return
         val state = stateFor(activity)
         if (catalog == null) return
-        installHelpButton(activity, state)
+        installHelpTab(activity, state)
         state.attachLayoutObserver(activity) {
+            state.helpTab?.onHostLayoutChanged()
             val now = SystemClock.uptimeMillis()
-            if (now - state.lastLayoutCheckAt < CHECK_INTERVAL_MS || state.overlay != null) return@attachLayoutObserver
+            if (now - state.lastLayoutCheckAt < CHECK_INTERVAL_MS) return@attachLayoutObserver
             state.lastLayoutCheckAt = now
+            if (state.overlay != null) return@attachLayoutObserver
             bestLayout(activity, includeSeen = false)?.let { show(activity, it, force = false) }
         }
         activity.window.decorView.post {
@@ -142,56 +144,19 @@ object UiGuideController {
     private fun stateFor(activity: Activity): ActivityGuideState =
         activityStates.getOrPut(activity) { ActivityGuideState() }
 
-    private fun installHelpButton(activity: Activity, state: ActivityGuideState) {
-        if (state.helpButton != null) return
+    private fun installHelpTab(activity: Activity, state: ActivityGuideState) {
+        if (state.helpTab != null) return
         if (catalog?.layouts.orEmpty().none { it.isAutomaticFor(activity) }) return
         val content = activity.findViewById<ViewGroup>(android.R.id.content) as? FrameLayout ?: return
-        val button = TextView(activity).apply {
-            text = "사용법"
-            gravity = Gravity.CENTER
-            textSize = 15f
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            contentDescription = "사용법 다시 보기"
-            isClickable = true
-            isFocusable = true
-            minHeight = dp(activity, 48)
-            setPadding(dp(activity, 16), 0, dp(activity, 16), 0)
-            elevation = dp(activity, 6).toFloat()
-            background = GradientDrawable().apply {
-                cornerRadius = dp(activity, 8).toFloat()
-                setColor(Color.rgb(24, 107, 77))
-            }
-            setOnClickListener { replay(activity) }
-        }
-        content.addView(
-            button,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                dp(activity, 48),
-                Gravity.END or Gravity.BOTTOM,
-            ).apply {
-                marginEnd = dp(activity, 16)
-                bottomMargin = dp(activity, 16)
-            },
+        val tab = UiGuideHelpTab(
+            activity = activity,
+            host = content,
+            preferences = preferences(activity),
+            onOpenGuide = { replay(activity) },
         )
-        ViewCompat.setOnApplyWindowInsetsListener(button) { view, insets ->
-            val safe = insets.getInsets(
-                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime(),
-            )
-            (view.layoutParams as? FrameLayout.LayoutParams)?.let { params ->
-                val marginEnd = dp(activity, 16) + safe.right
-                val bottomMargin = dp(activity, 16) + safe.bottom
-                if (params.marginEnd != marginEnd || params.bottomMargin != bottomMargin) {
-                    params.marginEnd = marginEnd
-                    params.bottomMargin = bottomMargin
-                    view.layoutParams = params
-                }
-            }
-            insets
-        }
-        ViewCompat.requestApplyInsets(button)
-        state.helpButton = button
+        content.addView(tab, tab.layoutParams())
+        state.helpTab = tab
+        tab.start()
     }
 
     private fun bestLayout(activity: Activity, includeSeen: Boolean): GuideLayout? {
@@ -263,7 +228,7 @@ object UiGuideController {
         val targets = visibleTargets(targetRoot, layout)
         if (targets.isEmpty()) return
         val startIndex = if (force) 0 else progress(activity, layout).coerceIn(0, targets.lastIndex)
-        state?.helpButton?.visibility = View.GONE
+        state?.helpTab?.hideTab()
         val overlay = GuideOverlay(
             activity = activity,
             layout = layout,
@@ -273,7 +238,7 @@ object UiGuideController {
             onDismiss = {
                 markSeen(activity, layout)
                 state?.overlay = null
-                state?.helpButton?.visibility = View.VISIBLE
+                state?.helpTab?.showTab()
             },
         )
         state?.overlay = overlay
@@ -370,30 +335,39 @@ object UiGuideController {
     }
 
     private class ActivityGuideState {
-        var helpButton: View? = null
+        var helpTab: UiGuideHelpTab? = null
         var overlay: GuideOverlay? = null
         var lastLayoutCheckAt: Long = 0
         private var layoutObserver: ViewTreeObserver.OnGlobalLayoutListener? = null
+        private var scrollObserver: ViewTreeObserver.OnScrollChangedListener? = null
 
         fun attachLayoutObserver(activity: Activity, onLayout: () -> Unit) {
             if (layoutObserver != null) return
             val observer = ViewTreeObserver.OnGlobalLayoutListener(onLayout)
             activity.window.decorView.viewTreeObserver.addOnGlobalLayoutListener(observer)
             layoutObserver = observer
+            val onScroll = ViewTreeObserver.OnScrollChangedListener {
+                if (overlay == null) helpTab?.onHostScrolled()
+            }
+            activity.window.decorView.viewTreeObserver.addOnScrollChangedListener(onScroll)
+            scrollObserver = onScroll
         }
 
         fun detachLayoutObserver(activity: Activity) {
             val observer = layoutObserver ?: return
             if (activity.window.decorView.viewTreeObserver.isAlive) {
                 activity.window.decorView.viewTreeObserver.removeOnGlobalLayoutListener(observer)
+                scrollObserver?.let(activity.window.decorView.viewTreeObserver::removeOnScrollChangedListener)
             }
             layoutObserver = null
+            scrollObserver = null
         }
 
         fun dispose() {
             overlay?.dismiss(markCompleted = false)
             overlay = null
-            helpButton = null
+            helpTab?.dispose()
+            helpTab = null
         }
     }
 
