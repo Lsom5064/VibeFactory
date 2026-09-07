@@ -656,12 +656,18 @@ class MainActivity : AppCompatActivity() {
     private fun restoreCurrentTaskState(trigger: String) {
         if (!hasRequiredPhoneNumber()) return
         val taskId = visibleTaskIdCandidate(pendingTaskSelectionKey)
-            ?: visibleTaskIdCandidate(currentTaskId)
             ?: visibleTaskIdCandidate(screenState.selectedTaskId)
+            ?: visibleTaskIdCandidate(currentTaskId)
             ?: visibleTaskIdCandidate(getLastSelectedTaskId())
         restoreTaskJob?.cancel()
         taskSyncJob?.cancel()
-        val selectionGeneration = advanceTaskSelectionGeneration()
+        val selectionGeneration = if (
+            AsyncTaskUiOwnershipPolicy.targetChangesVisibleTask(taskId, screenState.selectedTaskId)
+        ) {
+            advanceTaskSelectionGeneration()
+        } else {
+            taskSelectionGeneration
+        }
         restoreTaskJob = lifecycleScope.launch {
             if (taskId.isNullOrBlank()) {
                 fetchTaskList(
@@ -1163,8 +1169,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun ensureBackgroundMonitoringForActiveTask() {
         val activeTaskId = screenState.pollingTaskId
-            ?: currentTaskId
             ?: screenState.selectedTaskId
+            ?: currentTaskId
             ?: return
         if (
             screenState.inputMode == InputMode.READ_ONLY ||
@@ -1231,7 +1237,8 @@ class MainActivity : AppCompatActivity() {
         if (displayPrompt.isBlank() && attachments.isEmpty()) return
         val prompt = displayPrompt
         val attachedImagePreview = attachments.toChatImagePreview()
-        val useSavedUi = shouldUseSavedUi(currentTaskId ?: screenState.selectedTaskId)
+        val activeTaskId = visibleTaskIdCandidate(screenState.selectedTaskId)
+        val useSavedUi = shouldUseSavedUi(activeTaskId)
 
         if (isComposerOnNewChatSurface()) {
             clearComposerDraftAfterSubmit()
@@ -1255,7 +1262,7 @@ class MainActivity : AppCompatActivity() {
                 startAppSynthesis(prompt, attachedImagePreview, attachments = attachments, displayPrompt = displayPrompt)
             }
             InputMode.CHAT -> {
-                val taskId = currentTaskId
+                val taskId = activeTaskId
                 if (!taskId.isNullOrBlank()) {
                     clearComposerDraftAfterSubmit()
                     startTaskChatMessage(
@@ -1272,7 +1279,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             InputMode.CONTINUE_CLARIFICATION -> {
-                val taskId = currentTaskId
+                val taskId = activeTaskId
                 if (!taskId.isNullOrBlank()) {
                     clearComposerDraftAfterSubmit()
                     continueClarification(
@@ -1285,7 +1292,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             InputMode.REFINE_EXISTING -> {
-                val taskId = currentTaskId
+                val taskId = activeTaskId
                 if (!taskId.isNullOrBlank()) {
                     clearComposerDraftAfterSubmit()
                     dispatchLatestTaskFeedback(
@@ -1299,7 +1306,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             InputMode.RETRY_FAILED -> {
-                val taskId = currentTaskId
+                val taskId = activeTaskId
                 if (!taskId.isNullOrBlank()) {
                     clearComposerDraftAfterSubmit()
                     dispatchLatestTaskFeedback(
@@ -1313,7 +1320,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             InputMode.READ_ONLY -> {
-                val taskId = currentTaskId ?: screenState.selectedTaskId
+                val taskId = activeTaskId
                 if (!taskId.isNullOrBlank() && isTaskInputQueueActive(taskId)) {
                     clearComposerDraftAfterSubmit()
                     enqueueInputForActiveTask(
@@ -1642,17 +1649,24 @@ class MainActivity : AppCompatActivity() {
         requestAction: String? = null,
         useSavedUi: Boolean = false
     ) {
+        val requestSelectionGeneration = taskSelectionGeneration
         val deviceInfo = collectDeviceInfo()
         val referenceImagePreview = imagePreview ?: attachments.toChatImagePreview()
         val referenceImageName = referenceImagePreview?.displayName
         val referenceImageBase64 = referenceImagePreview?.base64
         val attachmentPayloads = attachments.toPayloads().takeIf { it.isNotEmpty() }
         val visiblePrompt = displayPrompt ?: prompt
-        if (sourceTaskId == null) {
-            appendLocalUserMessage(visiblePrompt, referenceImagePreview, attachments.toChatImagePreviews())
-        }
-        if (sourceTaskId == null) {
-            showThinkingMessage()
+        val initialRequestMessages = if (sourceTaskId == null) {
+            listOf(
+                appendLocalUserMessage(
+                    visiblePrompt,
+                    referenceImagePreview,
+                    attachments.toChatImagePreviews()
+                ),
+                showThinkingMessage()
+            )
+        } else {
+            emptyList()
         }
         lifecycleScope.launch {
             try {
@@ -1680,18 +1694,37 @@ class MainActivity : AppCompatActivity() {
                         use_ui_editor_draft = useSavedUi
                     )
                 )
+                val requestStillOwnsVisibleSurface =
+                    AsyncTaskUiOwnershipPolicy.requestStillOwnsVisibleSurface(
+                        sourceTaskId = sourceTaskId,
+                        selectedTaskId = screenState.selectedTaskId,
+                        requestSelectionGeneration = requestSelectionGeneration,
+                        currentSelectionGeneration = taskSelectionGeneration
+                    )
                 if (sourceTaskId == null) {
-                    moveLocalConversationToTask(response.task_id)
-                    pendingResponseScrollTaskIds += response.task_id
+                    moveInitialRequestConversationToTask(
+                        taskId = response.task_id,
+                        requestMessages = initialRequestMessages,
+                        selectTask = requestStillOwnsVisibleSurface
+                    )
+                    if (requestStillOwnsVisibleSurface) {
+                        pendingResponseScrollTaskIds += response.task_id
+                    }
                 }
+                removeLoadingMessages(response.task_id)
+                val shouldStartBuildWorkflow = shouldStartBuildWorkflow(response)
+                if (!requestStillOwnsVisibleSurface) {
+                    applyInactiveGenerateResponse(response, shouldStartBuildWorkflow)
+                    loadTaskList(autoSelectPendingTask = false)
+                    return@launch
+                }
+
                 currentTaskId = response.task_id
                 if (sourceTaskId != null) {
                     useSavedUiByTask[sourceTaskId] = false
                     uiEditorContextByTask.remove(sourceTaskId)
                     refreshTaskUiEditorContext(response.task_id)
                 }
-                removeLoadingMessages(response.task_id)
-                val shouldStartBuildWorkflow = shouldStartBuildWorkflow(response)
                 applyGenerateDecisionResponse(response)
                 if (shouldStartBuildWorkflow) {
                     startBuildCompletionMonitoring(response.task_id)
@@ -1708,17 +1741,64 @@ class MainActivity : AppCompatActivity() {
                 loadTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
-                setComposerEnabled(true)
-                removeLoadingMessages(sourceTaskId)
                 logApiFailure("/generate", deviceId = deviceId, throwable = e)
-                showLocalSystemMessage(getString(R.string.message_title_log), getString(R.string.generate_failed, userVisibleErrorMessage(e)))
-                screenState = screenState.copy(
-                    currentStatus = getString(R.string.status_error),
-                    statusDetail = getString(R.string.generate_failed, userVisibleErrorMessage(e))
-                )
-                renderState()
+                val requestStillOwnsVisibleSurface =
+                    AsyncTaskUiOwnershipPolicy.requestStillOwnsVisibleSurface(
+                        sourceTaskId = sourceTaskId,
+                        selectedTaskId = screenState.selectedTaskId,
+                        requestSelectionGeneration = requestSelectionGeneration,
+                        currentSelectionGeneration = taskSelectionGeneration
+                    )
+                if (sourceTaskId != null) {
+                    removeLoadingMessages(sourceTaskId)
+                } else if (requestStillOwnsVisibleSurface) {
+                    removeInitialRequestLoadingMessage(initialRequestMessages)
+                }
+                if (requestStillOwnsVisibleSurface) {
+                    setComposerEnabled(true)
+                    val failureMessage = getString(
+                        R.string.generate_failed,
+                        userVisibleErrorMessage(e)
+                    )
+                    showLocalSystemMessage(getString(R.string.message_title_log), failureMessage)
+                    screenState = screenState.copy(
+                        currentStatus = getString(R.string.status_error),
+                        statusDetail = failureMessage
+                    )
+                    renderState()
+                }
             }
         }
+    }
+
+    private fun applyInactiveGenerateResponse(
+        response: BuildResponse,
+        shouldStartBuildWorkflow: Boolean
+    ) {
+        val taskId = response.task_id.trim()
+        if (taskId.isBlank() || taskId in hiddenTaskIds) return
+        val appName = taskDisplayName(response.generated_app_name)
+            ?: taskDisplayName(response.app_name)
+        val statusText = if (shouldStartBuildWorkflow) {
+            buildWorkflowStartStatusText(response)
+        } else {
+            resolveStatusDisplayText(response.status, null, null)
+        }
+        ensureTaskSummaryVisible(
+            taskId = taskId,
+            title = appName
+                ?: response.summary?.trim()?.takeIf { it.isNotBlank() }
+                ?: taskSummaryById[taskId]?.title,
+            appName = appName ?: taskSummaryById[taskId]?.appName,
+            packageName = response.package_name?.trim()?.takeIf { it.isNotBlank() }
+                ?: taskSummaryById[taskId]?.packageName,
+            status = statusText,
+            hasApk = persistedApkUrlForTask(taskId) != null
+        )
+        if (shouldStartBuildWorkflow) {
+            startBuildCompletionMonitoring(taskId)
+        }
+        renderState()
     }
 
     private fun continueClarification(
@@ -1792,6 +1872,9 @@ class MainActivity : AppCompatActivity() {
                 loadTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
+                if (!isTaskSelectionGenerationCurrent(selectionGeneration)) {
+                    return@launch
+                }
                 logApiFailure("/status/{task_id}", taskId = resolvedTaskId, deviceId = deviceId, throwable = e)
                 addTaskEvent(
                     resolvedTaskId,
@@ -1862,6 +1945,9 @@ class MainActivity : AppCompatActivity() {
                 loadTaskList(autoSelectPendingTask = false)
             } catch (e: Exception) {
                 e.rethrowIfCancellation()
+                if (!isTaskSelectionGenerationCurrent(selectionGeneration)) {
+                    return@launch
+                }
                 logApiFailure("/status/{task_id}", taskId = resolvedTaskId, deviceId = deviceId, throwable = e)
                 addTaskEvent(
                     resolvedTaskId,
@@ -2941,8 +3027,10 @@ ${record.stackTrace}
     }
 
     private fun syncArtifactPointersForActiveTask() {
-        val activeTaskId = currentTaskId?.trim().takeUnless { it.isNullOrBlank() }
-            ?: screenState.selectedTaskId?.trim().takeUnless { it.isNullOrBlank() }
+        val activeTaskId = AsyncTaskUiOwnershipPolicy.visibleTaskId(
+            selectedTaskId = screenState.selectedTaskId,
+            currentTaskId = currentTaskId
+        )
         if (activeTaskId.isNullOrBlank() || activeTaskId in hiddenTaskIds) {
             latestApkUrl = null
             latestDownloadedTaskId = null
@@ -3735,7 +3823,10 @@ ${record.stackTrace}
                 setComposerEnabled(true)
             }
             InputMode.READ_ONLY -> {
-                val activeTaskId = currentTaskId ?: screenState.selectedTaskId
+                val activeTaskId = AsyncTaskUiOwnershipPolicy.visibleTaskId(
+                    selectedTaskId = screenState.selectedTaskId,
+                    currentTaskId = currentTaskId
+                )
                 val canQueueInput = activeTaskId?.let(::isTaskInputQueueActive) == true
                 inputModeLabel.text = buildModeLabel(
                     if (canQueueInput) {
@@ -4414,7 +4505,7 @@ ${record.stackTrace}
         message: String,
         imagePreview: ChatImagePreview? = null,
         imagePreviews: List<ChatImagePreview> = emptyList()
-    ) {
+    ): ChatMessage {
         val localUserMessage = ChatMessage(
             id = "local-${System.currentTimeMillis()}",
             kind = MessageKind.USER,
@@ -4429,6 +4520,7 @@ ${record.stackTrace}
         screenState = screenState.copy(messages = localMessages)
         requestScrollLatestAfterResponse(force = true)
         renderState()
+        return localUserMessage
     }
 
     private fun showAttachmentMenu() {
@@ -4657,17 +4749,17 @@ ${record.stackTrace}
         }
     }
 
-    private fun moveLocalConversationToTask(taskId: String) {
+    private fun moveInitialRequestConversationToTask(
+        taskId: String,
+        requestMessages: List<ChatMessage>,
+        selectTask: Boolean
+    ) {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank()) return
-        if (!currentTaskId.isNullOrBlank() || !screenState.selectedTaskId.isNullOrBlank()) return
-
-        val localMessages = screenState.messages
-        if (localMessages.isEmpty()) return
-
-        localMessages.forEach { message ->
+        requestMessages.forEach { message ->
             appendTaskTimelineMessage(normalizedTaskId, message)
         }
+        if (!selectTask) return
         if (pendingInitialChatScrollTaskId == normalizedTaskId) {
             pendingInitialChatScrollTaskId = null
         }
@@ -5014,7 +5106,7 @@ ${record.stackTrace}
     private fun taskHasUserMessageText(taskId: String, body: String): Boolean {
         val normalizedTaskId = taskId.trim()
         val taskMessages = taskConversationMessages[normalizedTaskId].orEmpty()
-        val activeScreenMessages = if (screenState.selectedTaskId == normalizedTaskId || currentTaskId == normalizedTaskId) {
+        val activeScreenMessages = if (screenState.selectedTaskId == normalizedTaskId) {
             screenState.messages
         } else {
             emptyList()
@@ -6150,6 +6242,10 @@ ${record.stackTrace}
         reportKind: String? = null
     ) {
         if (taskId in hiddenTaskIds) return
+        val targetsVisibleTask = TaskStatusUpdatePolicy.targetsVisibleTask(
+            taskId,
+            screenState.selectedTaskId
+        )
         val compactStackTrace = RuntimeErrorStoragePolicy.compactStackTrace(stackTrace)
         val existing = pendingRuntimeErrors[taskId]
         if (existing?.stackTrace == compactStackTrace && existing.awaitingUserConfirmation) {
@@ -6190,9 +6286,30 @@ ${record.stackTrace}
                 body = getString(R.string.runtime_error_analysis_pending)
             )
         )
-        currentTaskId = taskId
-        persistLastSelectedTaskId(taskId)
-        reenterTaskConversation(taskId, scrollToTop = false, scrollToLatest = true)
+        if (targetsVisibleTask) {
+            currentTaskId = taskId
+            persistLastSelectedTaskId(taskId)
+            reenterTaskConversation(taskId, scrollToTop = false, scrollToLatest = true)
+        } else {
+            val taskName = taskSummaryById[taskId]?.appName
+                ?: taskSummaryById[taskId]?.title
+                ?: getString(R.string.untitled_task)
+            ensureTaskSummaryVisible(
+                taskId = taskId,
+                title = taskSummaryById[taskId]?.title ?: taskName,
+                appName = taskSummaryById[taskId]?.appName,
+                packageName = taskSummaryById[taskId]?.packageName ?: packageName,
+                status = getString(R.string.status_warning),
+                hasApk = persistedApkUrlForTask(taskId) != null
+            )
+            BuildNotificationController.showTerminal(
+                context = this,
+                taskId = taskId,
+                taskName = taskName,
+                type = TerminalBuildNotification.ATTENTION
+            )
+            renderState()
+        }
         loadTaskList(autoSelectPendingTask = false)
         requestRuntimeErrorSummary(taskId, packageName, compactStackTrace, errorMessage, reportKind)
     }
@@ -7037,8 +7154,8 @@ ${record.stackTrace}
         )
     }
 
-    private fun showThinkingMessage() {
-        showLocalSystemMessage(
+    private fun showThinkingMessage(): ChatMessage {
+        return showLocalSystemMessage(
             title = getString(R.string.message_title_status),
             body = getString(R.string.status_thinking),
             detail = null,
@@ -7053,7 +7170,7 @@ ${record.stackTrace}
         detail: String? = null,
         kind: MessageKind = MessageKind.STATUS,
         isLoading: Boolean = false
-    ) {
+    ): ChatMessage {
         val message = ChatMessage(
             id = "local-system-${System.currentTimeMillis()}",
             kind = kind,
@@ -7063,16 +7180,33 @@ ${record.stackTrace}
             createdAt = currentTimestampString(),
             isLoading = isLoading
         )
-        val taskId = currentTaskId?.takeIf { it.isNotBlank() }
-            ?: screenState.selectedTaskId?.takeIf { it.isNotBlank() }
+        val taskId = AsyncTaskUiOwnershipPolicy.visibleTaskId(
+            selectedTaskId = screenState.selectedTaskId,
+            currentTaskId = currentTaskId
+        )
         if (!taskId.isNullOrBlank()) {
-            addTaskEvent(taskId, message.copy(id = "local-system-$taskId-${System.currentTimeMillis()}"))
-            return
+            val taskMessage = message.copy(id = "local-system-$taskId-${System.currentTimeMillis()}")
+            addTaskEvent(taskId, taskMessage)
+            return taskMessage
         }
         screenState = screenState.copy(messages = screenState.messages + message)
         if (isLoading) {
             requestScrollLatestAfterResponse(force = true)
         }
+        renderState()
+        return message
+    }
+
+    private fun removeInitialRequestLoadingMessage(requestMessages: List<ChatMessage>) {
+        val loadingMessageIds = requestMessages
+            .asSequence()
+            .filter(ChatMessage::isLoading)
+            .map(ChatMessage::id)
+            .toSet()
+        if (loadingMessageIds.isEmpty()) return
+        val nextMessages = screenState.messages.filterNot { it.id in loadingMessageIds }
+        if (nextMessages.size == screenState.messages.size) return
+        screenState = screenState.copy(messages = nextMessages)
         renderState()
     }
 

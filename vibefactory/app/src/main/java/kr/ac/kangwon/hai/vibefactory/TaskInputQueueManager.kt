@@ -46,7 +46,7 @@ class TaskInputQueueManager(
     fun isQueueActive(taskId: String, state: TaskInputQueueState): Boolean {
         val normalizedTaskId = taskId.trim()
         if (normalizedTaskId.isBlank()) return false
-        if (state.selectedTaskId != normalizedTaskId && state.currentTaskId != normalizedTaskId) return false
+        if (state.selectedTaskId?.trim() != normalizedTaskId) return false
         if (state.pollingTaskId == normalizedTaskId || state.isPollingActive) return true
         if (state.inputMode != InputMode.READ_ONLY) return false
         return isProcessingStatus(state.currentStatus) ||
