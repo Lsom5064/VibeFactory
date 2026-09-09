@@ -34,6 +34,30 @@ BASE_PROJECT = REPOSITORY_ROOT / "BaseProject"
 
 
 class ProjectIdentityTests(unittest.TestCase):
+    def test_runtime_restore_adds_help_entry_to_existing_app_without_replacing_activity(self) -> None:
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir) / "project"
+            native_android_project_builder.copy_project(BASE_PROJECT, project)
+            manifest_path = project / "app/src/main/AndroidManifest.xml"
+            manifest_path.write_text('''<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<!-- participant manifest note --><uses-permission android:name="android.permission.CAMERA"/><application android:name=".GeneratedApplication">
+<activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask"/>
+</application></manifest>''', encoding="utf-8")
+            restored = native_android_project_builder.restore_runtime_contracts(BASE_PROJECT, project)
+            self.assertIn("app/src/main/AndroidManifest.xml", restored)
+            self.assertIn("participant manifest note", manifest_path.read_text(encoding="utf-8"))
+            ns = "{http://schemas.android.com/apk/res/android}"
+            tree = ET.parse(manifest_path)
+            activities = tree.getroot().find("application").findall("activity")
+            self.assertEqual(2, len(activities))
+            self.assertEqual("singleTask", activities[0].get(ns + "launchMode"))
+            self.assertEqual("kr.ac.kangwon.hai.generated.UiGuideRestoreActivity", activities[1].get(ns + "name"))
+            self.assertEqual("true", activities[1].get(ns + "exported"))
+            self.assertEqual("android.permission.CAMERA", tree.getroot().find("uses-permission").get(ns + "name"))
+            self.assertNotIn("app/src/main/AndroidManifest.xml",
+                native_android_project_builder.restore_runtime_contracts(BASE_PROJECT, project))
+
     def test_uvicorn_access_log_filter_removes_query_string(self) -> None:
         record = logging.LogRecord(
             name="uvicorn.access",

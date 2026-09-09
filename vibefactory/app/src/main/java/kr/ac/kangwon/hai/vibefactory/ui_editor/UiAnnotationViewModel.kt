@@ -21,7 +21,13 @@ data class UiAnnotationSession(
     val images: MutableList<UiEditorImage>,
     val history: UiAnnotationHistory,
     var serverDraftId: String?,
-    var serverDraftVersion: Int?
+    var serverDraftVersion: Int?,
+    var pendingAddition: UiAnnotation? = null,
+    var pendingAdditionEditing: Boolean = false,
+    var selectedDeleteTargets: List<UiAnnotationTarget> = emptyList(),
+    var referenceCanvasWidthDp: Float? = null,
+    var referenceCanvasHeightDp: Float? = null,
+    var previewCanvasHeightDp: Float? = null
 ) {
     fun replaceAnnotations(value: List<UiAnnotation>) {
         annotations.clear()
@@ -93,7 +99,9 @@ class UiAnnotationViewModel : ViewModel() {
             images = applicable?.images.orEmpty().toMutableList(),
             history = UiAnnotationHistory(annotations),
             serverDraftId = applicable?.serverDraftId,
-            serverDraftVersion = applicable?.serverDraftVersion
+            serverDraftVersion = applicable?.serverDraftVersion,
+            pendingAddition = applicable?.pendingAddition,
+            pendingAdditionEditing = applicable?.pendingAdditionEditing == true
         ).also {
             session = it
             sessions[sessionKey(taskId, revisionLabel, layout)] = it

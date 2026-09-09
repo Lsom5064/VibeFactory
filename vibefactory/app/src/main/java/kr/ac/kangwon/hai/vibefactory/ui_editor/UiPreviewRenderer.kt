@@ -227,6 +227,8 @@ class UiPreviewRenderer(private val context: Context) {
         previewAndroidValue(node, "alpha")?.toFloatOrNull()?.let { view.alpha = it.coerceIn(0f, 1f) }
         previewAndroidValue(node, "enabled")?.toBooleanStrictOrNull()?.let { view.isEnabled = it }
         previewAndroidValue(node, "selected")?.toBooleanStrictOrNull()?.let { view.isSelected = it }
+        dimensionPx(previewAndroidValue(node, "translationX"))?.let { view.translationX = it.toFloat() }
+        dimensionPx(previewAndroidValue(node, "translationY"))?.let { view.translationY = it.toFloat() }
         applyPadding(view, node)
 
         drawable(previewAndroidValue(node, "background"))?.let { view.background = it }

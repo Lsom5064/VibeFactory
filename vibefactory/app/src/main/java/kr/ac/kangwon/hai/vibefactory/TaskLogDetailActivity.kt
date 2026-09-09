@@ -102,6 +102,15 @@ class TaskLogDetailActivity : AppCompatActivity() {
         bindRevisionSelector(payload, emptyList())
         loadRevisions(payload)
         bindApkAction(payload.apkAction)
+        findViewById<Button>(R.id.btnTaskLogRestoreHelp).setOnClickListener {
+            lifecycleScope.launch {
+                val packageName = payload.packageName?.takeIf(String::isNotBlank)
+                    ?: withContext(Dispatchers.IO) {
+                        downloadedApkFile?.let { ApkArtifactActionHandler.packageNameFromApk(this@TaskLogDetailActivity, it) }
+                    }
+                GeneratedAppHelpLauncher.restore(this@TaskLogDetailActivity, packageName)
+            }
+        }
 
         bindLogSections(payload)
     }

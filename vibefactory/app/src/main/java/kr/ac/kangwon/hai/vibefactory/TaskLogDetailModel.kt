@@ -9,7 +9,8 @@ data class TaskLogDetailPayload(
     val lastUpdated: String,
     val progressItems: List<TaskLogDetailItem>,
     val agentItems: List<TaskLogDetailItem>,
-    val apkAction: TaskLogApkAction?
+    val apkAction: TaskLogApkAction?,
+    val packageName: String? = null
 )
 
 data class TaskLogDetailItem(

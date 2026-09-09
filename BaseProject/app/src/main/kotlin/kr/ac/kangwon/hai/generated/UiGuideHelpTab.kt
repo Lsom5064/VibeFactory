@@ -97,7 +97,6 @@ internal class UiGuideHelpTab(
             imageTintList = ColorStateList.valueOf(Color.WHITE)
             scaleType = ImageView.ScaleType.CENTER_INSIDE
             setPadding(dp(7), dp(7), dp(7), dp(7))
-            elevation = dp(6).toFloat()
             isDuplicateParentStateEnabled = true
             importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
         }

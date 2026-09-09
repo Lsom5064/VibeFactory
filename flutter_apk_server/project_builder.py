@@ -211,6 +211,26 @@ class NativeAndroidProjectBuilder:
             initializer_destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(initializer_source, initializer_destination)
             restored.append(APP_INITIALIZER_RELATIVE_PATH.as_posix())
+        manifest_path = project_root / "app/src/main/AndroidManifest.xml"
+        if manifest_path.is_file():
+            android_ns = "http://schemas.android.com/apk/res/android"
+            ET.register_namespace("android", android_ns)
+            manifest = ET.parse(manifest_path, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+            application = manifest.getroot().find("application")
+            if application is not None:
+                name = "kr.ac.kangwon.hai.generated.UiGuideRestoreActivity"
+                activity = next((item for item in application.findall("activity")
+                                 if item.get(f"{{{android_ns}}}name") in (name, ".UiGuideRestoreActivity")), None)
+                attrs = {"name": name, "exported": "true", "noHistory": "true",
+                         "excludeFromRecents": "true", "theme": "@android:style/Theme.NoDisplay"}
+                if activity is None or any(activity.get(f"{{{android_ns}}}{key}") != value
+                                           for key, value in attrs.items()):
+                    if activity is None:
+                        activity = ET.SubElement(application, "activity")
+                    for key, value in attrs.items():
+                        activity.set(f"{{{android_ns}}}{key}", value)
+                    manifest.write(manifest_path, encoding="utf-8", xml_declaration=True)
+                    restored.append("app/src/main/AndroidManifest.xml")
         return tuple(restored)
 
     def apply_identity(

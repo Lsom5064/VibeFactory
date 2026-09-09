@@ -202,6 +202,16 @@
             </LinearLayout>
         </LinearLayout>
 
+        <Button
+            android:id="@+id/btnTaskLogRestoreHelp"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_button_secondary"
+            android:text="@string/generated_help_restore"
+            android:textAllCaps="false"
+            android:textColor="@color/text_primary" />
+
         <LinearLayout
             android:id="@+id/taskLogSectionsContainer"
             android:layout_width="match_parent"

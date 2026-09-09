@@ -350,6 +350,19 @@ class UiEditorApiTests(unittest.TestCase):
 </vf:ui-annotations>
 '''
 
+    def test_move_reference_canvas_does_not_change_with_preview_scroll_height(self):
+        xml = self.annotation_xml("", action="move").replace('schemaVersion="1"',
+            'schemaVersion="1" referenceCanvasWidthDp="360" referenceCanvasHeightDp="640" previewCanvasHeightDp="820"')
+        parsed = validate_ui_annotation_xml(xml, task_id=self.task_id, revision_label="rev_0001",
+            layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+        self.assertEqual({"x": 270.0, "y": 192.0}, parsed[0]["destination_center_dp"])
+        self.assertEqual(820.0, parsed[0]["coordinate_space"]["preview_canvas_dp"]["height"])
+        for invalid in ("nan", "inf", "0", "100001"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_ui_annotation_xml(xml.replace('referenceCanvasHeightDp="640"',
+                    f'referenceCanvasHeightDp="{invalid}"'), task_id=self.task_id, revision_label="rev_0001",
+                    layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+
     def save_draft(
         self,
         *,
@@ -374,6 +387,65 @@ class UiEditorApiTests(unittest.TestCase):
             params={"device_id": self.device_id, "phone_number": self.phone_number},
             json=payload,
         )
+
+    def addition_xml(self, instruction="누르면 메모를 저장하는 버튼", *, sketch=True):
+        drawing = ('<vf:stroke color="#FF19211D" width="0.009">'
+                   '<vf:point x="0.2" y="0.3"/><vf:point x="0.8" y="0.7"/>'
+                   '</vf:stroke>') if sketch else ''
+        addition = ('<vf:addition left="0.1" top="0.2" right="0.9" bottom="0.7" '
+                    f'backgroundColor="#FFFFFFFF">{drawing}</vf:addition>')
+        return self.annotation_xml(instruction, action="add").replace(
+            '<vf:instruction>', addition + '<vf:instruction>')
+
+    def test_addition_saves_sketch_without_changing_original_or_starting_build(self):
+        xml = self.addition_xml()
+        parsed = validate_ui_annotation_xml(xml, task_id=self.task_id, revision_label="rev_0001",
+            layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+        self.assertIsNone(parsed[0]["destination_point"])
+        self.assertEqual(2, len(parsed[0]["addition"]["strokes"][0]["points"]))
+        self.assertEqual([], parsed[0]["addition"]["replace_targets"])
+        response = self.save_draft(annotation_xml=xml)
+        self.assertEqual(200, response.status_code, response.text)
+        confirmed = self.confirm_draft(response.json())
+        self.assertEqual(200, confirmed.status_code, confirmed.text)
+        self.assertEqual("Success", self.db.get_task(self.task_id)["status"])
+        self.assertEqual(LAYOUT_XML, (self.project / "app/src/main/res/layout/activity_main.xml").read_text())
+
+    def test_addition_accepts_description_only_and_sketch_only(self):
+        for xml in (self.addition_xml(sketch=False), self.addition_xml(instruction="")):
+            parsed = validate_ui_annotation_xml(xml, task_id=self.task_id, revision_label="rev_0001",
+                layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+            self.assertEqual("add", parsed[0]["action"])
+
+    def test_addition_rejects_empty_or_invalid_region(self):
+        for xml in (self.addition_xml(instruction="", sketch=False),
+                    self.addition_xml().replace('right="0.9"', 'right="0.1"'),
+                    self.addition_xml().replace('x="0.2"', 'x="NaN"'),
+                    self.addition_xml().replace('action="add"', 'action="behavior"')):
+            with self.subTest(xml=xml):
+                response = self.save_draft(annotation_xml=xml)
+                self.assertEqual(400, response.status_code, response.text)
+
+    def test_addition_preserves_explicit_replacement_target(self):
+        xml = self.addition_xml().replace('</vf:addition>',
+            '<vf:replace-target stableId="id:title" resourceId="@+id/title" hierarchyPath="0.0" '
+            'className="TextView" left="0.1" top="0.2" right="0.6" bottom="0.3" />'
+            '</vf:addition>')
+        parsed = validate_ui_annotation_xml(xml, task_id=self.task_id, revision_label="rev_0001",
+            layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+        self.assertEqual("id:title", parsed[0]["addition"]["replace_targets"][0]["stableId"])
+
+    def test_addition_converts_reference_canvas_to_region_dimensions(self):
+        xml = self.addition_xml().replace('backgroundColor="#FFFFFFFF"',
+            'backgroundColor="#FFFFFFFF" canvasWidthDp="360" canvasHeightDp="640"')
+        parsed = validate_ui_annotation_xml(xml, task_id=self.task_id, revision_label="rev_0001",
+            layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+        for key, expected in {"left": 36.0, "top": 128.0, "width": 288.0, "height": 320.0}.items():
+            self.assertAlmostEqual(expected, parsed[0]["addition"]["region_dp"][key])
+        for invalid in (xml.replace('canvasWidthDp="360"', 'canvasWidthDp="NaN"'),
+                        xml.replace('canvasHeightDp="640"', '')):
+            response = self.save_draft(annotation_xml=invalid)
+            self.assertEqual(400, response.status_code, response.text)
 
     def confirm_draft(self, draft: dict[str, object]):
         return self.client.post(
@@ -653,8 +725,18 @@ class UiEditorApiTests(unittest.TestCase):
         self.assertIsNone(changed.json()["confirmed_at"])
 
     def test_checked_chat_request_attaches_confirmed_ui_to_normal_revision(self) -> None:
+        self.assert_checked_chat_request(self.annotation_xml("채팅에서 반영할 제목으로 변경"))
+
+    def test_checked_chat_addition_attaches_sketch_and_generation_rules(self) -> None:
+        self.assert_checked_chat_request(self.addition_xml("채팅에서 반영할 제목으로 변경"))
+        prompt = (self.workspace / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn('action="add"', prompt)
+        self.assertIn('<vf:stroke', prompt)
+        self.assertIn('addition.replace_targets', prompt)
+
+    def assert_checked_chat_request(self, annotation_xml: str) -> None:
         draft = self.save_draft(
-            annotation_xml=self.annotation_xml("채팅에서 반영할 제목으로 변경")
+            annotation_xml=annotation_xml
         ).json()
         confirmed = self.confirm_draft(draft)
         self.assertEqual(200, confirmed.status_code, confirmed.text)

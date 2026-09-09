@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import difflib
 import json
+import math
 import mimetypes
 import re
 import xml.etree.ElementTree as ElementTree
@@ -43,7 +44,7 @@ ALLOWED_BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
 UI_ANNOTATION_NAMESPACE = "urn:vibefactory:ui-annotations"
 UI_ANNOTATION_SCHEMA_VERSION = "1"
-UI_ANNOTATION_ACTIONS = {"delete", "move", "behavior"}
+UI_ANNOTATION_ACTIONS = {"delete", "move", "behavior", "add"}
 MAX_UI_ANNOTATIONS = 500
 MAX_UI_ANNOTATION_IMAGES = 5
 
@@ -456,12 +457,29 @@ def validate_ui_annotation_xml(
         if root.attrib.get(key) != expected:
             raise UiEditorInputError(f"UI annotation {key} does not match its revision")
 
+    coordinate_space = None
+    if any(key in root.attrib for key in ("referenceCanvasWidthDp", "referenceCanvasHeightDp", "previewCanvasHeightDp")):
+        try:
+            width_dp = float(root.attrib["referenceCanvasWidthDp"])
+            height_dp = float(root.attrib["referenceCanvasHeightDp"])
+            preview_height_dp = float(root.attrib.get("previewCanvasHeightDp", height_dp))
+        except (KeyError, ValueError) as exc:
+            raise UiEditorInputError("invalid UI annotation reference canvas") from exc
+        if any(not math.isfinite(value) or not 1 <= value <= 100_000
+               for value in (width_dp, height_dp, preview_height_dp)) or preview_height_dp < height_dp:
+            raise UiEditorInputError("invalid UI annotation reference canvas")
+        coordinate_space = {
+            "reference_canvas_dp": {"width": width_dp, "height": height_dp},
+            "preview_canvas_dp": {"width": width_dp, "height": preview_height_dp},
+        }
+
     annotation_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}annotation"
     target_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}target"
     destination_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}destination"
     point_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}destination-point"
     instruction_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}instruction"
     image_ref_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}image-ref"
+    addition_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}addition"
     parsed: list[dict[str, Any]] = []
     annotation_ids: set[str] = set()
     children = list(root)
@@ -482,6 +500,7 @@ def validate_ui_annotation_xml(
         points = [child for child in annotation if child.tag == point_tag]
         instructions = [child for child in annotation if child.tag == instruction_tag]
         image_refs = [child for child in annotation if child.tag == image_ref_tag]
+        additions = [child for child in annotation if child.tag == addition_tag]
         if len(targets) != 1 or len(destinations) > 1 or len(points) > 1 or len(instructions) != 1:
             raise UiEditorInputError("invalid UI annotation structure")
         if len(image_refs) > MAX_UI_ANNOTATION_IMAGES:
@@ -493,7 +512,7 @@ def validate_ui_annotation_xml(
             raise UiEditorInputError("invalid UI annotation image reference")
         if len(set(image_ids)) != len(image_ids):
             raise UiEditorInputError("duplicate UI annotation image reference")
-        allowed_children = {target_tag, destination_tag, point_tag, instruction_tag, image_ref_tag}
+        allowed_children = {target_tag, destination_tag, point_tag, instruction_tag, image_ref_tag, addition_tag}
         if any(child.tag not in allowed_children for child in annotation):
             raise UiEditorInputError("unexpected UI annotation child")
         if action == "move" and not destinations and not points:
@@ -505,6 +524,8 @@ def validate_ui_annotation_xml(
             raise UiEditorFileTooLargeError("UI annotation instruction is too large")
         if action == "behavior" and not instruction.strip():
             raise UiEditorInputError("behavior annotation requires an instruction")
+        if (action == "add" and len(additions) != 1) or (action != "add" and additions):
+            raise UiEditorInputError("only add annotations require an addition region")
 
         def target_payload(element: ElementTree.Element) -> dict[str, Any]:
             fields = {
@@ -529,6 +550,79 @@ def validate_ui_annotation_xml(
                 raise UiEditorInputError("invalid UI annotation bounds")
             return {**fields, "bounds": coordinates}
 
+        addition_payload: Optional[dict[str, Any]] = None
+        if additions:
+            addition = additions[0]
+
+            def unit_value(element: ElementTree.Element, key: str) -> float:
+                try:
+                    value = float(element.attrib[key])
+                except (KeyError, ValueError) as exc:
+                    raise UiEditorInputError("invalid addition coordinate") from exc
+                if not 0.0 <= value <= 1.0:
+                    raise UiEditorInputError("addition coordinate is outside the region")
+                return value
+
+            def sketch_color(element: ElementTree.Element, key: str) -> str:
+                value = element.attrib.get(key, "")
+                if not re.fullmatch(r"#[0-9A-Fa-f]{8}", value):
+                    raise UiEditorInputError("invalid addition color")
+                return value.upper()
+
+            bounds = {key: unit_value(addition, key) for key in ("left", "top", "right", "bottom")}
+            if bounds["left"] >= bounds["right"] or bounds["top"] >= bounds["bottom"]:
+                raise UiEditorInputError("addition region must have positive size")
+            strokes: list[dict[str, Any]] = []
+            replace_targets: list[dict[str, Any]] = []
+            point_count = 0
+            for child in addition:
+                if child.tag == f"{{{UI_ANNOTATION_NAMESPACE}}}replace-target":
+                    replace_targets.append(target_payload(child))
+                    if len(replace_targets) > 100:
+                        raise UiEditorFileTooLargeError("too many replacement targets")
+                elif child.tag == f"{{{UI_ANNOTATION_NAMESPACE}}}stroke":
+                    if len(strokes) >= 256:
+                        raise UiEditorFileTooLargeError("too many sketch strokes")
+                    width = unit_value(child, "width")
+                    if not 0.0 < width <= 0.08:
+                        raise UiEditorInputError("invalid sketch stroke width")
+                    stroke_points = []
+                    for point in child:
+                        if point.tag != f"{{{UI_ANNOTATION_NAMESPACE}}}point":
+                            raise UiEditorInputError("unexpected sketch element")
+                        stroke_points.append({key: unit_value(point, key) for key in ("x", "y")})
+                        point_count += 1
+                        if point_count > 8192:
+                            raise UiEditorFileTooLargeError("too many sketch points")
+                    if not stroke_points:
+                        raise UiEditorInputError("sketch stroke requires points")
+                    strokes.append({"color": sketch_color(child, "color"), "width": width, "points": stroke_points})
+                else:
+                    raise UiEditorInputError("unexpected addition element")
+            if len({target["stableId"] for target in replace_targets}) != len(replace_targets):
+                raise UiEditorInputError("duplicate replacement target")
+            if not instruction.strip() and not strokes:
+                raise UiEditorInputError("add annotation requires a sketch or an instruction")
+            addition_payload = {
+                "bounds": bounds, "background_color": sketch_color(addition, "backgroundColor"),
+                "strokes": strokes, "replace_targets": replace_targets,
+            }
+            if "canvasWidthDp" in addition.attrib or "canvasHeightDp" in addition.attrib:
+                try:
+                    canvas_dp = {key: float(addition.attrib[attr]) for key, attr in
+                                 (("width", "canvasWidthDp"), ("height", "canvasHeightDp"))}
+                except (KeyError, ValueError) as exc:
+                    raise UiEditorInputError("invalid addition reference canvas size") from exc
+                if any(not math.isfinite(value) or not 0 < value <= 100000 for value in canvas_dp.values()):
+                    raise UiEditorInputError("invalid addition reference canvas size")
+                addition_payload["reference_canvas_dp"] = canvas_dp
+                addition_payload["region_dp"] = {
+                    "left": bounds["left"] * canvas_dp["width"],
+                    "top": bounds["top"] * canvas_dp["height"],
+                    "width": (bounds["right"] - bounds["left"]) * canvas_dp["width"],
+                    "height": (bounds["bottom"] - bounds["top"]) * canvas_dp["height"],
+                }
+
         destination_point: Optional[dict[str, float]] = None
         if points:
             try:
@@ -547,6 +641,11 @@ def validate_ui_annotation_xml(
                 "destination_point": destination_point,
                 "instruction": instruction,
                 "image_ids": image_ids,
+                **({"coordinate_space": coordinate_space} if coordinate_space is not None else {}),
+                **({"destination_center_dp": {"x": destination_point["x"] * width_dp,
+                                              "y": destination_point["y"] * height_dp}}
+                   if coordinate_space is not None and destination_point is not None else {}),
+                **({"addition": addition_payload} if addition_payload is not None else {}),
             }
         )
     return parsed
@@ -676,6 +775,18 @@ def collect_ui_editor_source_context(project_root: Path) -> list[dict[str, str]]
     return context
 
 
+def describe_addition_regions(annotations: list[dict[str, Any]]) -> str:
+    lines = []
+    for index, annotation in enumerate(annotations, start=1):
+        addition = annotation.get("addition") or {}
+        region = addition.get("region_dp")
+        if annotation.get("action") != "add" or not isinstance(region, dict):
+            continue
+        dimensions = ", ".join(f"{key}={region[key]:.1f}dp" for key in ("left", "top", "width", "height"))
+        lines.append(f"- 추가 표시 {index}의 새 UI 묶음 외곽: {dimensions}. 원본 미리보기 기준이며 부모 전체 크기로 확대하지 않는다.")
+    return "\n".join(lines)
+
+
 def build_ui_editor_codex_prompt(
     *,
     task_id: str,
@@ -710,13 +821,19 @@ def build_ui_editor_codex_prompt(
 - 대상 layout: `app/src/main/res/{configuration}/{layout_name}.xml`
 - 앱 이름: `{app_name}`
 - package name: `{package_name}`
-- 원본 XML은 사용자가 수정한 결과물이 아니다. 주석 전용 XML의 `delete`, `move`, `behavior` 표시와 사용자 설명을 변경 의도의 최우선 기준으로 사용한다.
+- 원본 XML은 사용자가 수정한 결과물이 아니다. 주석 전용 XML의 `delete`, `move`, `behavior`, `add` 표시와 사용자 설명을 변경 의도의 최우선 기준으로 사용한다.
 - 대상은 View ID만으로 판단하지 않는다. `stableId`, `resourceId`, `hierarchyPath`, View class, 표시 텍스트, 정규화 좌표, 앞뒤 형제 정보를 함께 사용한다.
 - `delete`는 대상을 제거하고 관련 Kotlin/Java 참조와 이벤트를 안전하게 정리한다.
 - `move`의 `destination_point`는 사용자가 화살표 끝을 놓은 정확한 정규화 좌표이며 이동 위치의 최우선 기준이다.
+- coordinate_space가 있으면 정규화 좌표의 기준은 reference_canvas_dp다. 주변 UI가 밀려나 전체 스크린샷 높이(preview_canvas_dp)가 커져도 기준 높이를 바꾸지 않는다. destination_center_dp는 같은 목적지의 dp 중심 좌표다.
+- 이동 미리보기의 파란 실선 원본은 고정되어 있고, 파란 점선 영역은 대상 크기만큼 공간을 확보해 주변 UI를 밀어낸 상태다. 최종 앱에서는 선택 대상을 목적지로 이동하고 원본을 중복 생성하지 않는다. 주변 UI와 기능을 보존하며 겹치지 않게 배치한다.
 - 이동 후 대상 View의 중심이 `destination_point`와 일치하도록 배치한다. `destination` View 정보는 주변 구조와 제약을 파악하기 위한 참고일 뿐이며, 그 View의 중심으로 좌표를 바꾸지 않는다.
 - 절대 좌표에 고정하지 말고 ConstraintLayout 제약, 형제 순서, margin 등을 사용해 표시된 위치와 방향을 다양한 화면 크기에서도 최대한 유지한다.
 - `behavior`는 UI 모양만 바꾸지 말고 설명에 적힌 실제 동작과 상태 처리를 구현한다.
+- `add`는 초록색 추가 영역에 새 UI를 구현한다. target은 기존 부모·주변 구조를 찾는 기준이며, 추가 위치와 크기는 addition.bounds를 사용한다. 스케치의 좌표는 추가 영역 내부 기준이다.
+- addition.region_dp가 있으면 해당 미리보기 기준 위치·폭·높이를 새 UI 묶음의 외곽으로 사용한다. 부모의 빈 공간 전체로 확대하지 않는다. 스케치 이미지의 종횡비, 각 도형의 상대 크기·순서·간격을 보존하고 최종 제약·margin을 이 영역에 맞춘다. 터치 영역 확보에 필요한 최소 확장만 허용한다.
+- 추가 스케치와 설명을 실제 Android Views/XML 및 Kotlin 동작으로 구현한다. 스케치·원본 화면을 통째로 이미지로 붙이지 않는다. 펜 색이나 가림용 배경색을 최종 디자인 색으로 강제하지 않는다.
+- addition.replace_targets가 비어 있으면 기존 UI와 기능을 유지하며 추가 공간을 마련한다. 배경색으로 덮인 것은 그리기용 표시이며 삭제 지시가 아니다. 교체 대상이 명시된 경우에만 해당 요소를 교체하고 관련 참조를 갱신한다.
 - 사용자가 요구하지 않은 재디자인을 하지 않는다.
 - 기준 Revision은 수정하지 않는다. 현재 `project` 디렉터리만 수정한다.
 - 기존 View ID와 Kotlin 동작, package name, Task ID, 런타임 LLM·데이터 API·오류 보고 계약을 유지한다.
@@ -725,6 +842,8 @@ def build_ui_editor_codex_prompt(
 - 주석이 모호하거나 서로 충돌하면 사용자 설명을 우선하고, 임의로 기능을 제거하지 않는다.
 - 변경을 마치면 XML parse/resource linking, Kotlin compile, lint와 release APK build가 통과해야 한다.
 - 결과와 제한을 `.codex_result/task_result.json`에 전문 기록한다.
+
+{describe_addition_regions(annotations)}
 
 ### 변경 전 XML 전문
 
@@ -801,6 +920,8 @@ def build_ui_editor_chat_context(
         sections.append(
             f"""### 저장된 UI 변경 표시 {index}: `app/src/main/res/{draft.get('configuration') or 'layout'}/{draft.get('layout_name') or ''}.xml`
 
+{describe_addition_regions(annotations)}
+
 #### 원본 XML 전문
 
 ```xml
@@ -854,12 +975,15 @@ def build_ui_editor_chat_context(
 - 작업 Revision: `{generated_revision_label}`
 - 최신 채팅 요청: {user_prompt.strip()}
 - 원본 XML을 직접 편집한 결과로 취급하지 말고, 주석 XML과 스크린샷을 해석해 실제 앱 코드에 반영한다.
-- delete는 빨강, move는 파랑, behavior는 보라 표시이며 대상 식별 정보와 사용자 설명을 모두 사용한다.
+- delete는 빨강, move는 파랑, behavior는 보라, add는 초록 표시이며 대상 식별 정보와 사용자 설명을 모두 사용한다.
+- add의 target은 기존 부모·주변 UI이며 실제 추가 위치·크기는 addition.bounds다. 스케치 좌표는 추가 영역 내부 기준이다. 스케치와 설명을 실제 Views/XML과 Kotlin 동작으로 구현하고 스케치 이미지를 통째로 UI에 붙이지 않는다.
+- addition.region_dp는 미리보기 기준 새 UI 묶음의 외곽 위치·폭·높이다. 부모의 빈 공간 전체로 확대하지 말고 해당 영역 안에 스케치의 종횡비와 도형별 상대 크기·순서·간격을 맞춘다. 터치 영역에 필요한 최소 크기만 조정하며, 부모의 기존 여백은 유지할 수 있다.
+- add의 배경색 덮기는 그리기용 표시다. addition.replace_targets가 비어 있으면 기존 요소를 유지하며 공간을 마련하고, 명시된 교체 대상만 교체한다. 스케치 펜·배경색을 최종 디자인에 강제하지 않는다.
 - move의 `destination_point`는 사용자가 지정한 화살표 끝의 정확한 이동 위치다. 대상 View의 중심을 이 좌표에 맞추고, 함께 기록된 `destination` View의 중심으로 대체하지 않는다.
 - 이동 결과는 고정 픽셀 좌표 대신 제약, 형제 순서와 margin으로 표현해 화면 크기가 바뀌어도 사용자가 지정한 방향과 상대 위치를 유지한다.
 - 최신 채팅 요청은 기능과 세부 동작을 설명하며, 명시적으로 충돌하는 경우 최신 채팅 요청을 우선한다.
 - 기존 View ID, Kotlin 동작, package name, Task ID, 런타임 API와 오류 보고 계약을 유지한다.
-- 삭제·이동·동작 변경에 맞춰 XML, Kotlin/Java 참조와 이벤트 처리를 함께 수정한다.
+- 삭제·이동·동작 변경·추가에 맞춰 XML, Kotlin/Java 참조와 이벤트 처리를 함께 수정한다. 추가된 화면 요소를 사용설명서 카탈로그에도 반영한다.
 - 이 섹션이 없는 후속 요청에서는 저장 UI 초안을 새 입력으로 간주하지 않는다.
 
 {chr(10).join(sections)}

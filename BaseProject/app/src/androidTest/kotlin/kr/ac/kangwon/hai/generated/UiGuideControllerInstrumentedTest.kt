@@ -47,6 +47,29 @@ class UiGuideControllerInstrumentedTest {
     }
 
     @Test
+    fun hidingHelpSurvivesRecreationAndRestoresFromExplicitEntryPoint() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            assertDisplayedWithin(withText("도움말 버튼 숨기기"), 2_000L)
+            onView(withText("도움말 버튼 숨기기")).perform(click())
+            assertTrue(context.getSharedPreferences("vibe_ui_guide", Context.MODE_PRIVATE)
+                .getBoolean("help_button_hidden", false))
+            scenario.recreate()
+            scenario.onActivity { activity ->
+                assertFalse(activity.window.decorView.findViewWithContentDescription("사용법 다시 보기").isShown)
+            }
+        }
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                assertFalse(activity.window.decorView.findViewWithContentDescription("사용법 다시 보기").isShown)
+                activity.startActivity(android.content.Intent(activity, UiGuideRestoreActivity::class.java))
+            }
+            assertDisplayedWithin(withContentDescription("사용법 다시 보기"), 2_000L)
+            assertFalse(context.getSharedPreferences("vibe_ui_guide", Context.MODE_PRIVATE)
+                .getBoolean("help_button_hidden", true))
+        }
+    }
+
+    @Test
     fun firstRunRotationCompletionAndReplayFollowGuideContract() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             onView(withText("앱 제목")).check(matches(isDisplayed()))

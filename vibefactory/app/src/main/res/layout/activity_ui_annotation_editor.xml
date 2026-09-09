@@ -87,7 +87,7 @@
                 android:paddingStart="8dp"
                 android:paddingTop="8dp"
                 android:paddingEnd="8dp"
-                android:paddingBottom="92dp">
+                android:paddingBottom="8dp">
 
                 <ScrollView
                     android:id="@+id/uiAnnotationVerticalViewport"
@@ -166,6 +166,22 @@
                     android:textColor="@color/text_primary"
                     android:textSize="12sp" />
 
+                <Button
+                    android:id="@+id/btnUiAnnotationDeleteSelected"
+                    android:layout_width="wrap_content"
+                    android:layout_height="40dp"
+                    android:text="@string/ui_annotation_delete_selected"
+                    android:textAllCaps="false"
+                    android:textSize="12sp"
+                    android:visibility="gone" />
+
+                <Button
+                    android:id="@+id/btnUiAnnotationDraw"
+                    android:layout_width="wrap_content"
+                    android:layout_height="40dp"
+                    android:text="@string/ui_annotation_draw"
+                    android:visibility="gone" />
+
                 <ImageButton
                     android:id="@+id/btnCancelUiAnnotationAction"
                     android:layout_width="40dp"
@@ -229,6 +245,14 @@
                         android:background="?attr/selectableItemBackgroundBorderless"
                         android:contentDescription="@string/ui_annotation_behavior_tool"
                         android:src="@drawable/ic_annotation_behavior" />
+
+                    <ImageButton
+                        android:id="@+id/btnUiAnnotationAddTool"
+                        android:layout_width="44dp"
+                        android:layout_height="48dp"
+                        android:background="?attr/selectableItemBackgroundBorderless"
+                        android:contentDescription="@string/ui_annotation_add_tool"
+                        android:src="@drawable/ic_annotation_add" />
 
                     <View
                         android:layout_width="1dp"

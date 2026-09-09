@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <item name="uiAdditionSketchCanvas" type="id" />
+    <item name="uiAdditionInstruction" type="id" />
     <item name="recyclerTasks" type="id" />
 </resources>

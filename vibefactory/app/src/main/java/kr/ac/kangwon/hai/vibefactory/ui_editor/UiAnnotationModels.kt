@@ -7,7 +7,8 @@ import java.util.UUID
 enum class UiAnnotationAction(val wireName: String) {
     DELETE("delete"),
     MOVE("move"),
-    BEHAVIOR("behavior");
+    BEHAVIOR("behavior"),
+    ADD("add");
 
     companion object {
         fun fromWireName(value: String): UiAnnotationAction? = entries.firstOrNull { it.wireName == value }
@@ -55,7 +56,8 @@ data class UiAnnotation(
     val destinationY: Float? = null,
     val instruction: String = "",
     val imageIds: List<String> = emptyList(),
-    val createdAt: String = Instant.now().toString()
+    val createdAt: String = Instant.now().toString(),
+    val addition: UiAdditionSpec? = null
 )
 
 internal fun UiAnnotation.resolvedDestinationPoint(): Pair<Float, Float> {
@@ -114,7 +116,10 @@ object UiAnnotationXmlCodec {
         layoutName: String,
         configuration: String,
         baseXmlSha256: String,
-        annotations: List<UiAnnotation>
+        annotations: List<UiAnnotation>,
+        referenceCanvasWidthDp: Float? = null,
+        referenceCanvasHeightDp: Float? = null,
+        previewCanvasHeightDp: Float? = null
     ): String = buildString {
         append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n")
         append("<vf:ui-annotations xmlns:vf=\"").append(NAMESPACE).append("\"")
@@ -124,6 +129,11 @@ object UiAnnotationXmlCodec {
         attribute("layoutName", layoutName)
         attribute("configuration", configuration)
         attribute("baseXmlSha256", baseXmlSha256)
+        if (referenceCanvasWidthDp != null && referenceCanvasHeightDp != null) {
+            attribute("referenceCanvasWidthDp", canvasDimension(referenceCanvasWidthDp))
+            attribute("referenceCanvasHeightDp", canvasDimension(referenceCanvasHeightDp))
+            previewCanvasHeightDp?.let { attribute("previewCanvasHeightDp", canvasDimension(it)) }
+        }
         append(">\n")
         annotations.forEach { annotation ->
             append("  <vf:annotation")
@@ -132,6 +142,11 @@ object UiAnnotationXmlCodec {
             attribute("createdAt", annotation.createdAt)
             append(">\n")
             appendTarget("target", annotation.target, "    ")
+            annotation.addition?.let { spec ->
+                append(UiAdditionXmlCodec.encode(spec) { name, target ->
+                    buildString { appendTarget(name, target, "      ") }
+                })
+            }
             annotation.destination?.let { appendTarget("destination", it, "    ") }
             if (annotation.destinationX != null && annotation.destinationY != null) {
                 append("    <vf:destination-point")
@@ -189,7 +204,9 @@ object UiAnnotationXmlCodec {
                             .filter { it.localName == "image-ref" && it.namespaceURI == NAMESPACE }
                             .mapNotNull { image -> image.getAttribute("id").takeIf(String::isNotBlank) }
                             .distinct(),
-                        createdAt = element.getAttribute("createdAt").ifBlank { Instant.EPOCH.toString() }
+                        createdAt = element.getAttribute("createdAt").ifBlank { Instant.EPOCH.toString() },
+                        addition = element.childElements().firstOrNull { it.localName == "addition" }
+                            ?.let { UiAdditionXmlCodec.decode(it, ::readTarget) }
                     )
                 )
             }
@@ -240,6 +257,11 @@ object UiAnnotationXmlCodec {
     }
 
     private fun decimal(value: Float): String = "%.6f".format(java.util.Locale.US, value.coerceIn(0f, 1f))
+
+    private fun canvasDimension(value: Float): String {
+        require(value.isFinite() && value in 1f..100000f) { "Invalid annotation reference canvas size" }
+        return "%.6f".format(java.util.Locale.US, value)
+    }
 
     private fun escapeAttribute(value: String): String = escapeText(value)
         .replace("\"", "&quot;")

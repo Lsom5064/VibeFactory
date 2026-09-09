@@ -121,7 +121,8 @@ internal object TaskLogDetailFormatter {
             lastUpdated = lastUpdated,
             progressItems = progressItems,
             agentItems = agentItems,
-            apkAction = latestApkAction(messages, summary, taskId, appName)
+            apkAction = latestApkAction(messages, summary, taskId, appName),
+            packageName = summary?.packageName
         )
     }
 

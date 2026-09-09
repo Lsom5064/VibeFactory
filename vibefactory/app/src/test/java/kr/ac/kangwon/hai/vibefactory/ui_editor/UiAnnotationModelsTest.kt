@@ -133,4 +133,36 @@ class UiAnnotationModelsTest {
     fun `decoder rejects non annotation XML`() {
         UiAnnotationXmlCodec.decode("<LinearLayout />")
     }
+
+    @Test
+    fun `addition round trips geometry strokes replacements and escaped explanation`() {
+        val addition = UiAnnotation(action = UiAnnotationAction.ADD, target = target,
+            instruction = "메모 <입력> & 저장", imageIds = listOf("sketch_1"),
+            addition = UiAdditionSpec(UiNormalizedRect(0.12345678f, 0.3f, 0.9f, 0.8f), -1,
+                listOf(UiSketchStroke(listOf(UiSketchPoint(0.12345678f, 0.1f), UiSketchPoint(0.8f, 0.9f)), -16777216)),
+                listOf(target), referenceCanvasWidthDp = 360f, referenceCanvasHeightDp = 640f))
+        val encoded = UiAnnotationXmlCodec.encode("task_1", "rev_0001", "activity_main", "layout", "a".repeat(64), listOf(addition))
+        assertEquals(listOf(addition), UiAnnotationXmlCodec.decode(encoded))
+        val history = UiAnnotationHistory(listOf(addition))
+        history.record(emptyList())
+        assertEquals(listOf(addition), history.undo())
+        assertEquals(emptyList<UiAnnotation>(), history.redo())
+    }
+
+    @Test
+    fun `moving addition against edge keeps its size`() {
+        val bounds = UiAdditionGeometry.at(0.95f, 0.95f, 0.6f, 0.3f)
+        val moved = UiAdditionGeometry.translate(bounds, -2f, 3f)
+        assertEquals(0f, moved.left, 0.00001f)
+        assertEquals(1f, moved.bottom, 0.00001f)
+        assertEquals(0.6f, moved.right - moved.left, 0.00001f)
+        assertEquals(0.3f, moved.bottom - moved.top, 0.00001f)
+    }
+
+    @Test
+    fun `eraser hits between sparse touch samples and ignores distant strokes`() {
+        val stroke = UiSketchStroke(listOf(UiSketchPoint(.1f, .1f), UiSketchPoint(.9f, .9f)), -1)
+        assertTrue(UiAdditionGeometry.isNearStroke(stroke, UiSketchPoint(.5f, .5f)))
+        assertFalse(UiAdditionGeometry.isNearStroke(stroke, UiSketchPoint(.5f, .8f)))
+    }
 }

@@ -22,7 +22,9 @@ data class UiAnnotationDraftRecord(
     val updatedAt: String,
     val serverDraftId: String? = null,
     val serverDraftVersion: Int? = null,
-    val confirmed: Boolean = false
+    val confirmed: Boolean = false,
+    val pendingAddition: UiAnnotation? = null,
+    val pendingAdditionEditing: Boolean = false
 )
 
 class UiAnnotationDraftStore(context: Context, private val gson: Gson) {
@@ -116,6 +118,30 @@ class UiAnnotationDraftStore(context: Context, private val gson: Gson) {
         )
     }
 
+    /** Call on Dispatchers.IO: raster rendering, compression and file writes stay off the UI thread. */
+    fun persistSketch(session: UiAnnotationSession, annotation: UiAnnotation, aspectRatio: Float): UiEditorImage {
+        val spec = requireNotNull(annotation.addition)
+        val ratio = aspectRatio.coerceIn(0.05f, 20f)
+        val width = if (ratio >= 1f) 1024 else (1024 * ratio).toInt().coerceAtLeast(1)
+        val height = if (ratio >= 1f) (1024 / ratio).toInt().coerceAtLeast(1) else 1024
+        val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+        val bytes = try {
+            val canvas = android.graphics.Canvas(bitmap)
+            canvas.drawColor(spec.backgroundColor)
+            UiSketchRenderer.draw(canvas, android.graphics.RectF(0f, 0f, width.toFloat(), height.toFloat()), spec.strokes)
+            java.io.ByteArrayOutputStream().use { output ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, output)
+                output.toByteArray()
+            }
+        } finally { bitmap.recycle() }
+        val id = UUID.randomUUID().toString().replace("-", "")
+        val resource = "vibe_add_sketch_${id.take(12)}"
+        val dir = imageDirectory(session.taskId, session.revisionLabel, session.layout.layout_name).apply { mkdirs() }
+        val file = File(dir, "$resource.jpg").apply { writeBytes(bytes) }
+        return UiEditorImage(id, annotation.annotationId, "추가 UI 스케치", "image/jpeg", file.absolutePath,
+            resource, sha256(bytes), bytes.size.toLong())
+    }
+
     fun deleteLocalImage(image: UiEditorImage) {
         runCatching { File(image.localPath).takeIf(File::isFile)?.delete() }
     }
@@ -127,7 +153,10 @@ class UiAnnotationDraftStore(context: Context, private val gson: Gson) {
             layoutName = session.layout.layout_name,
             configuration = session.layout.configuration,
             baseXmlSha256 = session.baseXmlSha256,
-            annotations = session.annotations
+            annotations = session.annotations,
+            referenceCanvasWidthDp = session.referenceCanvasWidthDp,
+            referenceCanvasHeightDp = session.referenceCanvasHeightDp,
+            previewCanvasHeightDp = session.previewCanvasHeightDp
         )
         return UiAnnotationDraftRecord(
             taskId = session.taskId,
@@ -142,7 +171,9 @@ class UiAnnotationDraftStore(context: Context, private val gson: Gson) {
             updatedAt = Instant.now().toString(),
             serverDraftId = session.serverDraftId,
             serverDraftVersion = session.serverDraftVersion,
-            confirmed = confirmed
+            confirmed = confirmed,
+            pendingAddition = session.pendingAddition,
+            pendingAdditionEditing = session.pendingAdditionEditing
         )
     }
 

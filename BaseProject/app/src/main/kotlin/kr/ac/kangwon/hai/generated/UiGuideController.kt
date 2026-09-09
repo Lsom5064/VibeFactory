@@ -41,6 +41,7 @@ import org.xmlpull.v1.XmlPullParser
 object UiGuideController {
     private const val TAG = "VibeUiGuide"
     private const val PREFERENCES = "vibe_ui_guide"
+    private const val HELP_HIDDEN = "help_button_hidden"
     private const val CATALOG_RESOURCE = "vf_ui_catalog"
     private const val CHECK_INTERVAL_MS = 500L
     private val smallestWidthQualifier = Regex("sw(\\d+)dp")
@@ -56,6 +57,21 @@ object UiGuideController {
 
     @Volatile
     private var catalog: GuideCatalog? = null
+
+    fun restoreHelp(context: Context) {
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            .edit().putBoolean(HELP_HIDDEN, false).apply()
+        activityStates.values.forEach { state ->
+            if (state.overlay == null) state.helpTab?.showTab()
+        }
+    }
+
+    private fun hideHelp(activity: Activity) {
+        preferences(activity).edit().putBoolean(HELP_HIDDEN, true).apply()
+        activityStates.values.forEach { it.helpTab?.hideTab() }
+    }
+
+    private fun isHelpHidden(activity: Activity) = preferences(activity).getBoolean(HELP_HIDDEN, false)
 
     fun initialize(application: Application) {
         if (!initialized.compareAndSet(false, true)) return
@@ -157,6 +173,7 @@ object UiGuideController {
         content.addView(tab, tab.layoutParams())
         state.helpTab = tab
         tab.start()
+        if (isHelpHidden(activity)) tab.hideTab()
     }
 
     private fun bestLayout(activity: Activity, includeSeen: Boolean): GuideLayout? {
@@ -223,6 +240,7 @@ object UiGuideController {
         force: Boolean,
         state: ActivityGuideState?,
     ) {
+        if (!force && isHelpHidden(activity)) return
         if (!force && isSeen(activity, layout)) return
         if (state?.overlay != null || overlayHost == null || overlayHost.containsGuideOverlay()) return
         val targets = visibleTargets(targetRoot, layout)
@@ -238,8 +256,9 @@ object UiGuideController {
             onDismiss = {
                 markSeen(activity, layout)
                 state?.overlay = null
-                state?.helpTab?.showTab()
+                if (!isHelpHidden(activity)) state?.helpTab?.showTab()
             },
+            onHideHelp = { hideHelp(activity) },
         )
         state?.overlay = overlay
         overlayHost.addView(
@@ -459,6 +478,7 @@ object UiGuideController {
         startIndex: Int,
         private val onStepChanged: (Int) -> Unit,
         private val onDismiss: () -> Unit,
+        private val onHideHelp: () -> Unit,
     ) : FrameLayout(activity) {
         private val scrim = GuideScrimView(activity)
         private val card = ScrollView(activity)
@@ -595,6 +615,20 @@ object UiGuideController {
             cardContent.addView(actions, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(10)
             })
+            cardContent.addView(Button(activity).apply {
+                text = "도움말 버튼 숨기기"
+                isAllCaps = false
+                minHeight = dp(48)
+                setTextColor(primaryText)
+                backgroundTintList = ColorStateList.valueOf(secondaryButton)
+                setOnClickListener {
+                    onHideHelp()
+                    dismiss()
+                    android.widget.Toast.makeText(activity,
+                        "VibeFactory의 로그 보기에서 도움말을 다시 표시할 수 있어요.",
+                        android.widget.Toast.LENGTH_LONG).show()
+                }
+            }, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         }
 
         private fun showStep(requestedIndex: Int) {
@@ -877,5 +911,18 @@ object UiGuideController {
             canvas.drawRect(rect.right, rect.top, width.toFloat(), rect.bottom, dim)
             canvas.drawRoundRect(rect, 12f, 12f, border)
         }
+    }
+}
+
+/** Explicit entry point used by the host; works with both cold and running apps. */
+class UiGuideRestoreActivity : Activity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        UiGuideController.restoreHelp(this)
+        packageManager.getLaunchIntentForPackage(packageName)?.let { launch ->
+            launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(launch)
+        }
+        finish()
     }
 }
