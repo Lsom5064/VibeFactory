@@ -45,6 +45,12 @@ UiGuideController.show(activity, "component_summary", summaryView)
 ```
 
 Replay is provided exclusively by the movable edge help tab installed by `UiGuideController`.
+Replay includes the visible controls from components registered through
+`show(activity, layoutName, rootView)`, even if registration happened before measurement.
+Only roots still attached to that Activity are used. Repeated instances of the same component
+are described once, and a non-clickable container overview is omitted when its specific
+descendant controls have guide steps. Each meaningful control must still have its own catalog
+entry; a RecyclerView or screen-wide summary is not a substitute for input and button help.
 
 The guide is an overlay. Never add guide copy to the product layout itself.
 `UiGuideController` and `UiGuideHelpTab` supply one shared icon-only replay control. A tap replays

@@ -33,6 +33,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -109,10 +110,19 @@ object UiGuideController {
 
     fun replay(activity: Activity) {
         val state = stateFor(activity)
-        val selected = bestLayout(activity, includeSeen = true) ?: return
+        val components = registeredGuides(activity, state)
+        val selected = bestLayout(activity, includeSeen = true) ?: components.firstOrNull()?.first ?: return
+        val candidates = (components.flatMap { it.second } + visibleTargets(activity.window.decorView, selected))
+            .distinctBy { it.view }
+        // A whole-screen container must not replace the specific controls inside it.
+        val targets = candidates.filterNot { target ->
+            target.view is ViewGroup && !target.view.isClickable && candidates.any { other ->
+                other.view !== target.view && other.view.isInside(target.view)
+            }
+        }
+        if (targets.isEmpty()) return
         clearProgress(activity, selected)
-        show(activity, selected, force = true)
-        state.helpTab?.hideTab()
+        show(activity, selected, force = true, replayTargets = targets)
     }
 
     fun show(activity: Activity, layoutName: String) {
@@ -121,6 +131,9 @@ object UiGuideController {
     }
 
     fun show(activity: Activity, layoutName: String, targetRoot: View) {
+        // RecyclerView attachment can precede measurement or catalog loading. Remember the
+        // root even when no guide can be shown yet, so replay can resolve it after layout.
+        stateFor(activity).register(layoutName, targetRoot)
         val selected = selectExplicitLayout(layoutName, targetRoot) ?: return
         showInHost(
             activity = activity,
@@ -218,18 +231,34 @@ object UiGuideController {
             )
             ?.layout
 
-    private fun visibleTargets(targetRoot: View, layout: GuideLayout): List<GuideTarget> =
-        layout.elements.mapNotNull { element ->
+    private fun visibleTargets(targetRoot: View, layout: GuideLayout): List<GuideTarget> {
+        if (targetRoot.width <= 0 || targetRoot.height <= 0) return emptyList()
+        return layout.elements.mapNotNull { element ->
             val id = targetRoot.resources.getIdentifier(element.viewId, "id", targetRoot.context.packageName)
             if (id == 0) return@mapNotNull null
             val view = targetRoot.findViewById<View>(id) ?: return@mapNotNull null
             if (!view.isShown || view.width <= 0 || view.height <= 0) return@mapNotNull null
             GuideTarget(element, view)
         }
+    }
 
-    private fun show(activity: Activity, layout: GuideLayout, force: Boolean) {
+    private fun registeredGuides(activity: Activity, state: ActivityGuideState): List<Pair<GuideLayout, List<GuideTarget>>> {
+        val decor = activity.window.decorView
+        state.explicitGuides.removeAll { it.root.get() == null }
+        return state.explicitGuides.mapNotNull { registered ->
+            val root = registered.root.get() ?: return@mapNotNull null
+            if (!root.isAttachedToWindow || !root.isInside(decor)) return@mapNotNull null
+            val layout = selectExplicitLayout(registered.layoutName, root) ?: return@mapNotNull null
+            layout to visibleTargets(root, layout)
+        }.distinctBy { it.first.layoutName }
+    }
+
+    private fun View.isInside(root: View): Boolean =
+        generateSequence(this) { it.parent as? View }.any { it === root }
+
+    private fun show(activity: Activity, layout: GuideLayout, force: Boolean, replayTargets: List<GuideTarget>? = null) {
         val content = activity.findViewById<ViewGroup>(android.R.id.content) as? FrameLayout ?: return
-        showInHost(activity, layout, activity.window.decorView, content, force, stateFor(activity))
+        showInHost(activity, layout, activity.window.decorView, content, force, stateFor(activity), replayTargets)
     }
 
     private fun showInHost(
@@ -239,11 +268,12 @@ object UiGuideController {
         overlayHost: ViewGroup?,
         force: Boolean,
         state: ActivityGuideState?,
+        replayTargets: List<GuideTarget>? = null,
     ) {
         if (!force && isHelpHidden(activity)) return
         if (!force && isSeen(activity, layout)) return
         if (state?.overlay != null || overlayHost == null || overlayHost.containsGuideOverlay()) return
-        val targets = visibleTargets(targetRoot, layout)
+        val targets = replayTargets ?: visibleTargets(targetRoot, layout)
         if (targets.isEmpty()) return
         val startIndex = if (force) 0 else progress(activity, layout).coerceIn(0, targets.lastIndex)
         state?.helpTab?.hideTab()
@@ -354,11 +384,18 @@ object UiGuideController {
     }
 
     private class ActivityGuideState {
+        val explicitGuides = mutableListOf<RegisteredGuide>()
         var helpTab: UiGuideHelpTab? = null
         var overlay: GuideOverlay? = null
         var lastLayoutCheckAt: Long = 0
         private var layoutObserver: ViewTreeObserver.OnGlobalLayoutListener? = null
         private var scrollObserver: ViewTreeObserver.OnScrollChangedListener? = null
+
+        fun register(layoutName: String, root: View) {
+            explicitGuides.removeAll { it.root.get() == null ||
+                (it.layoutName == layoutName && it.root.get() === root) }
+            explicitGuides += RegisteredGuide(layoutName, WeakReference(root))
+        }
 
         fun attachLayoutObserver(activity: Activity, onLayout: () -> Unit) {
             if (layoutObserver != null) return
@@ -387,8 +424,11 @@ object UiGuideController {
             overlay = null
             helpTab?.dispose()
             helpTab = null
+            explicitGuides.clear()
         }
     }
+
+    private data class RegisteredGuide(val layoutName: String, val root: WeakReference<View>)
 
     private data class GuideCatalog(
         val guideVersion: String,
