@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from flutter_apk_server.ui_catalog import (
+from server.ui_catalog import (
     UI_CATALOG_RELATIVE_PATH,
     catalog_prompt_contract,
     catalog_layout_metadata,

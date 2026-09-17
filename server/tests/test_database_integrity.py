@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from flutter_apk_server.server import (
+from server.server import (
     AppDataDatabase,
     Database,
     build_agent_conversation_history,
@@ -128,7 +128,7 @@ class DatabaseIntegrityTests(unittest.TestCase):
                 connection.commit()
 
             with patch(
-                "flutter_apk_server.server.new_database_id",
+                "server.server.new_database_id",
                 side_effect=["duplicate-id", "replacement-id"],
             ) as id_factory:
                 event_id = database.log_event(
@@ -142,7 +142,7 @@ class DatabaseIntegrityTests(unittest.TestCase):
             self.assertEqual(2, id_factory.call_count)
 
             with patch(
-                "flutter_apk_server.server.new_database_id",
+                "server.server.new_database_id",
                 return_value="unused-id",
             ) as id_factory:
                 with self.assertRaises(sqlite3.IntegrityError):
@@ -165,7 +165,7 @@ class DatabaseIntegrityTests(unittest.TestCase):
                 return task_payload(task_id)
 
             with patch(
-                "flutter_apk_server.server.new_database_id",
+                "server.server.new_database_id",
                 side_effect=["duplicate-task", "replacement-task"],
             ):
                 task_id, task = database.create_task_with_generated_id(build_task)
@@ -200,7 +200,7 @@ class DatabaseIntegrityTests(unittest.TestCase):
                 connection.commit()
 
             with patch(
-                "flutter_apk_server.server.new_database_id",
+                "server.server.new_database_id",
                 side_effect=["duplicate-record", "replacement-record"],
             ):
                 record = database.create_record(

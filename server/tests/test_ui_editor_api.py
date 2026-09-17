@@ -2,6 +2,7 @@ import base64
 import hashlib
 import io
 import json
+import re
 import shutil
 import tempfile
 import unittest
@@ -12,8 +13,8 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 from PIL import Image
 
-import flutter_apk_server.server as server_module
-from flutter_apk_server.server import (
+import server.server as server_module
+from server.server import (
     AppDataDatabase,
     CodexTaskRunner,
     Database,
@@ -21,7 +22,7 @@ from flutter_apk_server.server import (
     load_settings,
     utc_now_iso,
 )
-from flutter_apk_server.ui_editor_server import (
+from server.ui_editor_server import (
     build_ui_editor_codex_prompt,
     structural_xml_diff,
     validate_ui_annotation_xml,
@@ -387,6 +388,89 @@ class UiEditorApiTests(unittest.TestCase):
             params={"device_id": self.device_id, "phone_number": self.phone_number},
             json=payload,
         )
+
+    def modification_v2(self, instruction="색만 보라색으로 바꾸고 동작은 유지"):
+        sketch = ('<vf:sketch backgroundColor="#FFFFFFFF">'
+                  '<vf:stroke color="#FF7B1FA2" width="0.009">'
+                  '<vf:point x="0.2" y="0.3"/><vf:point x="0.8" y="0.7"/>'
+                  '</vf:stroke></vf:sketch>')
+        return self.annotation_xml(instruction).replace('schemaVersion="1"', 'schemaVersion="2"').replace(
+            '<vf:instruction>', sketch + '<vf:instruction>')
+
+    def test_v2_requires_explanation_but_preserves_legacy_sketch_only_additions(self):
+        for xml in (self.modification_v2(""), self.addition_xml(instruction="").replace(
+                'schemaVersion="1"', 'schemaVersion="2"')):
+            response = self.save_draft(annotation_xml=xml)
+            self.assertEqual(400, response.status_code, response.text)
+            self.assertIn("requires an instruction", response.text)
+        self.assertEqual(200, self.save_draft(annotation_xml=self.addition_xml(instruction="")).status_code)
+
+    def test_v2_modification_rejects_invalid_sketch_geometry_and_roles(self):
+        xml = self.modification_v2()
+        for invalid in (xml.replace('x="0.2"', 'x="NaN"'),
+                        xml.replace('width="0.009"', 'width="0"'),
+                        xml.replace('action="behavior"', 'action="delete"'),
+                        xml.replace('schemaVersion="2"', 'schemaVersion="1"'),
+                        xml.replace('</vf:annotation>', '<vf:image-ref id="r" role="other"/></vf:annotation>'),
+                        xml.replace('</vf:annotation>', ''.join(f'<vf:image-ref id="r{i}" role="reference"/>' for i in range(6)) + '</vf:annotation>')):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(413 if 'id="r5"' in invalid else 400, self.save_draft(annotation_xml=invalid).status_code)
+
+    def test_sketch_five_references_and_v3_canvas_images_survive_save_confirm_reload(self):
+        refs = [(f"reference_{i}", "reference") for i in range(5)] + [("sketch_1", "sketch")]
+        previous = None
+        v2_drawings = [self.modification_v2(), self.addition_xml().replace('schemaVersion="1"', 'schemaVersion="2"')]
+        v3_drawings = [re.sub(r'<vf:stroke\b[^>]*>.*?</vf:stroke>', '', xml, flags=re.S)
+            .replace('schemaVersion="2"', 'schemaVersion="3"').replace('</vf:annotation>', ''.join(
+                f'<vf:image-layer imageId="reference_{i}" left="0.1" top="0.2" right="0.8" bottom="0.9"/>'
+                for i in range(5)) + '</vf:annotation>') for xml in v2_drawings]
+        for drawing_xml in v2_drawings + v3_drawings:
+            xml = drawing_xml.replace('</vf:annotation>', ''.join(
+                f'<vf:image-ref id="{image_id}" role="{role}"/>' for image_id, role in refs) + '</vf:annotation>')
+            parsed = validate_ui_annotation_xml(xml, task_id=self.task_id, revision_label="rev_0001",
+                layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+            self.assertEqual(6, len(parsed[0]["image_ids"]))
+            self.assertEqual("sketch", parsed[0]["image_roles"]["sketch_1"])
+            if 'schemaVersion="3"' in xml:
+                self.assertEqual(5, len(parsed[0]["image_layers"]))
+                self.assertEqual("reference_0", parsed[0]["image_layers"][0]["image_id"])
+                self.assertEqual(0.8, parsed[0]["image_layers"][0]["bounds"]["right"])
+            draft_response = self.save_draft(annotation_xml=xml,
+                draft_id=previous["draft_id"] if previous else None,
+                version=previous["version"] if previous else None)
+            self.assertEqual(200, draft_response.status_code, draft_response.text)
+            draft = draft_response.json()
+            previous = draft
+            image_buffer = io.BytesIO()
+            Image.new("RGB", (80, 60), "#7B1FA2").save(image_buffer, format="PNG")
+            for image_id, role in refs:
+                response = self.client.post(self.endpoint(f"drafts/{draft['draft_id']}/images"),
+                    params={"device_id": self.device_id, "phone_number": self.phone_number},
+                    json={"image_id": image_id, "element_stable_id": "annotation_1",
+                          "original_name": role + ".png", "mime_type": "image/png",
+                          "resource_name": "vibe_" + image_id,
+                          "base64": base64.b64encode(image_buffer.getvalue()).decode("ascii")})
+                self.assertEqual(200, response.status_code, response.text)
+            confirmed = self.confirm_draft(draft)
+            self.assertEqual(200, confirmed.status_code, confirmed.text)
+            restored = self.client.get(self.endpoint("drafts/activity_main"),
+                params={"device_id": self.device_id, "phone_number": self.phone_number}).json()
+            self.assertEqual(xml, restored["annotation_xml"])
+            self.assertEqual(6, len(restored["images"]))
+
+    def test_canvas_images_reject_invalid_coordinates_and_unlinked_references(self):
+        layer = '<vf:image-layer imageId="picture" left="0.1" top="0.2" right="0.8" bottom="0.9"/>'
+        xml = self.modification_v2().replace('schemaVersion="2"', 'schemaVersion="3"').replace(
+            '</vf:annotation>', layer + '<vf:image-ref id="picture" role="reference"/></vf:annotation>')
+        invalid = [xml.replace('schemaVersion="3"', 'schemaVersion="2"'),
+            xml.replace('imageId="picture"', 'imageId="missing"'), xml.replace(layer, layer+layer),
+            xml.replace('role="reference"', 'role="sketch"'),
+            xml.replace('right="0.8"', 'right="0.01"'),
+            xml.replace('action="behavior"', 'action="delete"')]
+        invalid += [xml.replace('right="0.8"', f'right="{value}"') for value in ['NaN', 'inf', '-0.1', '1.1']]
+        for value in invalid:
+            with self.subTest(xml=value):
+                self.assertEqual(400, self.save_draft(annotation_xml=value).status_code)
 
     def addition_xml(self, instruction="누르면 메모를 저장하는 버튼", *, sketch=True):
         drawing = ('<vf:stroke color="#FF19211D" width="0.009">'

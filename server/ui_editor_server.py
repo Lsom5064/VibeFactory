@@ -43,10 +43,11 @@ MAX_CODEX_CONTEXT_BYTES = 16 * 1024 * 1024
 ALLOWED_BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
 UI_ANNOTATION_NAMESPACE = "urn:vibefactory:ui-annotations"
-UI_ANNOTATION_SCHEMA_VERSION = "1"
+UI_ANNOTATION_SCHEMA_VERSION = "3"
 UI_ANNOTATION_ACTIONS = {"delete", "move", "behavior", "add"}
 MAX_UI_ANNOTATIONS = 500
-MAX_UI_ANNOTATION_IMAGES = 5
+MAX_UI_ANNOTATION_IMAGES = 6
+MAX_UI_ANNOTATION_REFERENCE_IMAGES = 5
 
 
 class UiEditorInputError(ValueError):
@@ -444,7 +445,7 @@ def validate_ui_annotation_xml(
     content = xml_text.encode("utf-8")
     root = parse_android_xml(content, source_name=f"{layout_name}.annotations.xml")
     expected_root = f"{{{UI_ANNOTATION_NAMESPACE}}}ui-annotations"
-    if root.tag != expected_root or root.attrib.get("schemaVersion") != UI_ANNOTATION_SCHEMA_VERSION:
+    if root.tag != expected_root or root.attrib.get("schemaVersion") not in {"1", "2", UI_ANNOTATION_SCHEMA_VERSION}:
         raise UiEditorInputError("unsupported UI annotation document")
     expected_metadata = {
         "taskId": task_id,
@@ -480,6 +481,9 @@ def validate_ui_annotation_xml(
     instruction_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}instruction"
     image_ref_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}image-ref"
     addition_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}addition"
+    sketch_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}sketch"
+    image_layer_tag = f"{{{UI_ANNOTATION_NAMESPACE}}}image-layer"
+    version = root.attrib["schemaVersion"]
     parsed: list[dict[str, Any]] = []
     annotation_ids: set[str] = set()
     children = list(root)
@@ -501,9 +505,11 @@ def validate_ui_annotation_xml(
         instructions = [child for child in annotation if child.tag == instruction_tag]
         image_refs = [child for child in annotation if child.tag == image_ref_tag]
         additions = [child for child in annotation if child.tag == addition_tag]
+        sketches = [child for child in annotation if child.tag == sketch_tag]
+        image_layer_elements = [child for child in annotation if child.tag == image_layer_tag]
         if len(targets) != 1 or len(destinations) > 1 or len(points) > 1 or len(instructions) != 1:
             raise UiEditorInputError("invalid UI annotation structure")
-        if len(image_refs) > MAX_UI_ANNOTATION_IMAGES:
+        if len(image_refs) > (MAX_UI_ANNOTATION_REFERENCE_IMAGES if version == "1" else MAX_UI_ANNOTATION_IMAGES):
             raise UiEditorFileTooLargeError(
                 f"UI annotation images exceed {MAX_UI_ANNOTATION_IMAGES} entries"
             )
@@ -512,7 +518,19 @@ def validate_ui_annotation_xml(
             raise UiEditorInputError("invalid UI annotation image reference")
         if len(set(image_ids)) != len(image_ids):
             raise UiEditorInputError("duplicate UI annotation image reference")
+        image_roles = {image.attrib["id"]: image.attrib.get("role", "reference") for image in image_refs}
+        if version in {"2", "3"}:
+            if any(role not in {"reference", "sketch"} for role in image_roles.values()):
+                raise UiEditorInputError("invalid annotation image role")
+            if list(image_roles.values()).count("reference") > MAX_UI_ANNOTATION_REFERENCE_IMAGES or list(image_roles.values()).count("sketch") > 1:
+                raise UiEditorFileTooLargeError("at most five reference images and one sketch are allowed")
+        elif any("role" in image.attrib for image in image_refs):
+            raise UiEditorInputError("annotation image roles require schema version 2")
         allowed_children = {target_tag, destination_tag, point_tag, instruction_tag, image_ref_tag, addition_tag}
+        if version in {"2", "3"}:
+            allowed_children.add(sketch_tag)
+        if version == "3":
+            allowed_children.add(image_layer_tag)
         if any(child.tag not in allowed_children for child in annotation):
             raise UiEditorInputError("unexpected UI annotation child")
         if action == "move" and not destinations and not points:
@@ -522,10 +540,33 @@ def validate_ui_annotation_xml(
         instruction = instructions[0].text or ""
         if len(instruction.encode("utf-8")) > 16 * 1024:
             raise UiEditorFileTooLargeError("UI annotation instruction is too large")
-        if action == "behavior" and not instruction.strip():
-            raise UiEditorInputError("behavior annotation requires an instruction")
+        if (action == "behavior" or (version in {"2", "3"} and action == "add")) and not instruction.strip():
+            raise UiEditorInputError(f"{action} annotation requires an instruction")
+        if len(sketches) > 1 or (sketches and (action != "behavior" or version not in {"2", "3"})):
+            raise UiEditorInputError("only version 2 or 3 behavior annotations may include a modification sketch")
         if (action == "add" and len(additions) != 1) or (action != "add" and additions):
             raise UiEditorInputError("only add annotations require an addition region")
+
+        image_layers: list[dict[str, Any]] = []
+        if len(image_layer_elements) > MAX_UI_ANNOTATION_REFERENCE_IMAGES:
+            raise UiEditorFileTooLargeError("at most five canvas images are allowed")
+        if image_layer_elements and (action not in {"behavior", "add"} or not (additions or sketches)):
+            raise UiEditorInputError("canvas images require a visual sketch region")
+        for layer in image_layer_elements:
+            image_id = str(layer.attrib.get("imageId") or "")
+            if image_roles.get(image_id) != "reference" or any(item["image_id"] == image_id for item in image_layers):
+                raise UiEditorInputError("canvas image must reference one unique attached image")
+            if list(layer):
+                raise UiEditorInputError("unexpected canvas image child")
+            try:
+                bounds = {key: float(layer.attrib[key]) for key in ("left", "top", "right", "bottom")}
+            except (KeyError, ValueError) as exc:
+                raise UiEditorInputError("invalid canvas image bounds") from exc
+            if any(not math.isfinite(value) or not 0 <= value <= 1 for value in bounds.values()):
+                raise UiEditorInputError("canvas image is outside the sketch region")
+            if bounds["left"] >= bounds["right"] or bounds["top"] >= bounds["bottom"]:
+                raise UiEditorInputError("canvas image must have positive size")
+            image_layers.append({"image_id": image_id, "bounds": bounds})
 
         def target_payload(element: ElementTree.Element) -> dict[str, Any]:
             fields = {
@@ -551,8 +592,10 @@ def validate_ui_annotation_xml(
             return {**fields, "bounds": coordinates}
 
         addition_payload: Optional[dict[str, Any]] = None
-        if additions:
-            addition = additions[0]
+        sketch_payload: Optional[dict[str, Any]] = None
+        if additions or sketches:
+            addition = (additions or sketches)[0]
+            is_modification = bool(sketches)
 
             def unit_value(element: ElementTree.Element, key: str) -> float:
                 try:
@@ -569,7 +612,8 @@ def validate_ui_annotation_xml(
                     raise UiEditorInputError("invalid addition color")
                 return value.upper()
 
-            bounds = {key: unit_value(addition, key) for key in ("left", "top", "right", "bottom")}
+            bounds = (target_payload(targets[0])["bounds"] if is_modification else
+                      {key: unit_value(addition, key) for key in ("left", "top", "right", "bottom")})
             if bounds["left"] >= bounds["right"] or bounds["top"] >= bounds["bottom"]:
                 raise UiEditorInputError("addition region must have positive size")
             strokes: list[dict[str, Any]] = []
@@ -577,6 +621,8 @@ def validate_ui_annotation_xml(
             point_count = 0
             for child in addition:
                 if child.tag == f"{{{UI_ANNOTATION_NAMESPACE}}}replace-target":
+                    if is_modification:
+                        raise UiEditorInputError("modification sketches cannot replace other targets")
                     replace_targets.append(target_payload(child))
                     if len(replace_targets) > 100:
                         raise UiEditorFileTooLargeError("too many replacement targets")
@@ -607,7 +653,11 @@ def validate_ui_annotation_xml(
                 "bounds": bounds, "background_color": sketch_color(addition, "backgroundColor"),
                 "strokes": strokes, "replace_targets": replace_targets,
             }
-            if "canvasWidthDp" in addition.attrib or "canvasHeightDp" in addition.attrib:
+            if is_modification:
+                sketch_payload = {"bounds": bounds, "background_color": sketch_color(addition, "backgroundColor"),
+                                  "strokes": strokes, "background_mode": "original"}
+                addition_payload = None
+            if not is_modification and ("canvasWidthDp" in addition.attrib or "canvasHeightDp" in addition.attrib):
                 try:
                     canvas_dp = {key: float(addition.attrib[attr]) for key, attr in
                                  (("width", "canvasWidthDp"), ("height", "canvasHeightDp"))}
@@ -622,6 +672,9 @@ def validate_ui_annotation_xml(
                     "width": (bounds["right"] - bounds["left"]) * canvas_dp["width"],
                     "height": (bounds["bottom"] - bounds["top"]) * canvas_dp["height"],
                 }
+
+        if "sketch" in image_roles.values() and not ((addition_payload or sketch_payload or {}).get("strokes") or image_layers):
+            raise UiEditorInputError("sketch image requires matching strokes or canvas images")
 
         destination_point: Optional[dict[str, float]] = None
         if points:
@@ -641,11 +694,14 @@ def validate_ui_annotation_xml(
                 "destination_point": destination_point,
                 "instruction": instruction,
                 "image_ids": image_ids,
+                "image_roles": image_roles,
+                **({"image_layers": image_layers} if image_layers else {}),
                 **({"coordinate_space": coordinate_space} if coordinate_space is not None else {}),
                 **({"destination_center_dp": {"x": destination_point["x"] * width_dp,
                                               "y": destination_point["y"] * height_dp}}
                    if coordinate_space is not None and destination_point is not None else {}),
                 **({"addition": addition_payload} if addition_payload is not None else {}),
+                **({"sketch": sketch_payload} if sketch_payload is not None else {}),
             }
         )
     return parsed
@@ -665,7 +721,8 @@ def linked_ui_annotation_images(
                 raise UiEditorInputError("referenced UI annotation image is missing")
             if str(image.get("element_stable_id") or "") != annotation_id:
                 raise UiEditorInputError("UI annotation image belongs to a different change marker")
-            linked.append({**image, "annotation_id": annotation_id})
+            linked.append({**image, "annotation_id": annotation_id,
+                           "image_role": (annotation.get("image_roles") or {}).get(str(image_id), "reference")})
     return linked
 
 
@@ -829,7 +886,10 @@ def build_ui_editor_codex_prompt(
 - 이동 미리보기의 파란 실선 원본은 고정되어 있고, 파란 점선 영역은 대상 크기만큼 공간을 확보해 주변 UI를 밀어낸 상태다. 최종 앱에서는 선택 대상을 목적지로 이동하고 원본을 중복 생성하지 않는다. 주변 UI와 기능을 보존하며 겹치지 않게 배치한다.
 - 이동 후 대상 View의 중심이 `destination_point`와 일치하도록 배치한다. `destination` View 정보는 주변 구조와 제약을 파악하기 위한 참고일 뿐이며, 그 View의 중심으로 좌표를 바꾸지 않는다.
 - 절대 좌표에 고정하지 말고 ConstraintLayout 제약, 형제 순서, margin 등을 사용해 표시된 위치와 방향을 다양한 화면 크기에서도 최대한 유지한다.
-- `behavior`는 UI 모양만 바꾸지 말고 설명에 적힌 실제 동작과 상태 처리를 구현한다.
+- `behavior`는 기존 요소의 모양·기능 변경이다. 색·크기·글꼴·모양 등 스타일만 요청하면 기존 동작과 상태 처리를 보존하고, 기능 변경을 요청한 경우에만 해당 동작을 수정한다.
+- behavior.sketch는 선택 요소의 원본 위에 덧그린 수정 의도다. 스케치 좌표는 선택 요소 내부의 0~1 좌표이며 화면 확대 배율과 무관하다. 원본 전체를 교체하거나 스케치를 이미지 UI로 붙이지 않는다.
+- image_role=sketch는 원본 배경·캔버스 이미지·펜 선을 합성한 편집 결과이고, image_role=reference는 개별 첨부 원본이다. 합성 결과 전체를 앱 이미지로 붙이지 않는다.
+- image_layers는 사용자가 스케치 캔버스 안에 직접 배치한 이미지다. 각 bounds는 선택 요소/추가 영역 내부의 0~1 좌표이며 보기 확대와 무관하다. 목록 순서대로 이미지를 겹치고 그 위에 펜 선을 해석한다. 위치·크기·종횡비를 보존한다. 설명에서 참고용이라고 지정하지 않은 배치 이미지는 연결된 원본 파일을 실제 이미지 리소스로 사용한다. 그 외 첨부는 참고 자료로 해석한다.
 - `add`는 초록색 추가 영역에 새 UI를 구현한다. target은 기존 부모·주변 구조를 찾는 기준이며, 추가 위치와 크기는 addition.bounds를 사용한다. 스케치의 좌표는 추가 영역 내부 기준이다.
 - addition.region_dp가 있으면 해당 미리보기 기준 위치·폭·높이를 새 UI 묶음의 외곽으로 사용한다. 부모의 빈 공간 전체로 확대하지 않는다. 스케치 이미지의 종횡비, 각 도형의 상대 크기·순서·간격을 보존하고 최종 제약·margin을 이 영역에 맞춘다. 터치 영역 확보에 필요한 최소 확장만 허용한다.
 - 추가 스케치와 설명을 실제 Android Views/XML 및 Kotlin 동작으로 구현한다. 스케치·원본 화면을 통째로 이미지로 붙이지 않는다. 펜 색이나 가림용 배경색을 최종 디자인 색으로 강제하지 않는다.
@@ -865,7 +925,7 @@ def build_ui_editor_codex_prompt(
 
 ### 부연 설명에 첨부된 참고 이미지
 
-각 항목의 `annotation_id`를 주석 데이터와 연결해 해석한다. 이미지는 요구사항의 근거이며 앱 리소스로 그대로 복사하라는 의미가 아니다.
+각 항목의 `annotation_id`를 주석 데이터와 연결한다. `image_layers`에서 참조하는 이미지는 지정된 위치의 이미지 요소이며 해당 원본 파일을 사용한다. 배치되지 않은 첨부는 참고 자료다. 합성 스케치 전체를 앱 리소스로 붙이지 않는다.
 
 ```json
 {json.dumps(linked_images, ensure_ascii=False, indent=2)}
@@ -975,7 +1035,8 @@ def build_ui_editor_chat_context(
 - 작업 Revision: `{generated_revision_label}`
 - 최신 채팅 요청: {user_prompt.strip()}
 - 원본 XML을 직접 편집한 결과로 취급하지 말고, 주석 XML과 스크린샷을 해석해 실제 앱 코드에 반영한다.
-- delete는 빨강, move는 파랑, behavior는 보라, add는 초록 표시이며 대상 식별 정보와 사용자 설명을 모두 사용한다.
+- delete는 빨강, move는 파랑, behavior(모양·기능 변경)는 보라, add는 초록 표시이며 대상 식별 정보와 사용자 설명을 모두 사용한다.
+- behavior의 스타일 변경만 요청하면 기존 동작을 보존한다. 기능 변경 요청이면 명시한 동작을 구현한다. sketch는 선택 요소 원본 위의 표시이며 좌표는 요소 내부 0~1 기준이다. image_role로 스케치와 참고 이미지를 구분하고 둘 다 설명과 함께 참고한다.
 - add의 target은 기존 부모·주변 UI이며 실제 추가 위치·크기는 addition.bounds다. 스케치 좌표는 추가 영역 내부 기준이다. 스케치와 설명을 실제 Views/XML과 Kotlin 동작으로 구현하고 스케치 이미지를 통째로 UI에 붙이지 않는다.
 - addition.region_dp는 미리보기 기준 새 UI 묶음의 외곽 위치·폭·높이다. 부모의 빈 공간 전체로 확대하지 말고 해당 영역 안에 스케치의 종횡비와 도형별 상대 크기·순서·간격을 맞춘다. 터치 영역에 필요한 최소 크기만 조정하며, 부모의 기존 여백은 유지할 수 있다.
 - add의 배경색 덮기는 그리기용 표시다. addition.replace_targets가 비어 있으면 기존 요소를 유지하며 공간을 마련하고, 명시된 교체 대상만 교체한다. 스케치 펜·배경색을 최종 디자인에 강제하지 않는다.

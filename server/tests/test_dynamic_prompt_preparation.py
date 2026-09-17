@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from flutter_apk_server.server import (
+from server.server import (
     build_intent_decision,
     build_initial_prompt_review_decision,
     build_prebuild_requirements_review_decision,
@@ -48,7 +48,7 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                 "INTENT_AGENT_ENABLED": "0",
             }
             with patch.dict(os.environ, environment, clear=False), patch(
-                "flutter_apk_server.server.decide_intent",
+                "server.server.decide_intent",
                 return_value=decision,
             ):
                 app = create_app()
@@ -105,7 +105,7 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                     self.assertIn("## 외부 연동 및 필수 조건", ready.json()["prepared_prompt"])
                     self.assertNotIn("secret", ready.json()["prepared_prompt"])
 
-    def test_initial_prompt_waits_for_prebuild_requirement_review(self) -> None:
+    def test_initial_prompt_only_waits_for_missing_prebuild_requirements(self) -> None:
         decision = build_intent_decision(
             mode="build",
             task_id="maps-task",
@@ -137,7 +137,7 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                 decision,
                 prerequisite_reviewed=True,
             )
-        self.assertEqual("confirm_prebuild_requirements", confirmation.confirmation_action)
+        self.assertEqual("submit_initial_prompt", confirmation.confirmation_action)
         self.assertEqual("submit_initial_prompt", reviewed.confirmation_action)
         self.assertIn("## 외부 연동 및 필수 조건", reviewed.prepared_prompt)
         self.assertNotIn("secret", reviewed.prepared_prompt)
@@ -194,7 +194,8 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                 prerequisite_reviewed=True,
             )
 
-        self.assertEqual("confirm_prebuild_requirements", first_review.confirmation_action)
+        self.assertEqual("build", first_review.mode)
+        self.assertEqual("", first_review.confirmation_action)
         self.assertEqual("build", already_reviewed.mode)
         self.assertEqual("build", accepted.mode)
 
@@ -411,6 +412,7 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                     "use_previous_pending_request": True,
                     "requires_existing_task_context": False,
                     "reason": "대화에서 구현 가능한 범위가 확정됐습니다.",
+                    "prebuild_requirements": [],
                     "questions": [],
                     "assistant_reply": "",
                 }
@@ -426,10 +428,10 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                 return workspace, project
 
             with patch.dict(os.environ, environment, clear=False), patch(
-                "flutter_apk_server.server.run_spec_clarification_agent",
+                "server.server.run_spec_clarification_agent",
                 side_effect=fake_agent,
             ), patch(
-                "flutter_apk_server.server.build_task_workspace",
+                "server.server.build_task_workspace",
                 side_effect=fake_workspace,
             ):
                 app = create_app()
@@ -590,10 +592,10 @@ class DynamicPromptPreparationTests(unittest.TestCase):
                 return workspace, project
 
             with patch.dict(os.environ, environment, clear=False), patch(
-                "flutter_apk_server.server.run_spec_clarification_agent",
+                "server.server.run_spec_clarification_agent",
                 return_value=agent_result,
             ), patch(
-                "flutter_apk_server.server.build_task_workspace",
+                "server.server.build_task_workspace",
                 side_effect=fake_workspace,
             ):
                 app = create_app()

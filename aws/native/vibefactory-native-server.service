@@ -4,12 +4,12 @@ After=network.target
 
 [Service]
 User=ubuntu
-WorkingDirectory=/opt/vibefactory-native/flutter_apk_server
+WorkingDirectory=/opt/vibefactory-native/server
 EnvironmentFile=/etc/vibefactory-native/server.env
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=ANDROID_SDK_ROOT=/opt/android-sdk
 Environment=ANDROID_HOME=/opt/android-sdk
-ExecStart=/opt/vibefactory-native/flutter_apk_server/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8001
+ExecStart=/opt/vibefactory-native/server/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8001
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

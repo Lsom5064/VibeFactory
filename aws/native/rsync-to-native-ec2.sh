@@ -28,12 +28,15 @@ rsync -az --progress \
   --exclude 'aws/*.pem' \
   --exclude 'aws/*.key' \
   --exclude 'aws/*.env' \
-  --exclude 'flutter_apk_server/*.db*' \
-  --exclude 'flutter_apk_server/workspaces/' \
-  --exclude 'flutter_apk_server/native_workspaces/' \
-  --exclude 'flutter_apk_server/profiles/' \
-  --exclude 'flutter_apk_server/.venv/' \
-  --exclude 'flutter_apk_server/.tooling/' \
+  --exclude 'server/*.db*' \
+  --exclude 'server/*.sqlite*' \
+  --exclude 'server/workspaces/' \
+  --exclude 'server/native_workspaces/' \
+  --exclude 'server/profiles/' \
+  --exclude 'server/logs/' \
+  --exclude 'server/uploads/' \
+  --exclude 'server/.venv/' \
+  --exclude 'server/.tooling/' \
   --exclude '**/__pycache__/' \
   --exclude '**/.dart_tool/' \
   --exclude '**/.gradle/' \

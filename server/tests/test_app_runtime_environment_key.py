@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from flutter_apk_server.server import create_app, utc_now_iso
+from server.server import create_app, utc_now_iso
 
 
 class AppRuntimeEnvironmentKeyTests(unittest.TestCase):
@@ -32,7 +32,7 @@ class AppRuntimeEnvironmentKeyTests(unittest.TestCase):
                 app = create_app()
                 with (
                     patch(
-                        "flutter_apk_server.server.invoke_app_runtime_model",
+                        "server.server.invoke_app_runtime_model",
                         return_value={
                             "message": "runtime response",
                             "usage": {

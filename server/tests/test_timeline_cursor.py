@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from flutter_apk_server.server import Database, task_event_to_timeline_event, utc_now_iso
+from server.server import Database, task_event_to_timeline_event, utc_now_iso
 
 
 class TimelineCursorTests(unittest.TestCase):

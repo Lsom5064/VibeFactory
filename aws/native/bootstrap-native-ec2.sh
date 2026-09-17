@@ -60,7 +60,7 @@ if ! command -v codex >/dev/null 2>&1; then
 fi
 
 echo "[bootstrap] installing Python dependencies"
-cd "$APP_ROOT/flutter_apk_server"
+cd "$APP_ROOT/server"
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt

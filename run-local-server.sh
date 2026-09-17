@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVER_DIR="$ROOT_DIR/flutter_apk_server"
+SERVER_DIR="$ROOT_DIR/server"
 VENV_DIR="$SERVER_DIR/.venv"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 HOST="${HOST:-0.0.0.0}"

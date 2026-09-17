@@ -311,6 +311,37 @@ INTEGRATION_CATALOG: tuple[IntegrationDefinition, ...] = (
 
 CATALOG_BY_ID = {item.integration_id: item for item in INTEGRATION_CATALOG}
 
+# Shared by initial specification and code-aware follow-up analysis. These are
+# existing runtime capabilities, not permission to deploy a new shared service.
+PREBUILD_REQUIREMENTS_POLICY = """
+Pre-build requirement policy (applies to the entire agreed app after this change):
+- Return a complete current prebuild_requirements snapshot, including still-used integrations. An empty array explicitly means none. Remove requirements for features the user excluded; never revive them from old conversation text.
+- Classify actual requested behavior, not keywords, brand comparisons, UI labels, historical mentions, or explicitly excluded features. Displaying prices/totals is not processing payments; a local calendar is not Google OAuth; drawing a chart is not fetching external data.
+- Ordinary implementation is not an external prerequisite. Local CRUD, calculations, filtering, charts and recording history from user entries or available responses can be implemented in app code. Simple shared records can use the existing VibeDataClient server API. Known public HTTP endpoints without credentials can use VibeHttpClient.
+- Delegate ordinary technical decisions to the coding agent: Android APIs, available built-in sensors, sensor fusion/filtering/calibration, game physics, layouts, algorithms, storage implementation, permission request flows, and reasonable tuning defaults. Do not ask users to choose APIs, sensors with equivalent behavior, thresholds, or implementation steps when their intended behavior is already clear.
+- Built-in hardware reported in device_info is available, not missing external equipment. Reading an available accelerometer/camera and implementing its lifecycle or permission flow is local_app implementation. Only unavailable required hardware, privileged access, or a genuinely different user-visible control scheme may require a question. Do not replace a requested interaction merely to avoid implementing it.
+- For such work, omit a prerequisite or use resolution=implementation with a concrete implementation_plan and capability=local_app, shared_records, or public_http. Preserve this plan in the app specification and acceptance criteria. Do not require the user to prepare a backend just to program these features.
+- These capabilities do NOT include deploying arbitrary per-app server code, always-on collectors/schedulers, private external datasets, production authentication/authorization, cloud file hosting, or provider credentials. Never claim those are available merely because server code could theoretically implement them.
+- If an external data provider/source or a materially different behavior is undecided, use resolution=clarification and one concrete Korean question with options. Distinguish importing a supplied file, manual updates, and automatic external collection. Do not substitute one for another without user agreement. Keep requested graphs/history when asking about the source; do not remove them as a workaround.
+- Never use clarification with an empty question or a list of coding instructions. State exactly which user-visible decision is unresolved and how to answer it in chat. Do not ask again about decisions already answered in the conversation.
+- For real external credentials, accounts, package registration or unavailable infrastructure use resolution=external_setup and capability=none. Use catalog IDs when applicable. The server, not the model, determines whether configuration and integration support are ready.
+- Use resolution=advisory for install-time settings, supported Android scheduling limits or permissions that do not prevent implementation. Privileged/unsupported behavior still requires clarification or external setup; do not disguise it as ordinary implementation.
+- Set blocking=false for implementation and advisory. Preserve advisories in the generated app's implementation/usage instructions; do not require a separate acknowledgement before building. Already configured supported integrations also need no additional prerequisite approval.
+- implementation_plan and question must be empty when inapplicable. Never put secret values in any output. Standalone research API keys for supported participant-managed providers may be registered in chat; provider apps, OAuth, signing and service accounts remain researcher-managed.
+""".strip()
+
+
+def requirement_snapshot(state: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """Presence, including [], takes precedence over older state, not truthiness."""
+    keys = ("pending_prebuild_requirements", "latest_prebuild_requirements") if state.get(
+        "awaiting_confirmation"
+    ) else ("latest_prebuild_requirements", "pending_prebuild_requirements")
+    for key in keys:
+        value = state.get(key)
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, dict)][:8]
+    return None
+
 
 def _normalized(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
@@ -364,6 +395,8 @@ def _catalog_requirement(
         "type": definition.requirement_type,
         "reason": _normalized(reason) or f"요청한 기능에 {definition.title} 연결이 필요합니다.",
         "blocking": True,
+        "resolution": "external_setup",
+        "recheckable": definition.supported,
         "configured": configured,
         "supported": definition.supported,
         "execution_location": definition.execution_location,
@@ -384,13 +417,29 @@ def _catalog_requirement(
     }
 
 
+def _clarification_question(item: Mapping[str, Any], title: str) -> str:
+    question = _normalized(item.get("question"))
+    if question:
+        return question
+    # Older records sometimes stored the actual question among setup steps.
+    for step in item.get("setup_steps", []):
+        text = _normalized(step)
+        if "?" in text or "？" in text:
+            return text
+    return (
+        f"‘{title}’에 사용할 기기나 서비스가 이미 정해져 있나요? "
+        "정해졌다면 이름이나 연결 방법을 채팅으로 알려주세요. "
+        "아직 없다면 ‘가능한 대안을 제안해 줘’라고 답해 주세요."
+    )
+
+
 def _custom_requirement(item: Mapping[str, Any]) -> dict[str, Any] | None:
     title = _normalized(item.get("title") or item.get("provider") or item.get("capability"))
     reason = _normalized(item.get("reason"))
     requirement_type = _normalized(item.get("type") or "external_requirement").lower()
     if not title and not reason:
         return None
-    blocking_types = {
+    credential_types = {
         "api_key",
         "server_api_key",
         "android_api_key",
@@ -400,10 +449,28 @@ def _custom_requirement(item: Mapping[str, Any]) -> dict[str, Any] | None:
         "payment_account",
         "server_credential",
         "cloud_project",
-        "backend",
-        "data_source",
     }
-    blocking = bool(item.get("blocking")) or requirement_type in blocking_types
+    resolution = _normalized(item.get("resolution")).lower()
+    plan = _normalized(item.get("implementation_plan"))
+    capability = _normalized(item.get("capability")).lower()
+    implementation_types = {
+        "local_app": {"backend", "data_source", "background_execution", "hardware", "special_permission"},
+        "shared_records": {"backend", "data_source"},
+        "public_http": {"data_source"},
+    }
+    if requirement_type in credential_types:
+        resolution = "external_setup"
+    elif resolution == "implementation":
+        if not plan or requirement_type not in implementation_types.get(capability, set()):
+            resolution = "clarification"
+    elif resolution not in {"clarification", "external_setup", "advisory"}:
+        # Legacy custom blockers have no configuration mechanism. Ask what is
+        # actually missing instead of presenting an endlessly failing recheck.
+        resolution = "clarification" if item.get("blocking") else "advisory"
+    # Semantic resolution takes precedence over inconsistent model flags.
+    # Credentials were forced to external_setup above; an advisory is not an
+    # instruction to stop before implementing a runtime permission flow.
+    blocking = resolution in {"external_setup", "clarification"}
     requirement_id = _normalized(item.get("id"))
     if not requirement_id:
         digest = hashlib.sha256(f"{title}|{reason}".encode("utf-8")).hexdigest()[:8]
@@ -414,9 +481,14 @@ def _custom_requirement(item: Mapping[str, Any]) -> dict[str, Any] | None:
         "type": requirement_type,
         "reason": reason or "앱 생성 전에 준비 여부를 확인해야 합니다.",
         "blocking": blocking,
+        "resolution": resolution,
+        "capability": capability,
+        "implementation_plan": plan if resolution == "implementation" else "",
+        "question": _clarification_question(item, title or "추가 기능") if resolution == "clarification" else "",
+        "recheckable": False,
         "configured": not blocking,
         "supported": not blocking,
-        "acknowledgement_only": not blocking,
+        "acknowledgement_only": resolution == "advisory",
         "execution_location": _normalized(item.get("execution_location")) or "user_setup",
         "setup_steps": [
             _normalized(step)
@@ -427,7 +499,7 @@ def _custom_requirement(item: Mapping[str, Any]) -> dict[str, Any] | None:
         "security_note": _normalized(item.get("security_note"))
         or "담당 연구원이 필요한 연결 방법을 확인합니다.",
         "participant_setup_steps": [],
-        "setup_owner": "researcher" if blocking else "participant",
+        "setup_owner": "researcher" if resolution == "external_setup" else "participant",
         "participant_can_register": False,
         "participant_credential_environment": "",
         "credential_pattern": "",
@@ -471,7 +543,9 @@ def resolve_prebuild_requirements(
         else:
             append(_custom_requirement(raw_item))
 
-    for definition in INTEGRATION_CATALOG:
+    # A semantic result (even []) is authoritative about scope. Keywords are
+    # only a compatibility fallback when no semantic analysis was supplied.
+    for definition in INTEGRATION_CATALOG if agent_requirements is None else ():
         if definition.integration_id not in seen and _matches(definition, prompt):
             append(
                 _catalog_requirement(
@@ -495,7 +569,12 @@ def missing_blocking_requirements(requirements: Sequence[Mapping[str, Any]]) -> 
 
 def format_prebuild_requirements(requirements: Sequence[Mapping[str, Any]]) -> str:
     missing = missing_blocking_requirements(requirements)
-    lines = ["**앱 생성 전에 준비사항을 확인해 주세요.**"]
+    has_questions = any(item.get("resolution") == "clarification" for item in missing)
+    lines = [
+        "**다음 질문에 채팅으로 답해 주세요.**" if has_questions
+        else "**앱 생성에 필요한 외부 연결을 준비해 주세요.**" if missing
+        else "**앱 구현에 반영할 안내입니다.**"
+    ]
     for item in requirements:
         title = _normalized(item.get("title")) or "추가 준비사항"
         configured = bool(item.get("configured"))
@@ -503,11 +582,20 @@ def format_prebuild_requirements(requirements: Sequence[Mapping[str, Any]]) -> s
         acknowledgement_only = bool(item.get("acknowledgement_only"))
         participant_can_register = bool(item.get("participant_can_register"))
         setup_owner = _normalized(item.get("setup_owner")) or "researcher"
+        resolution = _normalized(item.get("resolution"))
+        if resolution == "implementation":
+            continue
+        if resolution == "clarification":
+            lines.extend(["", f"**{title} · 선택 필요**", _normalized(item.get("reason"))])
+            lines.append(_clarification_question(item, title))
+            continue
         if acknowledgement_only:
-            state = "확인 필요"
+            state = "앱 사용 시 안내"
         elif configured and supported:
             state = "연결됨"
-        elif setup_owner == "researcher" or not supported:
+        elif not supported:
+            state = "연결 방식 확인 필요"
+        elif setup_owner == "researcher":
             state = "담당 연구원 설정 필요"
         elif participant_can_register:
             state = "API 키 입력 필요"
@@ -516,7 +604,11 @@ def format_prebuild_requirements(requirements: Sequence[Mapping[str, Any]]) -> s
         lines.extend(["", f"**{title} · {state}**", _normalized(item.get("reason"))])
         if configured and supported and not acknowledgement_only:
             continue
-        if setup_owner == "researcher" or not supported:
+        if not supported:
+            lines.append("현재 서버에는 이 연결을 완료하는 설정 경로가 없습니다. 키 등록만으로 준비가 완료되지는 않습니다.")
+            lines.append("담당 연구원과 지원 가능한 연결 방법을 확인해 주세요. 원하는 대안이 있다면 채팅으로 설명해 주세요.")
+            continue
+        if setup_owner == "researcher":
             lines.append("앱 등록 또는 서버 설정이 필요합니다. 담당 연구원에게 문의해 주세요.")
             continue
         steps = [
@@ -543,9 +635,11 @@ def format_prebuild_requirements(requirements: Sequence[Mapping[str, Any]]) -> s
         [
             "",
             (
-                "필수 준비가 완료되면 등록 상태를 확인한 뒤 다음 단계로 진행합니다."
+                "위 선택이나 연결 방법을 채팅으로 알려주시면 요청을 다시 검토합니다."
+                if any(not item.get("recheckable") for item in missing)
+                else "필수 준비가 완료되면 등록 상태를 확인한 뒤 다음 단계로 진행합니다."
                 if missing
-                else "준비사항을 확인했다면 아래 버튼을 눌러 생성 프롬프트를 확인하세요."
+                else "별도의 준비사항 승인은 필요하지 않습니다. 안내 내용은 앱 구현에 반영합니다."
             ),
         ]
     )

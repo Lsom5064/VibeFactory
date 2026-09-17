@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from flutter_apk_server.server import (
+from server.server import (
     CodexRateLimitSnapshot,
     CodexRateLimitWindow,
     build_token_usage_response,
@@ -18,7 +18,7 @@ class TokenUsageContractTests(unittest.TestCase):
         )
         snapshot = CodexRateLimitSnapshot(limit_name="codex", primary=weekly, secondary=None)
 
-        with patch("flutter_apk_server.server.load_usage_rate_limits", return_value=(snapshot, None)):
+        with patch("server.server.load_usage_rate_limits", return_value=(snapshot, None)):
             response = build_token_usage_response(settings=load_settings(), usage={})
 
         self.assertIsNone(response["primary_window"])
@@ -31,7 +31,7 @@ class TokenUsageContractTests(unittest.TestCase):
         short = CodexRateLimitWindow(used_percent=20, window_duration_mins=300, resets_at=10)
         snapshot = CodexRateLimitSnapshot(limit_name="codex", primary=weekly, secondary=short)
 
-        with patch("flutter_apk_server.server.load_usage_rate_limits", return_value=(snapshot, None)):
+        with patch("server.server.load_usage_rate_limits", return_value=(snapshot, None)):
             response = build_token_usage_response(settings=load_settings(), usage={})
 
         self.assertEqual(300, response["primary_window"]["window_duration_mins"])

@@ -1,5 +1,9 @@
 # VibeFactory Native Android Migration Plan
 
+> 보관 문서: 2026-09-07에 `docs/history/`로 이동했다. 아래는 당시 전환 계획과
+> 검증·복구 기록이며 현재 작업 지침은 [루트 AGENTS.md](../../AGENTS.md)를 따른다.
+> 기록 속 루트 경로·Goal 명령·배포 미완료 항목은 작성 당시의 상태다.
+
 - 작성일: 2026-08-14
 - 문서 상태: 로컬 Native 전환 및 XML 편집기 통합 완료, 별도 배포 검증 대기
 - 기준 저장소: `/Users/hai/Desktop/buildingAppswithCodex`

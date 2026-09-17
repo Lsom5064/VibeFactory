@@ -148,7 +148,7 @@ def fetch_codex_rate_limits_via_app_server(
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
-                    "params": {"clientInfo": {"name": "flutter_apk_server", "version": "1.0"}},
+                    "params": {"clientInfo": {"name": "server", "version": "1.0"}},
                 },
                 ensure_ascii=False,
             )
@@ -228,7 +228,7 @@ def fetch_codex_rate_limits_via_backend(
         headers={
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
-            "User-Agent": "flutter_apk_server/codex-limit-probe",
+            "User-Agent": "server/codex-limit-probe",
         },
         timeout=timeout_seconds,
     )

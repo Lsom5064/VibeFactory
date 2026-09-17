@@ -6,8 +6,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from flutter_apk_server.project_builder import native_android_project_builder
-from flutter_apk_server.server import (
+from server.project_builder import native_android_project_builder
+from server.server import (
     Database,
     GENERATED_APK_SIDELOAD_VERSION_CODE,
     apply_project_defaults,
@@ -26,7 +26,7 @@ from flutter_apk_server.server import (
     utc_now_iso,
     with_codex_reasoning_effort,
 )
-from flutter_apk_server.server_settings import UvicornAccessLogQueryFilter, default_codex_command
+from server.server_settings import UvicornAccessLogQueryFilter, default_codex_command
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]

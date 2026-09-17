@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from flutter_apk_server.server import (
+from server.server import (
     CodexTaskRunner,
     Database,
     load_settings,

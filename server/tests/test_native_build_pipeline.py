@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from flutter_apk_server.server import (
+from server.server import (
     CodexTaskRunner,
     Database,
     build_task_workspace,
@@ -207,7 +207,7 @@ class NativeBuildPipelineTests(unittest.TestCase):
                     "ensure_download_apk",
                     side_effect=lambda _task_id, _workspace, _project, apk: apk,
                 ),
-                patch("flutter_apk_server.server.validate_built_apk_install_contract"),
+                patch("server.server.validate_built_apk_install_contract"),
             ):
                 runner.process_task(task["task_id"])
 

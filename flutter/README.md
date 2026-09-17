@@ -16,8 +16,8 @@
 
 ## 주의
 
-현재 서비스는 루트의 `flutter_apk_server/`, `vibefactory/`, `BaseProject/`를 사용하며
-Native 런타임 데이터는 `flutter_apk_server/native_*` 경로를 사용한다.
+현재 서비스는 루트의 `server/`, `vibefactory/`, `BaseProject/`를 사용하며
+Native 런타임 데이터는 `server/native_*` 경로를 사용한다.
 
 이 디렉터리는 복구와 과거 기록 조회를 위한 아카이브다. 이전 Flutter BaseProject는
 현재 브랜치에 남아 있지 않으므로 `server/server.py`와 `aws/` 배포 파일만으로 이전

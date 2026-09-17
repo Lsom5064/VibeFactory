@@ -1,6 +1,6 @@
 import unittest
 
-from flutter_apk_server.prebuild_requirements import (
+from server.prebuild_requirements import (
     client_build_environment_for_requirements,
     extract_participant_credential,
     format_prebuild_requirements,
@@ -85,7 +85,7 @@ class PrebuildRequirementsTests(unittest.TestCase):
         self.assertTrue(requirements[0]["configured"])
         self.assertEqual([], missing_blocking_requirements(requirements))
         guidance = format_prebuild_requirements(requirements)
-        self.assertIn("확인 필요", guidance)
+        self.assertIn("앱 사용 시 안내", guidance)
         self.assertIn("알림 접근 설정에서 허용", guidance)
 
     def test_participant_can_register_simple_api_key_in_chat(self) -> None:

@@ -204,6 +204,8 @@ class Settings:
     generated_app_key_password: str
     shared_build_cache_enabled: bool
     admin_api_token: str
+    lint_recovery_max_attempts: int = 2
+    lint_recovery_timeout_seconds: int = 600
 
 
 def load_settings() -> Settings:
@@ -231,6 +233,8 @@ def load_settings() -> Settings:
         ),
         codex_command=os.getenv("CODEX_COMMAND", default_codex_command(root)),
         codex_timeout_seconds=codex_timeout_seconds,
+        lint_recovery_max_attempts=max(0, min(2, int(os.getenv("LINT_RECOVERY_MAX_ATTEMPTS", "2")))),
+        lint_recovery_timeout_seconds=max(1, min(600, int(os.getenv("LINT_RECOVERY_TIMEOUT_SECONDS", "600")))),
         server_base_url=os.getenv("SERVER_BASE_URL", "http://127.0.0.1:8000").rstrip("/"),
         max_concurrent_codex_runs=max(1, int(os.getenv("MAX_CONCURRENT_CODEX_RUNS", "1"))),
         db_path=resolve_path(os.getenv("DB_PATH", ""), root / "native_tasks.db", root),

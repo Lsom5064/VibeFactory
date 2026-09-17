@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from flutter_apk_server.server import (
+from server.server import (
     Database,
     GenerateAttachmentPayload,
     REFERENCE_IMAGE_MAX_DIMENSION,
@@ -157,7 +157,7 @@ class FullLoggingAndImageStorageTests(unittest.TestCase):
             ):
                 settings = load_settings()
                 with patch(
-                    "flutter_apk_server.server.run_openai_structured_agent",
+                    "server.server.run_openai_structured_agent",
                     return_value=None,
                 ) as mocked_agent:
                     result = run_spec_clarification_agent(
@@ -379,7 +379,7 @@ class FullLoggingAndImageStorageTests(unittest.TestCase):
                     )
 
                     with patch(
-                        "flutter_apk_server.server.invoke_app_runtime_model",
+                        "server.server.invoke_app_runtime_model",
                         return_value={
                             "message": response_message,
                             "usage": {

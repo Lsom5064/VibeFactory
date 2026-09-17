@@ -25,6 +25,11 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 
 try:
+    from .lint_recovery import LintValidationGuard, diagnose_lint_failure, render_lint_repair_prompt
+except ImportError:
+    from lint_recovery import LintValidationGuard, diagnose_lint_failure, render_lint_repair_prompt
+
+try:
     from .api_models import (
         AppDataCreateRequest,
         AppDataUpdateRequest,
@@ -55,6 +60,21 @@ except ImportError:
         UiEditorDraftRequest,
         UiEditorImageRequest,
         UiEditorSubmitRequest,
+    )
+
+try:
+    from .codex_failure_diagnostics import (
+        codex_failure_text,
+        looks_like_codex_auth_error,
+        looks_like_codex_quota_error,
+        looks_like_codex_sandbox_error,
+    )
+except ImportError:
+    from codex_failure_diagnostics import (  # type: ignore[no-redef]
+        codex_failure_text,
+        looks_like_codex_auth_error,
+        looks_like_codex_quota_error,
+        looks_like_codex_sandbox_error,
     )
 
 try:
@@ -93,21 +113,25 @@ except ImportError:
 
 try:
     from .prebuild_requirements import (
+        PREBUILD_REQUIREMENTS_POLICY,
         client_build_environment_for_requirements,
         extract_participant_credential,
         format_prebuild_requirements,
         missing_blocking_requirements,
         pending_participant_credential_requirement,
         resolve_prebuild_requirements,
+        requirement_snapshot,
     )
 except ImportError:
     from prebuild_requirements import (  # type: ignore[no-redef]
+        PREBUILD_REQUIREMENTS_POLICY,
         client_build_environment_for_requirements,
         extract_participant_credential,
         format_prebuild_requirements,
         missing_blocking_requirements,
         pending_participant_credential_requirement,
         resolve_prebuild_requirements,
+        requirement_snapshot,
     )
 
 try:
@@ -289,7 +313,7 @@ CODEX_ENGINE_CONTACT_MESSAGE = (
     "같은 문제가 반복되면 담당자 이정민(010-8187-6512)에게 알려주세요."
 )
 CODEX_ENGINE_AUTH_MESSAGE = (
-    "앱 생성 서버의 작업 엔진 인증이 만료되어 요청을 진행하지 못했어요. "
+    "앱 생성 서버의 작업 엔진 인증을 확인하지 못해 요청을 진행하지 못했어요. "
     "담당자 이정민(010-8187-6512)에게 알려주세요."
 )
 CODEX_ENGINE_QUOTA_MESSAGE = (
@@ -298,64 +322,17 @@ CODEX_ENGINE_QUOTA_MESSAGE = (
 )
 
 
-def looks_like_codex_quota_error(text: str) -> bool:
-    normalized = text.lower()
-    if not normalized.strip():
-        return False
-    markers = (
-        "rate limit",
-        "rate_limit",
-        "quota",
-        "usage limit",
-        "limit exceeded",
-        "too many requests",
-        "429",
-        "한도 초과",
-        "사용 한도",
-        "요청 한도",
-        "호출량 초과",
-        "사용량 한도",
-        "사용량 초과",
-        "쿼터",
-    )
-    return any(marker in normalized for marker in markers)
-
-
-def looks_like_codex_auth_error(text: str) -> bool:
-    normalized = text.lower()
-    if not normalized.strip():
-        return False
-    markers = (
-        "not logged in",
-        "not authenticated",
-        "authentication required",
-        "auth required",
-        "please login",
-        "please log in",
-        "login required",
-        "please sign in",
-        "sign in to",
-        "unauthorized",
-        "401",
-        "token expired",
-        "expired token",
-        "invalid token",
-        "access token expired",
-        "no auth credentials",
-        "codex login",
-        "인증이 만료",
-        "로그인이 필요",
-        "로그인 만료",
-        "인증 필요",
-        "인증 실패",
-    )
-    return any(marker in normalized for marker in markers)
-
-
 def codex_engine_issue_from_logs(
     log_text: str,
     exit_code: Optional[int],
 ) -> Optional[tuple[str, str, str, str]]:
+    if looks_like_codex_sandbox_error(log_text):
+        return (
+            "Error",
+            "앱 생성 서버의 격리 실행 환경에서 파일 작업을 진행하지 못했어요. 서버 실행 설정을 확인해 주세요.",
+            "codex_sandbox_error",
+            "앱 생성 실행 환경",
+        )
     if looks_like_codex_quota_error(log_text):
         return (
             "RateLimited",
@@ -378,6 +355,13 @@ def codex_engine_issue_from_logs(
             "앱 생성 작업 엔진",
         )
     return None
+
+
+def codex_engine_diagnostics(workspace_path: Path) -> str:
+    return codex_failure_text(
+        read_text_if_exists(workspace_path / "logs" / "codex_stdout.log", limit=None),
+        read_text_if_exists(workspace_path / "logs" / "codex_stderr.log", limit=None),
+    )
 
 
 def should_attempt_server_side_build(
@@ -473,6 +457,7 @@ class IntentDecision:
     storage_mode: str = "unspecified"
     stored_data: list[str] = field(default_factory=list)
     prebuild_requirements: list[dict[str, Any]] = field(default_factory=list)
+    prebuild_requirements_analyzed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1643,6 +1628,7 @@ def build_intent_decision(
             storage_mode=resolved_storage_mode,
             stored_data=resolved_stored_data,
             prebuild_requirements=resolved_prebuild_requirements,
+            prebuild_requirements_analyzed=prebuild_requirements is not None,
         )
     clarification_questions = questions or build_clarification_questions(effective_prompt)
     clarification_message = "수정을 시작하기 전에 몇 가지만 확인할게요." if resolved_request_scope == "existing_app_modification" else "앱 생성을 시작하기 전에 몇 가지만 확인할게요."
@@ -1684,6 +1670,7 @@ def build_intent_decision(
         storage_mode=resolved_storage_mode,
         stored_data=resolved_stored_data,
         prebuild_requirements=resolved_prebuild_requirements,
+        prebuild_requirements_analyzed=prebuild_requirements is not None,
     )
 
 
@@ -1741,6 +1728,8 @@ def build_prepared_generation_prompt(decision: IntentDecision) -> str:
         attachment_lines.append(f"주의: {image_conflict_note}")
     add_list_section("첨부 자료 반영", attachment_lines)
     integration_lines: list[str] = []
+    implementation_lines: list[str] = []
+    advisory_lines: list[str] = []
     for requirement in decision.prebuild_requirements:
         title = normalize_whitespace(str(requirement.get("title") or "추가 준비사항"))
         reason = normalize_whitespace(str(requirement.get("reason") or ""))
@@ -1752,6 +1741,9 @@ def build_prepared_generation_prompt(decision: IntentDecision) -> str:
         contract_parts = [title]
         if reason:
             contract_parts.append(reason)
+        implementation_plan = normalize_whitespace(str(requirement.get("implementation_plan") or ""))
+        if implementation_plan:
+            contract_parts.append(f"구현 방법: {implementation_plan}")
         if execution_location:
             contract_parts.append(f"실행 위치: {execution_location}")
         if client_env_names:
@@ -1765,7 +1757,16 @@ def build_prepared_generation_prompt(decision: IntentDecision) -> str:
                 contract_parts.append(
                     "앱 코드에서는 같은 이름의 BuildConfig 필드를 사용한다."
                 )
-        integration_lines.append(" / ".join(contract_parts))
+        resolution = requirement.get("resolution")
+        if resolution == "implementation":
+            implementation_lines.append(" / ".join(contract_parts))
+        elif resolution == "advisory":
+            steps = normalize_prompt_items(requirement.get("setup_steps"), max_items=5)
+            advisory_lines.append(" / ".join([*contract_parts, *steps]))
+        else:
+            integration_lines.append(" / ".join(contract_parts))
+    add_list_section("자동 구현 사항", implementation_lines)
+    add_list_section("앱 사용 시 안내", advisory_lines)
     add_list_section("외부 연동 및 필수 조건", integration_lines)
     add_list_section("완성 조건", acceptance_criteria)
     add_text_section("구체화된 앱 생성 요청", original_request)
@@ -1783,20 +1784,20 @@ def build_prebuild_requirements_review_decision(
         return decision
     requirements = resolve_prebuild_requirements(
         decision.effective_user_prompt,
-        decision.prebuild_requirements,
+        decision.prebuild_requirements if (
+            decision.prebuild_requirements_analyzed or decision.prebuild_requirements
+        ) else None,
         environment=environment,
         package_name=decision.package_name,
     )
     decision = replace(decision, prebuild_requirements=requirements)
     missing_requirements = missing_blocking_requirements(requirements)
-    known_ids = {normalize_whitespace(item) for item in (known_requirement_ids or set()) if item}
-    has_new_requirement = any(
-        normalize_whitespace(str(item.get("id") or "")) not in known_ids
-        for item in requirements
-    )
-    if requirements and (missing_requirements or (has_new_requirement and not prerequisite_reviewed)):
-        guidance = format_prebuild_requirements(requirements)
-        action = "recheck_prebuild_requirements" if missing_requirements else "confirm_prebuild_requirements"
+    # Keep legacy acknowledgement arguments compatible with existing callers,
+    # but only an unresolved dependency can interrupt generation now.
+    if missing_requirements:
+        guidance = format_prebuild_requirements(missing_requirements)
+        needs_answer = any(not item.get("recheckable") for item in missing_requirements)
+        action = "" if needs_answer else "recheck_prebuild_requirements"
         return replace(
             decision,
             mode="ask_confirmation",
@@ -1804,17 +1805,15 @@ def build_prebuild_requirements_review_decision(
             tool="ask_confirmation",
             message=guidance,
             summary=(
-                "필수 외부 연동이 아직 준비되지 않아 앱 생성 프롬프트를 만들기 전에 확인이 필요해요."
-                if missing_requirements
-                else "앱 생성에 영향을 주는 외부 연동과 기기 조건을 먼저 확인하고 있어요."
+                "요청한 기능을 구현할 데이터 출처나 연결 방법을 확인해야 해요."
+                if needs_answer
+                else "필수 외부 연동이 아직 준비되지 않아 앱 생성 프롬프트를 만들기 전에 확인이 필요해요."
             ),
             questions=[guidance],
             reason="필수 계정, 자격증명, 권한 또는 서비스 이용 조건을 앱 생성 전에 확인합니다.",
             confirmation_action=action,
             confirmation_payload=(
-                "필수 준비사항의 등록 상태를 다시 확인해 주세요."
-                if missing_requirements
-                else "필수 준비사항을 확인했습니다."
+                "" if needs_answer else "필수 준비사항의 등록 상태를 다시 확인해 주세요."
             ),
             prepared_prompt="",
         )
@@ -1924,15 +1923,7 @@ def build_initial_prompt_submission_decision(
             "공유 정보는 서버 데이터 API를 통해 저장하고 불러온다.",
         }
     ]
-    prebuild_requirements = [
-        dict(item)
-        for item in (
-            previous_conversation_state.get("latest_prebuild_requirements")
-            or previous_conversation_state.get("pending_prebuild_requirements")
-            or []
-        )
-        if isinstance(item, dict)
-    ][:8]
+    prebuild_requirements = requirement_snapshot(previous_conversation_state)
     decision = build_intent_decision(
         mode="build",
         task_id=task_id,
@@ -1979,15 +1970,7 @@ def build_prebuild_recheck_decision(
             or ""
         )
     )
-    requirements = [
-        dict(item)
-        for item in (
-            previous_conversation_state.get("pending_prebuild_requirements")
-            or previous_conversation_state.get("latest_prebuild_requirements")
-            or []
-        )
-        if isinstance(item, dict)
-    ][:8]
+    requirements = requirement_snapshot(previous_conversation_state)
     decision = build_intent_decision(
         mode="build",
         task_id=task_id,
@@ -2483,6 +2466,7 @@ def run_spec_clarification_agent(
     reference_image_base64: Optional[str] = None,
     reference_attachments: Optional[list[dict[str, str]]] = None,
     conversation_history: Optional[list[dict[str, Any]]] = None,
+    prebuild_review_only: bool = False,
 ) -> Optional[dict[str, Any]]:
     normalized_reference_image_name = normalize_reference_image_name(reference_image_name)
     normalized_reference_image_base64 = normalize_reference_image_base64(reference_image_base64)
@@ -2595,6 +2579,10 @@ def run_spec_clarification_agent(
                         "setup_steps",
                         "setup_url",
                         "security_note",
+                        "resolution",
+                        "capability",
+                        "implementation_plan",
+                        "question",
                     ],
                     "properties": {
                         "id": {"type": "string"},
@@ -2629,6 +2617,10 @@ def run_spec_clarification_agent(
                         },
                         "setup_url": {"type": "string"},
                         "security_note": {"type": "string"},
+                        "resolution": {"type": "string", "enum": ["implementation", "clarification", "external_setup", "advisory"]},
+                        "capability": {"type": "string", "enum": ["none", "local_app", "shared_records", "public_http"]},
+                        "implementation_plan": {"type": "string"},
+                        "question": {"type": "string"},
                     },
                 },
             },
@@ -2673,14 +2665,14 @@ Rules:
 - In that case, set effective_user_prompt to the revised buildable request, ask one short Korean confirmation question such as whether to proceed without that unsupported feature, and keep the rest of the app context intact.
 - Examples of likely-infeasible requests include deep Bixby integration or device-vendor/private assistant control that depends on private or policy-restricted capabilities.
 - For every build or ask_confirmation result, inspect the requested features for material pre-build requirements and fill prebuild_requirements.
-- Include requirements that must be known before showing the final generation prompt: external API keys, provider accounts, billing activation, OAuth consent, backend or shared-data infrastructure, privileged Android settings, required hardware or sensors, exact background scheduling limits, regulated or sensitive-data policies, and unavailable external data sources.
+- Include real external dependencies or unresolved user-visible choices before showing the final generation prompt. Apply the pre-build requirement policy below to distinguish implementation work from external setup.
 - Do not ask a participant to register an Android package name, signing certificate, OAuth redirect, service account, payment account, or provider application. Those are researcher-managed setup items.
 - A provider that only requires the participant to create an account and issue a standalone research API key may ask the participant to enter that key in the VibeFactory chat. The server handles storage and build injection; never copy an entered key into your output.
 - Do not add ordinary Android runtime permissions such as camera or location by themselves unless the request also requires a special Settings screen grant, background access, policy-sensitive access, or unavailable hardware.
 - Use a stable catalog id when it applies: openai, google_maps_platform, firebase, supabase, google_oauth, weather, public_data_portal, email_delivery, sms_delivery, payments, kakao_platform, naver_platform, youtube_data.
 - For an unknown provider or requirement, use a short lowercase id and provide concrete Korean setup_steps. Never invent an API key or claim an account is already configured.
-- Set blocking=true when the app cannot deliver the requested real behavior without the account, credential, backend, data source, or hardware. Use blocking=false for an important limitation that the user only needs to acknowledge.
-- API keys, passwords, tokens, and OAuth secrets must never appear in any returned field. Tell the user to register them through server configuration rather than chat.
+- Set blocking=true only for an unresolved external dependency or a material user-visible choice. Ordinary implementation, available built-in hardware, runtime permission flows and usage advisories have blocking=false; their implementation belongs to the coding agent.
+- API keys, passwords, tokens, and OAuth secrets must never appear in any returned field. Use the registration policy for the selected provider; never request unsupported secrets in chat.
 - request_scope=new_app when the user is asking to create a brand-new app.
 - request_scope=existing_app_modification when the user is trying to change an app that already exists.
 - Always propose app_name for build or ask_confirmation.
@@ -2701,14 +2693,12 @@ Rules:
 - Fill key_screens with 1-6 concrete user-facing screens or tabs needed by this app. Do not copy whole request sentences into this field.
 - Fill core_features with 1-8 concrete behaviors that must work in the first version. Each item must describe one observable feature.
 - For build or ask_confirmation, always fill secondary_requirements with 0-5 enhancement items that are nice-to-have, second-phase, or optional polish beyond the first-release core flow.
-- For a new app request, do not use mode=build until both of these are decided:
-  1. primary_user_flow is concrete enough,
-  2. secondary_scope_confirmed is true and secondary_requirements are either explicitly listed or explicitly confirmed as none for now.
-- If the user's message does not clearly separate first-release core flow from second-phase enhancements, use mode=ask_confirmation and propose 2-5 short feature questions yourself.
-- Do not ask the user to write or organize 1차 핵심 흐름 and 2차 고도화 요구 from scratch.
+- For a new app request, choose mode=build as soon as the core user-visible workflow is concrete and actual external dependencies are known. Let the coding agent decide routine implementation and polish.
+- Do not require a separate first-release/second-phase scope interview. Preserve explicitly requested enhancements; otherwise choose a minimal useful first version, leave optional secondary_requirements empty, and set secondary_scope_confirmed=true. The user can edit the final generation prompt.
+- Ask a short question only when different answers would materially change the requested product or an external dependency remains unresolved. Do not ask users to organize 1차 핵심 흐름 and 2차 고도화 요구.
 - This build system provides `VibeDataClient` for simple shared records through the VibeFactory server. It does not provide production-grade login, identity verification, per-role authorization, tenant isolation, file cloud storage, or end-to-end encrypted sync by default.
 - Do not add a blocking backend requirement when the request only needs ordinary shared records and `VibeDataClient` is sufficient.
-- Add a blocking backend, authentication, or policy requirement when the request needs accounts, owner/student/parent or doctor/patient role separation, private per-user records, sensitive personal data, cloud files, external web access, or provider-specific synchronization.
+- When the request needs remote identity, role-based access, private shared records, cloud files or provider-specific synchronization beyond the runtime, identify the actual missing service or ask about the intended behavior. Do not infer an external backend solely from local private records or sensitive subject matter; handle local data protection in app implementation and explain relevant limitations.
 - Do not ask whether login, account creation, server storage, cloud sync, or multi-device sync is needed unless the user explicitly requested login, accounts, sharing across users, teams, cloud sync, or multi-device use.
 - If persistent storage is implied or requested, assume local on-device persistence by default.
 - Do not ask where data should be stored. Only ask what user-visible data or actions must be saved when that materially changes the app.
@@ -2717,12 +2707,9 @@ Rules:
 - Set storage_mode=server only when the request explicitly needs sharing between users/devices, accounts, collaboration, or synchronization.
 - Set storage_mode=unspecified only for answer_question. For build or ask_confirmation, choose none, local, or server.
 - Fill stored_data with the actual records that must persist, such as 일정, 출석 기록, 메모, 즐겨찾기, or 사용자별 진도. Leave it empty when storage_mode=none.
-- Ask concrete option questions about user-visible behavior, such as:
-  - 작성만 있으면 될까요, 수정과 삭제도 같이 필요할까요?
-  - 첫 화면은 입력 중심으로 할까요, 목록이나 대시보드 중심으로 할까요?
-  - 검색 기능도 이번에 필요할까요?
+- When a question is necessary, give concrete options about the unresolved behavior or real data source. Choose reasonable defaults for screen arrangement, standard edit/delete actions, search, sorting, visual style, and other reversible polish.
 - Keep the questions short and easy for non-technical users to answer.
-- Do not guess the second-phase scope silently when the user has not decided it yet, but do guide the user with concrete feature questions first.
+- Do not invent extra external services or optional features as prerequisites. Put reasonable defaults in the final editable prompt instead of requesting another approval.
 - If the user explicitly says there is no second-phase scope for now, set secondary_scope_confirmed=true and leave secondary_requirements empty.
 - For build or ask_confirmation, always fill acceptance_criteria with 3-8 short Korean bullet-style conditions that describe what must really work in the finished app.
 - acceptance_criteria must capture user-visible must-have behavior, not internal implementation trivia.
@@ -2767,7 +2754,16 @@ Rules:
 - For answer_question, target_users, key_screens, core_features, and stored_data must be empty arrays, and storage_mode must be unspecified.
 - For answer_question, prebuild_requirements must be an empty array.
 
+{PREBUILD_REQUIREMENTS_POLICY}
+
 Return JSON only.
+"""
+    if prebuild_review_only:
+        agent_prompt += """
+This is the final prompt submitted after the user already reviewed the specification.
+The latest_user_prompt is the complete, authoritative edited specification; it supersedes earlier versions.
+Only review current external requirements and unresolved dependencies. Do not reopen first/second-phase scope, suggest extra features, rename the app, or rewrite the submitted prompt.
+Use mode=build when prerequisites can be determined; use ask_confirmation only for an actual unresolved dependency and provide a concrete question. Do not use answer_question here.
 """
 
     user_content: list[dict[str, Any]] = [
@@ -2882,7 +2878,7 @@ def decide_intent(
             request_scope="existing_app_modification",
             requires_existing_task_context=False,
         )
-    if existing_task and bool(previous_state.get("awaiting_confirmation")) and pending_prompt and looks_like_generic_confirmation(prompt):
+    if existing_task and bool(previous_state.get("awaiting_confirmation")) and pending_prompt and looks_like_generic_confirmation(prompt) and not (settings and settings.intent_agent_enabled):
         followup_scope = effective_followup_request_scope(
             previous_request_scope,
             existing_workspace_ready=existing_workspace_ready,
@@ -2901,6 +2897,7 @@ def decide_intent(
                 request_scope=followup_scope,
                 requires_existing_task_context=requires_existing_task_context,
                 acceptance_criteria=pending_acceptance_criteria,
+                prebuild_requirements=requirement_snapshot(previous_state),
             )
         return build_intent_decision(
             mode="build",
@@ -2914,6 +2911,7 @@ def decide_intent(
             request_scope=followup_scope,
             requires_existing_task_context=requires_existing_task_context,
             acceptance_criteria=pending_acceptance_criteria,
+            prebuild_requirements=requirement_snapshot(previous_state),
         )
 
     if settings and settings.intent_agent_enabled:
@@ -2970,7 +2968,15 @@ def decide_intent(
                 dict(item)
                 for item in (spec_payload.get("prebuild_requirements") or [])
                 if isinstance(item, dict)
-            ][:8]
+            ][:8] if isinstance(spec_payload.get("prebuild_requirements"), list) else None
+            if spec_mode in {"build", "ask_confirmation"} and spec_prebuild_requirements is None and not settings.mock_codex:
+                return build_intent_decision(
+                    mode="ask_confirmation", task_id=task_id, existing_task=existing_task,
+                    existing_workspace_ready=existing_workspace_ready, user_prompt=prompt,
+                    effective_user_prompt=pending_prompt or prompt,
+                    questions=["요청의 연동 조건을 확인하지 못했어요. 잠시 후 요청을 다시 보내 주세요."],
+                    reason="명세 분석 결과에 현재 사전조건 목록이 없습니다. 단어 검색으로 외부 설정을 확정하지 않습니다.",
+                )
             supported_revision = revise_prompt_for_supported_android_scope(prompt)
             if supported_revision and looks_like_build_request(prompt, existing_task):
                 return build_supported_revision_confirmation_decision(
@@ -3201,6 +3207,14 @@ def decide_intent(
                     or build_reference_image_summary(normalize_reference_image_name(reference_image_name)),
                 )
 
+    if settings and settings.intent_agent_enabled and not settings.mock_codex:
+        return build_intent_decision(
+            mode="ask_confirmation", task_id=task_id, existing_task=existing_task,
+            existing_workspace_ready=existing_workspace_ready, user_prompt=prompt,
+            effective_user_prompt=pending_prompt or prompt,
+            questions=["요청 내용을 확인하는 중 일시적인 문제가 생겼어요. 잠시 후 요청을 다시 보내 주세요."],
+            reason="명세 분석을 완료하지 못했습니다. 연동 필요 여부를 단어 검색으로 확정하지 않습니다.",
+        )
     return fallback_decide_intent(
         prompt,
         task_id,
@@ -5206,6 +5220,8 @@ def render_task_agents_md(task_id: str) -> str:
 - 최종 signed release APK 빌드는 서버가 수행하므로 `assembleRelease`를 직접 실행하지 않는다.
 - `task_result.json`의 `apk_path`는 `project/app/build/outputs/apk/release/app-release.apk`로 기록한다.
 - 사용자가 요청한 핵심 기능을 더 쉬운 대체 구현으로 바꾸지 않는다.
+- Android API, 사용 가능한 내장 센서 선택, 필터링·중립 보정·민감도, 게임 로직, 저장 구조, 레이아웃과 일반적인 권한 요청 흐름은 명세에 맞춰 직접 결정하고 구현한다. 이런 구현 선택을 사용자 준비사항이나 추가 승인으로 돌리지 않는다.
+- 기기·SDK 정보를 확인하고 합리적인 기본값으로 완성한다. 단순 사용 안내나 설치 후 권한은 앱 안의 적절한 시점에 제공한다. 실제로 없는 외부 계정·자격증명·장비가 필수이거나 사용자가 정한 핵심 동작을 바꿔야 할 때만 구체적인 미해결 조건을 보고한다.
 - `prompt.md`에 적힌 `1차 핵심 흐름`을 이번 빌드의 최우선 범위로 본다.
 - `2차 고도화 요구`는 1차가 안정적으로 성립한 뒤에 반영한다. 시간이 부족하거나 충돌하면 1차를 우선하고, 못 넣은 2차 요구는 `known_limitations`에 남긴다.
 - 예를 들어 카메라 요구를 수동 텍스트 입력으로, OCR 요구를 붙여넣기 전용 흐름으로, AI/외부정보 조회를 하드코딩 샘플 데이터로, 저장 기능을 메모리 리스트만으로 대체하면 안 된다.
@@ -5947,8 +5963,8 @@ Also include `change_summary` as one or two short Korean sentences explaining wh
 `change_summary` must be a code-aware paraphrase, not a repetition or quotation of the user's message.
 Do not use a template such as "이번 수정은 {{사용자 원문}}을 반영해요."
 Do not include paths, code identifiers, commands, or developer terminology in `change_summary`.
-For `build` or `ask_confirmation`, inspect whether the latest change newly requires an external API key, provider account, billing, OAuth, backend or role authorization, a privileged Android setting, special hardware, exact background execution, sensitive-data policy, or an unavailable external data source.
-Put each material condition in `prebuild_requirements`. Use an empty array when the latest change adds none.
+For `build` or `ask_confirmation`, inspect the resulting app's external requirements from its code and the agreed change. Return the complete current snapshot, retaining still-used integrations and removing only dependencies of removed features.
+{PREBUILD_REQUIREMENTS_POLICY}
 Use the same stable ids as the initial spec flow when applicable: openai, google_maps_platform, firebase, supabase, google_oauth, weather, public_data_portal, email_delivery, sms_delivery, payments, kakao_platform, naver_platform, youtube_data.
 Never include an actual API key, password, token, or OAuth secret in your output. The server may separately recognize a participant key message and replace it with a registration marker before this context reaches you.
 If `previous_conversation_state.awaiting_confirmation` is true and the latest user message answers that pending question, merge the pending request and latest answer into `effective_user_prompt`.
@@ -5968,6 +5984,10 @@ Result JSON schema:
       "type": "api_key | server_api_key | android_api_key | oauth | external_account | provider_account | payment_account | server_credential | cloud_project | backend | data_source | special_permission | hardware | background_execution | policy",
       "reason": "string",
       "blocking": true,
+      "resolution": "implementation | clarification | external_setup | advisory",
+      "capability": "none | local_app | shared_records | public_http",
+      "implementation_plan": "string",
+      "question": "string",
       "execution_location": "string",
       "setup_steps": ["string"],
       "setup_url": "string",
@@ -6130,7 +6150,7 @@ Context:
         dict(item)
         for item in (parsed.get("prebuild_requirements") or [])
         if isinstance(item, dict)
-    ][:8]
+    ][:8] if isinstance(parsed.get("prebuild_requirements"), list) else None
 
     log_agent_output_event(
         db,
@@ -6580,15 +6600,13 @@ def current_task_prebuild_requirements(task: dict[str, Any]) -> list[dict[str, A
     if not isinstance(conversation_state, dict):
         conversation_state = {}
     for value in (
+        requirement_snapshot(conversation_state),
         state_payload.get("prebuild_requirements"),
-        conversation_state.get("latest_prebuild_requirements"),
-        conversation_state.get("pending_prebuild_requirements"),
     ):
         if not isinstance(value, list):
             continue
         requirements = [dict(item) for item in value if isinstance(item, dict)][:8]
-        if requirements:
-            return requirements
+        return requirements
     return []
 
 
@@ -6838,11 +6856,14 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
     latest_stored_data = decision.stored_data or normalize_context_list(
         previous_conversation_state.get("latest_stored_data")
     )
-    latest_prebuild_requirements = decision.prebuild_requirements or [
-        dict(item)
-        for item in (previous_conversation_state.get("latest_prebuild_requirements") or [])
-        if isinstance(item, dict)
-    ][:8]
+    latest_prebuild_requirements = (
+        decision.prebuild_requirements
+        if decision.prebuild_requirements_analyzed
+        else list({
+            str(item.get("id") or ""): dict(item)
+            for item in (requirement_snapshot(previous_conversation_state) or []) + decision.prebuild_requirements
+        }.values())[:8]
+    )
     latest_summary = decision.summary or str(previous_conversation_state.get("latest_summary") or "")
     return {
         "status": decision.status,
@@ -6864,7 +6885,7 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
         "key_screens": decision.key_screens,
         "storage_mode": decision.storage_mode,
         "stored_data": decision.stored_data,
-        "prebuild_requirements": decision.prebuild_requirements,
+        "prebuild_requirements": latest_prebuild_requirements,
         "confirmation_action": decision.confirmation_action,
         "confirmation_payload": decision.confirmation_payload,
         "image_reference_summary": decision.image_reference_summary,
@@ -6891,6 +6912,7 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "latest_storage_mode": latest_storage_mode,
             "latest_stored_data": latest_stored_data,
             "latest_prebuild_requirements": latest_prebuild_requirements,
+            "final_prompt_requirements_pending": bool(previous_conversation_state.get("final_prompt_requirements_pending")) and not decision.prebuild_requirements_analyzed,
             "awaiting_confirmation": decision.mode == "ask_confirmation",
             "awaiting_prompt_review": awaiting_prompt_review,
             "confirmation_action": decision.confirmation_action,
@@ -6908,7 +6930,7 @@ def make_decision_state(task: dict[str, Any], decision: IntentDecision, user_pro
             "pending_key_screens": decision.key_screens if decision.mode == "ask_confirmation" else [],
             "pending_storage_mode": decision.storage_mode if decision.mode == "ask_confirmation" else "unspecified",
             "pending_stored_data": decision.stored_data if decision.mode == "ask_confirmation" else [],
-            "pending_prebuild_requirements": decision.prebuild_requirements if decision.mode == "ask_confirmation" else [],
+            "pending_prebuild_requirements": latest_prebuild_requirements if decision.mode == "ask_confirmation" else [],
             "used_previous_pending_prompt": decision.used_previous_pending_prompt,
             "request_scope": state_request_scope,
             "requires_existing_task_context": decision.requires_existing_task_context,
@@ -7869,9 +7891,15 @@ class CodexTaskRunner:
         started_at: float,
     ) -> None:
         elapsed_seconds = time.monotonic() - started_at
+        result_exists = result_path.exists()
+        engine_issue = (
+            None
+            if result_exists
+            else codex_engine_issue_from_logs(codex_engine_diagnostics(workspace_path), exit_code)
+        )
         phase = (
             "failed"
-            if timed_out or (exit_code not in (0, None) and not result_path.exists())
+            if timed_out or engine_issue is not None
             else "succeeded"
         )
         body = (
@@ -7893,13 +7921,6 @@ class CodexTaskRunner:
             ),
         )
         identity_changed = self.enforce_task_project_identity(task_id)
-        result_exists = result_path.exists()
-        codex_log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
-        engine_issue = (
-            None
-            if result_exists
-            else codex_engine_issue_from_logs(codex_log_text, exit_code)
-        )
         result_status = ""
         if result_exists:
             try:
@@ -7926,11 +7947,14 @@ class CodexTaskRunner:
         workspace_path: Path,
         stdout_path: Path,
         stderr_path: Path,
+        *,
+        prompt_override: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> tuple[Optional[int], bool]:
         task_id = str(task["task_id"])
         if self.is_task_cancelled(task_id):
             return None, False
-        prompt = (workspace_path / "prompt.md").read_text(encoding="utf-8")
+        prompt = prompt_override if prompt_override is not None else (workspace_path / "prompt.md").read_text(encoding="utf-8")
         project_path = Path(str(task.get("project_path") or workspace_path / "project"))
         prompt_placeholder = "__CODEX_PROMPT_PLACEHOLDER_6F4A1F45__"
         try:
@@ -7961,16 +7985,16 @@ class CodexTaskRunner:
                 self.terminate_task_process(task_id)
                 return process.returncode, False
             try:
-                return self.wait_for_process(process), False
+                return self.wait_for_process(process, timeout_seconds), False
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                self.terminate_process(process)
                 return process.returncode, True
             finally:
                 self.unregister_process(process)
 
-    def wait_for_process(self, process: subprocess.Popen[Any]) -> int:
-        timeout_seconds = self.settings.codex_timeout_seconds
+    def wait_for_process(self, process: subprocess.Popen[Any], timeout_seconds: Optional[float] = None) -> int:
+        if timeout_seconds is None:
+            timeout_seconds = self.settings.codex_timeout_seconds
         if timeout_seconds is None:
             return process.wait()
         return process.wait(timeout=timeout_seconds)
@@ -8036,6 +8060,7 @@ class CodexTaskRunner:
         env: dict[str, str],
         log_path: Path,
         task_id: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> tuple[int, bool, float]:
         if task_id and self.is_task_cancelled(task_id):
             return 1, False, 0.0
@@ -8062,14 +8087,13 @@ class CodexTaskRunner:
                 log_file.flush()
                 return process.returncode or 1, False, elapsed
             try:
-                exit_code = self.wait_for_process(process)
+                exit_code = self.wait_for_process(process, timeout_seconds)
                 elapsed = time.monotonic() - started_at
                 log_file.write(f"\n[server] command finished exit_code={exit_code} duration={elapsed:.1f}s\n")
                 log_file.flush()
                 return exit_code, False, elapsed
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                self.terminate_process(process)
                 elapsed = time.monotonic() - started_at
                 log_file.write(f"\n[server] command timed out after {elapsed:.1f}s\n")
                 log_file.flush()
@@ -8313,6 +8337,163 @@ class CodexTaskRunner:
             )
             return prepared_apk
 
+    def run_lint_with_recovery(
+        self,
+        *,
+        task_id: str,
+        workspace_path: Path,
+        project_path: Path,
+        command: list[str],
+        env: dict[str, str],
+        build_log_path: Path,
+        recovery: dict[str, Any],
+    ) -> tuple[int, bool, float]:
+        started = time.monotonic()
+        recovery.update(attempts=[], stop_reason="not_needed")
+
+        def run_check(timeout: Optional[float] = None) -> tuple[tuple[int, bool, float], str]:
+            offset = build_log_path.stat().st_size if build_log_path.exists() else 0
+            result = self.run_logged_command(
+                command, cwd=project_path, env=env, log_path=build_log_path,
+                task_id=task_id, timeout_seconds=timeout,
+            )
+            with build_log_path.open("rb") as log:
+                log.seek(offset)
+                text = log.read().decode("utf-8", errors="replace")
+            return result, text
+
+        result, diagnostic_text = run_check()
+        if result[0] == 0 or result[1] or self.is_task_cancelled(task_id):
+            return result
+        max_attempts = self.settings.lint_recovery_max_attempts
+        if not max_attempts or self.settings.mock_codex:
+            recovery["stop_reason"] = "disabled"
+            return result
+        deadline = time.monotonic() + self.settings.lint_recovery_timeout_seconds
+        seen_errors: set[str] = set()
+        guard = LintValidationGuard.capture(project_path)
+        original_prompt_path = workspace_path / "prompt.md"
+        original_prompt = original_prompt_path.read_text(encoding="utf-8") if original_prompt_path.exists() else ""
+        # Keep agent repair output separate from the original generation/result contract.
+        result_path = workspace_path / ".codex_result/task_result.json"
+        original_result = result_path.read_bytes() if result_path.exists() else None
+        control_files = {
+            path: path.read_bytes()
+            for path in (original_prompt_path, workspace_path / "AGENTS.md") if path.exists()
+        }
+        controls_changed = False
+        recovery["stop_reason"] = "attempt_limit"
+        for attempt in range(1, max_attempts + 1):
+            if self.is_task_cancelled(task_id) or self.stop_event.is_set():
+                recovery["stop_reason"] = "cancelled"
+                break
+            diagnostic = diagnose_lint_failure(diagnostic_text)
+            if diagnostic.category != "source":
+                recovery["stop_reason"] = diagnostic.category
+                break
+            if diagnostic.fingerprint in seen_errors:
+                recovery["stop_reason"] = "unchanged_errors"
+                break
+            seen_errors.add(diagnostic.fingerprint)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                recovery["stop_reason"] = "time_limit"
+                break
+            message = f"앱 검증 중 발견한 오류를 자동으로 수정하고 있어요. ({attempt}/{max_attempts})"
+            if not self.db.update_task_if_status(task_id, {"running"}, message=message):
+                recovery["stop_reason"] = "cancelled"
+                break
+            log_task_status_event(self.db, self.db.get_task(task_id), event_type="build_stage_lint_repair")
+            log_build_stage_event(self.db, task_id, stage="Android lint 자동 복구", phase="started", body=message)
+            repair_dir = workspace_path / "logs/lint_recovery" / uuid.uuid4().hex
+            repair_dir.mkdir(parents=True)
+            stdout_path, stderr_path = repair_dir / "stdout.jsonl", repair_dir / "stderr.log"
+            errors = list(diagnostic.errors)
+            for key, value in env.items():
+                if value and re.search(r"PASSWORD|SECRET|TOKEN|API_KEY|SERVICE_KEY", key):
+                    errors = [error.replace(value, "[REDACTED]") for error in errors]
+            prompt = render_lint_repair_prompt(original_prompt, tuple(errors), attempt)
+            (repair_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+            record: dict[str, Any] = {
+                "attempt": attempt, "stdout_path": str(stdout_path.relative_to(workspace_path)),
+                "stderr_path": str(stderr_path.relative_to(workspace_path)),
+            }
+            recovery["attempts"].append(record)
+            try:
+                repair_exit, repair_timeout = self.run_codex(
+                    self.db.get_task(task_id), workspace_path, stdout_path, stderr_path,
+                    prompt_override=prompt, timeout_seconds=remaining,
+                )
+                record.update(exit_code=repair_exit, timed_out=repair_timeout)
+            except (OSError, RuntimeError) as exc:
+                record.update(exit_code=None, timed_out=False, error=type(exc).__name__)
+                repair_exit, repair_timeout = None, False
+            finally:
+                if original_result is not None:
+                    result_path.write_bytes(original_result)
+                for path, content in control_files.items():
+                    if not path.is_file() or path.read_bytes() != content:
+                        controls_changed = True
+                        path.write_bytes(content)
+                # Persist complete repair input/output independently of abbreviated progress messages.
+                repair_usage = parse_codex_usage_from_jsonl(stdout_path)
+                record["usage"] = codex_usage_payload(repair_usage) if repair_usage else None
+                self.db.log_event(
+                    task_id, actor="system", event_type="lint_repair_output",
+                    message_text=f"검증 오류 자동 수정 {attempt}회 실행 결과를 기록했어요.",
+                    payload={**record, "prompt": prompt,
+                             "stdout": read_text_if_exists(stdout_path, limit=None),
+                             "stderr": read_text_if_exists(stderr_path, limit=None)},
+                )
+            if self.is_task_cancelled(task_id) or self.stop_event.is_set():
+                recovery["stop_reason"] = "cancelled"
+                break
+            if repair_timeout or time.monotonic() >= deadline:
+                recovery["stop_reason"] = "time_limit"
+                break
+            if repair_exit != 0:
+                recovery["stop_reason"] = "repair_engine_failed"
+                break
+            try:
+                guard.validate(project_path)
+                if controls_changed:
+                    raise ValueError("자동 복구 중 원래 요청 또는 작업 지침이 변경되었어요.")
+                native_android_project_builder.validate_project_structure(project_path)
+                self.enforce_task_project_identity(task_id)
+                restore_project_runtime_contracts(project_path, self.settings.base_project_path)
+                ensure_project_ui_catalog(project_path)
+                # Recheck after server normalization as well; build settings stay identical.
+                guard.validate(project_path)
+            except (OSError, RuntimeError, ValueError) as exc:
+                recovery["stop_reason"] = "validation_guard"
+                record["guard_error"] = str(exc)
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                recovery["stop_reason"] = "time_limit"
+                break
+            if not self.db.update_task_if_status(task_id, {"running"}, message=f"수정한 앱을 다시 검증하고 있어요. ({attempt}/{max_attempts})"):
+                recovery["stop_reason"] = "cancelled"
+                break
+            log_task_status_event(self.db, self.db.get_task(task_id), event_type="build_stage_lint_recheck")
+            result, diagnostic_text = run_check(remaining)
+            record["lint_exit_code"] = result[0]
+            if result[0] == 0:
+                recovery["stop_reason"] = "recovered"
+                break
+            if result[1]:
+                recovery["stop_reason"] = "time_limit"
+                break
+        recovery["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        self.db.log_event(task_id, actor="system", event_type="lint_recovery_finished",
+                          message_text="앱 검증 오류 자동 복구를 마쳤어요.", payload=recovery)
+        if recovery["attempts"]:
+            log_build_stage_event(self.db, task_id, stage="Android lint 자동 복구",
+                                  phase="succeeded" if result[0] == 0 else "failed",
+                                  body="검증 오류를 수정했어요." if result[0] == 0 else "검증 오류를 자동으로 해결하지 못했어요.",
+                                  detail=f"수정 시도: {len(recovery['attempts'])}회, 종료 이유: {recovery['stop_reason']}")
+        return result[0], result[1], time.monotonic() - started
+
     def attempt_server_side_build(
         self,
         task_id: str,
@@ -8449,9 +8630,10 @@ class CodexTaskRunner:
             )
             return
         build_steps = native_android_project_builder.build_steps(project_path)
+        lint_recovery: dict[str, Any] = {}
 
         build_log_path.write_text(
-            f"[server] 결과 파일이 없어 서버가 직접 Android 검증을 이어갑니다. worker_exit_code={codex_exit_code}\n",
+            f"[server] 서버 최종 Android 검증을 시작합니다. worker_exit_code={codex_exit_code}\n",
             encoding="utf-8",
         )
         log_build_stage_event(
@@ -8487,13 +8669,17 @@ class CodexTaskRunner:
                 body=status_message,
                 detail="명령을 실행하고 있어요.",
             )
-            exit_code, timed_out, elapsed_seconds = self.run_logged_command(
-                list(build_step.command),
-                cwd=project_path,
-                env=env,
-                log_path=build_log_path,
-                task_id=task_id,
-            )
+            if stage_key == "lint":
+                exit_code, timed_out, elapsed_seconds = self.run_lint_with_recovery(
+                    task_id=task_id, workspace_path=workspace_path, project_path=project_path,
+                    command=list(build_step.command), env=env, build_log_path=build_log_path,
+                    recovery=lint_recovery,
+                )
+            else:
+                exit_code, timed_out, elapsed_seconds = self.run_logged_command(
+                    list(build_step.command), cwd=project_path, env=env,
+                    log_path=build_log_path, task_id=task_id,
+                )
             if self.is_task_cancelled(task_id):
                 return
             if timed_out:
@@ -8513,16 +8699,20 @@ class CodexTaskRunner:
                         "error_stage": stage_key,
                         "message": f"{stage_label} 단계가 시간 제한을 초과했어요.",
                         "build_log_path": "logs/build.log",
+                        "lint_recovery": lint_recovery,
                     },
                 )
                 return
             if exit_code != 0:
+                failure_message = f"{stage_label} 단계에 실패했어요."
+                if stage_key == "lint" and lint_recovery.get("attempts"):
+                    failure_message += f" 자동 수정 {len(lint_recovery['attempts'])}회 후에도 검증을 통과하지 못했어요."
                 log_build_stage_event(
                     self.db,
                     task_id,
                     stage=stage_label,
                     phase="failed",
-                    body=f"{stage_label} 단계에 실패했어요.",
+                    body=failure_message,
                     detail=f"종료 코드: {exit_code}, 소요 시간: {elapsed_seconds:.1f}초",
                 )
                 write_result_json(
@@ -8531,8 +8721,9 @@ class CodexTaskRunner:
                         "status": "failed",
                         "task_id": task_id,
                         "error_stage": stage_key,
-                        "message": f"{stage_label} 단계에 실패했어요.",
+                        "message": failure_message,
                         "build_log_path": "logs/build.log",
+                        "lint_recovery": lint_recovery,
                     },
                 )
                 return
@@ -8554,6 +8745,7 @@ class CodexTaskRunner:
                     "error_stage": "codex",
                     "message": "Codex가 앱 내용을 만들지 못해 기본 템플릿 화면만 남았습니다.",
                     "build_log_path": "logs/build.log",
+                    "lint_recovery": lint_recovery,
                 },
             )
             return
@@ -8568,6 +8760,7 @@ class CodexTaskRunner:
                     "error_stage": "build",
                     "message": "서명된 Android APK 산출물을 확인할 수 없습니다.",
                     "build_log_path": "logs/build.log",
+                    "lint_recovery": lint_recovery,
                 },
             )
             return
@@ -8587,6 +8780,7 @@ class CodexTaskRunner:
                     "error_stage": "build",
                     "message": f"APK 설치 계약 검증에 실패했습니다: {exc}",
                     "build_log_path": "logs/build.log",
+                    "lint_recovery": lint_recovery,
                 },
             )
             return
@@ -8603,6 +8797,7 @@ class CodexTaskRunner:
                 "apk_path": apk_relative.as_posix(),
                 "message": "APK build completed",
                 "build_log_path": "logs/build.log",
+                "lint_recovery": lint_recovery,
             },
         )
 
@@ -8826,6 +9021,21 @@ class CodexTaskRunner:
             return
         task_state = load_task_state_payload(task)
         usage = parse_codex_usage_from_jsonl(workspace_path / "logs" / "codex_stdout.log")
+        if result_path.is_file():
+            try:
+                recovery = json.loads(result_path.read_text(encoding="utf-8")).get("lint_recovery") or {}
+                for record in recovery.get("attempts", []):
+                    repair_log = (workspace_path / str(record.get("stdout_path") or "")).resolve()
+                    if not ensure_within_root(repair_log, workspace_path / "logs/lint_recovery"):
+                        continue
+                    repair_usage = parse_codex_usage_from_jsonl(repair_log)
+                    if repair_usage:
+                        usage = CodexUsage(**{
+                            key: int(getattr(usage, key, 0)) + getattr(repair_usage, key)
+                            for key in CodexUsage.__dataclass_fields__
+                        })
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass  # The normal finalizer below reports an invalid result contract.
         self.log_ui_editor_codex_completion(
             task_id=task_id,
             workspace_path=workspace_path,
@@ -8864,7 +9074,7 @@ class CodexTaskRunner:
 
         if not result_path.exists():
             log_text = collect_task_logs(workspace_path, "logs/build.log", full=True)
-            engine_issue = codex_engine_issue_from_logs(log_text, exit_code)
+            engine_issue = codex_engine_issue_from_logs(codex_engine_diagnostics(workspace_path), exit_code)
             if engine_issue is not None:
                 status, message, event_type, stage = engine_issue
                 self.finalize_failure(
@@ -9814,15 +10024,7 @@ def create_app() -> FastAPI:
                 "recheck_prebuild_requirements",
             }
             task_integration_environment = merged_task_integration_environment(db, followup_task_id)
-            stored_prebuild_requirements = [
-                dict(item)
-                for item in (
-                    previous_conversation_state.get("pending_prebuild_requirements")
-                    or previous_conversation_state.get("latest_prebuild_requirements")
-                    or []
-                )
-                if isinstance(item, dict)
-            ][:8]
+            stored_prebuild_requirements = requirement_snapshot(previous_conversation_state)
             resolved_stored_requirements = resolve_prebuild_requirements(
                 str(
                     previous_conversation_state.get("pending_user_prompt")
@@ -9837,8 +10039,7 @@ def create_app() -> FastAPI:
             participant_credential_requirement = (
                 pending_participant_credential_requirement(resolved_stored_requirements)
                 if not request_action
-                and previous_conversation_state.get("confirmation_action")
-                == "recheck_prebuild_requirements"
+                and previous_conversation_state.get("awaiting_confirmation")
                 and not requested_reference_attachments
                 else None
             )
@@ -9852,7 +10053,10 @@ def create_app() -> FastAPI:
                 participant_credential_requirement
                 and (
                     is_participant_credential_submission
-                    or re.fullmatch(r"\S{8,4096}", request.prompt.strip())
+                    or (
+                        previous_conversation_state.get("confirmation_action") == "recheck_prebuild_requirements"
+                        and re.fullmatch(r"\S{8,4096}", request.prompt.strip())
+                    )
                 )
             )
             selected_ui_editor_drafts: list[dict[str, Any]] = []
@@ -10031,6 +10235,57 @@ def create_app() -> FastAPI:
                     final_prompt=request.prompt,
                     previous_conversation_state=previous_conversation_state,
                 )
+                reviewed_prompt = str(previous_conversation_state.get("prepared_prompt") or "").strip()
+                if (request.prompt.strip() != reviewed_prompt or previous_conversation_state.get("final_prompt_requirements_pending")) and settings.intent_agent_enabled:
+                    # Review only dependencies; the user's exact edited text
+                    # remains the build request, including when retried.
+                    reviewed = run_spec_clarification_agent(
+                        settings,
+                        prompt=request.prompt,
+                        task_id=followup_task_id,
+                        existing_task=True,
+                        previous_conversation_state=previous_conversation_state,
+                        device_info=request_device_info,
+                        reference_attachments=effective_reference_attachments,
+                        prebuild_review_only=True,
+                    )
+                    if reviewed:
+                        meta = reviewed.get("__agent_meta") or {}
+                        log_agent_output_event(
+                            db, followup_task_id,
+                            agent_name="submitted_prompt_prebuild_review",
+                            model=str(meta.get("model") or settings.intent_agent_model),
+                            raw_output_text=str(meta.get("raw_output_text") or ""),
+                            parsed_result={key: value for key, value in reviewed.items() if key != "__agent_meta"},
+                            usage=meta.get("usage") or {},
+                            raw_response=meta.get("raw_response") or {},
+                        )
+                    if not reviewed or reviewed.get("mode") not in {"build", "ask_confirmation"} or not isinstance(reviewed.get("prebuild_requirements"), list):
+                        previous_conversation_state = {**previous_conversation_state, "final_prompt_requirements_pending": True}
+                        decision = replace(
+                            decision, mode="ask_confirmation", status="Pending Decision", tool="ask_confirmation",
+                            message="수정한 요청의 연동 조건을 확인하지 못했어요. 잠시 후 프롬프트를 다시 전송해 주세요.",
+                            confirmation_action="submit_initial_prompt", confirmation_payload=request.prompt,
+                            prebuild_requirements_analyzed=False,
+                        )
+                    else:
+                        previous_conversation_state = {**previous_conversation_state, "final_prompt_requirements_pending": False}
+                        decision = replace(
+                            decision,
+                            prebuild_requirements=[dict(item) for item in reviewed["prebuild_requirements"] if isinstance(item, dict)][:8],
+                            prebuild_requirements_analyzed=True,
+                        )
+                        if reviewed.get("mode") == "ask_confirmation":
+                            questions = normalize_prompt_items(reviewed.get("questions"), max_items=5)
+                            if questions:
+                                decision = replace(
+                                    decision, mode="ask_confirmation", status="Pending Decision", tool="ask_confirmation",
+                                    questions=questions, message="\n".join(questions),
+                                    confirmation_action="", confirmation_payload="",
+                                )
+                decision = build_prebuild_requirements_review_decision(
+                    decision, prerequisite_reviewed=True, environment=task_integration_environment,
+                )
                 previous_conversation_state = {
                     **previous_conversation_state,
                     "awaiting_prompt_review": False,
@@ -10140,11 +10395,7 @@ def create_app() -> FastAPI:
                             str((codex_followup_payload or {}).get("effective_user_prompt") or request.prompt)
                         ),
                         questions=codex_questions or build_clarification_questions(request.prompt),
-                        prebuild_requirements=[
-                            dict(item)
-                            for item in (codex_followup_payload or {}).get("prebuild_requirements", [])
-                            if isinstance(item, dict)
-                        ][:8],
+                        prebuild_requirements=(codex_followup_payload or {}).get("prebuild_requirements"),
                         reason=korean_text_or_fallback(
                             str((codex_followup_payload or {}).get("reason") or ""),
                             "기존 앱 코드를 확인했지만 수정 전에 막히는 세부사항이 있어요.",
@@ -10184,11 +10435,7 @@ def create_app() -> FastAPI:
                         acceptance_criteria=normalize_acceptance_criteria(
                             previous_conversation_state.get("latest_acceptance_criteria")
                         ),
-                        prebuild_requirements=[
-                            dict(item)
-                            for item in (codex_followup_payload or {}).get("prebuild_requirements", [])
-                            if isinstance(item, dict)
-                        ][:8],
+                        prebuild_requirements=(codex_followup_payload or {}).get("prebuild_requirements"),
                         user_visible_summary=codex_change_summary,
                     )
             else:
@@ -10215,6 +10462,18 @@ def create_app() -> FastAPI:
                     or build_reference_image_summary(effective_reference_image_name),
                 )
             decision = preserve_followup_task_identity(decision, task, previous_conversation_state)
+            if existing_workspace_ready and decision.mode == "build" and not decision.prebuild_requirements_analyzed:
+                # UI-only and legacy follow-ups have no complete semantic
+                # snapshot. Retain existing build injection/runtime contracts.
+                detected = resolve_prebuild_requirements(
+                    decision.effective_user_prompt,
+                    environment=task_integration_environment,
+                    package_name=decision.package_name,
+                )
+                decision = replace(decision, prebuild_requirements=list({
+                    str(item.get("id") or ""): dict(item)
+                    for item in (stored_prebuild_requirements or []) + detected
+                }.values())[:8])
             prebuild_prerequisite_reviewed = (
                 is_prebuild_requirements_review or is_participant_credential_submission
             )
@@ -10248,6 +10507,8 @@ def create_app() -> FastAPI:
                         decision,
                         message=f"API 키를 등록했어요. {decision.message}",
                     )
+                else:
+                    decision = replace(decision, message=f"API 키를 등록했어요.\n\n{decision.message}")
             elif is_participant_credential_attempt:
                 credential_format_error = (
                     "입력한 값이 안내된 API 키 형식과 맞지 않아요. "

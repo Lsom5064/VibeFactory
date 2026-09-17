@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from flutter_apk_server.server import (
+from server.server import (
     AppDataDatabase,
     CodexTaskRunner,
     Database,
@@ -17,7 +17,7 @@ from flutter_apk_server.server import (
     load_settings,
     utc_now_iso,
 )
-from flutter_apk_server.project_builder import NativeAndroidProjectBuilder
+from server.project_builder import NativeAndroidProjectBuilder
 
 
 REQUIRED_ROUTES = {
@@ -261,7 +261,7 @@ class HostApiContractTests(unittest.TestCase):
     def test_oversized_followup_attachment_preserves_existing_task_status(self) -> None:
         oversized_pdf = b"%PDF-1.4\n" + (b"x" * 32)
 
-        with patch("flutter_apk_server.reference_attachments.REFERENCE_PDF_MAX_BYTES", 16):
+        with patch("server.reference_attachments.REFERENCE_PDF_MAX_BYTES", 16):
             response = self.client.post(
                 "/generate",
                 json={

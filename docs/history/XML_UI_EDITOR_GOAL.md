@@ -1,16 +1,21 @@
 # VibeFactory XML UI Editor Historical Development Goal
 
+> 보관 문서: 2026-09-07에 `docs/history/`로 이동했다. 아래의 초기 XML 직접 편집
+> 설계는 현재의 시각 표시 방식과 다르다. 현재 작업은 [루트 AGENTS.md](../../AGENTS.md)와
+> [호스트 연동 계약](../../server/HOST_APP_INTEGRATION_NOTES.md)을 따른다.
+
 - 작성일: 2026-08-20
 - 문서 상태: **완료된 격리 개발 기록. 현재 실행 지침으로 사용하지 않음**
 - 기준 저장소: `/Users/hai/Desktop/buildingAppswithCodex`
 - 기준 소스: GitHub가 아니라 Goal 시작 시점의 현재 로컬 파일
 - 실험 작업 루트: `/Users/hai/Desktop/buildingAppswithCodex/ui_xml_editor_workspace`
 
-> **주의:** XML UI 편집 기능은 현재 저장소의 `flutter_apk_server/`,
+> **주의:** XML UI 편집 기능은 현재 저장소의 `server/`,
 > `vibefactory/`, `BaseProject/`에 병합되었고 격리 작업 디렉터리는 제거되었다.
 > 아래의 디렉터리 복사, 8100 포트 실행, 원본 무변경 지침은 당시 개발 과정의
 > 재현 기록일 뿐이며 새 작업에서 실행하면 안 된다. 현재 구현과 검증은 저장소
-> 루트의 `AGENTS.md`, `NATIVE_ANDROID_MIGRATION_PLAN.md`와 실제 코드를 기준으로 한다.
+> 루트의 `AGENTS.md`와 실제 코드를 기준으로 한다. Native 전환 기록은 같은 보관
+> 디렉터리의 `NATIVE_ANDROID_MIGRATION_PLAN.md`에 있다.
 
 ## 1. Goal
 

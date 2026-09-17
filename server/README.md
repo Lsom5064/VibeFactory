@@ -2,7 +2,14 @@
 
 Android 호스트 앱의 생성·수정 요청을 받아 Task별 workspace를 만들고, Codex CLI가 Kotlin과 Android Views/XML 소스를 구현한 뒤 서버가 Gradle lint, signed release APK 빌드, 식별자·서명 검증을 수행하는 FastAPI 서버다.
 
-전체 Flutter에서 Native Android로의 전환 절차와 완료 기준은 저장소 루트의 `NATIVE_ANDROID_MIGRATION_PLAN.md`를 따른다.
+현재 구조와 작업 지침은 저장소 루트의 [AGENTS.md](../AGENTS.md)를 따른다.
+Flutter에서 Native Android로의 전환 계획·복구 정보는
+[과거 전환 기록](../docs/history/NATIVE_ANDROID_MIGRATION_PLAN.md)에 보존한다.
+해당 문서의 과거 Goal을 현재 서비스에 다시 수행하지 않는다.
+
+서버 소스의 현재 디렉터리는 저장소 루트의 `server/`다. 저장소 루트에서는
+`server.server`로 import하고, `server/` 안에서는 `uvicorn server:app`으로 실행한다.
+DB와 Task workspace의 경로도 `server/`를 기준으로 사용한다.
 
 ## 구조
 
@@ -29,10 +36,10 @@ app/src/main/res/layout/activity_main.xml
 기본값은 기존 Flutter 데이터와 분리된다.
 
 ```text
-DB_PATH=flutter_apk_server/native_tasks.db
-APP_DATA_DB_PATH=flutter_apk_server/native_app_data.db
-WORKSPACES_ROOT=flutter_apk_server/native_workspaces
-BUILD_CACHE_ROOT=flutter_apk_server/.native_tooling
+DB_PATH=server/native_tasks.db
+APP_DATA_DB_PATH=server/native_app_data.db
+WORKSPACES_ROOT=server/native_workspaces
+BUILD_CACHE_ROOT=server/.native_tooling
 ```
 
 기존 `tasks.db`, `app_data.db`, `workspaces/`는 `../flutter/runtime/`에 보존된
@@ -67,6 +74,8 @@ CODEX_FAST_MODE
 CODEX_SANDBOX_MODE
 CODEX_DANGEROUS_BYPASS
 CODEX_TIMEOUT_SECONDS
+LINT_RECOVERY_MAX_ATTEMPTS
+LINT_RECOVERY_TIMEOUT_SECONDS
 MAX_CONCURRENT_CODEX_RUNS
 
 GENERATED_APP_KEYSTORE_PATH
@@ -108,6 +117,24 @@ Codex는 Kotlin/XML 구현과 정적 확인만 담당한다. 서버는 성공 �
 ./gradlew :app:lintDebug
 ./gradlew :app:assembleRelease
 ```
+
+최종 lint가 Kotlin/Java/XML/리소스 오류로 실패하면 같은 Task·리비전에서 Codex에
+진단과 원래 요청을 전달해 소스를 수정하고 다시 검증한다. 기본 자동 수정은 최대 2회
+(`LINT_RECOVERY_MAX_ATTEMPTS`, 0으로 비활성화, 상한 2)이며 최초 검증을 포함해
+서버 lint는 최대 3회 실행한다. 복구와 재검증을 합친 추가 시간은 최대 600초
+(`LINT_RECOVERY_TIMEOUT_SECONDS`, 상한 600)다. 최초 Codex 실행과 최초 lint의
+시간 제한은 기존 `CODEX_TIMEOUT_SECONDS`를 따른다.
+
+같은 오류가 반복되거나 복구 시간 초과, 취소, 복구 엔진 실패가 발생하면 중단한다.
+SDK·디스크·메모리·네트워크·권한 문제와 분류할 수 없는 오류에는 소스 자동 수정을
+시도하지 않는다. 수정 범위는 `app/src/`이며 빌드 설정·lint baseline 변경과 새
+오류 무시 지시를 검사한다. 서버 공통 런타임·식별자·사용설명서 계약을 다시 확인한 뒤
+lint와 release 빌드 및 APK 서명 검증을 모두 통과해야 성공한다.
+
+진행 메시지는 `앱 검증 중 발견한 오류를 자동으로 수정하고 있어요. (1/2)`로 표시한다.
+전체 복구 입력·출력은 `logs/lint_recovery/<실행 ID>/`와 `lint_repair_output` 이벤트에
+보존하며, 시도 횟수·종료 이유·소요 시간은 결과의 `lint_recovery`와
+`lint_recovery_finished` 이벤트에 기록한다. 복구 Codex 토큰도 해당 요청 사용량에 합산한다.
 
 APK 경로:
 
@@ -166,8 +193,8 @@ GET|POST|PATCH|DELETE /apps/{task_id}/data/{collection}...
 ## 테스트
 
 ```bash
-flutter_apk_server/.venv/bin/python -m unittest discover \
-  -s flutter_apk_server/tests -p 'test_*.py' -v
+server/.venv/bin/python -m unittest discover \
+  -s server/tests -p 'test_*.py' -v
 
 cd BaseProject
 source ~/.vibefactory/signing/generated-app-signing.env
