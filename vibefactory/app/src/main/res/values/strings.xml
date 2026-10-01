@@ -338,7 +338,7 @@
     <string name="ui_annotation_delete_hint">삭제할 UI를 여러 개 선택하세요. 다시 누르면 선택이 해제돼요.</string>
     <string name="ui_annotation_move_hint">이동할 UI를 터치한 뒤 원하는 위치로 끌어 주세요.</string>
     <string name="ui_annotation_behavior_hint">모양이나 기능을 변경할 UI를 누르세요.</string>
-    <string name="ui_annotation_destination_hint">원하는 위치로 끈 뒤 팝업의 추가하기를 눌러 확정하세요.</string>
+    <string name="ui_annotation_destination_hint">여러 번 끌어서 위치를 조정한 뒤, 이 안내의 추가하기를 누르세요.</string>
     <string name="ui_sketch_zoom_in">확대</string>
     <string name="ui_sketch_zoom_out">축소</string>
     <string name="ui_sketch_zoom_reset">전체 보기</string>

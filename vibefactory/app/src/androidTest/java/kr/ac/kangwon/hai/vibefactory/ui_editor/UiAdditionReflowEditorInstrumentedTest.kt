@@ -110,7 +110,8 @@ class UiAdditionReflowEditorInstrumentedTest {
             .get(activity).let { (it as? kotlinx.coroutines.Job)?.cancel() }
     }
 
-    @Test fun moveDragShowsConfirmationAndBannerDoesNotCoverPreview() = withEditor { scenario ->
+    @Test fun repeatedMoveAdjustmentsWaitForBannerConfirmationAndSurviveRecreation() = withEditor { scenario ->
+        var finalPosition: Pair<Float, Float>? = null
         scenario.onActivity { it.findViewById<View>(R.id.btnUiAnnotationMoveTool).performClick() }
         settle()
         scenario.onActivity { activity ->
@@ -127,16 +128,71 @@ class UiAdditionReflowEditorInstrumentedTest {
             val targetY = root.height * .5f
             val view = overlay(activity)
             touch(view, MotionEvent.ACTION_DOWN, bounds.exactCenterX(), bounds.exactCenterY())
+            touch(view, MotionEvent.ACTION_UP, bounds.exactCenterX(), bounds.exactCenterY())
+            val confirm = activity.findViewById<View>(R.id.btnUiAnnotationConfirmMove)
+            assertEquals(View.VISIBLE, confirm.visibility)
+            assertFalse(confirm.isEnabled)
+            touch(view, MotionEvent.ACTION_DOWN, bounds.exactCenterX(), bounds.exactCenterY())
             touch(view, MotionEvent.ACTION_MOVE, targetX, targetY)
             touch(view, MotionEvent.ACTION_UP, targetX, targetY)
             assertTrue(session(activity).annotations.isEmpty())
+            val dialogField = UiAnnotationEditorActivity::class.java.getDeclaredField("instructionDialog")
+                .also { it.isAccessible = true }
+            assertNull("Releasing a drag must not open the sheet", dialogField.get(activity))
+            assertTrue(confirm.isEnabled)
+            touch(view, MotionEvent.ACTION_DOWN, targetX, targetY)
+            touch(view, MotionEvent.ACTION_MOVE, targetX + 20f, targetY + 25f)
+            touch(view, MotionEvent.ACTION_UP, targetX + 20f, targetY + 25f)
+            assertNull("Repeated adjustments must keep the preview editable", dialogField.get(activity))
+            assertTrue(session(activity).annotations.isEmpty())
+            @Suppress("UNCHECKED_CAST")
+            finalPosition = UiAnnotationEditorActivity::class.java.getDeclaredField("previewDestination")
+                .also { it.isAccessible = true }.get(activity) as Pair<Float, Float>
+        }
+        scenario.recreate()
+        settle()
+        scenario.onActivity { activity ->
+            val confirm = activity.findViewById<View>(R.id.btnUiAnnotationConfirmMove)
+            assertEquals(View.VISIBLE, confirm.visibility)
+            assertTrue(confirm.isEnabled)
+            assertNull(UiAnnotationEditorActivity::class.java.getDeclaredField("instructionDialog")
+                .also { it.isAccessible = true }.get(activity))
+            confirm.performClick()
             val dialog = UiAnnotationEditorActivity::class.java.getDeclaredField("instructionDialog")
                 .also { it.isAccessible = true }.get(activity) as com.google.android.material.bottomsheet.BottomSheetDialog
             assertTrue(dialog.isShowing)
+            assertTrue(session(activity).annotations.isEmpty())
             dialog.findViewById<View>(R.id.btnSaveUiAnnotationInstruction)!!.performClick()
             cancelServerSave(activity)
             assertEquals(1, session(activity).annotations.size)
             assertEquals(UiAnnotationAction.MOVE, session(activity).annotations.single().action)
+            assertEquals(finalPosition!!.first, session(activity).annotations.single().destinationX!!, .001f)
+            assertEquals(finalPosition!!.second, session(activity).annotations.single().destinationY!!, .001f)
+            assertEquals(View.GONE, confirm.visibility)
+        }
+    }
+
+    @Test fun cancellingMovePlacementHidesConfirmationAndRestoresThePreview() = withEditor { scenario ->
+        scenario.onActivity { activity ->
+            val root = canvas(activity)
+            val source = root.findViewWithTag<View>("id:a")
+            val originalWidth = source.width
+            val bounds = android.graphics.Rect().also(source::getDrawingRect)
+            root.offsetDescendantRectToMyCoords(source, bounds)
+            activity.findViewById<View>(R.id.btnUiAnnotationMoveTool).performClick()
+            touch(overlay(activity), MotionEvent.ACTION_DOWN, bounds.exactCenterX(), bounds.exactCenterY())
+            touch(overlay(activity), MotionEvent.ACTION_MOVE, root.width * .7f, root.height * .6f)
+            touch(overlay(activity), MotionEvent.ACTION_UP, root.width * .7f, root.height * .6f)
+            assertTrue(activity.findViewById<View>(R.id.btnUiAnnotationConfirmMove).isEnabled)
+            touch(overlay(activity), MotionEvent.ACTION_DOWN, root.width * .7f, root.height * .6f)
+            touch(overlay(activity), MotionEvent.ACTION_CANCEL, root.width * .7f, root.height * .6f)
+            assertFalse(activity.findViewById<View>(R.id.btnUiAnnotationConfirmMove).isEnabled)
+            activity.findViewById<View>(R.id.btnCancelUiAnnotationAction).performClick()
+            assertEquals(View.GONE, activity.findViewById<View>(R.id.btnUiAnnotationConfirmMove).visibility)
+            assertTrue(session(activity).annotations.isEmpty())
+            assertEquals(originalWidth, source.width)
+            assertNull(UiAnnotationEditorActivity::class.java.getDeclaredField("instructionDialog")
+                .also { it.isAccessible = true }.get(activity))
         }
     }
 

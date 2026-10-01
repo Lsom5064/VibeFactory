@@ -75,6 +75,7 @@ class UiTouchFlowInstrumentedTest {
                 assertTrue(tagBounds("id:destinationRow").top > targetBefore.top)
                 screenshot("04_move_drag_reflow")
             }
+            tapId(R.id.btnUiAnnotationConfirmMove)
             await { textNode("이동 요청 설명") != null }
             tapText(context.getString(R.string.ui_annotation_add))
             await { main { session().annotations.any { it.action == UiAnnotationAction.MOVE } } }

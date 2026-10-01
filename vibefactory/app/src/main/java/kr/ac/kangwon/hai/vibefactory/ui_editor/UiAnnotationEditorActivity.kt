@@ -218,6 +218,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         bindTool(R.id.btnUiAnnotationBehaviorTool, UiAnnotationAction.BEHAVIOR)
         bindTool(R.id.btnUiAnnotationAddTool, UiAnnotationAction.ADD)
         findViewById<Button>(R.id.btnUiAnnotationDraw).setOnClickListener { openAdditionEditor() }
+        findViewById<Button>(R.id.btnUiAnnotationConfirmMove).setOnClickListener { openMoveInstructionDialog() }
         findViewById<Button>(R.id.btnUiAnnotationDeleteSelected).setOnClickListener { applyDeleteSelection() }
         updateActions()
     }
@@ -548,10 +549,12 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
-            destinationTapListener = this@UiAnnotationEditorActivity::completeMoveDestination
+            destinationTapListener = this@UiAnnotationEditorActivity::finishMoveDestinationGesture
             destinationDragListener = this@UiAnnotationEditorActivity::handleMoveDestinationDrag
             movePreviewListener = { x, y ->
                 previewDestination = if (x != null && y != null) x to y else null
+                this@UiAnnotationEditorActivity.findViewById<Button>(R.id.btnUiAnnotationConfirmMove).isEnabled =
+                    pendingMoveSource != null && previewDestination != null && !isSaving
                 scheduleMovePreview()
             }
             targetTapListener = this@UiAnnotationEditorActivity::completeArmedTarget
@@ -654,9 +657,21 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         return true
     }
 
-    private fun completeMoveDestination(x: Float, y: Float) {
+    private fun finishMoveDestinationGesture(x: Float, y: Float) {
         val source = pendingMoveSource ?: return
         stopEdgeAutoScroll()
+        previewDestination = x to y
+        overlay?.showPendingMove(source, x, y)
+        refreshMovePreview()
+        updateActions()
+    }
+
+    private fun openMoveInstructionDialog() {
+        val source = pendingMoveSource ?: return
+        val (x, y) = previewDestination ?: return
+        if (instructionDialog?.isShowing == true) return
+        stopEdgeAutoScroll()
+        refreshMovePreview()
         val canvas = findViewById<FrameLayout>(R.id.uiAnnotationCanvas)
         val destinationPixelX = x * (movePreview?.width ?: canvas.width.toFloat())
         val destinationPixelY = y * (movePreview?.height ?: canvas.height.toFloat())
@@ -664,9 +679,6 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         val destination = currentTargetHits.firstOrNull {
             it.bounds.contains(destinationPixelX.roundToInt(), destinationPixelY.roundToInt())
         }?.target?.takeUnless { it.stableId == source.stableId }
-        previewDestination = x to y
-        overlay?.showPendingMove(source, x, y)
-        refreshMovePreview()
         showInstructionDialog(UiAnnotationAction.MOVE, source, destination, x, y)
     }
 
@@ -1707,6 +1719,10 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         }
         updateDeleteSelection()
         val session = viewModel.session
+        findViewById<Button>(R.id.btnUiAnnotationConfirmMove).apply {
+            visibility = if (pendingMoveSource != null) View.VISIBLE else View.GONE
+            isEnabled = pendingMoveSource != null && previewDestination != null && !isSaving
+        }
         findViewById<ImageButton>(R.id.btnUiAnnotationUndo).isEnabled = session?.history?.canUndo == true
         findViewById<ImageButton>(R.id.btnUiAnnotationRedo).isEnabled = session?.history?.canRedo == true
         findViewById<ImageButton>(R.id.btnUiAnnotationList).isEnabled = session?.annotations?.isNotEmpty() == true

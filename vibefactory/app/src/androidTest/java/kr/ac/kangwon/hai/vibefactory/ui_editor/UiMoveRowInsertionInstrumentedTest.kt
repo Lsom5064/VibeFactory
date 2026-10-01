@@ -93,6 +93,8 @@ class UiMoveRowInsertionInstrumentedTest {
                         touch(overlay, MotionEvent.ACTION_DOWN, source.exactCenterX(), source.exactCenterY())
                         touch(overlay, MotionEvent.ACTION_MOVE, x, y)
                         touch(overlay, MotionEvent.ACTION_UP, x, y)
+                        assertNull(field(activity, "instructionDialog"))
+                        activity.findViewById<View>(R.id.btnUiAnnotationConfirmMove).performClick()
                         val dialog = field(activity, "instructionDialog") as Dialog
                         dialog.findViewById<View>(R.id.btnSaveUiAnnotationInstruction).performClick()
                         cancelSave(activity)
