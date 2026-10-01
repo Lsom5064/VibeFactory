@@ -23,6 +23,9 @@ from server.server import (
     utc_now_iso,
 )
 from server.ui_editor_server import (
+    EQUAL_WIDTH_MOVE_RULES,
+    VISUAL_INTENT_RULES,
+    build_ui_editor_chat_context,
     build_ui_editor_codex_prompt,
     structural_xml_diff,
     validate_ui_annotation_xml,
@@ -364,11 +367,35 @@ class UiEditorApiTests(unittest.TestCase):
                     f'referenceCanvasHeightDp="{invalid}"'), task_id=self.task_id, revision_label="rev_0001",
                     layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
 
+    def test_equal_width_move_metadata_survives_save_and_rejects_invalid_values(self):
+        xml = self.annotation_xml("", action="move").replace('schemaVersion="1"',
+            'schemaVersion="3" referenceCanvasWidthDp="360" referenceCanvasHeightDp="640"').replace(
+            'x="0.750000" y="0.300000"',
+            'x="0.750000" y="0.300000" anchorX="0.95" anchorY="0.3" width="0.5" layout="equal_width_row"')
+        def parse(value):
+            return validate_ui_annotation_xml(value, task_id=self.task_id, revision_label="rev_0001",
+                layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+        parsed = parse(xml)[0]
+        self.assertEqual({"x": .75, "y": .3}, parsed["destination_point"])
+        self.assertEqual({"mode": "equal_width_row", "width_fraction": .5, "width_dp": 180}, parsed["destination_layout"])
+        response = self.save_draft(annotation_xml=xml)
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(xml, response.json()["annotation_xml"])
+        for invalid in ("0", "-1", "1.1", "nan", "inf", "bad"):
+            with self.subTest(width=invalid), self.assertRaises(ValueError):
+                parse(xml.replace('width="0.5"', f'width="{invalid}"'))
+        for invalid in ('anchorX="nan"', 'anchorX="1.1"', 'anchorZ="0.2"'):
+            with self.subTest(anchor=invalid), self.assertRaises(ValueError):
+                parse(xml.replace('anchorX="0.95"', invalid))
+        with self.assertRaises(ValueError):
+            parse(xml.replace('layout="equal_width_row"', 'layout="unknown"'))
+
     def save_draft(
         self,
         *,
         annotation_xml: str | None = None,
-        edited_xml: str = LAYOUT_XML,
+        edited_xml: str | None = None,
+        original_xml: str = LAYOUT_XML,
         draft_id: str | None = None,
         version: int | None = None,
     ):
@@ -376,8 +403,8 @@ class UiEditorApiTests(unittest.TestCase):
             "draft_id": draft_id,
             "configuration": "layout",
             "base_xml_sha256": self.base_sha,
-            "original_xml": LAYOUT_XML,
-            "edited_xml": edited_xml,
+            "original_xml": original_xml,
+            "edited_xml": original_xml if edited_xml is None else edited_xml,
             "annotation_xml": annotation_xml or self.annotation_xml("제목을 더 이해하기 쉽게 바꿔 주세요."),
             "descriptions": {},
             "expected_version": version,
@@ -626,6 +653,103 @@ class UiEditorApiTests(unittest.TestCase):
         )
         self.assertEqual(legacy_xml, self.db.get_ui_editor_draft(str(legacy["draft_id"]))["edited_xml"])
 
+    def test_building_current_revision_cannot_be_opened_saved_or_confirmed(self) -> None:
+        draft = self.save_draft().json()
+        for status in ("Queued", "Running"):
+            with self.subTest(status=status):
+                self.db.update_task(self.task_id, status=status)
+                context = self.client.get(f"/tasks/{self.task_id}/ui/editor-context?{self.query()}")
+                self.assertFalse(context.json()["source_available"])
+                layouts = self.client.get(f"{self.endpoint('layouts')}?{self.query()}")
+                self.assertFalse(layouts.json()["source_available"])
+                self.assertIn("생성 중", layouts.json()["unavailable_reason"])
+                document = self.client.get(f"{self.endpoint('layouts/activity_main')}?{self.query()}")
+                self.assertEqual(409, document.status_code)
+                saved = self.save_draft(draft_id=draft["draft_id"], version=draft["version"])
+                self.assertEqual(409, saved.status_code)
+                confirmed = self.confirm_draft(draft)
+                self.assertEqual(409, confirmed.status_code)
+                self.assertEqual(draft["version"], self.db.get_ui_editor_draft(draft["draft_id"])["version"])
+        self.db.update_task(self.task_id, status="Success")
+        self.assertEqual(200, self.confirm_draft(draft).status_code)
+
+    def test_previous_revision_remains_editable_while_new_revision_builds(self) -> None:
+        current = self.workspace / "revisions" / "rev_0002" / "project"
+        current.mkdir(parents=True)
+        self.db.update_task(self.task_id, status="Running", project_path=str(current))
+        layouts = self.client.get(f"{self.endpoint('layouts')}?{self.query()}")
+        self.assertTrue(layouts.json()["source_available"])
+        saved = self.save_draft()
+        self.assertEqual(200, saved.status_code, saved.text)
+        self.assertEqual(200, self.confirm_draft(saved.json()).status_code)
+
+    def change_source_layout(self) -> str:
+        updated = LAYOUT_XML.replace('@string/editor_title', 'Updated title')
+        (self.project / "app/src/main/res/layout/activity_main.xml").write_text(updated, encoding="utf-8")
+        self.base_sha = hashlib.sha256(updated.encode("utf-8")).hexdigest()
+        return updated
+
+    def test_changed_source_draft_is_preserved_and_new_annotation_can_be_confirmed(self) -> None:
+        draft = self.save_draft().json()
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), "green").save(image_buffer, format="PNG")
+        image = self.client.post(
+            self.endpoint(f"drafts/{draft['draft_id']}/images"),
+            params={"device_id": self.device_id},
+            json={"image_id": "preserved-image", "element_stable_id": "title",
+                  "original_name": "reference.png", "mime_type": "image/png",
+                  "resource_name": "preserved_reference",
+                  "base64": base64.b64encode(image_buffer.getvalue()).decode("ascii")},
+        )
+        self.assertEqual(200, image.status_code, image.text)
+        self.assertEqual(200, self.confirm_draft(draft).status_code)
+        original = self.db.get_ui_editor_draft(draft["draft_id"])
+        original_images = self.db.list_ui_editor_images(draft["draft_id"])
+        updated_xml = self.change_source_layout()
+
+        replacement = self.save_draft(original_xml=updated_xml)
+        self.assertEqual(200, replacement.status_code, replacement.text)
+        self.assertNotEqual(draft["draft_id"], replacement.json()["draft_id"])
+        self.assertEqual(200, self.confirm_draft(replacement.json()).status_code)
+        preserved = self.db.get_ui_editor_draft(draft["draft_id"])
+        self.assertEqual("superseded", preserved["status"])
+        for field in ("original_xml", "annotation_xml", "descriptions", "version", "confirmed_at", "created_at"):
+            self.assertEqual(original[field], preserved[field], field)
+        self.assertEqual(original_images, self.db.list_ui_editor_images(draft["draft_id"]))
+        self.assertTrue((self.workspace / original_images[0]["workspace_path"]).is_file())
+        active = self.client.get(f"{self.endpoint('drafts/activity_main')}?{self.query()}").json()
+        self.assertEqual(replacement.json()["draft_id"], active["draft_id"])
+
+    def test_same_source_competing_draft_is_still_a_conflict(self) -> None:
+        original = self.save_draft().json()
+        conflict = self.save_draft(annotation_xml=self.annotation_xml("다른 기기의 변경"))
+        self.assertEqual(409, conflict.status_code)
+        self.assertEqual(original["draft_id"], conflict.json()["detail"]["current"]["draft_id"])
+        self.assertEqual("draft", self.db.get_ui_editor_draft(original["draft_id"])["status"])
+
+    def test_stale_xml_or_version_cannot_supersede_a_draft(self) -> None:
+        original = self.save_draft().json()
+        original_sha = self.base_sha
+        updated_xml = self.change_source_layout()
+        current_sha = self.base_sha
+        self.base_sha = original_sha
+        stale_xml = self.save_draft()
+        self.assertEqual(409, stale_xml.status_code)
+        self.base_sha = current_sha
+        for draft_id in (None, original["draft_id"]):
+            with self.subTest(draft_id=draft_id):
+                response = self.save_draft(original_xml=updated_xml, draft_id=draft_id, version=original["version"])
+                self.assertEqual(409, response.status_code)
+                self.assertEqual("draft", self.db.get_ui_editor_draft(original["draft_id"])["status"])
+
+    def test_failed_replacement_rolls_back_superseding_old_draft(self) -> None:
+        original = self.save_draft().json()
+        updated_xml = self.change_source_layout()
+        with patch("server.server.new_database_id", return_value=original["draft_id"]):
+            response = self.save_draft(original_xml=updated_xml)
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("draft", self.db.get_ui_editor_draft(original["draft_id"])["status"])
+
     def test_ui_editor_image_is_optimized_stored_and_linked_to_draft(self) -> None:
         created = self.save_draft()
         draft_id = created.json()["draft_id"]
@@ -817,8 +941,73 @@ class UiEditorApiTests(unittest.TestCase):
         self.assertIn('action="add"', prompt)
         self.assertIn('<vf:stroke', prompt)
         self.assertIn('addition.replace_targets', prompt)
+        self.assertIn('추가 영역의 위치·폭·높이는 사용자가 정한 고정 영역', prompt)
+        self.assertIn('원래 너비 비율과 순서를 유지', prompt)
+        self.assertIn('중심이 그 행 밖에 있어도 좌우 배치를 검토', prompt)
+        self.assertIn('기존 최소 너비나 48dp를 이유로 무조건 아래로 내리지 않는다', prompt)
+        self.assertIn('addition.bounds/region_dp를 새 화면 높이로 다시 환산하지 않는다', prompt)
+        self.assertIn(VISUAL_INTENT_RULES, prompt)
+        self.assertIn(EQUAL_WIDTH_MOVE_RULES, prompt)
 
-    def assert_checked_chat_request(self, annotation_xml: str) -> None:
+    def test_visual_intent_policy_reaches_both_generation_routes_without_changing_evidence(self):
+        instructions = (
+            "상단 제목 아래에 카드 두 개를 나란히 배치",
+            "입력란 아래에 저장 버튼을 만들고 누르면 입력을 저장",
+            "배경은 그린 것처럼 상하 두 색상 영역과 둥근 경계로 구성",
+            "카드 안에 입력란과 버튼을 두고 바깥에는 배경 장식을 배치",
+            "이 동작을 나타내는 아이콘 버튼",
+            "이 손그림 자체를 배경 작품으로 사용",
+            "그린 사람을 배경으로 써줘",
+            "그린 풍경을 다듬어서 배경으로 만들어줘",
+            "이 그림은 다듬지 말고 선과 질감을 원본 그대로 배경 이미지로 써줘",
+            "배치는 그대로 두고 인물 그림을 완성해서 배경으로 써줘",
+            "모양만 정돈하고 기능 유지",
+        )
+        for xml in (factory(instruction) for instruction in instructions
+                    for factory in (self.addition_xml, self.modification_v2)):
+            with self.subTest(xml=xml):
+                annotations = validate_ui_annotation_xml(xml, task_id=self.task_id, revision_label="rev_0001",
+                    layout_name="activity_main", configuration="layout", base_xml_sha256=self.base_sha)
+                direct, payload = build_ui_editor_codex_prompt(task_id=self.task_id,
+                    base_revision_label="rev_0001", generated_revision_label="rev_0002", layout_name="activity_main",
+                    configuration="layout", original_xml=LAYOUT_XML, annotation_xml=xml, annotations=annotations,
+                    preview_workspace_path="", package_name="example.xml.editor", app_name="fixture", source_context=[])
+                chat, chat_payload = build_ui_editor_chat_context(task_id=self.task_id,
+                    base_revision_label="rev_0001", generated_revision_label="rev_0002", user_prompt="저장한 UI 적용",
+                    drafts=[{"original_xml": LAYOUT_XML, "annotation_xml": xml, "annotations": annotations}])
+                for prompt in (direct, chat):
+                    self.assertIn(VISUAL_INTENT_RULES, prompt)
+                    self.assertIn(EQUAL_WIDTH_MOVE_RULES, prompt)
+                    self.assertIn("기계적으로 추적하지 않는다", prompt)
+                    self.assertIn("레이아웃, 버튼, 입력 요소, 배경", prompt)
+                    self.assertIn("모든 그림을 아이콘으로 변환하거나", prompt)
+                    self.assertIn("명시적으로 요청한 경우에만 원본 손그림을 재사용", prompt)
+                    self.assertIn("용도나 문맥만으로 원형 보존을 추정하지 않는다", prompt)
+                    self.assertIn("다듬어진 그래픽을 새로 구성", prompt)
+                    self.assertIn("배치·색·의미를 유지하라는 요청은 이 예외에 해당하지 않는다", prompt)
+                    self.assertNotIn("문맥상 그림의 원형이 요구되는 경우", prompt)
+                    self.assertIn("요소의 묶음·포함 관계", prompt)
+                    self.assertNotIn("스케치 이미지의 종횡비, 각 도형", prompt)
+                    self.assertNotIn("완성 아이콘의 형태로 강제", prompt)
+                self.assertEqual(annotations, payload["annotations"])
+                self.assertEqual(xml, payload["annotation_xml"])
+                self.assertEqual(annotations, chat_payload["drafts"][0]["annotations"])
+
+    def test_background_sketch_completion_rules_reach_the_actual_followup_prompt(self):
+        instruction = "그린 사람을 배경으로 써줘"
+        self.assert_checked_chat_request(self.addition_xml(instruction), expected_instruction=instruction,
+            chat_prompt="저장한 스케치를 완성해서 배경으로 만들어줘")
+        prompt = (self.workspace / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn(instruction, prompt)
+        self.assertIn(VISUAL_INTENT_RULES, prompt)
+        self.assertIn("다듬어진 그래픽을 새로 구성", prompt)
+        self.assertIn("명시적으로 요청한 경우에만 원본 손그림을 재사용", prompt)
+        self.assertNotIn("문맥상 그림의 원형이 요구되는 경우", prompt)
+
+    def assert_checked_chat_request(self, annotation_xml: str, *,
+        expected_instruction: str = "채팅에서 반영할 제목으로 변경",
+        chat_prompt: str = "저장한 배치를 유지하고 제목 동작도 수정해줘",
+    ) -> None:
         draft = self.save_draft(
             annotation_xml=annotation_xml
         ).json()
@@ -843,7 +1032,7 @@ class UiEditorApiTests(unittest.TestCase):
                     "task_id": self.task_id,
                     "device_id": self.device_id,
                     "phone_number": self.phone_number,
-                    "prompt": "저장한 배치를 유지하고 제목 동작도 수정해줘",
+                    "prompt": chat_prompt,
                     "use_ui_editor_draft": True,
                 },
             )
@@ -851,15 +1040,15 @@ class UiEditorApiTests(unittest.TestCase):
         fake_runner.enqueue.assert_called_once_with(self.task_id)
         prompt = (self.workspace / "prompt.md").read_text(encoding="utf-8")
         self.assertIn("채팅 요청에 선택된 저장 UI", prompt)
-        self.assertIn("채팅에서 반영할 제목으로 변경", prompt)
+        self.assertIn(expected_instruction, prompt)
         self.assertIn("주석 전용 XML", prompt)
-        self.assertIn("저장한 배치를 유지하고 제목 동작도 수정해줘", prompt)
+        self.assertIn(chat_prompt, prompt)
         attached_event = next(
             event
             for event in self.db.list_events(self.task_id)
             if event["event_type"] == "ui_editor_chat_context_attached"
         )
-        self.assertIn("채팅에서 반영할 제목으로 변경", attached_event["payload_json"])
+        self.assertIn(expected_instruction, attached_event["payload_json"])
         queued_task = self.db.get_task(self.task_id)
         self.assertEqual("rev_0002", Path(queued_task["project_path"]).parent.name)
         queued_state = json.loads(queued_task["codex_result_json"])

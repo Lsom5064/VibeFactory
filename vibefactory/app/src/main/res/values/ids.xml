@@ -1,5 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <item name="uiSketchPen" type="id" />
+    <item name="uiSketchEraser" type="id" />
+    <item name="uiSketchUndo" type="id" />
+    <item name="uiSketchRedo" type="id" />
+    <item name="uiSketchAddImage" type="id" />
+    <item name="uiSketchOriginal" type="id" />
+    <item name="uiSketchZoomIn" type="id" />
+    <item name="uiSketchZoomOut" type="id" />
+    <item name="uiSketchZoomReset" type="id" />
+    <item name="uiSketchZoomLevel" type="id" />
     <item name="uiAdditionSketchCanvas" type="id" />
     <item name="uiAdditionInstruction" type="id" />
     <item name="recyclerTasks" type="id" />

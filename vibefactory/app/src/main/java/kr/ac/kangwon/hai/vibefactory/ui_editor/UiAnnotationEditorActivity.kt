@@ -24,7 +24,6 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -89,12 +88,10 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     private var restoredMove: UiAnnotation? = null
     private var remoteSaveJob: Job? = null
     private var isSaving = false
+    private val canvasPreviewBitmaps = mutableMapOf<String, Bitmap>()
     private var armedAction: UiAnnotationAction? = null
     private var pendingMoveSource: UiAnnotationTarget? = null
-    private val destinationScrollGate = UiAnnotationDragScrollGate()
-    private var edgeAutoScrollJob: Job? = null
-    private var edgeScrollX = 0
-    private var edgeScrollY = 0
+    private var moveEdgeScroller: UiMoveEdgeScroller? = null
     private var loadGeneration = 0
     private var toolbarCollapsed = false
     private var restoredToolbarX = 0f
@@ -103,11 +100,16 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     private var instructionDialog: BottomSheetDialog? = null
     private var instructionInput: EditText? = null
     private var instructionImagesCommitted = false
-    private var additionDialog: UiAdditionEditorDialog? = null
+    private var additionDialog: UiVisualChangeDialog? = null
 
     private val instructionImagePicker =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
             if (uris.isNotEmpty()) addInstructionImages(uris)
+        }
+
+    private val visualImagePicker =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
+            if (uris.isNotEmpty()) addVisualImages(uris)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -175,6 +177,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        stopEdgeAutoScroll()
         persistLocal()
         super.onStop()
     }
@@ -475,7 +478,8 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                 )
             remoteRecord != null -> remoteRecord.copy(
                 pendingAddition = validLocal?.pendingAddition,
-                pendingAdditionEditing = validLocal?.pendingAdditionEditing == true
+                pendingAdditionEditing = validLocal?.pendingAdditionEditing == true,
+                pendingModification = validLocal?.pendingModification
             )
             else -> validLocal
         }
@@ -524,6 +528,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     private fun renderSession() {
         val session = viewModel.session ?: return
         val canvas = findViewById<FrameLayout>(R.id.uiAnnotationCanvas)
+        stopEdgeAutoScroll()
         movePreview = null
         previewDestination = null
         canvas.minimumHeight = (640f * density).roundToInt()
@@ -550,6 +555,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                 scheduleMovePreview()
             }
             targetTapListener = this@UiAnnotationEditorActivity::completeArmedTarget
+            moveSourceTouchListener = this@UiAnnotationEditorActivity::selectMoveSourceAt
             annotationTapListener = { displayed ->
                 confirmRemoveAnnotations(displayed.mapNotNull { marked ->
                     session.annotations.firstOrNull { it.annotationId == marked.annotationId }
@@ -559,13 +565,16 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                 session.pendingAddition = session.pendingAddition?.let {
                     it.copy(addition = requireNotNull(it.addition).copy(bounds = bounds, replaceTargets = emptyList()))
                 }
-                if (finished) persistLocal()
+                if (finished) { refreshMovePreview(); persistLocal() } else scheduleMovePreview()
             }
             enableTargetSelection(armedAction != null)
             showAnnotations(session.annotations)
         }
         canvas.addView(annotationOverlay)
         overlay = annotationOverlay
+        moveEdgeScroller = UiMoveEdgeScroller(
+            findViewById(R.id.uiAnnotationHorizontalViewport),
+            findViewById(R.id.uiAnnotationVerticalViewport), annotationOverlay)
         canvas.setOnDragListener(null)
         currentTargetHits = emptyList()
         canvas.post {
@@ -595,7 +604,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
             if (session.pendingAddition != null) {
                 showAdditionPlacement()
                 if (session.pendingAdditionEditing) openAdditionEditor()
-            }
+            } else session.pendingModification?.let(::openModificationEditor)
         }
         showCanvas()
         updateActions()
@@ -612,97 +621,41 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         }
     }
 
-    private fun isInsideAutoScrollSafeZone(x: Float, y: Float): Boolean {
-        val horizontal = findViewById<HorizontalScrollView>(R.id.uiAnnotationHorizontalViewport)
-        val vertical = findViewById<ScrollView>(R.id.uiAnnotationVerticalViewport)
-        val threshold = 52f * density
-        return x >= horizontal.scrollX + threshold &&
-            x <= horizontal.scrollX + horizontal.width - threshold &&
-            y >= vertical.scrollY + threshold &&
-            y <= vertical.scrollY + vertical.height - threshold
-    }
-
-    private fun edgeScrollDirection(x: Float, y: Float): Pair<Int, Int> {
-        val horizontal = findViewById<HorizontalScrollView>(R.id.uiAnnotationHorizontalViewport)
-        val vertical = findViewById<ScrollView>(R.id.uiAnnotationVerticalViewport)
-        val threshold = 52f * density
-        val horizontalDirection = when {
-            x < horizontal.scrollX + threshold -> -1
-            x > horizontal.scrollX + horizontal.width - threshold -> 1
-            else -> 0
-        }
-        val verticalDirection = when {
-            y < vertical.scrollY + threshold -> -1
-            y > vertical.scrollY + vertical.height - threshold -> 1
-            else -> 0
-        }
-        return horizontalDirection to verticalDirection
-    }
-
-    private fun updateEdgeAutoScroll(x: Float, y: Float, keepArrowUnderFinger: Boolean) {
-        val (directionX, directionY) = edgeScrollDirection(x, y)
-        edgeScrollX = directionX
-        edgeScrollY = directionY
-        if (directionX == 0 && directionY == 0) {
-            stopEdgeAutoScroll()
-            return
-        }
-        if (edgeAutoScrollJob?.isActive == true) return
-        edgeAutoScrollJob = lifecycleScope.launch {
-            val horizontal = findViewById<HorizontalScrollView>(R.id.uiAnnotationHorizontalViewport)
-            val vertical = findViewById<ScrollView>(R.id.uiAnnotationVerticalViewport)
-            val step = (6f * density).roundToInt()
-            while (edgeScrollX != 0 || edgeScrollY != 0) {
-                val beforeX = horizontal.scrollX
-                val beforeY = vertical.scrollY
-                horizontal.scrollBy(edgeScrollX * step, 0)
-                vertical.scrollBy(0, edgeScrollY * step)
-                if (keepArrowUnderFinger) {
-                    overlay?.offsetPendingPointBy(
-                        (horizontal.scrollX - beforeX).toFloat(),
-                        (vertical.scrollY - beforeY).toFloat()
-                    )
-                }
-                delay(32)
-            }
-        }
-    }
-
     private fun stopEdgeAutoScroll() {
-        edgeScrollX = 0
-        edgeScrollY = 0
-        edgeAutoScrollJob?.cancel()
-        edgeAutoScrollJob = null
+        moveEdgeScroller?.stop()
     }
 
     private fun handleMoveDestinationDrag(x: Float, y: Float, active: Boolean) {
-        if (!active) {
-            destinationScrollGate.reset()
-            stopEdgeAutoScroll()
-            return
-        }
-        if (destinationScrollGate.shouldAutoScroll(isInsideAutoScrollSafeZone(x, y))) {
-            updateEdgeAutoScroll(x, y, keepArrowUnderFinger = true)
-        } else {
-            stopEdgeAutoScroll()
-        }
+        if (active) moveEdgeScroller?.update(x, y) else stopEdgeAutoScroll()
     }
 
     private fun selectTargetForAction(action: UiAnnotationAction, target: UiAnnotationTarget) {
         armedAction = null
+        overlay?.enableTargetSelection(false)
         if (action == UiAnnotationAction.MOVE) {
             pendingMoveSource = target
-            destinationScrollGate.reset()
             overlay?.showPendingMove(target)
             updateInstruction(getString(R.string.ui_annotation_destination_hint), true)
+            updateActions()
+            persistLocal()
+        } else if (action == UiAnnotationAction.BEHAVIOR) {
+            openModificationEditor(UiAnnotation(action = action, target = target))
         } else {
             showInstructionDialog(action, target, null, null, null)
         }
     }
 
+    private fun selectMoveSourceAt(x: Float, y: Float): Boolean {
+        if (armedAction != UiAnnotationAction.MOVE) return false
+        val canvas = findViewById<FrameLayout>(R.id.uiAnnotationCanvas)
+        val target = findTargetAt(x * (movePreview?.width ?: canvas.width.toFloat()),
+            y * (movePreview?.height ?: canvas.height.toFloat())) ?: return false
+        selectTargetForAction(UiAnnotationAction.MOVE, target)
+        return true
+    }
+
     private fun completeMoveDestination(x: Float, y: Float) {
         val source = pendingMoveSource ?: return
-        destinationScrollGate.reset()
         stopEdgeAutoScroll()
         val canvas = findViewById<FrameLayout>(R.id.uiAnnotationCanvas)
         val destinationPixelX = x * (movePreview?.width ?: canvas.width.toFloat())
@@ -794,6 +747,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         val pending = viewModel.session?.pendingAddition ?: return
         overlay?.enableTargetSelection(false)
         overlay?.showAdditionPlacement(pending)
+        refreshMovePreview()
         updateInstruction(getString(R.string.ui_annotation_add_region_hint), true)
         findViewById<Button>(R.id.btnUiAnnotationDraw).visibility = View.VISIBLE
         updateActions()
@@ -831,45 +785,124 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     private fun openAdditionEditor() {
         val session = viewModel.session ?: return
         val annotation = session.pendingAddition ?: return
-        val spec = annotation.addition ?: return
-        if (additionDialog?.isShowing == true) return
-        val canvas = findViewById<FrameLayout>(R.id.uiAnnotationCanvas)
-        val aspect = (spec.bounds.right - spec.bounds.left) * (movePreview?.width ?: canvas.width.toFloat()) /
-            ((spec.bounds.bottom - spec.bounds.top) * (movePreview?.height ?: canvas.height.toFloat())).coerceAtLeast(1f)
         session.pendingAdditionEditing = true
-        val candidates = replacementCandidates(spec.bounds)
-        additionDialog = UiAdditionEditorDialog(
-            this, annotation, captureAdditionOriginal(spec.bounds), aspect, candidates,
-            onDraftChanged = { draft -> session.pendingAddition = draft; persistLocal() },
-            onBackToRegion = {
-                session.pendingAdditionEditing = false
-                showAdditionPlacement()
+        openVisualEditor(annotation)
+    }
+
+    private fun openModificationEditor(annotation: UiAnnotation) {
+        val session = viewModel.session ?: return
+        val prepared = annotation.copy(sketch = annotation.sketch ?: UiModificationSketch(android.graphics.Color.WHITE))
+        session.pendingModification = prepared
+        openVisualEditor(prepared)
+    }
+
+    private fun pendingVisual(session: UiAnnotationSession): UiAnnotation? =
+        session.pendingModification ?: session.pendingAddition
+
+    private fun updatePendingVisual(session: UiAnnotationSession, value: UiAnnotation) {
+        if (value.action == UiAnnotationAction.ADD) session.pendingAddition = value
+        else session.pendingModification = value
+    }
+
+    private fun openVisualEditor(annotation: UiAnnotation) {
+        val session = viewModel.session ?: return
+        if (additionDialog?.isShowing == true) return
+        if (annotation.imageIds.any { id -> session.images.none { it.imageId == id } }) {
+            Toast.makeText(this, "첨부 이미지를 불러오지 못했어요. 편집 화면을 다시 열어 주세요.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val adding = annotation.action == UiAnnotationAction.ADD
+        val bounds = annotation.addition?.bounds ?: (movePreview?.displayBounds(annotation.target) ?: annotation.target.bounds)
+        val canvas = findViewById<FrameLayout>(R.id.uiAnnotationCanvas)
+        val aspect = (bounds.right - bounds.left) * (movePreview?.width ?: canvas.width.toFloat()) /
+            ((bounds.bottom - bounds.top) * (movePreview?.height ?: canvas.height.toFloat())).coerceAtLeast(1f)
+        additionDialog = UiVisualChangeDialog(
+            this, annotation, captureAdditionOriginal(bounds), aspect,
+            if (adding) replacementCandidates(bounds) else emptyList(),
+            onDraftChanged = { draft ->
+                updatePendingVisual(session, draft)
+                if (adding) scheduleMovePreview()
                 persistLocal()
             },
+            onBack = {
+                additionDialog = null
+                if (adding) { session.pendingAdditionEditing = false; showAdditionPlacement() }
+                else { session.pendingModification = null; cancelCurrentAction() }
+                persistLocal()
+            },
+            onPickImages = {
+                if (pendingVisual(session)?.referenceImages(session.images).orEmpty().size >= MAX_IMAGES_PER_ANNOTATION) {
+                    Toast.makeText(this, R.string.ui_annotation_image_limit, Toast.LENGTH_SHORT).show()
+                } else visualImagePicker.launch(arrayOf("image/*"))
+            },
             onSave = { draft, dialog ->
+                val original = dialog.copyOriginal()
                 lifecycleScope.launch {
-                    runCatching {
-                        val image = if (draft.addition?.strokes?.isNotEmpty() == true) {
-                            withContext(Dispatchers.IO) { draftStore.persistSketch(session, draft, aspect) }
+                    try {
+                        val strokes = draft.addition?.strokes ?: draft.sketch?.strokes.orEmpty()
+                        val image = if (strokes.isNotEmpty() || draft.canvasImages.isNotEmpty()) withContext(Dispatchers.IO) {
+                            draftStore.persistSketch(session, draft, aspect, original)
                         } else null
-                        check(viewModel.session === session && session.pendingAddition?.annotationId == draft.annotationId)
-                        val saved = draft.copy(imageIds = listOfNotNull(image?.imageId))
+                        check(viewModel.session === session && pendingVisual(session)?.annotationId == draft.annotationId)
+                        val saved = draft.copy(imageIds = draft.referenceImages(session.images).map { it.imageId } +
+                            listOfNotNull(image?.imageId), sketchImageId = image?.imageId)
                         check(upsertAnnotation(saved))
                         image?.let { session.images += it }
                         session.pendingAddition = null
                         session.pendingAdditionEditing = false
-                        dialog.dismiss()
-                        additionDialog = null
-                        cancelCurrentAction()
-                        recordChange()
-                    }.onFailure {
+                        session.pendingModification = null
+                        dialog.dismiss(); additionDialog = null
+                        cancelCurrentAction(); recordChange()
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                    catch (error: Exception) {
                         dialog.allowRetry()
-                        Toast.makeText(this@UiAnnotationEditorActivity, "추가 표시를 저장하지 못했어요. 다시 시도해 주세요.", Toast.LENGTH_LONG).show()
-                    }
+                        Toast.makeText(this@UiAnnotationEditorActivity, "표시를 저장하지 못했어요. 다시 시도해 주세요.", Toast.LENGTH_LONG).show()
+                    } finally { original?.recycle() }
                 }
             }
-        ).also { it.show() }
+        ).also { it.show(); it.showReferenceImages(annotation.referenceImages(session.images)) }
         persistLocal()
+    }
+
+    private fun refreshVisualImages(session: UiAnnotationSession) {
+        val draft = pendingVisual(session) ?: return
+        additionDialog?.replaceDraft(draft)
+        additionDialog?.showReferenceImages(draft.referenceImages(session.images))
+    }
+
+    private fun addVisualImages(uris: List<Uri>) {
+        val session = viewModel.session ?: return
+        val pending = pendingVisual(session) ?: return
+        val available = (MAX_IMAGES_PER_ANNOTATION - pending.referenceImages(session.images).size).coerceAtLeast(0)
+        if (available == 0) return
+        additionDialog?.setBusy(true)
+        lifecycleScope.launch {
+            try {
+                val images = withContext(Dispatchers.IO) {
+                    uris.distinct().take(available).mapNotNull { uri ->
+                        val attachment = buildSelectedAttachment(contentResolver, uri, SelectedAttachmentKind.IMAGE,
+                            maxOriginalImageBytes = MAX_ANNOTATION_IMAGE_SOURCE_BYTES,
+                            maxImagePayloadBytes = MAX_ANNOTATION_IMAGE_BYTES, maxPdfBytes = 0, maxTextBytes = 0)
+                            ?: return@mapNotNull null
+                        draftStore.persistImage(session.taskId, session.revisionLabel, session.layout.layout_name,
+                            pending.annotationId, attachment)
+                    }
+                }
+                if (viewModel.session !== session || pendingVisual(session)?.annotationId != pending.annotationId) return@launch
+                val current = requireNotNull(pendingVisual(session))
+                val existing = current.referenceImages(session.images)
+                val accepted = images.distinctBy { it.sha256 }.filter { image -> existing.none { it.sha256 == image.sha256 } }
+                    .take((MAX_IMAGES_PER_ANNOTATION - existing.size).coerceAtLeast(0))
+                session.images += accepted
+                updatePendingVisual(session, current.copy(imageIds = current.imageIds + accepted.map { it.imageId }))
+                refreshVisualImages(session); persistLocal()
+                if (images.isEmpty()) Toast.makeText(this@UiAnnotationEditorActivity, R.string.ui_annotation_image_failed, Toast.LENGTH_SHORT).show()
+                if (uris.size > available) Toast.makeText(this@UiAnnotationEditorActivity, R.string.ui_annotation_image_limit, Toast.LENGTH_SHORT).show()
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                Toast.makeText(this@UiAnnotationEditorActivity, R.string.ui_annotation_image_failed, Toast.LENGTH_SHORT).show()
+            } finally { additionDialog?.allowRetry() }
+        }
     }
 
     private fun editAnnotation(annotation: UiAnnotation) {
@@ -878,8 +911,9 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
             viewModel.session?.pendingAddition = annotation
             showAdditionPlacement()
             openAdditionEditor()
-        } else showInstructionDialog(annotation.action, annotation.target, annotation.destination,
-            annotation.destinationX, annotation.destinationY, annotation)
+        } else if (annotation.action == UiAnnotationAction.BEHAVIOR) openModificationEditor(annotation)
+        else showInstructionDialog(annotation.action, annotation.target, annotation.destination,
+            annotation.moveAnchorX ?: annotation.destinationX, annotation.moveAnchorY ?: annotation.destinationY, annotation)
     }
 
     private fun confirmRemoveAnnotations(annotations: List<UiAnnotation>) {
@@ -998,6 +1032,11 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                 createdAt = state.createdAt
             )
             if (!upsertAnnotation(annotation)) return@saveClick
+            if (state.action == UiAnnotationAction.MOVE) {
+                pendingMoveSource = null
+                previewDestination = null
+                overlay?.showPendingMove(null)
+            }
             state.images.forEach { image ->
                 if (session.images.none { it.imageId == image.imageId }) session.images += image
             }
@@ -1160,8 +1199,8 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                 it.destinationX == annotation.destinationX &&
                 it.destinationY == annotation.destinationY &&
                 it.instruction == annotation.instruction &&
-                it.addition == annotation.addition &&
-                it.imageIds == annotation.imageIds
+                it.addition == annotation.addition && it.sketch == annotation.sketch &&
+                it.imageIds == annotation.imageIds && it.canvasImages == annotation.canvasImages
         }
         if (duplicate) {
             Toast.makeText(this, R.string.ui_annotation_duplicate, Toast.LENGTH_LONG).show()
@@ -1179,10 +1218,11 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     private fun findTargetAt(x: Float, y: Float): UiAnnotationTarget? {
         if (currentTargetHits.isEmpty()) rebuildTargetIndex()
         val preview = movePreview
+        val canvas = findViewById<View>(R.id.uiAnnotationCanvas)
+        val width = preview?.width ?: canvas.width.toFloat()
+        val height = preview?.height ?: canvas.height.toFloat()
         return currentTargetHits.firstOrNull { hit ->
             val bounds = preview?.displayBounds(hit.target) ?: hit.target.bounds
-            val width = preview?.width ?: findViewById<View>(R.id.uiAnnotationCanvas).width.toFloat()
-            val height = preview?.height ?: findViewById<View>(R.id.uiAnnotationCanvas).height.toFloat()
             x >= bounds.left * width && x < bounds.right * width && y >= bounds.top * height && y < bounds.bottom * height
         }?.target
     }
@@ -1300,20 +1340,44 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         val moves = session.annotations.filter { it.action == UiAnnotationAction.MOVE }.toMutableList()
         val source = pendingMoveSource
         val point = previewDestination
-        if (source != null && point != null) moves += UiAnnotation(action = UiAnnotationAction.MOVE,
-            target = source, destinationX = point.first, destinationY = point.second)
-        movePreview?.apply(moves, updateXml)
+        val pendingMove = if (source != null && point != null) UiAnnotation(action = UiAnnotationAction.MOVE,
+            target = source, destinationX = point.first, destinationY = point.second) else null
+        pendingMove?.let(moves::add)
+        val additions = session.annotations.filter { it.action == UiAnnotationAction.ADD &&
+            it.annotationId != session.pendingAddition?.annotationId } + listOfNotNull(session.pendingAddition)
+        movePreview?.apply(moves, updateXml, additions)
+        if (pendingMove == null && session.pendingAddition == null) session.replaceAnnotations(session.annotations.map { annotation ->
+            if (annotation.action == UiAnnotationAction.MOVE) movePreview?.resolvedMove(annotation) ?: annotation else annotation
+        })
+        val destinations = movePreview?.destinationBounds.orEmpty()
+        overlay?.showMoveDestinationBounds(destinations, pendingMove?.let { destinations[it.annotationId] })
         session.previewCanvasHeightDp = findViewById<View>(R.id.uiAnnotationCanvas).minimumHeight / density
-        overlay?.showAnnotations(session.annotations.map { annotation ->
+        overlay?.showAnnotations(session.annotations.filter { it.annotationId != session.pendingAddition?.annotationId }.map { annotation ->
             annotation.copy(target = annotation.target.copy(bounds = movePreview?.displayBounds(annotation.target) ?: annotation.target.bounds))
         })
+        lifecycleScope.launch { loadCanvasPreviews(session, strict = false) }
         updateDeleteSelection()
+    }
+
+    private suspend fun loadCanvasPreviews(session: UiAnnotationSession, strict: Boolean) {
+        val ids = session.annotations.filter { it.canvasImages.isNotEmpty() }.mapNotNull { it.sketchImageId }.toSet()
+        val missing = ids.filterNot { it in canvasPreviewBitmaps }
+        if (missing.isNotEmpty()) {
+            val files = session.images.filter { it.imageId in missing }
+            val decoded = withContext(Dispatchers.IO) {
+                files.mapNotNull { image -> UiSketchImages.decode(image.localPath, 512)?.let { image.imageId to it } }.toMap()
+            }
+            if (viewModel.session !== session) return
+            canvasPreviewBitmaps.putAll(decoded)
+        }
+        if (strict) check(ids.all { it in canvasPreviewBitmaps }) { "이미지 미리보기를 불러오지 못했어요." }
+        overlay?.sketchPreviews = canvasPreviewBitmaps.filterKeys { it in ids }
     }
 
     private fun recordChange() {
         val session = viewModel.session ?: return
-        session.history.record(session.annotations)
         refreshMovePreview()
+        session.history.record(session.annotations)
         updateActions()
         persistLocal()
         scheduleRemoteSave()
@@ -1578,8 +1642,8 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
 
     private fun validateAnnotationsForSubmit(annotations: List<UiAnnotation>): String? {
         if (annotations.any { it.action == UiAnnotationAction.ADD &&
-                (it.addition == null || (it.instruction.isBlank() && it.addition.strokes.isEmpty())) }) {
-            return "추가할 UI의 그림이나 설명을 입력해 주세요."
+                (it.addition == null || it.instruction.isBlank()) }) {
+            return "추가할 UI의 설명을 입력해 주세요."
         }
         if (annotations.any { it.action == UiAnnotationAction.BEHAVIOR && it.instruction.isBlank() }) {
             return getString(R.string.ui_annotation_behavior_missing)
@@ -1599,7 +1663,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                 it.destinationX?.toString().orEmpty(),
                 it.destinationY?.toString().orEmpty(),
                 it.instruction,
-                it.addition?.toString().orEmpty()
+                it.addition?.toString().orEmpty(), it.sketch?.toString().orEmpty(), it.imageIds.joinToString(",")
             ).joinToString("|")
         }
         return if (signatures.distinct().size != signatures.size) {
@@ -1608,6 +1672,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     }
 
     private suspend fun captureAnnotatedPreview(): String? {
+        viewModel.session?.let { loadCanvasPreviews(it, strict = true) }
         val canvasView = findViewById<FrameLayout>(R.id.uiAnnotationCanvas)
         if (canvasView.width <= 0 || canvasView.height <= 0) return null
         val maxDimension = 1600f
@@ -1647,7 +1712,8 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         findViewById<ImageButton>(R.id.btnUiAnnotationList).isEnabled = session?.annotations?.isNotEmpty() == true
         findViewById<ImageButton>(R.id.btnUiAnnotationClear).isEnabled = session?.annotations?.isNotEmpty() == true
         findViewById<Button>(R.id.btnUiAnnotationSave).isEnabled =
-            session?.annotations?.isNotEmpty() == true && session.pendingAddition == null && !isSaving
+            session?.annotations?.isNotEmpty() == true && session.pendingAddition == null &&
+                session.pendingModification == null && pendingMoveSource == null && !isSaving
         findViewById<TextView>(R.id.uiAnnotationCount).text = if (session?.annotations.isNullOrEmpty()) {
             getString(R.string.ui_annotation_empty)
         } else {
@@ -1656,14 +1722,11 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     }
 
     private fun cancelCurrentAction(clearBanner: Boolean = true, clearPendingAddition: Boolean = true) {
-        destinationScrollGate.reset()
         stopEdgeAutoScroll()
         armedAction = null
         pendingMoveSource = null
         previewDestination = null
-        refreshMovePreview()
         viewModel.session?.selectedDeleteTargets = emptyList()
-        updateDeleteSelection()
         overlay?.showHover(null, null)
         overlay?.showPendingMove(null)
         overlay?.enableTargetSelection(false)
@@ -1672,6 +1735,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
             viewModel.session?.pendingAddition = null
             viewModel.session?.pendingAdditionEditing = false
         }
+        refreshMovePreview()
         findViewById<Button>(R.id.btnUiAnnotationDraw).visibility = View.GONE
         updateActions()
         if (clearBanner) updateInstruction("", false)

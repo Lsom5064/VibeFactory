@@ -229,6 +229,7 @@ class UiPreviewRenderer(private val context: Context) {
         previewAndroidValue(node, "selected")?.toBooleanStrictOrNull()?.let { view.isSelected = it }
         dimensionPx(previewAndroidValue(node, "translationX"))?.let { view.translationX = it.toFloat() }
         dimensionPx(previewAndroidValue(node, "translationY"))?.let { view.translationY = it.toFloat() }
+        dimensionPx(previewAndroidValue(node, "minWidth"))?.let { view.minimumWidth = it.coerceAtLeast(0) }
         applyPadding(view, node)
 
         drawable(previewAndroidValue(node, "background"))?.let { view.background = it }

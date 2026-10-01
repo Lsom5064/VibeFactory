@@ -19,6 +19,8 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
+    var sketchPreviews: Map<String, android.graphics.Bitmap> = emptyMap()
+        set(value) { field = value; invalidate() }
     private var referenceWidth = 0
     private var referenceHeight = 0
     private val coordinateWidth get() = referenceWidth.takeIf { it > 0 } ?: width
@@ -57,9 +59,21 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     private var pendingMoveSource: UiAnnotationTarget? = null
     private var pendingPointX: Float? = null
     private var pendingPointY: Float? = null
+    private var moveDestinationBounds: Map<String, UiNormalizedRect> = emptyMap()
+    private var pendingMoveBounds: UiNormalizedRect? = null
+
+    fun showMoveDestinationBounds(saved: Map<String, UiNormalizedRect>, pending: UiNormalizedRect?) {
+        moveDestinationBounds = saved.toMap()
+        pendingMoveBounds = pending
+        invalidate()
+    }
     var destinationTapListener: ((Float, Float) -> Unit)? = null
     var destinationDragListener: ((Float, Float, Boolean) -> Unit)? = null
     var targetTapListener: ((Float, Float) -> Unit)? = null
+    /** Select a move source on DOWN so the same touch can continue into a drag. */
+    var moveSourceTouchListener: ((Float, Float) -> Boolean)? = null
+    private var selectedMoveOnDown = false
+    private var moveGestureDragged = false
     private var targetSelectionEnabled = false
     var annotationTapListener: ((List<UiAnnotation>) -> Unit)? = null
     var additionBoundsChanged: ((UiNormalizedRect, Boolean) -> Unit)? = null
@@ -68,6 +82,10 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     private var downY = 0f
     private var tappedAnnotations: List<UiAnnotation> = emptyList()
     private var resizeCorner = -1
+    private var additionStartBounds: UiNormalizedRect? = null
+    private var additionCanDrag = false
+    private var additionDragging = false
+    private var additionCornerWasSelected = false
 
     init {
         isClickable = false
@@ -87,6 +105,7 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     }
 
     fun showPendingMove(source: UiAnnotationTarget?, x: Float? = null, y: Float? = null) {
+        pendingMoveBounds = null
         pendingMoveSource = source
         pendingPointX = x
         pendingPointY = y
@@ -100,6 +119,7 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     }
 
     fun showAdditionPlacement(annotation: UiAnnotation?) {
+        resetAdditionGesture()
         pendingAddition = annotation
         resizeCorner = -1
         updateClickable()
@@ -117,13 +137,15 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
         UiAdditionGeometry.contains(b, x / coordinateWidth.coerceAtLeast(1), y / coordinateHeight.coerceAtLeast(1)) ||
             (abs(x - badgeX) <= 18f * density && abs(y - badgeY) <= 18f * density) ||
             (annotation.action == UiAnnotationAction.MOVE && annotation.resolvedDestinationPoint().let {
-                val endX = it.first * coordinateWidth; val endY = it.second * coordinateHeight
+                val destination = moveDestinationRect(annotation.target.bounds, it.first * coordinateWidth,
+                    it.second * coordinateHeight, moveDestinationBounds[annotation.annotationId])
+                val endX = destination.centerX(); val endY = destination.centerY()
                 val start = rect(annotation.target.bounds)
                 val dx = endX - start.centerX(); val dy = endY - start.centerY()
                 val lengthSquared = dx * dx + dy * dy
                 val t = if (lengthSquared == 0f) 0f else
                     (((x - start.centerX()) * dx + (y - start.centerY()) * dy) / lengthSquared).coerceIn(0f, 1f)
-                moveDestinationRect(annotation.target.bounds, endX, endY).contains(x, y) ||
+                destination.contains(x, y) ||
                     kotlin.math.hypot(x - start.centerX() - t * dx, y - start.centerY() - t * dy) <= 18f * density
             })
     }
@@ -132,19 +154,31 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
         if (pendingAddition != null) return handleAdditionTouch(event)
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             downX = event.x; downY = event.y
+            moveGestureDragged = false
+            selectedMoveOnDown = pendingMoveSource == null && targetSelectionEnabled &&
+                moveSourceTouchListener?.invoke(event.x / coordinateWidth.coerceAtLeast(1),
+                    event.y / coordinateHeight.coerceAtLeast(1)) == true
             tappedAnnotations = if (pendingMoveSource == null && !targetSelectionEnabled) annotationsAt(event.x, event.y) else emptyList()
         }
         if (pendingMoveSource == null && !targetSelectionEnabled && tappedAnnotations.isEmpty()) return false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (pendingMoveSource != null) parent.requestDisallowInterceptTouchEvent(true)
+                // A tap only selects the source; release must not open the confirmation sheet yet.
+                if (selectedMoveOnDown) return true
                 pendingPointX = (event.x / coordinateWidth.coerceAtLeast(1)).coerceIn(0f, 1f)
                 pendingPointY = (event.y / coordinateHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
-                if (pendingMoveSource != null) movePreviewListener?.invoke(pendingPointX, pendingPointY)
+                if (pendingMoveSource != null) {
+                    destinationDragListener?.invoke(event.x, event.y, true)
+                    movePreviewListener?.invoke(pendingPointX, pendingPointY)
+                }
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                if (abs(event.x - downX) > ViewConfiguration.get(context).scaledTouchSlop ||
+                    abs(event.y - downY) > ViewConfiguration.get(context).scaledTouchSlop) moveGestureDragged = true
+                if (selectedMoveOnDown && !moveGestureDragged) return true
                 pendingPointX = (event.x / coordinateWidth.coerceAtLeast(1)).coerceIn(0f, 1f)
                 pendingPointY = (event.y / coordinateHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
                 if (pendingMoveSource != null) {
@@ -163,12 +197,14 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
                     val x = pendingPointX ?: touchX
                     val y = pendingPointY ?: touchY
                     destinationDragListener?.invoke(event.x, event.y, false)
-                    destinationTapListener?.invoke(x, y)
+                    if (!selectedMoveOnDown || moveGestureDragged) destinationTapListener?.invoke(x, y)
                 } else if (abs(event.x - downX) <= ViewConfiguration.get(context).scaledTouchSlop &&
                     abs(event.y - downY) <= ViewConfiguration.get(context).scaledTouchSlop) {
-                    if (tappedAnnotations.isNotEmpty()) annotationTapListener?.invoke(tappedAnnotations)
-                    else
-                    targetTapListener?.invoke(event.x / coordinateWidth.coerceAtLeast(1), event.y / coordinateHeight.coerceAtLeast(1))
+                    if (tappedAnnotations.isNotEmpty()) {
+                        annotationTapListener?.invoke(tappedAnnotations)
+                    } else {
+                        targetTapListener?.invoke(event.x / coordinateWidth.coerceAtLeast(1), event.y / coordinateHeight.coerceAtLeast(1))
+                    }
                 }
                 tappedAnnotations = emptyList()
                 return true
@@ -194,38 +230,97 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
         val annotation = pendingAddition ?: return false
         val spec = annotation.addition ?: return false
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { downX = event.x; downY = event.y }
+            MotionEvent.ACTION_DOWN -> {
+                downX = event.x; downY = event.y
+                additionStartBounds = spec.bounds
+                additionDragging = false
+                additionCornerWasSelected = resizeCorner >= 0
+                val b = spec.bounds
+                val touchedCorner = listOf(b.left to b.top, b.right to b.top, b.left to b.bottom, b.right to b.bottom)
+                    .withIndex().filter { (_, point) ->
+                        abs(event.x - point.first * coordinateWidth) <= 24f * density &&
+                            abs(event.y - point.second * coordinateHeight) <= 24f * density
+                    }.minByOrNull { (_, point) ->
+                        kotlin.math.hypot(event.x - point.first * coordinateWidth, event.y - point.second * coordinateHeight)
+                    }?.index ?: -1
+                if (!additionCornerWasSelected) resizeCorner = touchedCorner
+                additionCanDrag = touchedCorner >= 0 || UiAdditionGeometry.contains(spec.bounds,
+                    event.x / coordinateWidth.coerceAtLeast(1), event.y / coordinateHeight.coerceAtLeast(1))
+                // Keep drags inside the region out of both preview scroll views.
+                // Outside touches may still scroll, or reposition the region with a tap.
+                if (additionCanDrag) parent?.requestDisallowInterceptTouchEvent(true)
+                invalidate()
+            }
+            MotionEvent.ACTION_MOVE -> updateAdditionDrag(event)
             MotionEvent.ACTION_UP -> {
-                if (abs(event.x - downX) > ViewConfiguration.get(context).scaledTouchSlop ||
-                    abs(event.y - downY) > ViewConfiguration.get(context).scaledTouchSlop) return true
+                val b = additionStartBounds ?: return true
+                updateAdditionDrag(event)
+                if (additionDragging) {
+                    pendingAddition?.addition?.bounds?.let { additionBoundsChanged?.invoke(it, true) }
+                    resizeCorner = -1
+                    resetAdditionGesture()
+                    invalidate()
+                    return true
+                }
+                val isTap = abs(event.x - downX) <= ViewConfiguration.get(context).scaledTouchSlop &&
+                    abs(event.y - downY) <= ViewConfiguration.get(context).scaledTouchSlop
+                resetAdditionGesture()
+                if (!isTap) { resizeCorner = -1; invalidate(); return true }
+                if (resizeCorner >= 0 && !additionCornerWasSelected) {
+                    invalidate(); performClick(); return true
+                }
                 val x = (event.x / coordinateWidth.coerceAtLeast(1)).coerceIn(0f, 1f)
                 val y = (event.y / coordinateHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
-                val b = spec.bounds
-                if (resizeCorner < 0) {
-                    val corners = listOf(b.left to b.top, b.right to b.top, b.left to b.bottom, b.right to b.bottom)
-                    resizeCorner = corners.indexOfFirst {
-                        abs(event.x - it.first * coordinateWidth) < 24f * density && abs(event.y - it.second * coordinateHeight) < 24f * density
-                    }
-                    if (resizeCorner >= 0) { invalidate(); performClick(); return true }
-                }
-                val minW = minOf(64f * density / coordinateWidth.coerceAtLeast(1), b.right - b.left)
-                val minH = minOf(48f * density / coordinateHeight.coerceAtLeast(1), b.bottom - b.top)
                 val result = if (resizeCorner < 0) {
                     UiAdditionGeometry.translate(b, x - (b.left + b.right) / 2, y - (b.top + b.bottom) / 2)
-                } else UiNormalizedRect(
-                    if (resizeCorner == 0 || resizeCorner == 2) x.coerceIn(0f, b.right - minW) else b.left,
-                    if (resizeCorner < 2) y.coerceIn(0f, b.bottom - minH) else b.top,
-                    if (resizeCorner == 1 || resizeCorner == 3) x.coerceIn(b.left + minW, 1f) else b.right,
-                    if (resizeCorner >= 2) y.coerceIn(b.top + minH, 1f) else b.bottom
-                )
+                } else resizeAddition(b, x - (if (resizeCorner == 0 || resizeCorner == 2) b.left else b.right),
+                    y - (if (resizeCorner < 2) b.top else b.bottom))
                 resizeCorner = -1
-                pendingAddition = annotation.copy(addition = spec.copy(bounds = result))
-                additionBoundsChanged?.invoke(result, true)
+                updateAdditionBounds(result, true)
                 performClick()
+            }
+            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
+                if (additionDragging) additionStartBounds?.let { updateAdditionBounds(it, true) }
+                resizeCorner = -1
+                resetAdditionGesture()
                 invalidate()
             }
         }
         return true
+    }
+
+    private fun updateAdditionDrag(event: MotionEvent) {
+        val start = additionStartBounds ?: return
+        if (!additionCanDrag) return
+        val dx = event.x - downX
+        val dy = event.y - downY
+        if (!additionDragging && abs(dx) <= ViewConfiguration.get(context).scaledTouchSlop &&
+            abs(dy) <= ViewConfiguration.get(context).scaledTouchSlop) return
+        additionDragging = true
+        val normalizedX = dx / coordinateWidth.coerceAtLeast(1)
+        val normalizedY = dy / coordinateHeight.coerceAtLeast(1)
+        val bounds = if (resizeCorner < 0) UiAdditionGeometry.translate(start, normalizedX, normalizedY)
+            else resizeAddition(start, normalizedX, normalizedY)
+        if (bounds != pendingAddition?.addition?.bounds) updateAdditionBounds(bounds, false)
+    }
+
+    private fun resizeAddition(bounds: UiNormalizedRect, dx: Float, dy: Float): UiNormalizedRect =
+        UiAdditionGeometry.resize(bounds, resizeCorner, dx, dy,
+            64f * density / coordinateWidth.coerceAtLeast(1), 48f * density / coordinateHeight.coerceAtLeast(1))
+
+    private fun updateAdditionBounds(bounds: UiNormalizedRect, finished: Boolean) {
+        pendingAddition = pendingAddition?.let { annotation ->
+            annotation.copy(addition = annotation.addition?.copy(bounds = bounds))
+        }
+        additionBoundsChanged?.invoke(bounds, finished)
+        invalidate()
+    }
+
+    private fun resetAdditionGesture() {
+        parent?.requestDisallowInterceptTouchEvent(false)
+        additionStartBounds = null
+        additionCanDrag = false
+        additionDragging = false
     }
 
     fun offsetPendingPointBy(deltaX: Float, deltaY: Float) {
@@ -265,8 +360,9 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
             drawBox(canvas, sourceRect, MOVE_COLOR, "↗", null, dashed = false)
             val destinationX = (pendingPointX ?: source.bounds.right).coerceIn(0f, 1f) * coordinateWidth
             val destinationY = (pendingPointY ?: source.bounds.bottom).coerceIn(0f, 1f) * coordinateHeight
-            drawDestination(canvas, moveDestinationRect(source.bounds, destinationX, destinationY), MOVE_COLOR)
-            drawArrow(canvas, sourceRect.centerX(), sourceRect.centerY(), destinationX, destinationY, MOVE_COLOR)
+            val destination = moveDestinationRect(source.bounds, destinationX, destinationY, pendingMoveBounds)
+            drawDestination(canvas, destination, MOVE_COLOR)
+            drawArrow(canvas, sourceRect.centerX(), sourceRect.centerY(), destination.centerX(), destination.centerY(), MOVE_COLOR)
         }
     }
 
@@ -278,23 +374,29 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
             canvas.drawRect(targetRect, fillPaint)
             UiSketchRenderer.draw(canvas, targetRect, spec.strokes)
         }
+        annotation.sketch?.let { UiSketchRenderer.draw(canvas, targetRect, it.strokes) }
+        if (annotation.canvasImages.isNotEmpty()) sketchPreviews[annotation.sketchImageId]?.let {
+            canvas.drawBitmap(it, null, targetRect, Paint(Paint.FILTER_BITMAP_FLAG))
+        }
         drawBox(canvas, targetRect, color, symbolFor(annotation.action), number.takeIf { it > 0 }, dashed = false)
         if (annotation.action == UiAnnotationAction.MOVE) {
             val (normalizedX, normalizedY) = annotation.resolvedDestinationPoint()
             val endX = normalizedX * coordinateWidth
             val endY = normalizedY * coordinateHeight
-            drawDestination(canvas, moveDestinationRect(annotation.target.bounds, endX, endY), color)
-            drawArrow(canvas, targetRect.centerX(), targetRect.centerY(), endX, endY, color)
+            val destination = moveDestinationRect(annotation.target.bounds, endX, endY, moveDestinationBounds[annotation.annotationId])
+            drawDestination(canvas, destination, color)
+            drawArrow(canvas, targetRect.centerX(), targetRect.centerY(), destination.centerX(), destination.centerY(), color)
         }
     }
 
-    internal fun moveDestinationRect(sourceBounds: UiNormalizedRect, centerX: Float, centerY: Float): RectF {
+    internal fun moveDestinationRect(sourceBounds: UiNormalizedRect, centerX: Float, centerY: Float,
+        previewBounds: UiNormalizedRect? = null): RectF {
+        if (previewBounds != null) return RectF(previewBounds.left * coordinateWidth, previewBounds.top * coordinateHeight,
+            previewBounds.right * coordinateWidth, previewBounds.bottom * coordinateHeight)
         val source = sourceBounds.normalized()
         val halfWidth = (source.right - source.left) * coordinateWidth / 2f
         val halfHeight = (source.bottom - source.top) * coordinateHeight / 2f
-        // Keep the source's actual size and the chosen center. Canvas clipping
-        // handles edges; clamping or the selection box's minimum size would
-        // misrepresent the requested move.
+        // Free placement keeps its source size. Row placement above uses the shared slot geometry.
         return RectF(centerX - halfWidth, centerY - halfHeight, centerX + halfWidth, centerY + halfHeight)
     }
 

@@ -16,6 +16,58 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class UiMoveDestinationInstrumentedTest {
+    @Test fun sourceTouchCanContinueIntoDragWithoutCommittingAnAnnotation() {
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val view = overlay()
+            var sourceSelected = false
+            var requestedDestination: Pair<Float, Float>? = null
+            view.enableTargetSelection(true)
+            view.moveSourceTouchListener = { _, _ ->
+                sourceSelected = true
+                view.enableTargetSelection(false)
+                view.showPendingMove(source)
+                true
+            }
+            view.destinationTapListener = { x, y -> requestedDestination = x to y }
+            send(view, MotionEvent.ACTION_DOWN, 150f, 120f)
+            assertTrue(sourceSelected)
+            send(view, MotionEvent.ACTION_UP, 150f, 120f)
+            assertEquals(null, requestedDestination)
+            // Start again to exercise a single uninterrupted source-to-destination drag.
+            view.showPendingMove(null)
+            view.enableTargetSelection(true)
+            send(view, MotionEvent.ACTION_DOWN, 150f, 120f)
+            send(view, MotionEvent.ACTION_MOVE, 700f, 560f)
+            assertEquals(null, requestedDestination)
+            send(view, MotionEvent.ACTION_UP, 700f, 560f)
+            assertEquals(.7f, requestedDestination!!.first, .001f)
+            assertEquals(.7f, requestedDestination!!.second, .001f)
+            assertTrue(view.annotationsAt(700f, 560f).isEmpty())
+        }
+    }
+
+    @Test fun fittedDestinationIsUsedForDrawingAndTappingWhileSourceStaysFullWidth() {
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val view = overlay()
+            val annotation = move().copy(target = source.copy(bounds = UiNormalizedRect(.05f, .1f, .85f, .2f)))
+            val fitted = UiNormalizedRect(.6f, .65f, .8f, .75f)
+            view.showAnnotations(listOf(annotation))
+            view.showMoveDestinationBounds(mapOf(annotation.annotationId to fitted), null)
+            assertDestinationOutline(view)
+            assertTrue(view.annotationsAt(780f, 590f).contains(annotation))
+            assertTrue(view.annotationsAt(980f, 590f).isEmpty())
+            view.showAnnotations(emptyList())
+            view.showPendingMove(annotation.target, .7f, .7f)
+            view.showMoveDestinationBounds(emptyMap(), fitted)
+            assertDestinationOutline(view)
+            val bitmap = Bitmap.createBitmap(1000, 800, Bitmap.Config.ARGB_8888)
+            try {
+                view.draw(Canvas(bitmap))
+                assertTrue("The solid source keeps its width", bluePixels(bitmap, 600, 76, 750, 85) > 100)
+            } finally { bitmap.recycle() }
+        }
+    }
+
     private val source = UiAnnotationTarget(
         "id:source", "@+id/source", "0.1", "Button", "이동할 버튼", "",
         UiNormalizedRect(.05f, .1f, .25f, .2f), "", ""

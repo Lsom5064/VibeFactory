@@ -64,7 +64,7 @@ class UiAnnotationModelsTest {
 
         assertTrue(encoded.contains("제목 &amp; 안내"))
         assertTrue(encoded.contains("설명 &lt;확인&gt;"))
-        assertTrue(encoded.contains("<vf:image-ref id=\"reference_1\" />"))
+        assertTrue(encoded.contains("<vf:image-ref id=\"reference_1\" role=\"reference\" />"))
         assertEquals(annotations, UiAnnotationXmlCodec.decode(encoded))
     }
 
@@ -83,6 +83,41 @@ class UiAnnotationModelsTest {
         )
 
         assertEquals(0.86f to 0.74f, annotation.resolvedDestinationPoint())
+    }
+
+    @Test fun `modification keeps sketch and five references with their roles`() {
+        val original = UiAnnotation(action = UiAnnotationAction.BEHAVIOR, target = target,
+            instruction = "동작은 그대로 두고 둥근 보라색 버튼으로 변경",
+            sketch = UiModificationSketch(-1, listOf(UiSketchStroke(listOf(UiSketchPoint(.2f, .3f)), -16777216))),
+            imageIds = (1..5).map { "reference_$it" } + "sketch_1", sketchImageId = "sketch_1")
+        val encoded = UiAnnotationXmlCodec.encode("task", "rev_0001", "activity_main", "layout", "a".repeat(64), listOf(original))
+        assertEquals(original, UiAnnotationXmlCodec.decode(encoded).single())
+        assertTrue(encoded.contains("role=\"sketch\""))
+        assertTrue(encoded.contains("schemaVersion=\"3\""))
+    }
+
+    @Test fun `version one records are still readable`() {
+        val original = UiAnnotation(action = UiAnnotationAction.BEHAVIOR, target = target, instruction = "기존 요청")
+        val legacy = UiAnnotationXmlCodec.encode("task", "rev_0001", "activity_main", "layout", "a".repeat(64), listOf(original))
+            .replace("schemaVersion=\"3\"", "schemaVersion=\"1\"")
+        assertEquals(original, UiAnnotationXmlCodec.decode(legacy).single())
+    }
+
+    @Test fun `both visual tools preserve canvas image order position and pen width`() {
+        val strokes = listOf(UiSketchStroke(listOf(UiSketchPoint(.1f,.2f)), -16777216, .032f))
+        for (action in listOf(UiAnnotationAction.BEHAVIOR, UiAnnotationAction.ADD)) {
+            val annotation = UiAnnotation(action = action, target = target, instruction = "이미지 배치 유지",
+                sketch = if (action == UiAnnotationAction.BEHAVIOR) UiModificationSketch(-1,strokes) else null,
+                addition = if (action == UiAnnotationAction.ADD) UiAdditionSpec(target.bounds,-1,strokes) else null,
+                imageIds = listOf("photo_b", "photo_a", "composite"), sketchImageId = "composite",
+                imageLayers = listOf(UiSketchImageLayer("photo_b",UiNormalizedRect(.1f,.2f,.4f,.5f)),
+                    UiSketchImageLayer("photo_a",UiNormalizedRect(.4f,.5f,.7f,.8f))))
+            val xml = UiAnnotationXmlCodec.encode("task","rev_0001","activity_main","layout","a".repeat(64),listOf(annotation))
+            assertEquals(annotation, UiAnnotationXmlCodec.decode(xml).single())
+        }
+        val old = UiAnnotation(action = UiAnnotationAction.BEHAVIOR, target = target, instruction = "이전 초안")
+        val json = com.google.gson.Gson().toJson(old)
+        assertTrue(com.google.gson.Gson().fromJson(json,UiAnnotation::class.java).canvasImages.isEmpty())
     }
 
     @Test

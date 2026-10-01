@@ -233,6 +233,7 @@ class MainActivity : AppCompatActivity() {
     private var downloadProgressBytes: Long = 0L
     private var skipNextResumeRestore: Boolean = false
     private var hasAttemptedPhonePermissionRequest: Boolean = false
+    private val activeGenerateTaskIds = mutableSetOf<String>()
     private var restoreTaskJob: Job? = null
     private var taskSyncJob: Job? = null
     private var taskSelectionGeneration: Long = 0L
@@ -1232,6 +1233,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun submitMessage() {
+        if (screenState.selectedTaskId in activeGenerateTaskIds) return
         val displayPrompt = inputPrompt.text.toString().trim()
         val attachments = selectedAttachments.toList()
         if (displayPrompt.isBlank() && attachments.isEmpty()) return
@@ -1477,6 +1479,10 @@ class MainActivity : AppCompatActivity() {
             ?: screenState.selectedTaskId
             ?: currentTaskId
             ?: return
+        if (taskId in activeGenerateTaskIds) {
+            Toast.makeText(this, R.string.prompt_review_updating, Toast.LENGTH_SHORT).show()
+            return
+        }
         val prompt = message.promptReviewText
             ?: message.confirmPayload
             ?: message.body
@@ -1490,6 +1496,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun submitReviewedInitialPrompt(taskId: String, finalPrompt: String, promptReviewMessageId: String = "") {
+        if (taskId in activeGenerateTaskIds || promptReviewMessageId in handledConfirmationMessageIds) {
+            Toast.makeText(this, R.string.prompt_review_use_latest, Toast.LENGTH_SHORT).show()
+            return
+        }
         val trimmedPrompt = finalPrompt.trim()
         if (trimmedPrompt.isBlank()) {
             Toast.makeText(this, R.string.prompt_review_empty, Toast.LENGTH_SHORT).show()
@@ -1649,6 +1659,7 @@ class MainActivity : AppCompatActivity() {
         requestAction: String? = null,
         useSavedUi: Boolean = false
     ) {
+        if (sourceTaskId != null && !activeGenerateTaskIds.add(sourceTaskId)) return
         val requestSelectionGeneration = taskSelectionGeneration
         val deviceInfo = collectDeviceInfo()
         val referenceImagePreview = imagePreview ?: attachments.toChatImagePreview()
@@ -1766,6 +1777,11 @@ class MainActivity : AppCompatActivity() {
                         statusDetail = failureMessage
                     )
                     renderState()
+                }
+            } finally {
+                if (sourceTaskId != null) {
+                    activeGenerateTaskIds.remove(sourceTaskId)
+                    if (screenState.selectedTaskId == sourceTaskId) renderState()
                 }
             }
         }
@@ -2066,13 +2082,21 @@ class MainActivity : AppCompatActivity() {
 
         if (response.tool == "ask_confirmation") {
             if (isPromptReviewRenderMode(response) && preparedPrompt.isNotBlank()) {
+                // Earlier drafts remain readable, but only the latest draft may start a build.
+                val reviewMessageId = "decision-prompt-review-$taskId-${preparedPrompt.hashCode()}"
+                val previousReviews = buildTaskTimeline(taskId).filter {
+                    PromptReviewMessagePolicy.isPromptReview(it)
+                }.map { it.id }.toSet()
+                handledConfirmationMessageIds.addAll(previousReviews)
+                handledConfirmationMessageIds.remove(reviewMessageId)
+                refreshConfirmationActions(previousReviews + reviewMessageId)
                 val promptReviewMessage = message.ifBlank {
                     summary.ifBlank { getString(R.string.prompt_review_open) }
                 }
                 appendOptimisticTaskMessage(
                     taskId,
                     ChatMessage(
-                        id = "decision-prompt-review-$taskId-${preparedPrompt.hashCode()}",
+                        id = reviewMessageId,
                         kind = MessageKind.CONFIRMATION,
                         title = getString(R.string.confirmation_title),
                         body = preparedPrompt,
@@ -2092,7 +2116,7 @@ class MainActivity : AppCompatActivity() {
                     statusDetail = promptReviewMessage
                 )
                 renderState()
-                setComposerEnabled(false)
+                setComposerEnabled(true)
                 return
             }
             if (isConfirmationRenderMode(response) && confirmationAction.isNotBlank()) {
@@ -3795,7 +3819,7 @@ ${record.stackTrace}
         if (awaitingPromptReview) {
             inputModeLabel.text = buildModeLabel(getString(R.string.input_mode_prompt_review))
             inputPrompt.hint = getString(R.string.prompt_hint_review)
-            setComposerEnabled(false)
+            setComposerEnabled(true)
         } else when (screenState.inputMode) {
             InputMode.NEW_GENERATE -> {
                 inputModeLabel.text = buildModeLabel(getString(R.string.input_mode_new_chat))
@@ -4480,8 +4504,8 @@ ${record.stackTrace}
     private fun setComposerEnabled(enabled: Boolean) {
         inputPrompt.isEnabled = enabled
         updateAttachmentButtonState()
-        btnSend.isEnabled = enabled
-        btnSend.alpha = if (enabled) 1.0f else 0.5f
+        btnSend.isEnabled = enabled && screenState.selectedTaskId !in activeGenerateTaskIds
+        btnSend.alpha = if (btnSend.isEnabled) 1.0f else 0.5f
     }
 
     private fun updateAttachmentButtonState() {

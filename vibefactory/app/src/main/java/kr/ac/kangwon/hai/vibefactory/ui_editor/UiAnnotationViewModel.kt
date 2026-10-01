@@ -24,6 +24,7 @@ data class UiAnnotationSession(
     var serverDraftVersion: Int?,
     var pendingAddition: UiAnnotation? = null,
     var pendingAdditionEditing: Boolean = false,
+    var pendingModification: UiAnnotation? = null,
     var selectedDeleteTargets: List<UiAnnotationTarget> = emptyList(),
     var referenceCanvasWidthDp: Float? = null,
     var referenceCanvasHeightDp: Float? = null,
@@ -101,7 +102,8 @@ class UiAnnotationViewModel : ViewModel() {
             serverDraftId = applicable?.serverDraftId,
             serverDraftVersion = applicable?.serverDraftVersion,
             pendingAddition = applicable?.pendingAddition,
-            pendingAdditionEditing = applicable?.pendingAdditionEditing == true
+            pendingAdditionEditing = applicable?.pendingAdditionEditing == true,
+            pendingModification = applicable?.pendingModification
         ).also {
             session = it
             sessions[sessionKey(taskId, revisionLabel, layout)] = it

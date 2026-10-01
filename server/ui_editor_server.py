@@ -122,6 +122,16 @@ def resolve_revision_source(
         return RevisionSource(False, None, "Revision source is outside the server workspace.")
     if not workspace.is_dir() or not project.is_dir():
         return RevisionSource(False, None, "Revision source has been archived or removed.")
+    current_project = str(task.get("project_path") or "").strip()
+    if (
+        str(task.get("status") or "").strip().lower() in {"queued", "running"}
+        and current_project
+        and Path(current_project).expanduser().resolve() == project
+    ):
+        # A newly allocated revision already contains the previous layout while
+        # Codex is still changing it. Only completed, stable sources are editable;
+        # older revisions remain available while another revision is building.
+        return RevisionSource(False, None, "이 버전은 생성 중입니다. 완료된 뒤 UI를 수정해 주세요.")
     return RevisionSource(True, project)
 
 
@@ -677,6 +687,7 @@ def validate_ui_annotation_xml(
             raise UiEditorInputError("sketch image requires matching strokes or canvas images")
 
         destination_point: Optional[dict[str, float]] = None
+        destination_layout = None
         if points:
             try:
                 destination_point = {key: float(points[0].attrib[key]) for key in ("x", "y")}
@@ -684,6 +695,25 @@ def validate_ui_annotation_xml(
                 raise UiEditorInputError("invalid UI annotation destination") from exc
             if any(not 0.0 <= value <= 1.0 for value in destination_point.values()):
                 raise UiEditorInputError("UI annotation destination is outside the screen")
+            attributes = points[0].attrib
+            if any(key in attributes for key in ("anchorX", "anchorY")):
+                try:
+                    anchor = [float(attributes[key]) for key in ("anchorX", "anchorY")]
+                except (KeyError, ValueError) as exc:
+                    raise UiEditorInputError("invalid move insertion anchor") from exc
+                if any(not 0 <= value <= 1 for value in anchor):
+                    raise UiEditorInputError("invalid move insertion anchor")
+            if "width" in attributes or "layout" in attributes:
+                try:
+                    move_width = float(attributes["width"])
+                except (KeyError, ValueError) as exc:
+                    raise UiEditorInputError("invalid move destination width") from exc
+                mode = attributes.get("layout", "free")
+                if not 0 < move_width <= 1 or mode not in {"free", "equal_width_row"}:
+                    raise UiEditorInputError("invalid move destination layout")
+                destination_layout = {"mode": mode, "width_fraction": move_width}
+                if coordinate_space is not None:
+                    destination_layout["width_dp"] = move_width * width_dp
         parsed.append(
             {
                 "annotation_id": annotation_id,
@@ -692,6 +722,7 @@ def validate_ui_annotation_xml(
                 "target": target_payload(targets[0]),
                 "destination": target_payload(destinations[0]) if destinations else None,
                 "destination_point": destination_point,
+                **({"destination_layout": destination_layout} if destination_layout is not None else {}),
                 "instruction": instruction,
                 "image_ids": image_ids,
                 "image_roles": image_roles,
@@ -832,6 +863,27 @@ def collect_ui_editor_source_context(project_root: Path) -> list[dict[str, str]]
     return context
 
 
+VISUAL_INTENT_RULES = """- 스케치는 사용자가 원하는 화면을 표현하는 시각적 명세다. 설명, 스케치 전체의 구조와 개별 표현, 기존 화면 문맥을 함께 보고 무엇을 구현하려는지 추론한다. 사용자가 표현 유형을 따로 선택하게 하거나 특정 키워드로 유형을 고정하지 않는다.
+- 레이아웃, 버튼, 입력 요소, 배경, 장식, 아이콘, 그림 콘텐츠 등이 표현될 수 있으며 이 예시에 한정하지 않는다. 하나의 스케치 안에 여러 역할이 섞일 수도 있다. 모든 그림을 아이콘으로 변환하거나 전체 스케치를 단일 이미지·단일 View로 축소하지 않는다.
+- 요소의 묶음·포함 관계, 정렬·순서·간격·상대 크기, 전경과 배경의 관계를 해석하고 각 역할에 맞는 Android Views/XML, 레이아웃 제약, 스타일·drawable 또는 필요한 커스텀 렌더링으로 구현한다. 상호작용 요소에는 요청한 실제 동작과 상태 처리를 연결한다. 획마다 별도 컨트롤을 만들거나 비상호작용 배경에 임의의 클릭 동작을 부여하지 않는다.
+- 사용자 설명의 구조·모양·기능을 우선하고 스케치가 전달하는 시각적 관계와 의미 있는 형태·색을 반영한다. 도구가 자동으로 표시한 테두리·화살표·핸들·번호·가림용 배경과 사용자가 디자인으로 그린 배경·장식을 구분한다. 지정하지 않은 세부 스타일은 기존 화면과 어울리도록 정돈한다.
+- 구현 의도를 나타내는 손그림은 흔들림이나 개별 점·곡선·획 경로를 SVG/VectorDrawable/Canvas로 기계적으로 추적하지 않는다. 배치와 의미를 이해한 뒤 적절한 UI로 구현하며, 표준 아이콘으로 해석되는 경우에만 그 의미에 맞는 아이콘을 선택한다.
+- 기본 동작은 스케치의 의도를 해석해 완성된 UI 또는 그래픽으로 구현하는 것이다. 배경·삽화·장식처럼 그림이 최종 결과가 되는 요청도 스케치의 주제·구도·형태·색과 지정 영역을 바탕으로 다듬어진 그래픽을 새로 구성해 사용한다. 그림 콘텐츠를 모두 표준 UI나 아이콘으로 치환하지 않는다.
+- '배경으로 써줘', '그림을 사용해줘'처럼 용도만 지정한 요청은 원본 손그림을 그대로 재사용하라는 허용이 아니다. 용도나 문맥만으로 원형 보존을 추정하지 않는다. 손그림을 확대·자르기·색상 변경하거나 획을 벡터로 옮기기만 하고 스케치를 완성했다고 간주하지 않는다.
+- 사용자가 원본 그림 자체를 수정 없이 그대로 사용하라고 명시적으로 요청한 경우에만 원본 손그림을 재사용한다. 특정 단어의 포함 여부가 아니라 요청 전체에서 원본의 획·질감까지 유지하려는 명시적 의도를 확인한다. 배치·색·의미를 유지하라는 요청은 이 예외에 해당하지 않는다. 예외를 적용했다면 결과 설명에 근거가 된 사용자 요청을 기록한다.
+- 원본 재사용 예외도 편집 도구의 테두리·핸들·번호나 의도하지 않은 기존 화면까지 복사하는 허용은 아니다. 요청한 그림만 분리된 콘텐츠로 사용한다. 캔버스에 별도로 첨부·배치한 image_layers의 원본 이미지 리소스 정책은 유지하되, 합성 스케치를 첨부 원본처럼 취급해 위 기본 원칙을 우회하지 않는다.
+- 완료 전에 스케치와 설명을 다시 대조하여 전체 구성, 요소 간 관계, 배경·스타일, 의미 있는 형태 및 요청한 동작이 반영됐는지 검토한다. 원본 재사용을 명시하지 않은 그림 콘텐츠는 스케치를 해석해 완성한 결과인지 확인한다. 단순 복제나 미완성 그래픽을 완료했다고 보고하지 않는다."""
+
+EQUAL_WIDTH_MOVE_RULES = """- 같은 행에 이미 배치된 이동 결과도 행의 구성원이다. 모든 이동의 최종 destination_point와 width_fraction/width_dp를 함께 읽어 점선 사이·점선과 기존 UI 사이의 최종 좌우 순서를 반영한다.
+- equal_width_row에는 고정된 개수 제한이나 원래 컨트롤의 최소 너비를 적용해 줄바꿈하지 않는다. 기존 고정 너비·minWidth·과한 가로 padding/inset을 조정해 같은 행 전체를 균등 분할한다. 기능과 접근성 설명을 보존하고 텍스트·아이콘을 배정된 공간에 맞춘다."""
+
+ADDITION_REFLOW_RULES = """- 추가 영역의 위치·폭·높이는 사용자가 정한 고정 영역이다. 기존 UI와 동일한 weight로 나누어 추가 영역 자체를 축소하거나 아래로 옮기지 않는다.
+- 추가 영역과 행이 짧은 쪽 높이의 절반을 넘게 겹치면 중심이 그 행 밖에 있어도 좌우 배치를 검토한다. 세로로 긴 추가 영역 옆에 여러 행을 배치할 수 있다. 영역을 제외한 왼쪽·오른쪽 공간을 각각 계산하고, 각 공간의 기존 UI끼리는 원래 너비 비율과 순서를 유지해 재배치한다.
+- 추가 영역의 지정 너비를 유지하고 기존 UI의 고정 너비·minWidth·가로 padding/inset을 조정해 남는 좌우 공간에 맞춘다. 간격도 필요하면 줄인다. 기존 최소 너비나 48dp를 이유로 무조건 아래로 내리지 않는다. 좌우에 실제로 배치할 공간이 없을 때만 다음 줄로 내린다.
+- 행 사이 추가는 겹치는 기존 UI와 영향을 받는 아래 UI를 필요한 만큼 아래로 민다. 빈 공간의 추가로 겹치지 않는 UI까지 재배치하지 않는다. 명시된 교체 대상 외의 기존 UI와 기능은 보존한다.
+- 추가 영역과 스케치 좌표의 기준 캔버스는 고정이다. 아래 UI가 밀려 화면이 길어져도 addition.bounds/region_dp를 새 화면 높이로 다시 환산하지 않는다."""
+
+
 def describe_addition_regions(annotations: list[dict[str, Any]]) -> str:
     lines = []
     for index, annotation in enumerate(annotations, start=1):
@@ -883,17 +935,21 @@ def build_ui_editor_codex_prompt(
 - `delete`는 대상을 제거하고 관련 Kotlin/Java 참조와 이벤트를 안전하게 정리한다.
 - `move`의 `destination_point`는 사용자가 화살표 끝을 놓은 정확한 정규화 좌표이며 이동 위치의 최우선 기준이다.
 - coordinate_space가 있으면 정규화 좌표의 기준은 reference_canvas_dp다. 주변 UI가 밀려나 전체 스크린샷 높이(preview_canvas_dp)가 커져도 기준 높이를 바꾸지 않는다. destination_center_dp는 같은 목적지의 dp 중심 좌표다.
-- 이동 미리보기의 파란 실선 원본은 고정되어 있고, 파란 점선 영역은 대상 크기만큼 공간을 확보해 주변 UI를 밀어낸 상태다. 최종 앱에서는 선택 대상을 목적지로 이동하고 원본을 중복 생성하지 않는다. 주변 UI와 기능을 보존하며 겹치지 않게 배치한다.
+- 이동 미리보기의 파란 실선 원본은 고정되어 있고, 파란 점선 영역은 이동 후 크기만큼 공간을 확보한 상태다. 최종 앱에서는 선택 대상을 목적지로 이동하고 원본을 중복 생성하지 않는다. 주변 UI와 기능을 보존하며 겹치지 않게 배치한다.
+- `destination_layout.mode=equal_width_row`이면 같은 행의 기존 UI와 이동할 UI 모두 동일한 너비를 갖는다. 행의 padding과 간격을 제외한 공간을 균등 분할하고 Android horizontal LinearLayout의 layout_width=0dp, layout_weight=1 또는 동등한 제약으로 구현한다. width_fraction/width_dp는 표시된 이동 후 너비다. anchorX/anchorY는 삽입 순서를 정하는 원래 포인터 위치이며 최종 중심 좌표로 사용하지 않는다.
+{EQUAL_WIDTH_MOVE_RULES}
 - 이동 후 대상 View의 중심이 `destination_point`와 일치하도록 배치한다. `destination` View 정보는 주변 구조와 제약을 파악하기 위한 참고일 뿐이며, 그 View의 중심으로 좌표를 바꾸지 않는다.
 - 절대 좌표에 고정하지 말고 ConstraintLayout 제약, 형제 순서, margin 등을 사용해 표시된 위치와 방향을 다양한 화면 크기에서도 최대한 유지한다.
 - `behavior`는 기존 요소의 모양·기능 변경이다. 색·크기·글꼴·모양 등 스타일만 요청하면 기존 동작과 상태 처리를 보존하고, 기능 변경을 요청한 경우에만 해당 동작을 수정한다.
-- behavior.sketch는 선택 요소의 원본 위에 덧그린 수정 의도다. 스케치 좌표는 선택 요소 내부의 0~1 좌표이며 화면 확대 배율과 무관하다. 원본 전체를 교체하거나 스케치를 이미지 UI로 붙이지 않는다.
-- image_role=sketch는 원본 배경·캔버스 이미지·펜 선을 합성한 편집 결과이고, image_role=reference는 개별 첨부 원본이다. 합성 결과 전체를 앱 이미지로 붙이지 않는다.
+- behavior.sketch는 선택 요소의 원본 위에 덧그린 수정 의도다. 스케치 좌표는 선택 요소 내부의 0~1 좌표이며 화면 확대 배율과 무관하다. 원본 손그림의 재사용은 아래 공통 해석 정책의 명시적 요청 예외에만 따른다. 의도하지 않은 기존 화면 전체를 교체하지 않는다.
+- image_role=sketch는 원본 배경·캔버스 이미지·펜 선을 합성한 편집 결과이고, image_role=reference는 개별 첨부 원본이다. 기본적으로 합성 결과 전체를 앱 이미지로 붙이지 않고, 원본 재사용을 명시한 경우에도 요청한 그림만 분리한다.
 - image_layers는 사용자가 스케치 캔버스 안에 직접 배치한 이미지다. 각 bounds는 선택 요소/추가 영역 내부의 0~1 좌표이며 보기 확대와 무관하다. 목록 순서대로 이미지를 겹치고 그 위에 펜 선을 해석한다. 위치·크기·종횡비를 보존한다. 설명에서 참고용이라고 지정하지 않은 배치 이미지는 연결된 원본 파일을 실제 이미지 리소스로 사용한다. 그 외 첨부는 참고 자료로 해석한다.
 - `add`는 초록색 추가 영역에 새 UI를 구현한다. target은 기존 부모·주변 구조를 찾는 기준이며, 추가 위치와 크기는 addition.bounds를 사용한다. 스케치의 좌표는 추가 영역 내부 기준이다.
-- addition.region_dp가 있으면 해당 미리보기 기준 위치·폭·높이를 새 UI 묶음의 외곽으로 사용한다. 부모의 빈 공간 전체로 확대하지 않는다. 스케치 이미지의 종횡비, 각 도형의 상대 크기·순서·간격을 보존하고 최종 제약·margin을 이 영역에 맞춘다. 터치 영역 확보에 필요한 최소 확장만 허용한다.
-- 추가 스케치와 설명을 실제 Android Views/XML 및 Kotlin 동작으로 구현한다. 스케치·원본 화면을 통째로 이미지로 붙이지 않는다. 펜 색이나 가림용 배경색을 최종 디자인 색으로 강제하지 않는다.
+- addition.region_dp가 있으면 해당 미리보기 기준 위치·폭·높이를 새 UI 묶음의 외곽으로 사용한다. 부모의 빈 공간 전체로 확대하지 않는다. 각 UI 요소의 상대 크기·순서·간격을 해석하고 최종 제약·margin을 이 영역에 맞춘다. 의도를 표현한 손그림의 개별 획을 그대로 복제하는 대신 요청한 구조·형태·스타일을 구현한다. 추가 영역의 외곽 위치·크기를 임의로 바꾸지 않는다.
+- 추가 스케치와 설명을 실제 Android Views/XML, 완성된 그래픽 및 필요한 Kotlin 동작으로 구현한다. 원본 손그림의 재사용은 아래 공통 해석 정책의 명시적 요청 예외에만 따른다. 펜 색이나 가림용 배경색을 최종 디자인 색으로 강제하지 않는다.
+{VISUAL_INTENT_RULES}
 - addition.replace_targets가 비어 있으면 기존 UI와 기능을 유지하며 추가 공간을 마련한다. 배경색으로 덮인 것은 그리기용 표시이며 삭제 지시가 아니다. 교체 대상이 명시된 경우에만 해당 요소를 교체하고 관련 참조를 갱신한다.
+{ADDITION_REFLOW_RULES}
 - 사용자가 요구하지 않은 재디자인을 하지 않는다.
 - 기준 Revision은 수정하지 않는다. 현재 `project` 디렉터리만 수정한다.
 - 기존 View ID와 Kotlin 동작, package name, Task ID, 런타임 LLM·데이터 API·오류 보고 계약을 유지한다.
@@ -925,7 +981,7 @@ def build_ui_editor_codex_prompt(
 
 ### 부연 설명에 첨부된 참고 이미지
 
-각 항목의 `annotation_id`를 주석 데이터와 연결한다. `image_layers`에서 참조하는 이미지는 지정된 위치의 이미지 요소이며 해당 원본 파일을 사용한다. 배치되지 않은 첨부는 참고 자료다. 합성 스케치 전체를 앱 리소스로 붙이지 않는다.
+각 항목의 `annotation_id`를 주석 데이터와 연결한다. `image_layers`에서 참조하는 이미지는 지정된 위치의 이미지 요소이며 해당 원본 파일을 사용한다. 배치되지 않은 첨부는 참고 자료다. 합성 스케치에는 공통 해석 정책을 적용하며, 원본 재사용을 명시한 경우에도 요청한 그림만 분리한다.
 
 ```json
 {json.dumps(linked_images, ensure_ascii=False, indent=2)}
@@ -1037,10 +1093,14 @@ def build_ui_editor_chat_context(
 - 원본 XML을 직접 편집한 결과로 취급하지 말고, 주석 XML과 스크린샷을 해석해 실제 앱 코드에 반영한다.
 - delete는 빨강, move는 파랑, behavior(모양·기능 변경)는 보라, add는 초록 표시이며 대상 식별 정보와 사용자 설명을 모두 사용한다.
 - behavior의 스타일 변경만 요청하면 기존 동작을 보존한다. 기능 변경 요청이면 명시한 동작을 구현한다. sketch는 선택 요소 원본 위의 표시이며 좌표는 요소 내부 0~1 기준이다. image_role로 스케치와 참고 이미지를 구분하고 둘 다 설명과 함께 참고한다.
-- add의 target은 기존 부모·주변 UI이며 실제 추가 위치·크기는 addition.bounds다. 스케치 좌표는 추가 영역 내부 기준이다. 스케치와 설명을 실제 Views/XML과 Kotlin 동작으로 구현하고 스케치 이미지를 통째로 UI에 붙이지 않는다.
-- addition.region_dp는 미리보기 기준 새 UI 묶음의 외곽 위치·폭·높이다. 부모의 빈 공간 전체로 확대하지 말고 해당 영역 안에 스케치의 종횡비와 도형별 상대 크기·순서·간격을 맞춘다. 터치 영역에 필요한 최소 크기만 조정하며, 부모의 기존 여백은 유지할 수 있다.
+- add의 target은 기존 부모·주변 UI이며 실제 추가 위치·크기는 addition.bounds다. 스케치 좌표는 추가 영역 내부 기준이다. 스케치와 설명을 실제 Views/XML, 완성된 그래픽 및 필요한 Kotlin 동작으로 구현한다. 원본 손그림의 재사용은 아래 공통 해석 정책의 명시적 요청 예외에만 따른다.
+- addition.region_dp는 미리보기 기준 새 UI 묶음의 외곽 위치·폭·높이다. 부모의 빈 공간 전체로 확대하지 말고 해당 영역 안에 UI 요소의 상대 크기·순서·간격을 맞춘다. 의도를 표현한 손그림의 개별 획을 그대로 복제하는 대신 요청한 구조·형태·스타일을 구현한다. 추가 영역의 외곽 위치·크기를 보존하고 기존 부모 여백은 이 위치를 바꾸지 않는 범위에서 유지한다.
+{VISUAL_INTENT_RULES}
 - add의 배경색 덮기는 그리기용 표시다. addition.replace_targets가 비어 있으면 기존 요소를 유지하며 공간을 마련하고, 명시된 교체 대상만 교체한다. 스케치 펜·배경색을 최종 디자인에 강제하지 않는다.
+{ADDITION_REFLOW_RULES}
 - move의 `destination_point`는 사용자가 지정한 화살표 끝의 정확한 이동 위치다. 대상 View의 중심을 이 좌표에 맞추고, 함께 기록된 `destination` View의 중심으로 대체하지 않는다.
+- destination_layout의 equal_width_row는 같은 행의 기존 UI와 이동할 UI 전체의 너비를 균등하게 나누라는 뜻이다. 저장된 destination_point는 균등 배치된 점선의 중심이며 width_fraction/width_dp도 함께 반영한다.
+{EQUAL_WIDTH_MOVE_RULES}
 - 이동 결과는 고정 픽셀 좌표 대신 제약, 형제 순서와 margin으로 표현해 화면 크기가 바뀌어도 사용자가 지정한 방향과 상대 위치를 유지한다.
 - 최신 채팅 요청은 기능과 세부 동작을 설명하며, 명시적으로 충돌하는 경우 최신 채팅 요청을 우선한다.
 - 기존 View ID, Kotlin 동작, package name, Task ID, 런타임 API와 오류 보고 계약을 유지한다.

@@ -312,6 +312,34 @@ class SubmittedPrebuildScopeTests(unittest.TestCase):
             "request_action": "submit_initial_prompt",
         })
 
+    def test_chat_refines_prepared_prompt_repeatedly_without_building_until_explicit_submission(self):
+        task_id = self.initial["task_id"]
+        chats = ["가격 기록은 유지하고 월별 그래프를 추가해줘.", "그래프 색상을 파란색으로 바꿔줘."]
+        prepared = self.initial["prepared_prompt"]
+        with patch.object(self.app.state.runner, "enqueue") as enqueue:
+            for chat in chats:
+                revised_spec = "가격을 기기에 기록하고 파란색 월별 그래프를 보여준다. " + chat
+                with patch("server.server.decide_intent", return_value=decision(revised_spec, [])) as decide:
+                    response = self.client.post("/generate", json={
+                        "task_id": task_id, "device_id": "scope-device", "prompt": chat,
+                    })
+                self.assertEqual(200, response.status_code, response.text)
+                self.assertEqual("submit_initial_prompt", response.json()["confirmation_action"])
+                self.assertIn(chat, response.json()["prepared_prompt"])
+                self.assertEqual(prepared, decide.call_args.kwargs["previous_conversation_state"]["prepared_prompt"])
+                prepared = response.json()["prepared_prompt"]
+                self.assertFalse(self.app.state.db.get_task(task_id)["workspace_path"])
+                self.workspace_builder.assert_not_called()
+                enqueue.assert_not_called()
+            result = self.submit(prepared)
+            self.assertEqual(200, result.status_code, result.text)
+            self.assertEqual("build_started", result.json()["interaction_type"])
+            enqueue.assert_called_once_with(task_id)
+            task = self.app.state.db.get_task(task_id)
+            self.assertIn(prepared, task["build_request_prompt"])
+            saved = json.loads(task["codex_result_json"])
+            self.assertEqual(prepared, saved["conversation_state"]["final_generation_prompt"])
+
     def test_sensor_implementation_reaches_prompt_then_build_without_extra_setup_approval(self):
         plan = "가속도계 값을 필터링하고 중립 보정을 적용해 패들을 이동한다."
         raw = {"id": "tilt_sensor_game", "title": "가속도계 조작", "type": "hardware",

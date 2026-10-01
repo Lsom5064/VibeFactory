@@ -1842,7 +1842,7 @@ def build_initial_prompt_review_decision(
         status="Pending Decision",
         tool="ask_confirmation",
         message="앱 생성 프롬프트를 준비했어요. 확인하거나 수정한 뒤 전송해 주세요.",
-        summary="아래 프롬프트를 확인한 뒤 그대로 보내거나 필요한 내용을 직접 고쳐서 보낼 수 있어요.",
+        summary="채팅으로 내용을 더 구체화하거나 프롬프트를 직접 고칠 수 있어요. 프롬프트 확인 화면에서 전송하기를 누르면 앱을 만듭니다.",
         questions=[],
         reason="사용자가 최종 앱 생성 프롬프트를 확인한 뒤 빌드를 시작합니다.",
         effective_user_prompt=prepared_prompt,
@@ -2719,7 +2719,8 @@ Rules:
 - If existing_task=true and existing_workspace_ready=true, this thread already has an app workspace. Treat app-change requests as existing_app_modification.
 - If existing_task=true but existing_workspace_ready=false, the app has not entered build execution yet. In that case, follow-up revisions like removing, replacing, or refining features are still part of the same new_app request unless the user clearly refers to a previously built/existing app.
 - Do not classify a follow-up like "그 기능 빼고 진행해줘", "이 부분만 제외하고 진행", or "그럼 그 연동은 빼고 만들어줘" as existing_app_modification when the current thread has no workspace yet.
-- If existing_workspace_ready=false and the user appears to be asking to modify an already existing app, do not build. Use mode=ask_confirmation and set requires_existing_task_context=true.
+- While existing_workspace_ready=false and previous_conversation_state.awaiting_prompt_review=true, a follow-up chat refines the current new-app specification. Merge the latest changes with the prepared prompt, preserve requirements the user has not changed, and return the complete revised specification with request_scope=new_app. Do not mistake editing this draft for modifying an already installed app. The server will present it for review again; only the explicit submit_initial_prompt action starts generation.
+- Otherwise, if existing_workspace_ready=false and the user appears to be asking to modify an already existing app, do not build. Use mode=ask_confirmation and set requires_existing_task_context=true.
 - When requires_existing_task_context=true, ask the user to continue from the original app task/thread or to clearly say they want a brand-new app instead.
 - mode=build when the core workflow and key features are concrete enough to implement, even if some secondary preferences remain unspecified.
 - If the user already provided a structured build spec, agent handoff format, JSON/YAML output template, or other downstream-agent instructions, but the clear end goal is still to build an app, treat it as an app request rather than a discussion.
@@ -4705,6 +4706,23 @@ class Database:
                     (draft_id,),
                 ).fetchone()
             if row is None:
+                if expected_version is not None:
+                    connection.rollback()
+                    raise UiEditorDraftConflictError(None)
+                # The HTTP caller has validated this hash against the source.
+                # Preserve obsolete drafts and their images as history, then
+                # create a new draft instead of trapping the client in a 409
+                # loop. Never supersede a competing draft on the same XML.
+                connection.execute(
+                    """
+                    UPDATE ui_editor_drafts
+                    SET status = 'superseded', updated_at = ?
+                    WHERE task_id = ? AND base_revision_label = ? AND layout_name = ?
+                      AND configuration = ? AND status = 'draft'
+                      AND (TRIM(annotation_xml) = '' OR LOWER(base_xml_sha256) <> LOWER(?))
+                    """,
+                    (now, task_id, base_revision_label, layout_name, configuration, base_xml_sha256),
+                )
                 active = connection.execute(
                     """
                     SELECT * FROM ui_editor_drafts
@@ -4715,24 +4733,9 @@ class Database:
                     """,
                     (task_id, base_revision_label, layout_name, configuration),
                 ).fetchone()
-                if active is not None and not str(active["annotation_xml"] or "").strip():
-                    # Keep pre-annotation editor drafts as history, but do not let a
-                    # legacy direct-XML draft block the replacement read-only flow.
-                    connection.execute(
-                        """
-                        UPDATE ui_editor_drafts
-                        SET status = 'superseded', updated_at = ?
-                        WHERE draft_id = ? AND status = 'draft'
-                        """,
-                        (now, str(active["draft_id"])),
-                    )
-                    active = None
                 if active is not None:
                     connection.rollback()
                     raise UiEditorDraftConflictError(self.serialize_ui_editor_draft(active))
-                if expected_version is not None:
-                    connection.rollback()
-                    raise UiEditorDraftConflictError(None)
                 allocated_id = draft_id or new_database_id()
                 try:
                     connection.execute(
@@ -11786,6 +11789,21 @@ def create_app() -> FastAPI:
                 "saved_at": "",
             }
         revision_label = current_revision_label(Path(project_value))
+        source = resolve_revision_source(
+            workspaces_root=app.state.settings.workspaces_root,
+            task=task,
+            snapshot=db.get_project_snapshot(task_id, revision_label) or {},
+            revision_label=revision_label,
+        )
+        if not source.available:
+            return {
+                "task_id": task_id,
+                "revision_label": revision_label,
+                "source_available": False,
+                "has_saved_ui": False,
+                "saved_draft_count": 0,
+                "saved_at": "",
+            }
         drafts = db.list_confirmed_ui_editor_drafts(
             task_id=task_id,
             base_revision_label=revision_label,

@@ -76,7 +76,7 @@ class UiTouchFlowInstrumentedTest {
                 screenshot("04_move_drag_reflow")
             }
             await { textNode("이동 요청 설명") != null }
-            tapText("표시 추가")
+            tapText(context.getString(R.string.ui_annotation_add))
             await { main { session().annotations.any { it.action == UiAnnotationAction.MOVE } } }
             assertEquals(sourceBefore, tagBounds("id:sourceAction"))
             assertTrue(main { session().annotations.first { it.action == UiAnnotationAction.MOVE }.instruction.isBlank() })
@@ -84,9 +84,9 @@ class UiTouchFlowInstrumentedTest {
             screenshot("05_move_saved")
 
             tapId(R.id.btnUiAnnotationBehaviorTool); tapTag("id:behaviorAction")
-            await { textNode("기능 변경 설명") != null }
+            await { textNode(context.getString(R.string.ui_annotation_behavior_label)) != null }
             setText("버튼을 누르면 저장한 메모를 보여줘.")
-            tapText("표시 추가")
+            tapText("표시 저장")
             await { main { session().annotations.any { it.action == UiAnnotationAction.BEHAVIOR } } }
 
             tapId(R.id.btnUiAnnotationAddTool)

@@ -24,7 +24,8 @@ data class UiAnnotationDraftRecord(
     val serverDraftVersion: Int? = null,
     val confirmed: Boolean = false,
     val pendingAddition: UiAnnotation? = null,
-    val pendingAdditionEditing: Boolean = false
+    val pendingAdditionEditing: Boolean = false,
+    val pendingModification: UiAnnotation? = null
 )
 
 class UiAnnotationDraftStore(context: Context, private val gson: Gson) {
@@ -119,26 +120,40 @@ class UiAnnotationDraftStore(context: Context, private val gson: Gson) {
     }
 
     /** Call on Dispatchers.IO: raster rendering, compression and file writes stay off the UI thread. */
-    fun persistSketch(session: UiAnnotationSession, annotation: UiAnnotation, aspectRatio: Float): UiEditorImage {
-        val spec = requireNotNull(annotation.addition)
+    fun persistSketch(session: UiAnnotationSession, annotation: UiAnnotation, aspectRatio: Float,
+                      original: android.graphics.Bitmap? = null): UiEditorImage {
+        val backgroundColor = annotation.addition?.backgroundColor ?: requireNotNull(annotation.sketch).backgroundColor
+        val strokes = annotation.addition?.strokes ?: requireNotNull(annotation.sketch).strokes
         val ratio = aspectRatio.coerceIn(0.05f, 20f)
         val width = if (ratio >= 1f) 1024 else (1024 * ratio).toInt().coerceAtLeast(1)
         val height = if (ratio >= 1f) (1024 / ratio).toInt().coerceAtLeast(1) else 1024
         val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
         val bytes = try {
             val canvas = android.graphics.Canvas(bitmap)
-            canvas.drawColor(spec.backgroundColor)
-            UiSketchRenderer.draw(canvas, android.graphics.RectF(0f, 0f, width.toFloat(), height.toFloat()), spec.strokes)
+            canvas.drawColor(backgroundColor)
+            val bounds = android.graphics.RectF(0f, 0f, width.toFloat(), height.toFloat())
+            if (annotation.action == UiAnnotationAction.BEHAVIOR && original != null) {
+                canvas.drawBitmap(original, null, bounds, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+            }
+            val imageBitmaps = mutableMapOf<String, android.graphics.Bitmap>()
+            try {
+                annotation.canvasImages.forEach { layer ->
+                    val image = session.images.first { it.imageId == layer.imageId }
+                    imageBitmaps[layer.imageId] = requireNotNull(UiSketchImages.decode(image.localPath))
+                }
+                UiSketchImages.draw(canvas, bounds, annotation.canvasImages, imageBitmaps)
+            } finally { imageBitmaps.values.forEach { it.recycle() } }
+            UiSketchRenderer.draw(canvas, bounds, strokes)
             java.io.ByteArrayOutputStream().use { output ->
                 bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, output)
                 output.toByteArray()
             }
         } finally { bitmap.recycle() }
         val id = UUID.randomUUID().toString().replace("-", "")
-        val resource = "vibe_add_sketch_${id.take(12)}"
+        val resource = "vibe_${if (annotation.action == UiAnnotationAction.ADD) "add" else "edit"}_sketch_${id.take(12)}"
         val dir = imageDirectory(session.taskId, session.revisionLabel, session.layout.layout_name).apply { mkdirs() }
         val file = File(dir, "$resource.jpg").apply { writeBytes(bytes) }
-        return UiEditorImage(id, annotation.annotationId, "추가 UI 스케치", "image/jpeg", file.absolutePath,
+        return UiEditorImage(id, annotation.annotationId, "${if (annotation.action == UiAnnotationAction.ADD) "추가" else "모양·기능 변경"} UI 스케치", "image/jpeg", file.absolutePath,
             resource, sha256(bytes), bytes.size.toLong())
     }
 
@@ -173,7 +188,8 @@ class UiAnnotationDraftStore(context: Context, private val gson: Gson) {
             serverDraftVersion = session.serverDraftVersion,
             confirmed = confirmed,
             pendingAddition = session.pendingAddition,
-            pendingAdditionEditing = session.pendingAdditionEditing
+            pendingAdditionEditing = session.pendingAdditionEditing,
+            pendingModification = session.pendingModification
         )
     }
 

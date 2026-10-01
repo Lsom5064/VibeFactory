@@ -57,8 +57,27 @@ data class UiAnnotation(
     val instruction: String = "",
     val imageIds: List<String> = emptyList(),
     val createdAt: String = Instant.now().toString(),
-    val addition: UiAdditionSpec? = null
+    val addition: UiAdditionSpec? = null,
+    val sketch: UiModificationSketch? = null,
+    val sketchImageId: String? = null,
+    // Nullable so drafts written before canvas images remain readable by Gson.
+    val imageLayers: List<UiSketchImageLayer>? = null,
+    // The pointer chooses an insertion slot; destinationX/Y describe the resulting visual centre.
+    val moveAnchorX: Float? = null,
+    val moveAnchorY: Float? = null,
+    val destinationWidth: Float? = null,
+    val equalWidthRow: Boolean? = null
 )
+
+data class UiSketchImageLayer(val imageId: String, val bounds: UiNormalizedRect)
+internal val UiAnnotation.canvasImages: List<UiSketchImageLayer> get() = imageLayers.orEmpty()
+
+data class UiModificationSketch(val backgroundColor: Int, val strokes: List<UiSketchStroke> = emptyList())
+
+internal fun UiAnnotation.referenceImages(images: List<UiEditorImage>): List<UiEditorImage> =
+    images.filter { it.imageId in imageIds && it.imageId != sketchImageId &&
+        // Older additions predate image roles but have a dedicated generated resource name.
+        !(action == UiAnnotationAction.ADD && it.resourceName.startsWith("vibe_add_sketch_")) }
 
 internal fun UiAnnotation.resolvedDestinationPoint(): Pair<Float, Float> {
     val exactX = destinationX
@@ -107,7 +126,7 @@ class UiAnnotationHistory(initial: List<UiAnnotation>, private val limit: Int = 
 }
 
 object UiAnnotationXmlCodec {
-    const val SCHEMA_VERSION = 1
+    const val SCHEMA_VERSION = 3
     const val NAMESPACE = "urn:vibefactory:ui-annotations"
 
     fun encode(
@@ -147,11 +166,25 @@ object UiAnnotationXmlCodec {
                     buildString { appendTarget(name, target, "      ") }
                 })
             }
+            annotation.sketch?.let { append(UiAdditionXmlCodec.encodeModification(it)) }
+            annotation.canvasImages.forEach { layer ->
+                append("    <vf:image-layer")
+                attribute("imageId", layer.imageId)
+                attribute("left", decimal(layer.bounds.left))
+                attribute("top", decimal(layer.bounds.top))
+                attribute("right", decimal(layer.bounds.right))
+                attribute("bottom", decimal(layer.bounds.bottom))
+                append(" />\n")
+            }
             annotation.destination?.let { appendTarget("destination", it, "    ") }
             if (annotation.destinationX != null && annotation.destinationY != null) {
                 append("    <vf:destination-point")
                 attribute("x", decimal(annotation.destinationX))
                 attribute("y", decimal(annotation.destinationY))
+                annotation.moveAnchorX?.let { attribute("anchorX", decimal(it)) }
+                annotation.moveAnchorY?.let { attribute("anchorY", decimal(it)) }
+                annotation.destinationWidth?.let { attribute("width", decimal(it)) }
+                if (annotation.equalWidthRow == true) attribute("layout", "equal_width_row")
                 append(" />\n")
             }
             append("    <vf:instruction>")
@@ -160,6 +193,7 @@ object UiAnnotationXmlCodec {
             annotation.imageIds.distinct().forEach { imageId ->
                 append("    <vf:image-ref")
                 attribute("id", imageId)
+                attribute("role", if (imageId == annotation.sketchImageId) "sketch" else "reference")
                 append(" />\n")
             }
             append("  </vf:annotation>\n")
@@ -173,7 +207,7 @@ object UiAnnotationXmlCodec {
         require(root.localName == "ui-annotations" && root.namespaceURI == NAMESPACE) {
             "Unsupported UI annotation document"
         }
-        require(root.getAttribute("schemaVersion").toIntOrNull() == SCHEMA_VERSION) {
+        require(root.getAttribute("schemaVersion").toIntOrNull() in 1..SCHEMA_VERSION) {
             "Unsupported UI annotation schema version"
         }
         return buildList {
@@ -197,6 +231,10 @@ object UiAnnotationXmlCodec {
                         destination = destination,
                         destinationX = point?.getAttribute("x")?.toFloatOrNull(),
                         destinationY = point?.getAttribute("y")?.toFloatOrNull(),
+                        moveAnchorX = point?.getAttribute("anchorX")?.toFloatOrNull(),
+                        moveAnchorY = point?.getAttribute("anchorY")?.toFloatOrNull(),
+                        destinationWidth = point?.getAttribute("width")?.toFloatOrNull(),
+                        equalWidthRow = point?.getAttribute("layout")?.takeIf { it.isNotBlank() }?.let { it == "equal_width_row" },
                         instruction = element.childElements()
                             .firstOrNull { it.localName == "instruction" }
                             ?.textContent.orEmpty(),
@@ -206,7 +244,21 @@ object UiAnnotationXmlCodec {
                             .distinct(),
                         createdAt = element.getAttribute("createdAt").ifBlank { Instant.EPOCH.toString() },
                         addition = element.childElements().firstOrNull { it.localName == "addition" }
-                            ?.let { UiAdditionXmlCodec.decode(it, ::readTarget) }
+                            ?.let { UiAdditionXmlCodec.decode(it, ::readTarget) },
+                        sketch = element.childElements().firstOrNull { it.localName == "sketch" }
+                            ?.let(UiAdditionXmlCodec::decodeModification),
+                        sketchImageId = element.childElements().firstOrNull {
+                            it.localName == "image-ref" && it.getAttribute("role") == "sketch"
+                        }?.getAttribute("id"),
+                        imageLayers = element.childElements().filter {
+                            it.localName == "image-layer" && it.namespaceURI == NAMESPACE
+                        }.map { layer ->
+                            fun coordinate(name: String) = layer.getAttribute(name).toFloat().also {
+                                require(it.isFinite() && it in 0f..1f)
+                            }
+                            UiSketchImageLayer(layer.getAttribute("imageId"), UiNormalizedRect(
+                                coordinate("left"), coordinate("top"), coordinate("right"), coordinate("bottom")))
+                        }.takeIf { it.isNotEmpty() }
                     )
                 )
             }
