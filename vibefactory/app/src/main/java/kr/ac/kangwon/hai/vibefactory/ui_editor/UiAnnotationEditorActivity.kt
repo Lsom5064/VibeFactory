@@ -49,8 +49,11 @@ import kr.ac.kangwon.hai.vibefactory.UiEditorSaveRequestDto
 import kr.ac.kangwon.hai.vibefactory.UiLayoutSummaryDto
 import kr.ac.kangwon.hai.vibefactory.buildSelectedAttachment
 import kr.ac.kangwon.hai.vibefactory.createVibeApiService
+import kr.ac.kangwon.hai.vibefactory.runSuspendCatching
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
@@ -379,50 +382,59 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         val generation = ++loadGeneration
         showLoading(getString(R.string.ui_editor_loading_preview))
         lifecycleScope.launch {
-            val result = runCatching {
-                val documentResponse = withContext(Dispatchers.IO) {
-                    apiService.getRevisionUiLayout(
-                        taskId = taskId,
-                        revisionLabel = revisionLabel,
-                        layoutName = layout.layout_name,
-                        configuration = layout.configuration,
-                        deviceId = preferencesStore.getOrCreateDeviceId(),
-                        userId = null,
-                        phoneNumber = preferencesStore.loadPhoneNumber()
-                    )
-                }
-                val local = withContext(Dispatchers.IO) {
-                    draftStore.load(taskId, revisionLabel, layout.layout_name, layout.configuration)
-                }
-                val remote = withContext(Dispatchers.IO) {
-                    runCatching {
-                        apiService.getUiEditorDraft(
+            val result = runSuspendCatching {
+                coroutineScope {
+                    val deviceId = preferencesStore.getOrCreateDeviceId()
+                    val phoneNumber = preferencesStore.loadPhoneNumber()
+                    val documentRequest = async(Dispatchers.IO) {
+                        apiService.getRevisionUiLayout(
                             taskId = taskId,
                             revisionLabel = revisionLabel,
                             layoutName = layout.layout_name,
                             configuration = layout.configuration,
-                            deviceId = preferencesStore.getOrCreateDeviceId(),
+                            deviceId = deviceId,
                             userId = null,
-                            phoneNumber = preferencesStore.loadPhoneNumber()
+                            phoneNumber = phoneNumber
                         )
-                    }.getOrNull()
+                    }
+                    val localRequest = async(Dispatchers.IO) {
+                        draftStore.load(taskId, revisionLabel, layout.layout_name, layout.configuration)
+                    }
+                    val remoteRequest = async(Dispatchers.IO) {
+                        runSuspendCatching {
+                            apiService.getUiEditorDraft(
+                                taskId = taskId,
+                                revisionLabel = revisionLabel,
+                                layoutName = layout.layout_name,
+                                configuration = layout.configuration,
+                                deviceId = deviceId,
+                                userId = null,
+                                phoneNumber = phoneNumber
+                            )
+                        }.getOrNull()
+                    }
+                    val documentResponse = documentRequest.await()
+                    val (document, resolvedResources) = withContext(Dispatchers.Default) {
+                        AndroidXmlDocument.parse(documentResponse.xml, documentResponse.sha256) to
+                            ResolvedUiResources.from(documentResponse.resource_files)
+                    }
+                    val local = localRequest.await()
+                    val remote = remoteRequest.await()
+                    val resolvedDraft = withContext(Dispatchers.IO) { reconcileDrafts(document, local, remote) }
+                    if (generation != loadGeneration) return@coroutineScope
+                    viewModel.initialize(
+                        taskId = taskId,
+                        revisionLabel = revisionLabel,
+                        layout = layout,
+                        document = document,
+                        resources = resolvedResources,
+                        unresolvedResourceCount = documentResponse.unresolved_resources.size,
+                        previewChildren = documentResponse.preview_children,
+                        previewDynamicTextViewIds = documentResponse.preview_dynamic_text_view_ids.toSet(),
+                        previewHiddenViewIds = documentResponse.preview_hidden_view_ids.toSet(),
+                        draft = resolvedDraft
+                    )
                 }
-                val document = withContext(Dispatchers.Default) {
-                    AndroidXmlDocument.parse(documentResponse.xml, documentResponse.sha256)
-                }
-                val resolvedDraft = withContext(Dispatchers.IO) { reconcileDrafts(document, local, remote) }
-                viewModel.initialize(
-                    taskId = taskId,
-                    revisionLabel = revisionLabel,
-                    layout = layout,
-                    document = document,
-                    resources = ResolvedUiResources.from(documentResponse.resource_files),
-                    unresolvedResourceCount = documentResponse.unresolved_resources.size,
-                    previewChildren = documentResponse.preview_children,
-                    previewDynamicTextViewIds = documentResponse.preview_dynamic_text_view_ids.toSet(),
-                    previewHiddenViewIds = documentResponse.preview_hidden_view_ids.toSet(),
-                    draft = resolvedDraft
-                )
             }
             if (generation != loadGeneration) return@launch
             result.onSuccess {
@@ -1156,9 +1168,19 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
             val preview = ImageView(this).apply {
                 scaleType = ImageView.ScaleType.CENTER_CROP
                 contentDescription = image.displayName
-                decodeImagePreview(File(image.localPath), dp(88))?.let(::setImageBitmap)
             }
             tile.addView(preview, FrameLayout.LayoutParams(dp(88), dp(88)))
+            val targetSize = dp(88)
+            lifecycleScope.launch {
+                val bitmap = withContext(Dispatchers.IO) {
+                    decodeImagePreview(File(image.localPath), targetSize)
+                }
+                if (preview.parent === tile && tile.parent === list) {
+                    bitmap?.let(preview::setImageBitmap)
+                } else {
+                    bitmap?.recycle()
+                }
+            }
             val remove = ImageButton(this).apply {
                 setImageResource(R.drawable.ic_annotation_delete)
                 background = getDrawable(R.drawable.bg_ui_annotation_toolbar)

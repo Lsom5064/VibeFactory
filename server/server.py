@@ -25,6 +25,11 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 
 try:
+    from .json_response_compression import JsonResponseCompressionMiddleware
+except ImportError:
+    from json_response_compression import JsonResponseCompressionMiddleware
+
+try:
     from .lint_recovery import LintValidationGuard, diagnose_lint_failure, render_lint_repair_prompt
 except ImportError:
     from lint_recovery import LintValidationGuard, diagnose_lint_failure, render_lint_repair_prompt
@@ -6670,8 +6675,11 @@ def task_has_app_context(task: dict[str, Any], state_payload: Optional[dict[str,
     )
 
 
-def build_task_conversation_state(task: dict[str, Any]) -> dict[str, Any]:
-    state_payload = load_task_state_payload(task)
+def build_task_conversation_state(
+    task: dict[str, Any], *, state_payload: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    if state_payload is None:
+        state_payload = load_task_state_payload(task)
     raw_existing_state = state_payload.get("conversation_state")
     existing_state: dict[str, Any] = raw_existing_state if isinstance(raw_existing_state, dict) else {}
     conversation_state: dict[str, Any] = dict(existing_state)
@@ -7151,7 +7159,10 @@ def parse_event_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, Any]]:
     event_type = str(row.get("event_type") or "")
-    if event_type in {"ui_editor_draft_created", "ui_editor_draft_saved"}:
+    if (
+        event_type in {"ui_editor_draft_created", "ui_editor_draft_saved", "agent_raw_output"}
+        or event_type.startswith("app_llm_")
+    ):
         return None
     actor = str(row.get("actor") or "")
     message_text = sanitize_user_visible_text(str(row.get("message_text") or ""))
@@ -7238,8 +7249,6 @@ def task_event_to_timeline_event(row: dict[str, Any]) -> Optional[dict[str, Any]
             )
         )
     else:
-        if event_type == "agent_raw_output" or event_type.startswith("app_llm_"):
-            return None
         kind = "log" if actor == "system" else "assistant"
         title = "로그" if kind == "log" else "AI"
         body = message_text or sanitize_user_visible_text(str(payload.get("message") or ""))
@@ -7284,6 +7293,10 @@ def build_task_timeline_events(
     limit: int = 120,
     after_event_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
+    source_limit = limit * 3 if limit > 0 else None
+    rows = db.list_events(task_id, limit=source_limit, after_event_id=after_event_id)
+    if not rows:
+        return []
     attachments_by_event_id: dict[str, list[dict[str, Any]]] = {}
     for attachment in db.list_task_attachments(task_id):
         event_id = str(attachment.get("event_id") or "").strip()
@@ -7300,12 +7313,7 @@ def build_task_timeline_events(
         )
 
     timeline: list[dict[str, Any]] = []
-    source_limit = limit * 3 if limit > 0 else None
-    for row in db.list_events(
-        task_id,
-        limit=source_limit,
-        after_event_id=after_event_id,
-    ):
+    for row in rows:
         event = task_event_to_timeline_event(row)
         if event:
             event_id = str(row.get("event_id") or "").strip()
@@ -9421,7 +9429,7 @@ def serialize_task_for_status(
         if workspace_root.exists() and workspace_root.is_dir():
             raw_log_sections = collect_raw_log_sections(workspace_root, "logs/build.log")
     state_payload = load_task_state_payload(task)
-    conversation_state = build_task_conversation_state(task)
+    conversation_state = build_task_conversation_state(task, state_payload=state_payload)
     task_message = sanitize_user_visible_text(str(task.get("message") or ""))
     latest_assistant_message = sanitize_user_visible_text(str(state_payload.get("message") or task_message))
     latest_assistant_message_type = str(state_payload.get("tool") or "status")
@@ -9900,6 +9908,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     install_uvicorn_access_log_query_filter()
     app = FastAPI(title="Native Android APK Builder Server", lifespan=lifespan)
+    app.add_middleware(JsonResponseCompressionMiddleware)
     dashboard_module_name = (
         f"{__package__}.admin_dashboard"
         if __package__

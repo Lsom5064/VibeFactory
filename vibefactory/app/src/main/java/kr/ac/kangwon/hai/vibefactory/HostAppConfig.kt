@@ -1,6 +1,7 @@
 package kr.ac.kangwon.hai.vibefactory
 
 import com.google.gson.Gson
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -29,14 +30,17 @@ object HostAppConfig {
     const val PREF_DARK_MODE_ENABLED = "dark_mode_enabled"
 }
 
-fun createVibeApiService(
-    gson: Gson? = null,
+private val hostConnectionPool = ConnectionPool()
+
+internal fun createVibeHttpClient(
     connectTimeoutSeconds: Long = 15,
     readTimeoutSeconds: Long = 120,
     writeTimeoutSeconds: Long = 120,
     callTimeoutSeconds: Long? = 150
-): VibeApiService {
+): OkHttpClient {
     val clientBuilder = OkHttpClient.Builder()
+        // Reuse sockets across screens without sharing their request dispatchers.
+        .connectionPool(hostConnectionPool)
         .connectTimeout(connectTimeoutSeconds, TimeUnit.SECONDS)
         .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
         .writeTimeout(writeTimeoutSeconds, TimeUnit.SECONDS)
@@ -45,12 +49,24 @@ fun createVibeApiService(
         clientBuilder.callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
     }
 
+    return clientBuilder.build()
+}
+
+fun createVibeApiService(
+    gson: Gson? = null,
+    connectTimeoutSeconds: Long = 15,
+    readTimeoutSeconds: Long = 120,
+    writeTimeoutSeconds: Long = 120,
+    callTimeoutSeconds: Long? = 150
+): VibeApiService {
     val converterFactory = gson?.let { GsonConverterFactory.create(it) }
         ?: GsonConverterFactory.create()
 
     return Retrofit.Builder()
         .baseUrl(HostAppConfig.BASE_URL)
-        .client(clientBuilder.build())
+        .client(createVibeHttpClient(
+            connectTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds, callTimeoutSeconds
+        ))
         .addConverterFactory(converterFactory)
         .build()
         .create(VibeApiService::class.java)

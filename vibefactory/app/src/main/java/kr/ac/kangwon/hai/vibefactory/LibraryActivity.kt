@@ -7,10 +7,14 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
 import com.google.gson.GsonBuilder
 import com.google.gson.annotations.SerializedName
 import java.io.File
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class LibraryActivity : AppCompatActivity() {
     private val gson = GsonBuilder().create()
@@ -21,7 +25,10 @@ class LibraryActivity : AppCompatActivity() {
         applyRootSystemBarPadding()
 
         findViewById<ImageButton>(R.id.btnBackLibrary).setOnClickListener { finish() }
-        bindSnapshot(loadSnapshot())
+        lifecycleScope.launch {
+            val snapshot = withContext(Dispatchers.IO) { loadSnapshot() }
+            bindSnapshot(snapshot)
+        }
     }
 
     private fun loadSnapshot(): LibrarySnapshot? {
