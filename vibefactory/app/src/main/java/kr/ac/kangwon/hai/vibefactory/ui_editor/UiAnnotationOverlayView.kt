@@ -33,6 +33,7 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     var movePreviewListener: ((Float?, Float?) -> Unit)? = null
     internal var alignmentTargetsProvider: (() -> List<UiSnapTarget>)? = null
     internal var alignmentTargetBoundsProvider: ((String) -> UiPreviewBox?)? = null
+    internal var additionAlignmentTargetsProvider: ((UiAnnotation, UiPreviewBox) -> List<UiSnapTarget>)? = null
     private val alignmentSnapper = UiAlignmentSnapper()
     private var alignmentTargets: List<UiSnapTarget> = emptyList()
     private var alignmentGuides: List<UiSnapGuide> = emptyList()
@@ -398,8 +399,19 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
         val box = pixelBox(raw)
         val result = if (resizeCorner < 0) alignmentSnapper.translate(box, visibleAlignmentTargets(),
             snappingDistance(8f), snappingDistance(14f), alignmentCanvas(), containEdges = true)
-        else alignmentSnapper.resize(box, resizeCorner, visibleAlignmentTargets(), snappingDistance(8f), snappingDistance(14f),
-            alignmentCanvas(), minOf(64f * density, box.width), minOf(48f * density, box.height))
+        else {
+            val minWidth = minOf(64f * density, box.width)
+            val visibleIds = visibleAlignmentTargets().map { it.id }.toSet()
+            val pending = pendingAddition
+            val predictor = additionAlignmentTargetsProvider
+            val widthProvider: ((UiPreviewBox) -> List<UiSnapTarget>)? = if (predictor != null && pending != null) { adjusted ->
+                UiReflowWidthSnapper.targets(adjusted, resizeCorner, alignmentCanvas(), minWidth, snappingDistance(14f)) { candidate ->
+                    predictor(pending, candidate).filter { it.id in visibleIds }
+                }
+            } else null
+            alignmentSnapper.resize(box, resizeCorner, visibleAlignmentTargets(), snappingDistance(8f), snappingDistance(14f),
+                alignmentCanvas(), minWidth, minOf(48f * density, box.height), widthProvider)
+        }
         alignmentGuides = result.guides
         return normalizedBox(result.box)
     }

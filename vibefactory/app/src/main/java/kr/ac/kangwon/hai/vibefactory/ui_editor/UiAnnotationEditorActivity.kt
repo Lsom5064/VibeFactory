@@ -570,6 +570,12 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                 ).orEmpty()
             }
             alignmentTargetBoundsProvider = { id -> movePreview?.alignmentTargetBounds(id) }
+            additionAlignmentTargetsProvider = { pending, box ->
+                movePreview?.additionAlignmentTargets(
+                    session.annotations.filter { it.action == UiAnnotationAction.MOVE },
+                    session.annotations.filter { it.action == UiAnnotationAction.ADD }, pending, box
+                ).orEmpty()
+            }
             destinationTapListener = this@UiAnnotationEditorActivity::finishMoveDestinationGesture
             destinationDragListener = this@UiAnnotationEditorActivity::handleMoveDestinationDrag
             movePreviewListener = { x, y ->

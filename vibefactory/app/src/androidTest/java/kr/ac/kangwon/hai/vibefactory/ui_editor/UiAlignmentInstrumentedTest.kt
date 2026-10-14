@@ -33,12 +33,13 @@ class UiAlignmentInstrumentedTest {
     private lateinit var preview: UiMovePreviewLayout
     private lateinit var source: UiAnnotationTarget
     private lateinit var peer: UiSnapTarget
+    private lateinit var secondPeer: UiSnapTarget
     private var pendingMove: UiAnnotation? = null
     private var pendingAddition: UiAnnotation? = null
     private var moveSource: UiAnnotationTarget? = null
     private var activeTouch: Triple<Long, Float, Float>? = null
 
-    private fun fixture(block: () -> Unit) {
+    private fun fixture(wideRow: Boolean = false, block: () -> Unit) {
         val ready = CountDownLatch(1)
         // Empty log payload does not query a Task; the temporary content is removed when this activity closes.
         ActivityScenario.launch<TaskLogDetailActivity>(Intent(context, TaskLogDetailActivity::class.java)).use { scenario ->
@@ -50,9 +51,9 @@ class UiAlignmentInstrumentedTest {
                         android:layout_width="match_parent" android:layout_height="match_parent"
                         android:orientation="vertical" android:padding="16dp" android:background="#FFFFFF">
                         <LinearLayout android:layout_width="match_parent" android:layout_height="64dp" android:orientation="horizontal">
-                            <Button android:id="@+id/peer" android:layout_width="80dp" android:layout_height="64dp"
+                            <Button android:id="@+id/peer" android:layout_width="${if (wideRow) 160 else 80}dp" android:layout_height="64dp"
                                 android:text="기준 UI" android:minWidth="0dp" android:minHeight="0dp" />
-                            <Button android:id="@+id/second" android:layout_width="80dp" android:layout_height="64dp"
+                            <Button android:id="@+id/second" android:layout_width="${if (wideRow) 160 else 80}dp" android:layout_height="64dp"
                                 android:layout_marginStart="8dp" android:text="주변 UI" android:minWidth="0dp" android:minHeight="0dp" />
                         </LinearLayout>
                         <Button android:id="@+id/source" android:layout_width="100dp" android:layout_height="64dp"
@@ -73,8 +74,12 @@ class UiAlignmentInstrumentedTest {
                     }
                     source = target("source")
                     peer = preview.alignmentTargets(emptyList(), emptyList(), null).first { it.id == target("peer").stableId }
+                    secondPeer = preview.alignmentTargets(emptyList(), emptyList(), null).first { it.id == target("second").stableId }
                     overlay.alignmentTargetsProvider = { preview.alignmentTargets(emptyList(), emptyList(), moveSource) }
                     overlay.alignmentTargetBoundsProvider = preview::alignmentTargetBounds
+                    overlay.additionAlignmentTargetsProvider = { pending, box ->
+                        preview.additionAlignmentTargets(emptyList(), emptyList(), pending, box)
+                    }
                     overlay.moveSourceTouchListener = { x, y ->
                         if (UiAdditionGeometry.contains(source.bounds, x, y)) {
                             moveSource = source
@@ -121,7 +126,9 @@ class UiAlignmentInstrumentedTest {
         send(down, MotionEvent.ACTION_MOVE, centerX, peer.box.top + halfHeight + 11f * density)
         assertEquals((peer.box.top + halfHeight) / canvas.height, pendingMove!!.destinationY!!, .0001f)
         send(down, MotionEvent.ACTION_MOVE, centerX, peer.box.top + halfHeight + 17f * density)
-        assertEquals((peer.box.top + halfHeight + 17f * density) / canvas.height, pendingMove!!.destinationY!!, .0001f)
+        // Let a rapidly injected move settle; Android resamples input within about a screen pixel.
+        send(down, MotionEvent.ACTION_MOVE, centerX, peer.box.top + halfHeight + 17f * density)
+        assertEquals((peer.box.top + halfHeight + 17f * density) / canvas.height, pendingMove!!.destinationY!!, density / canvas.height)
         send(down, MotionEvent.ACTION_MOVE, centerX, peer.box.top + halfHeight + 4f * density)
         send(down, MotionEvent.ACTION_UP, centerX, peer.box.top + halfHeight + 4f * density)
         assertEquals(0, screenshot("move_released"))
@@ -176,6 +183,39 @@ class UiAlignmentInstrumentedTest {
             referenceCanvasWidthDp = canvas.width / density, referenceCanvasHeightDp = canvas.height / density)
         assertEquals(annotation.addition!!.bounds, UiAnnotationXmlCodec.decode(xml).single().addition!!.bounds)
         File(context.getExternalFilesDir(null), "alignment_test_20261014/addition.xml").writeText(xml)
+    }
+
+    @Test fun additionMatchesTheWidthOfNeighboursAfterTheyShrink() = fixture(wideRow = true) {
+        val right = secondPeer.box.right
+        val top = peer.box.top
+        val bottom = peer.box.bottom
+        showAddition(UiPreviewBox(right - 150f * density, top, right, bottom))
+        val down = SystemClock.uptimeMillis()
+        send(down, MotionEvent.ACTION_DOWN, right - 150f * density, bottom)
+        val pointerX = right - 110f * density
+        send(down, MotionEvent.ACTION_MOVE, pointerX, bottom)
+        val once = pendingAddition!!.addition!!.bounds
+        val width = (once.right - once.left) * canvas.width
+        assertEquals((peer.box.width + secondPeer.box.width) / 3f, width, .15f)
+        assertEquals(width, preview.alignmentTargetBounds(peer.id)!!.width, 1.1f)
+        assertEquals(width, preview.alignmentTargetBounds(secondPeer.id)!!.width, 1.1f)
+        assertTrue("Final size match must be visible", screenshot("addition_reflow_same_width") > 100)
+        repeat(3) {
+            send(down, MotionEvent.ACTION_MOVE, pointerX, bottom)
+            assertEquals(once, pendingAddition!!.addition!!.bounds)
+        }
+        send(down, MotionEvent.ACTION_MOVE, right - 127f * density, bottom)
+        send(down, MotionEvent.ACTION_MOVE, right - 127f * density, bottom)
+        val releasedWidth = (pendingAddition!!.addition!!.bounds.right - pendingAddition!!.addition!!.bounds.left) * canvas.width
+        assertEquals(127f * density, releasedWidth, density)
+        assertTrue(kotlin.math.abs(releasedWidth - preview.alignmentTargetBounds(peer.id)!!.width) > 14f * density)
+        send(down, MotionEvent.ACTION_MOVE, pointerX, bottom)
+        send(down, MotionEvent.ACTION_UP, pointerX, bottom)
+        assertEquals(0, screenshot("addition_reflow_released"))
+        val xml = UiAnnotationXmlCodec.encode("isolated", "rev_0001", "activity_main", "xml", "sha", listOf(pendingAddition!!.copy(instruction = "새 UI를 추가해 줘")),
+            referenceCanvasWidthDp = canvas.width / density, referenceCanvasHeightDp = canvas.height / density)
+        assertEquals(pendingAddition!!.addition!!.bounds, UiAnnotationXmlCodec.decode(xml).single().addition!!.bounds)
+        File(context.getExternalFilesDir(null), "alignment_test_20261014/addition_reflow.xml").writeText(xml)
     }
 
     private fun showAddition(box: UiPreviewBox) = instrumentation.runOnMainSync {

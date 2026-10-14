@@ -109,6 +109,16 @@ internal class UiMovePreviewLayout(
 
     fun alignmentTargetBounds(id: String): UiPreviewBox? = alignmentViews[id]?.let(::boxOf) ?: alignmentRegions[id]
 
+    /** Counterfactual geometry only: never resize a View while searching for a matching width. */
+    fun additionAlignmentTargets(
+        moves: List<UiAnnotation>, additions: List<UiAnnotation>, pending: UiAnnotation, bounds: UiPreviewBox
+    ): List<UiSnapTarget> {
+        val spec = pending.addition ?: return emptyList()
+        val candidate = pending.copy(addition = spec.copy(bounds = normalizedBox(bounds), replaceTargets = emptyList()))
+        return alignmentTargets(moves, additions.filterNot { it.annotationId == pending.annotationId } + candidate, null)
+            .filterNot { it.id == "add:${pending.annotationId}" }
+    }
+
     fun apply(moves: List<UiAnnotation>, updateXml: Boolean = true, additions: List<UiAnnotation> = emptyList()) {
         baseX.forEach { (view, x) -> view.translationX = x }
         baseY.forEach { (view, y) -> view.translationY = y }

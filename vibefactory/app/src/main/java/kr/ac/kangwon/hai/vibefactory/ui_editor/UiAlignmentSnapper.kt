@@ -12,7 +12,7 @@ internal data class UiSnapGuide(
 )
 internal data class UiSnapResult(val box: UiPreviewBox, val guides: List<UiSnapGuide>)
 
-/** Pixel-space geometry only. Callers freeze references for a gesture and persist the resulting bounds. */
+/** Pixel-space geometry only. Edge references stay frozen; width references may predict final reflow. */
 internal class UiAlignmentSnapper {
     private data class Candidate(val key: String, val delta: Float, val guide: UiSnapGuide, val preferred: Boolean)
     private var lockedX: String? = null
@@ -27,16 +27,19 @@ internal class UiAlignmentSnapper {
 
     fun resize(
         raw: UiPreviewBox, corner: Int, targets: List<UiSnapTarget>, acquire: Float, release: Float,
-        canvas: UiPreviewBox, minWidth: Float, minHeight: Float
+        canvas: UiPreviewBox, minWidth: Float, minHeight: Float,
+        widthTargetsProvider: ((UiPreviewBox) -> List<UiSnapTarget>)? = null
     ): UiSnapResult {
         require(corner in 0..3)
-        return snap(raw, targets, acquire, release, canvas, true, corner, minWidth, minHeight)
+        return snap(raw, targets, acquire, release, canvas, true, corner, minWidth, minHeight, widthTargetsProvider)
     }
 
     private fun snap(
         raw: UiPreviewBox, targets: List<UiSnapTarget>, acquire: Float, release: Float,
-        canvas: UiPreviewBox, containEdges: Boolean, corner: Int?, minWidth: Float, minHeight: Float
+        canvas: UiPreviewBox, containEdges: Boolean, corner: Int?, minWidth: Float, minHeight: Float,
+        widthTargetsProvider: ((UiPreviewBox) -> List<UiSnapTarget>)? = null
     ): UiSnapResult {
+        var widthTargets = targets
         fun moved(axis: UiSnapAxis, delta: Float): UiPreviewBox = when {
             corner == null && axis == UiSnapAxis.X -> raw.copy(left = raw.left + delta, right = raw.right + delta)
             corner == null -> raw.copy(top = raw.top + delta, bottom = raw.bottom + delta)
@@ -72,7 +75,12 @@ internal class UiAlignmentSnapper {
                         "${target.id}:$axis:$sourceAnchor:$targetAnchor", delta,
                         UiSnapGuide(axis, UiSnapKind.ALIGN, position, sourceAnchor, box, target.id, targetAnchor), target.preferred))
                 }
-                if (corner != null) {
+            }
+            if (corner != null) {
+                for (target in if (axis == UiSnapAxis.X) widthTargets else targets) {
+                    val box = target.box
+                    val targetSize = if (axis == UiSnapAxis.X) box.width else box.height
+                    if (targetSize <= 0f) continue
                     val delta = (targetSize - size) * if (activeAnchor == 0f) -1f else 1f
                     if (valid(moved(axis, delta))) add(Candidate(
                         "${target.id}:$axis:size", delta,
@@ -93,8 +101,10 @@ internal class UiAlignmentSnapper {
                     .thenBy { it.key }
             )
         }
-        val x = choose(UiSnapAxis.X, lockedX)
         val y = choose(UiSnapAxis.Y, lockedY)
+        // Predict the final width after height alignment; vertical overlap determines the affected row.
+        if (corner != null && widthTargetsProvider != null) widthTargets = widthTargetsProvider(moved(UiSnapAxis.Y, y?.delta ?: 0f))
+        val x = choose(UiSnapAxis.X, lockedX)
         lockedX = x?.key; lockedY = y?.key
         val dx = x?.delta ?: 0f; val dy = y?.delta ?: 0f
         val snapped = if (corner == null) raw.copy(left = raw.left + dx, right = raw.right + dx,
