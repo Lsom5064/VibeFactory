@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.MotionEvent
@@ -30,6 +31,13 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
         referenceHeight = height
     }
     var movePreviewListener: ((Float?, Float?) -> Unit)? = null
+    internal var alignmentTargetsProvider: (() -> List<UiSnapTarget>)? = null
+    internal var alignmentTargetBoundsProvider: ((String) -> UiPreviewBox?)? = null
+    private val alignmentSnapper = UiAlignmentSnapper()
+    private var alignmentTargets: List<UiSnapTarget> = emptyList()
+    private var alignmentGuides: List<UiSnapGuide> = emptyList()
+    private var rawPointX: Float? = null
+    private var rawPointY: Float? = null
     private val density = resources.displayMetrics.density
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -105,10 +113,12 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     }
 
     fun showPendingMove(source: UiAnnotationTarget?, x: Float? = null, y: Float? = null) {
+        clearAlignment()
         pendingMoveBounds = null
         pendingMoveSource = source
         pendingPointX = x
         pendingPointY = y
+        rawPointX = x; rawPointY = y
         updateClickable()
         invalidate()
     }
@@ -159,6 +169,7 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
                 moveSourceTouchListener?.invoke(event.x / coordinateWidth.coerceAtLeast(1),
                     event.y / coordinateHeight.coerceAtLeast(1)) == true
             tappedAnnotations = if (pendingMoveSource == null && !targetSelectionEnabled) annotationsAt(event.x, event.y) else emptyList()
+            if (pendingMoveSource != null) beginAlignmentGesture()
         }
         if (pendingMoveSource == null && !targetSelectionEnabled && tappedAnnotations.isEmpty()) return false
         when (event.actionMasked) {
@@ -166,11 +177,9 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
                 if (pendingMoveSource != null) parent.requestDisallowInterceptTouchEvent(true)
                 // A tap only selects the source; release must not open the confirmation sheet yet.
                 if (selectedMoveOnDown) return true
-                pendingPointX = (event.x / coordinateWidth.coerceAtLeast(1)).coerceIn(0f, 1f)
-                pendingPointY = (event.y / coordinateHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
                 if (pendingMoveSource != null) {
                     destinationDragListener?.invoke(event.x, event.y, true)
-                    movePreviewListener?.invoke(pendingPointX, pendingPointY)
+                    updatePendingMovePoint(event.x, event.y)
                 }
                 invalidate()
                 return true
@@ -179,11 +188,9 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
                 if (abs(event.x - downX) > ViewConfiguration.get(context).scaledTouchSlop ||
                     abs(event.y - downY) > ViewConfiguration.get(context).scaledTouchSlop) moveGestureDragged = true
                 if (selectedMoveOnDown && !moveGestureDragged) return true
-                pendingPointX = (event.x / coordinateWidth.coerceAtLeast(1)).coerceIn(0f, 1f)
-                pendingPointY = (event.y / coordinateHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
                 if (pendingMoveSource != null) {
                     destinationDragListener?.invoke(event.x, event.y, true)
-                    movePreviewListener?.invoke(pendingPointX, pendingPointY)
+                    updatePendingMovePoint(event.x, event.y)
                 }
                 invalidate()
                 return true
@@ -207,12 +214,15 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
                     }
                 }
                 tappedAnnotations = emptyList()
+                clearAlignment()
+                invalidate()
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
                 parent.requestDisallowInterceptTouchEvent(false)
                 destinationDragListener?.invoke(event.x, event.y, false)
                 tappedAnnotations = emptyList()
+                clearAlignment()
                 if (pendingMoveSource != null) {
                     pendingPointX = null; pendingPointY = null
                     movePreviewListener?.invoke(null, null)
@@ -233,6 +243,7 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
             MotionEvent.ACTION_DOWN -> {
                 downX = event.x; downY = event.y
                 additionStartBounds = spec.bounds
+                beginAlignmentGesture()
                 additionDragging = false
                 additionCornerWasSelected = resizeCorner >= 0
                 val b = spec.bounds
@@ -275,8 +286,12 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
                     UiAdditionGeometry.translate(b, x - (b.left + b.right) / 2, y - (b.top + b.bottom) / 2)
                 } else resizeAddition(b, x - (if (resizeCorner == 0 || resizeCorner == 2) b.left else b.right),
                     y - (if (resizeCorner < 2) b.top else b.bottom))
+                beginAlignmentGesture()
+                val snapped = snapAdditionBounds(result)
                 resizeCorner = -1
-                updateAdditionBounds(result, true)
+                updateAdditionBounds(snapped, true)
+                clearAlignment()
+                invalidate()
                 performClick()
             }
             MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
@@ -301,7 +316,8 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
         val normalizedY = dy / coordinateHeight.coerceAtLeast(1)
         val bounds = if (resizeCorner < 0) UiAdditionGeometry.translate(start, normalizedX, normalizedY)
             else resizeAddition(start, normalizedX, normalizedY)
-        if (bounds != pendingAddition?.addition?.bounds) updateAdditionBounds(bounds, false)
+        val snapped = snapAdditionBounds(bounds)
+        if (snapped != pendingAddition?.addition?.bounds) updateAdditionBounds(snapped, false) else invalidate()
     }
 
     private fun resizeAddition(bounds: UiNormalizedRect, dx: Float, dy: Float): UiNormalizedRect =
@@ -321,14 +337,71 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
         additionStartBounds = null
         additionCanDrag = false
         additionDragging = false
+        clearAlignment()
     }
 
     fun offsetPendingPointBy(deltaX: Float, deltaY: Float) {
         if (pendingMoveSource == null) return
-        pendingPointX = ((pendingPointX ?: 0f) + deltaX / coordinateWidth.coerceAtLeast(1)).coerceIn(0f, 1f)
-        pendingPointY = ((pendingPointY ?: 0f) + deltaY / coordinateHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
-        movePreviewListener?.invoke(pendingPointX, pendingPointY)
+        updatePendingMovePoint((rawPointX ?: pendingPointX ?: 0f) * coordinateWidth + deltaX,
+            (rawPointY ?: pendingPointY ?: 0f) * coordinateHeight + deltaY)
         invalidate()
+    }
+
+    private fun beginAlignmentGesture() {
+        alignmentSnapper.reset()
+        alignmentGuides = emptyList()
+        alignmentTargets = alignmentTargetsProvider?.invoke().orEmpty()
+    }
+
+    private fun clearAlignment() {
+        alignmentSnapper.reset()
+        alignmentGuides = emptyList()
+        alignmentTargets = emptyList()
+    }
+
+    private fun visibleAlignmentTargets(): List<UiSnapTarget> {
+        val visible = Rect()
+        if (!getLocalVisibleRect(visible)) return emptyList()
+        return alignmentTargets.filter { target -> target.box.left < visible.right && target.box.right > visible.left &&
+            target.box.top < visible.bottom && target.box.bottom > visible.top }
+    }
+
+    private fun snappingDistance(dp: Float): Float {
+        var scale = scaleX
+        var ancestor = parent as? View
+        while (ancestor != null) { scale *= ancestor.scaleX; ancestor = ancestor.parent as? View }
+        return dp * density / scale.coerceAtLeast(.01f)
+    }
+
+    private fun pixelBox(bounds: UiNormalizedRect) = UiPreviewBox(bounds.left * coordinateWidth, bounds.top * coordinateHeight,
+        bounds.right * coordinateWidth, bounds.bottom * coordinateHeight)
+    private fun normalizedBox(box: UiPreviewBox) = UiNormalizedRect(box.left / coordinateWidth.coerceAtLeast(1),
+        box.top / coordinateHeight.coerceAtLeast(1), box.right / coordinateWidth.coerceAtLeast(1), box.bottom / coordinateHeight.coerceAtLeast(1)).normalized()
+    private fun alignmentCanvas() = UiPreviewBox(0f, 0f, coordinateWidth.toFloat(), coordinateHeight.toFloat())
+
+    private fun updatePendingMovePoint(x: Float, y: Float) {
+        val source = pendingMoveSource ?: return
+        rawPointX = (x / coordinateWidth.coerceAtLeast(1)).coerceIn(0f, 1f)
+        rawPointY = (y / coordinateHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
+        val b = pixelBox(source.bounds)
+        val cx = rawPointX!! * coordinateWidth; val cy = rawPointY!! * coordinateHeight
+        val result = alignmentSnapper.translate(UiPreviewBox(cx - b.width / 2, cy - b.height / 2,
+            cx + b.width / 2, cy + b.height / 2), visibleAlignmentTargets(), snappingDistance(8f), snappingDistance(14f),
+            alignmentCanvas(), containEdges = false)
+        alignmentGuides = result.guides
+        pendingPointX = (result.box.left + result.box.right) / (2 * coordinateWidth.coerceAtLeast(1))
+        pendingPointY = (result.box.top + result.box.bottom) / (2 * coordinateHeight.coerceAtLeast(1))
+        movePreviewListener?.invoke(pendingPointX, pendingPointY)
+    }
+
+    private fun snapAdditionBounds(raw: UiNormalizedRect): UiNormalizedRect {
+        val box = pixelBox(raw)
+        val result = if (resizeCorner < 0) alignmentSnapper.translate(box, visibleAlignmentTargets(),
+            snappingDistance(8f), snappingDistance(14f), alignmentCanvas(), containEdges = true)
+        else alignmentSnapper.resize(box, resizeCorner, visibleAlignmentTargets(), snappingDistance(8f), snappingDistance(14f),
+            alignmentCanvas(), minOf(64f * density, box.width), minOf(48f * density, box.height))
+        alignmentGuides = result.guides
+        return normalizedBox(result.box)
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -364,6 +437,58 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
             drawDestination(canvas, destination, MOVE_COLOR)
             drawArrow(canvas, sourceRect.centerX(), sourceRect.centerY(), destination.centerX(), destination.centerY(), MOVE_COLOR)
         }
+        drawAlignmentGuides(canvas)
+    }
+
+    private fun drawAlignmentGuides(canvas: Canvas) {
+        val box = pendingAddition?.addition?.bounds?.let(::pixelBox) ?: pendingMoveSource?.let { source ->
+            pendingMoveBounds?.let(::pixelBox) ?: pixelBox(source.bounds).let { b ->
+                val cx = (pendingPointX ?: return@let b) * coordinateWidth
+                val cy = (pendingPointY ?: return@let b) * coordinateHeight
+                UiPreviewBox(cx - b.width / 2, cy - b.height / 2, cx + b.width / 2, cy + b.height / 2)
+            }
+        } ?: return
+        val visible = Rect()
+        if (!getLocalVisibleRect(visible)) return
+        val guidePaint = borderPaint
+        guidePaint.color = Color.rgb(196, 45, 168)
+        guidePaint.strokeWidth = 1.2f * density
+        guidePaint.pathEffect = null
+        alignmentGuides.forEach { guide ->
+            val target = if (alignmentTargetBoundsProvider == null) guide.target
+                else alignmentTargetBoundsProvider?.invoke(guide.targetId) ?: return@forEach
+            val anchor = if (guide.axis == UiSnapAxis.X) box.left + box.width * guide.sourceAnchor
+                else box.top + box.height * guide.sourceAnchor
+            // Row allocation takes precedence; never show an alignment line the final dashed box does not meet.
+            if (abs(anchor - guide.position) > 2f) return@forEach
+            val targetAnchor = if (guide.axis == UiSnapAxis.X) target.left + target.width * guide.targetAnchor
+                else target.top + target.height * guide.targetAnchor
+            if (guide.kind == UiSnapKind.ALIGN && abs(targetAnchor - guide.position) > 2f) return@forEach
+            if (guide.kind == UiSnapKind.WIDTH && abs(target.width - box.width) > 2f) return@forEach
+            if (guide.kind == UiSnapKind.HEIGHT && abs(target.height - box.height) > 2f) return@forEach
+            if (guide.kind == UiSnapKind.ALIGN) {
+                if (guide.axis == UiSnapAxis.X) canvas.drawLine(guide.position, maxOf(visible.top.toFloat(), minOf(box.top, target.top) - 8f * density),
+                    guide.position, minOf(visible.bottom.toFloat(), maxOf(box.bottom, target.bottom) + 8f * density), guidePaint)
+                else canvas.drawLine(maxOf(visible.left.toFloat(), minOf(box.left, target.left) - 8f * density), guide.position,
+                    minOf(visible.right.toFloat(), maxOf(box.right, target.right) + 8f * density), guide.position, guidePaint)
+            } else {
+                val sameWidth = guide.kind == UiSnapKind.WIDTH
+                val label = context.getString(if (sameWidth) kr.ac.kangwon.hai.vibefactory.R.string.ui_annotation_same_width
+                    else kr.ac.kangwon.hai.vibefactory.R.string.ui_annotation_same_height)
+                if (sameWidth) canvas.drawLine(box.left, box.top, box.right, box.top, guidePaint)
+                else canvas.drawLine(box.right, box.top, box.right, box.bottom, guidePaint)
+                val labelWidth = instructionPaint.measureText(label) + 12f * density
+                val labelHeight = 22f * density
+                val left = (if (sameWidth) (box.left + box.right - labelWidth) / 2 else box.right + 4f * density)
+                    .coerceIn(visible.left.toFloat(), maxOf(visible.left.toFloat(), visible.right - labelWidth))
+                val top = (if (sameWidth) box.top - labelHeight - 4f * density else (box.top + box.bottom - labelHeight) / 2)
+                    .coerceIn(visible.top.toFloat(), maxOf(visible.top.toFloat(), visible.bottom - labelHeight))
+                fillPaint.color = guidePaint.color
+                canvas.drawRoundRect(RectF(left, top, left + labelWidth, top + labelHeight), 4f * density, 4f * density, fillPaint)
+                canvas.drawText(label, left + 6f * density, top + 15f * density, instructionPaint)
+            }
+        }
+        borderPaint.strokeWidth = 3f * density
     }
 
     private fun drawAnnotation(canvas: Canvas, annotation: UiAnnotation, number: Int) {

@@ -23,6 +23,8 @@ internal class UiMovePreviewLayout(
     private data class Size(val width: Int, val height: Int, val weight: Float?)
     private val sizes = linkedMapOf<View, Size>()
     private var resizedViews = emptySet<View>()
+    private var alignmentViews: Map<String, View> = emptyMap()
+    private var alignmentRegions: Map<String, UiPreviewBox> = emptyMap()
     private val boxes = linkedMapOf<View, UiPreviewBox>()
     private val ids = nodeViews.entries.associate { it.value to it.key }
     var previewDocument: AndroidXmlDocument = document
@@ -48,9 +50,13 @@ internal class UiMovePreviewLayout(
         }
     }
 
-    fun apply(moves: List<UiAnnotation>, updateXml: Boolean = true, additions: List<UiAnnotation> = emptyList()) {
-        baseX.forEach { (view, x) -> view.translationX = x }
-        baseY.forEach { (view, y) -> view.translationY = y }
+    private data class Arrangement(
+        val units: Map<String, View>, val blocks: Map<String, UiPreviewBox>,
+        val placement: UiMovePreviewGeometry.Placement, val arranged: Map<String, UiPreviewBox>,
+        val regions: List<UiPreviewBox>, val pinnedViews: Set<View>
+    )
+
+    private fun arrange(moves: List<UiAnnotation>, additions: List<UiAnnotation>): Arrangement {
         val pinnedViews = moves.mapNotNull { targetView(it.target) }.toSet()
         val replacedViews = additions.flatMap { it.addition?.replaceTargets.orEmpty() }.mapNotNull(::targetView).toSet()
         fun containsProtected(view: View) = (pinnedViews + replacedViews).any { pin ->
@@ -80,13 +86,46 @@ internal class UiMovePreviewLayout(
         val scopes = units.mapValues { parents.indexOf(it.value.parent).toString() }
         val placement = UiMovePreviewGeometry.arrange(blocks, destinations, pinnedViews.mapNotNull(boxes::get),
             scopes)
-        destinationBounds = placement.destinations.mapValues { (_, box) -> normalizedBox(box) }
-        equalRowMoves = placement.equalRowMoves
         val regions = additions.mapNotNull { it.addition?.bounds }.map { box ->
             UiPreviewBox(box.left * width, box.top * height, box.right * width, box.bottom * height)
         }
         val arranged = UiAdditionPreviewGeometry.arrange(blocks + placement.blocks, regions,
             pinnedViews.mapNotNull(boxes::get) + placement.destinations.values, scopes)
+        return Arrangement(units, blocks, placement, arranged, regions, pinnedViews)
+    }
+
+    /** Pure reference layout excludes the current operation, so displaced neighbours cannot chase the pointer. */
+    fun alignmentTargets(moves: List<UiAnnotation>, additions: List<UiAnnotation>, source: UiAnnotationTarget?): List<UiSnapTarget> {
+        val referenceMoves = moves + listOfNotNull(source?.let { UiAnnotation(action = UiAnnotationAction.MOVE, target = it) })
+        val reference = arrange(referenceMoves, additions)
+        val sourceParent = source?.let(::targetView)?.parent
+        return reference.arranged.filterKeys { reference.units[it] !is android.widget.Space }.map { (id, box) ->
+            UiSnapTarget(id, box, sourceParent != null && reference.units[id]?.parent === sourceParent)
+        } + reference.placement.destinations.map { (id, box) -> UiSnapTarget("move:$id", box) } +
+            additions.mapNotNull { annotation -> annotation.addition?.bounds?.let { b ->
+                UiSnapTarget("add:${annotation.annotationId}", UiPreviewBox(b.left * width, b.top * height, b.right * width, b.bottom * height))
+            } }
+    }
+
+    fun alignmentTargetBounds(id: String): UiPreviewBox? = alignmentViews[id]?.let(::boxOf) ?: alignmentRegions[id]
+
+    fun apply(moves: List<UiAnnotation>, updateXml: Boolean = true, additions: List<UiAnnotation> = emptyList()) {
+        baseX.forEach { (view, x) -> view.translationX = x }
+        baseY.forEach { (view, y) -> view.translationY = y }
+        val reference = arrange(moves, additions)
+        val units = reference.units
+        val blocks = reference.blocks
+        val pinnedViews = reference.pinnedViews
+        val placement = reference.placement
+        val regions = reference.regions
+        val arranged = reference.arranged
+        alignmentViews = units
+        alignmentRegions = placement.destinations.mapKeys { "move:${it.key}" } + additions.mapNotNull { annotation ->
+            annotation.addition?.bounds?.let { b -> "add:${annotation.annotationId}" to
+                UiPreviewBox(b.left * width, b.top * height, b.right * width, b.bottom * height) }
+        }.toMap()
+        destinationBounds = placement.destinations.mapValues { (_, box) -> normalizedBox(box) }
+        equalRowMoves = placement.equalRowMoves
         val frames = arranged.filter { (id, box) -> box != blocks.getValue(id) }.mapKeys { units.getValue(it.key) }
         val hasResize = frames.any { (view, box) -> box.width != boxes.getValue(view).width }
         // Freeze the measured footprint of siblings (including weighted sources), then remeasure
