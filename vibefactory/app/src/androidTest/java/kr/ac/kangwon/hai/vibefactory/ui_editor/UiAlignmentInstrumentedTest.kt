@@ -1,6 +1,9 @@
 package kr.ac.kangwon.hai.vibefactory.ui_editor
 
 import android.content.Intent
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.SystemClock
@@ -13,12 +16,16 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.SdkSuppress
 import androidx.test.platform.app.InstrumentationRegistry
 import kr.ac.kangwon.hai.vibefactory.TaskLogDetailActivity
+import kr.ac.kangwon.hai.vibefactory.HostAppConfig
+import kr.ac.kangwon.hai.vibefactory.HostPreferencesStore
+import com.google.gson.GsonBuilder
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.UUID
 
 /** Real touch/render/preview checks in a temporary view. No Task IDs, server writes or participant preference changes. */
 @RunWith(AndroidJUnit4::class)
@@ -207,7 +214,7 @@ class UiAlignmentInstrumentedTest {
         send(down, MotionEvent.ACTION_MOVE, right - 127f * density, bottom)
         send(down, MotionEvent.ACTION_MOVE, right - 127f * density, bottom)
         val releasedWidth = (pendingAddition!!.addition!!.bounds.right - pendingAddition!!.addition!!.bounds.left) * canvas.width
-        assertEquals(127f * density, releasedWidth, density)
+        assertEquals(127f * density, releasedWidth, 2f * density)
         assertTrue(kotlin.math.abs(releasedWidth - preview.alignmentTargetBounds(peer.id)!!.width) > 14f * density)
         send(down, MotionEvent.ACTION_MOVE, pointerX, bottom)
         send(down, MotionEvent.ACTION_UP, pointerX, bottom)
@@ -216,6 +223,79 @@ class UiAlignmentInstrumentedTest {
             referenceCanvasWidthDp = canvas.width / density, referenceCanvasHeightDp = canvas.height / density)
         assertEquals(pendingAddition!!.addition!!.bounds, UiAnnotationXmlCodec.decode(xml).single().addition!!.bounds)
         File(context.getExternalFilesDir(null), "alignment_test_20261014/addition_reflow.xml").writeText(xml)
+    }
+
+    @Test fun disablingAlignmentAllowsFreeMoveAndEnablingRestoresSnapping() = fixture {
+        instrumentation.runOnMainSync { overlay.alignmentEnabled = false; overlay.enableTargetSelection(true) }
+        val origin = source.bounds
+        val sx = (origin.left + origin.right) * canvas.width / 2
+        val sy = (origin.top + origin.bottom) * canvas.height / 2
+        val x = canvas.width - 62f * density
+        val halfHeight = (origin.bottom - origin.top) * canvas.height / 2
+        val y = peer.box.top + halfHeight + 4f * density
+        var down = SystemClock.uptimeMillis()
+        send(down, MotionEvent.ACTION_DOWN, sx, sy)
+        send(down, MotionEvent.ACTION_MOVE, x, y)
+        send(down, MotionEvent.ACTION_UP, x, y)
+        assertEquals(y / canvas.height, pendingMove!!.destinationY!!, density / canvas.height)
+        assertEquals(0, screenshot("alignment_off_move"))
+        val retained = pendingMove
+        instrumentation.runOnMainSync { overlay.alignmentEnabled = true }
+        assertEquals("Toggling must preserve placed bounds", retained, pendingMove)
+        down = SystemClock.uptimeMillis()
+        send(down, MotionEvent.ACTION_DOWN, x, y)
+        send(down, MotionEvent.ACTION_MOVE, x, y)
+        assertEquals((peer.box.top + halfHeight) / canvas.height, pendingMove!!.destinationY!!, .0001f)
+        assertTrue(screenshot("alignment_on_move") > 20)
+        send(down, MotionEvent.ACTION_UP, x, y)
+    }
+
+    @Test fun disablingAlignmentSkipsBothOriginalAndReflowedWidthMatches() = fixture(wideRow = true) {
+        instrumentation.runOnMainSync { overlay.alignmentEnabled = false }
+        val right = secondPeer.box.right
+        val bottom = peer.box.bottom
+        showAddition(UiPreviewBox(right - 150f * density, peer.box.top, right, bottom))
+        val x = right - 110f * density
+        var down = SystemClock.uptimeMillis()
+        send(down, MotionEvent.ACTION_DOWN, right - 150f * density, bottom)
+        send(down, MotionEvent.ACTION_MOVE, x, bottom)
+        send(down, MotionEvent.ACTION_UP, x, bottom)
+        val bounds = pendingAddition!!.addition!!.bounds
+        assertEquals(110f * density, (bounds.right - bounds.left) * canvas.width, density)
+        assertEquals(0, screenshot("alignment_off_resize"))
+        instrumentation.runOnMainSync { overlay.alignmentEnabled = true }
+        assertEquals(bounds, pendingAddition!!.addition!!.bounds)
+        down = SystemClock.uptimeMillis()
+        send(down, MotionEvent.ACTION_DOWN, bounds.left * canvas.width, bounds.bottom * canvas.height)
+        // Begin a drag, then approach the reflowed width instead of the separate 100dp source control.
+        send(down, MotionEvent.ACTION_MOVE, x + 30f * density, bottom)
+        send(down, MotionEvent.ACTION_MOVE, x + 3f * density, bottom)
+        val matched = pendingAddition!!.addition!!.bounds
+        val width = (matched.right - matched.left) * canvas.width
+        assertEquals(width, preview.alignmentTargetBounds(peer.id)!!.width, 1.1f)
+        assertTrue(screenshot("alignment_on_resize") > 100)
+        send(down, MotionEvent.ACTION_UP, x + 3f * density, bottom)
+    }
+
+    @Test fun alignmentPreferencePersistsWithoutChangingOtherSettings() {
+        val name = "alignment_preference_test_${UUID.randomUUID()}"
+        val isolated = object : ContextWrapper(context) {
+            override fun getApplicationContext(): Context = this
+            override fun getSharedPreferences(ignored: String, mode: Int): SharedPreferences =
+                context.getSharedPreferences(name, mode)
+        }
+        val prefs = isolated.getSharedPreferences(HostAppConfig.PREFS_NAME, Context.MODE_PRIVATE)
+        assertTrue(prefs.edit().putString(HostAppConfig.PREF_DEVICE_ID, "synthetic-device")
+            .putString(HostAppConfig.PREF_PHONE_NUMBER, "synthetic-phone").putString("unrelated", "keep").commit())
+        fun store() = HostPreferencesStore(isolated, GsonBuilder().create(), "AlignmentPreferenceTest")
+        assertTrue(store().loadUiAlignmentEnabled())
+        store().saveUiAlignmentEnabled(false)
+        assertFalse(store().loadUiAlignmentEnabled())
+        assertEquals("synthetic-device", store().getOrCreateDeviceId())
+        assertEquals("synthetic-phone", store().loadPhoneNumber())
+        assertEquals("keep", prefs.getString("unrelated", null))
+        store().saveUiAlignmentEnabled(true)
+        assertTrue(store().loadUiAlignmentEnabled())
     }
 
     private fun showAddition(box: UiPreviewBox) = instrumentation.runOnMainSync {

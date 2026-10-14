@@ -30,6 +30,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
@@ -104,6 +105,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     private var instructionInput: EditText? = null
     private var instructionImagesCommitted = false
     private var additionDialog: UiVisualChangeDialog? = null
+    private var alignmentEnabled = true
 
     private val instructionImagePicker =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
@@ -139,6 +141,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         toolbarCollapsed = savedInstanceState?.getBoolean(STATE_TOOLBAR_COLLAPSED, false) ?: false
         restoredToolbarX = savedInstanceState?.getFloat(STATE_TOOLBAR_X, 0f) ?: 0f
         restoredToolbarY = savedInstanceState?.getFloat(STATE_TOOLBAR_Y, 0f) ?: 0f
+        alignmentEnabled = preferencesStore.loadUiAlignmentEnabled()
 
         applyWindowInsets()
         bindActions()
@@ -223,6 +226,14 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnUiAnnotationDraw).setOnClickListener { openAdditionEditor() }
         findViewById<Button>(R.id.btnUiAnnotationConfirmMove).setOnClickListener { openMoveInstructionDialog() }
         findViewById<Button>(R.id.btnUiAnnotationDeleteSelected).setOnClickListener { applyDeleteSelection() }
+        findViewById<SwitchCompat>(R.id.switchUiAnnotationAlignment).apply {
+            isChecked = alignmentEnabled
+            setOnCheckedChangeListener { _, enabled ->
+                alignmentEnabled = enabled
+                preferencesStore.saveUiAlignmentEnabled(enabled)
+                this@UiAnnotationEditorActivity.overlay?.alignmentEnabled = enabled
+            }
+        }
         updateActions()
     }
 
@@ -557,6 +568,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         currentNodes = session.document.root.descendantsAndSelf().associateBy(UiNode::stableId)
         currentNodeViews.values.forEach(::makePreviewReadOnly)
         val annotationOverlay = UiAnnotationOverlayView(this).apply {
+            alignmentEnabled = this@UiAnnotationEditorActivity.alignmentEnabled
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -1756,6 +1768,9 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         }
         updateDeleteSelection()
         val session = viewModel.session
+        findViewById<View>(R.id.switchUiAnnotationAlignment).visibility =
+            if (armedAction == UiAnnotationAction.MOVE || armedAction == UiAnnotationAction.ADD ||
+                pendingMoveSource != null || session?.pendingAddition != null) View.VISIBLE else View.GONE
         findViewById<Button>(R.id.btnUiAnnotationConfirmMove).apply {
             visibility = if (pendingMoveSource != null) View.VISIBLE else View.GONE
             isEnabled = pendingMoveSource != null && previewDestination != null && !isSaving

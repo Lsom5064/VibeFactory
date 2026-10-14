@@ -34,6 +34,14 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     internal var alignmentTargetsProvider: (() -> List<UiSnapTarget>)? = null
     internal var alignmentTargetBoundsProvider: ((String) -> UiPreviewBox?)? = null
     internal var additionAlignmentTargetsProvider: ((UiAnnotation, UiPreviewBox) -> List<UiSnapTarget>)? = null
+    var alignmentEnabled: Boolean = true
+        set(value) {
+            if (field == value) return
+            field = value
+            clearAlignment()
+            // Keep the placed bounds intact; only subsequent gestures use the new setting.
+            invalidate()
+        }
     private val alignmentSnapper = UiAlignmentSnapper()
     private var alignmentTargets: List<UiSnapTarget> = emptyList()
     private var alignmentGuides: List<UiSnapGuide> = emptyList()
@@ -351,7 +359,7 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     private fun beginAlignmentGesture() {
         alignmentSnapper.reset()
         alignmentGuides = emptyList()
-        alignmentTargets = alignmentTargetsProvider?.invoke().orEmpty()
+        alignmentTargets = if (alignmentEnabled) alignmentTargetsProvider?.invoke().orEmpty() else emptyList()
     }
 
     private fun clearAlignment() {
@@ -386,9 +394,9 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
         rawPointY = (y / coordinateHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
         val b = pixelBox(source.bounds)
         val cx = rawPointX!! * coordinateWidth; val cy = rawPointY!! * coordinateHeight
-        val result = alignmentSnapper.translate(UiPreviewBox(cx - b.width / 2, cy - b.height / 2,
-            cx + b.width / 2, cy + b.height / 2), visibleAlignmentTargets(), snappingDistance(8f), snappingDistance(14f),
-            alignmentCanvas(), containEdges = false)
+        val raw = UiPreviewBox(cx - b.width / 2, cy - b.height / 2, cx + b.width / 2, cy + b.height / 2)
+        val result = if (alignmentEnabled) alignmentSnapper.translate(raw, visibleAlignmentTargets(), snappingDistance(8f), snappingDistance(14f),
+            alignmentCanvas(), containEdges = false) else UiSnapResult(raw, emptyList())
         alignmentGuides = result.guides
         pendingPointX = (result.box.left + result.box.right) / (2 * coordinateWidth.coerceAtLeast(1))
         pendingPointY = (result.box.top + result.box.bottom) / (2 * coordinateHeight.coerceAtLeast(1))
@@ -396,6 +404,7 @@ class UiAnnotationOverlayView @JvmOverloads constructor(
     }
 
     private fun snapAdditionBounds(raw: UiNormalizedRect): UiNormalizedRect {
+        if (!alignmentEnabled) return raw
         val box = pixelBox(raw)
         val result = if (resizeCorner < 0) alignmentSnapper.translate(box, visibleAlignmentTargets(),
             snappingDistance(8f), snappingDistance(14f), alignmentCanvas(), containEdges = true)

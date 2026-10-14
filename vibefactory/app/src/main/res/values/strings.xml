@@ -1,4 +1,5 @@
 <resources>
+    <string name="ui_annotation_alignment_toggle">자동 보정</string>
     <string name="ui_annotation_same_width">같은 너비</string>
     <string name="ui_annotation_same_height">같은 높이</string>
     <string name="app_name">vibefactory</string>

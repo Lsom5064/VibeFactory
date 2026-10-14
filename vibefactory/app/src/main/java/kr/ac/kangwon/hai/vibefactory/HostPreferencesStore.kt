@@ -30,6 +30,7 @@ class HostPreferencesStore(
         private const val MAX_PERSISTED_DETAIL_CHARS = 4_000
         private const val MAX_PERSISTED_IMAGE_PREVIEW_CHARS = 120_000
         private const val TRUNCATED_SUFFIX = "\n\n[긴 내용은 앱 성능을 위해 일부만 저장했어요.]"
+        private const val PREF_UI_ALIGNMENT_ENABLED = "ui_alignment_enabled"
         private val TASK_CHAT_WRITER = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "vibefactory-task-chat-writer").apply { isDaemon = true }
         }
@@ -75,6 +76,12 @@ class HostPreferencesStore(
         prefs.edit()
             .putString(HostAppConfig.PREF_PHONE_NUMBER, phoneNumber?.trim()?.ifBlank { null })
             .apply()
+    }
+
+    fun loadUiAlignmentEnabled(): Boolean = prefs.getBoolean(PREF_UI_ALIGNMENT_ENABLED, true)
+
+    fun saveUiAlignmentEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(PREF_UI_ALIGNMENT_ENABLED, enabled).apply()
     }
 
     fun saveLastSelectedTaskId(taskId: String?) {
