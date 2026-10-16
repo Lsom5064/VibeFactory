@@ -190,7 +190,9 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
 
     override fun onStop() {
         stopEdgeAutoScroll()
-        persistLocal()
+        // Batch save already persists every screen, including its confirmation state.
+        // Finishing must not overwrite the last saved screen with an unconfirmed snapshot.
+        if (!isSaving) persistLocal()
         super.onStop()
     }
 
