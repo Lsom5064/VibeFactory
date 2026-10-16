@@ -4,6 +4,11 @@ import androidx.lifecycle.ViewModel
 import kr.ac.kangwon.hai.vibefactory.UiLayoutSummaryDto
 import kr.ac.kangwon.hai.vibefactory.UiPreviewChildDto
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 
 data class UiAnnotationSession(
     val taskId: String,
@@ -37,6 +42,12 @@ data class UiAnnotationSession(
 }
 
 class UiAnnotationViewModel : ViewModel() {
+    val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override fun onCleared() {
+        persistenceScope.cancel()
+        super.onCleared()
+    }
     private val sessions = object : LinkedHashMap<String, UiAnnotationSession>(4, 0.75f, true) {
         override fun removeEldestEntry(
             eldest: MutableMap.MutableEntry<String, UiAnnotationSession>?
@@ -50,13 +61,41 @@ class UiAnnotationViewModel : ViewModel() {
     var loadGeneration: Int = 0
     val serverDraftMutex = Mutex()
     val localDraftMutex = Mutex()
-    var nextLocalSaveSequence: Long = 0
-    var savedLocalSequence: Long = 0
+    val nextLocalSaveSequence = java.util.concurrent.atomic.AtomicLong()
+    private val savedLocalSequences = mutableMapOf<String, Long>()
+    val localSaveJobs = mutableListOf<kotlinx.coroutines.Job>()
+    private val annotationCounts = mutableMapOf<String, Int>()
     var remoteSaveSequence: Long = 0
 
     fun setLayouts(value: List<UiLayoutSummaryDto>) {
         layouts = value
         layoutMenuGroups = UiLayoutPresentation.groups(value)
+    }
+
+    fun rememberDrafts(records: List<UiAnnotationDraftRecord>) {
+        records.forEach { annotationCounts["${it.configuration}:${it.layoutName}"] = it.annotations.size }
+    }
+
+    fun annotationCounts(): Map<String, Int> {
+        sessions.values.forEach { annotationCounts["${it.layout.configuration}:${it.layout.layout_name}"] = it.annotations.size }
+        session?.let { annotationCounts["${it.layout.configuration}:${it.layout.layout_name}"] = it.annotations.size }
+        return annotationCounts.toMap()
+    }
+
+    fun cachedSessions(): List<UiAnnotationSession> = (sessions.values + listOfNotNull(session)).distinctBy {
+        sessionKey(it.taskId, it.revisionLabel, it.layout)
+    }
+
+    fun cachedSession(taskId: String, revisionLabel: String, layout: UiLayoutSummaryDto): UiAnnotationSession? =
+        sessions[sessionKey(taskId, revisionLabel, layout)]
+
+    suspend fun persistRecord(record: UiAnnotationDraftRecord, sequence: Long, write: (UiAnnotationDraftRecord) -> Unit) {
+        localDraftMutex.withLock {
+            val key = "${record.taskId}:${record.revisionLabel}:${record.configuration}:${record.layoutName}"
+            if (sequence <= (savedLocalSequences[key] ?: 0L)) return
+            write(record)
+            savedLocalSequences[key] = sequence
+        }
     }
 
     fun restoreCachedSession(

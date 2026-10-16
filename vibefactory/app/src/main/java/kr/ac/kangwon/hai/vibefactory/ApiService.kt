@@ -133,6 +133,15 @@ interface VibeApiService {
         @Query("phone_number") phoneNumber: String? = null
     ): ResponseBody
 
+    @POST("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/confirm")
+    suspend fun confirmUiEditorDrafts(
+        @Path("task_id") taskId: String,
+        @Path("revision_label") revisionLabel: String,
+        @Query("device_id") deviceId: String,
+        @Query("phone_number") phoneNumber: String? = null,
+        @Body request: UiEditorBatchConfirmRequestDto
+    ): UiEditorBatchConfirmResponseDto
+
     @POST("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/confirm")
     suspend fun confirmUiEditorDraft(
         @Path("task_id") taskId: String,

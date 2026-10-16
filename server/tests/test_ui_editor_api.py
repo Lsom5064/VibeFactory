@@ -840,6 +840,97 @@ class UiEditorApiTests(unittest.TestCase):
         self.assertIn("부연 설명에 첨부된 참고 이미지", prompt)
         self.assertIn(".ui_editor_drafts/reference.jpg", prompt)
 
+    def batch_fixture(self):
+        first = self.save_draft(annotation_xml=self.annotation_xml("체크박스 바로 완료")).json()
+        layout = "calendar_batch"
+        (self.project / "app/src/main/res/layout" / f"{layout}.xml").write_text(LAYOUT_XML, encoding="utf-8")
+        annotation = self.addition_xml("오늘 날짜로 돌아갈 수 있는 버튼").replace('layoutName="activity_main"', f'layoutName="{layout}"')
+        annotation = annotation.replace('schemaVersion="1"', 'schemaVersion="3"').replace('</vf:annotation>', '<vf:image-ref id="batch_sketch" role="sketch" /></vf:annotation>')
+        second, _ = self.db.save_ui_editor_draft(task_id=self.task_id, base_revision_label="rev_0001",
+            layout_name=layout, configuration="layout", base_xml_sha256=self.base_sha,
+            original_xml=LAYOUT_XML, edited_xml=LAYOUT_XML, annotation_xml=annotation,
+            descriptions={}, is_new_layout=False, draft_id=None, expected_version=None)
+        image = io.BytesIO()
+        Image.new("RGB", (240, 400), "white").save(image, format="PNG")
+        preview = base64.b64encode(image.getvalue()).decode("ascii")
+        uploaded = self.client.post(self.endpoint(f"drafts/{second['draft_id']}/images"),
+            params={"device_id": self.device_id}, json={"image_id": "batch_sketch", "element_stable_id": "annotation_1",
+                "original_name": "calendar-sketch.png", "mime_type": "image/png", "resource_name": "vibe_batch_sketch", "base64": preview})
+        self.assertEqual(200, uploaded.status_code, uploaded.text)
+        return [first, second], [{"draft_id": d["draft_id"], "expected_version": d["version"],
+            "preview_image_base64": preview} for d in [first, second]]
+
+    def test_batch_confirms_all_screens_and_forwards_both_to_the_agent(self):
+        drafts, items = self.batch_fixture()
+        response = self.client.post(self.endpoint("drafts/confirm"), params={"device_id": self.device_id}, json={"drafts": items})
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(2, len(response.json()["drafts"]))
+        context = self.client.get(f"/tasks/{self.task_id}/ui/editor-context", params={"device_id": self.device_id}).json()
+        self.assertEqual(2, context["saved_draft_count"])
+        runner = Mock()
+        self.app.state.runner = runner
+        def revision(workspace, source, _base):
+            destination = workspace / "revisions/rev_0002/project"
+            shutil.copytree(source, destination)
+            return destination, "rev_0002"
+        with patch.object(server_module, "create_followup_project_revision", side_effect=revision), patch.object(server_module, "apply_project_defaults", return_value=False):
+            generated = self.client.post("/generate", json={"task_id": self.task_id, "device_id": self.device_id,
+                "phone_number": self.phone_number, "prompt": "수정사항 반영", "use_ui_editor_draft": True})
+        self.assertEqual(200, generated.status_code, generated.text)
+        event = next(e for e in self.db.list_events(self.task_id) if e["event_type"] == "ui_editor_chat_context_attached")
+        payload = json.loads(event["payload_json"])
+        self.assertEqual({d["draft_id"] for d in drafts}, {d["draft_id"] for d in payload["drafts"]})
+        self.assertIn("체크박스 바로 완료", payload["prompt"])
+        self.assertIn("오늘 날짜로 돌아갈 수 있는 버튼", payload["prompt"])
+        self.assertIn("vf:stroke", payload["prompt"])
+        calendar = next(d for d in payload["drafts"] if d["layout_name"] == "calendar_batch")
+        self.assertEqual("batch_sketch", calendar["images"][0]["image_id"])
+        self.assertIn(calendar["images"][0]["workspace_path"], payload["prompt"])
+
+    def test_batch_invalid_version_never_confirms_earlier_screens(self):
+        drafts, items = self.batch_fixture()
+        items[1]["expected_version"] += 1
+        response = self.client.post(self.endpoint("drafts/confirm"), params={"device_id": self.device_id}, json={"drafts": items})
+        self.assertEqual(409, response.status_code)
+        self.assertTrue(all(not self.db.get_ui_editor_draft(d["draft_id"])["confirmed_at"] for d in drafts))
+
+    def test_batch_rejects_duplicates_and_unauthorized_owner(self):
+        drafts, items = self.batch_fixture()
+        duplicate = self.client.post(self.endpoint("drafts/confirm"), params={"device_id": self.device_id}, json={"drafts": [items[0], items[0]]})
+        self.assertEqual(422, duplicate.status_code)
+        denied = self.client.post(self.endpoint("drafts/confirm"), params={"device_id": "unrelated"}, json={"drafts": items})
+        self.assertEqual(404, denied.status_code)
+        self.assertTrue(all(not self.db.get_ui_editor_draft(d["draft_id"])["confirmed_at"] for d in drafts))
+
+    def test_batch_version_race_rolls_back_every_confirmation(self):
+        drafts, items = self.batch_fixture()
+        original = self.db.confirm_ui_editor_drafts
+        def change_then_confirm(**kwargs):
+            with self.db.connect() as connection:
+                connection.execute("UPDATE ui_editor_drafts SET version=version+1 WHERE draft_id=?", (drafts[1]["draft_id"],))
+                connection.commit()
+            return original(**kwargs)
+        with patch.object(self.db, "confirm_ui_editor_drafts", side_effect=change_then_confirm):
+            response = self.client.post(self.endpoint("drafts/confirm"), params={"device_id": self.device_id}, json={"drafts": items})
+        self.assertEqual(409, response.status_code)
+        self.assertTrue(all(not self.db.get_ui_editor_draft(d["draft_id"])["confirmed_at"] for d in drafts))
+
+    def test_batch_bad_second_preview_preserves_previous_confirmation_image(self):
+        drafts, items = self.batch_fixture()
+        initial = self.client.post(self.endpoint(f"drafts/{drafts[0]['draft_id']}/confirm"),
+            params={"device_id": self.device_id}, json=items[0])
+        self.assertEqual(200, initial.status_code)
+        before = self.db.get_ui_editor_draft(drafts[0]["draft_id"])
+        old_bytes = (self.workspace / before["preview_workspace_path"]).read_bytes()
+        other = io.BytesIO(); Image.new("RGB", (240, 400), "red").save(other, format="PNG")
+        items[0]["preview_image_base64"] = base64.b64encode(other.getvalue()).decode("ascii")
+        items[1]["preview_image_base64"] = "invalid"
+        response = self.client.post(self.endpoint("drafts/confirm"), params={"device_id": self.device_id}, json={"drafts": items})
+        self.assertEqual(400, response.status_code)
+        self.assertEqual(before["preview_workspace_path"], self.db.get_ui_editor_draft(drafts[0]["draft_id"])["preview_workspace_path"])
+        self.assertEqual(old_bytes, (self.workspace / before["preview_workspace_path"]).read_bytes())
+        self.assertFalse(self.db.get_ui_editor_draft(drafts[1]["draft_id"])["confirmed_at"])
+
     def test_annotation_schema_and_annotated_preview_are_persisted_with_integrity(self) -> None:
         move_xml = self.annotation_xml("카드 아래로 이동", action="move")
         parsed_move = validate_ui_annotation_xml(

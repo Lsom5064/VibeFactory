@@ -332,6 +332,17 @@ data class UiEditorSaveResponseDto(
     val draft: UiEditorDraftDto
 )
 
+data class UiEditorBatchConfirmItemDto(
+    val draft_id: String,
+    val expected_version: Int,
+    val preview_image_base64: String
+)
+
+data class UiEditorBatchConfirmRequestDto(val drafts: List<UiEditorBatchConfirmItemDto>)
+data class UiEditorBatchConfirmResponseDto(
+    val task_id: String = "", val status: String = "", val drafts: List<UiEditorDraftDto> = emptyList()
+)
+
 data class UiEditorContextResponseDto(
     val task_id: String = "",
     val revision_label: String = "",

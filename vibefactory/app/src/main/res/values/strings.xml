@@ -1,4 +1,8 @@
 <resources>
+    <string name="ui_annotation_all_screens_count">%1$d개 화면 · 표시 %2$d개</string>
+    <string name="ui_annotation_saving_screen">수정한 모든 화면 저장 중… (%1$d/%2$d)</string>
+    <string name="ui_annotation_finish_other_screen">%1$s 화면의 진행 중인 추가·변경을 먼저 완료해 주세요.</string>
+    <string name="ui_annotation_batch_server_required">모든 화면을 함께 저장하려면 서버 업데이트가 필요해요. 담당 연구원에게 알려주세요.</string>
     <string name="ui_annotation_alignment_toggle">자동 보정</string>
     <string name="ui_annotation_same_width">같은 너비</string>
     <string name="ui_annotation_same_height">같은 높이</string>

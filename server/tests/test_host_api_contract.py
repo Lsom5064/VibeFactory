@@ -21,6 +21,7 @@ from server.project_builder import NativeAndroidProjectBuilder
 
 
 REQUIRED_ROUTES = {
+    ("POST", "/tasks/{task_id}/revisions/{revision_label}/ui/drafts/confirm"),
     ("GET", "/tasks"),
     ("POST", "/generate"),
     ("GET", "/status/{task_id}"),

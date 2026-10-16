@@ -61,6 +61,19 @@ class UiAnnotationDraftStore(context: Context, private val gson: Gson) {
         }
     }
 
+    /** Includes off-screen drafts and layouts evicted from the in-memory rendering cache. IO thread only. */
+    fun loadAll(taskId: String, revisionLabel: String): List<UiAnnotationDraftRecord> {
+        val directory = File(root, "${safe(taskId)}/${safe(revisionLabel)}")
+        return directory.walkTopDown().filter { it.isFile && it.extension == "json" }.map { file ->
+            val record = gson.fromJson(file.readText(), UiAnnotationDraftRecord::class.java)
+            require(record.taskId == taskId && record.revisionLabel == revisionLabel &&
+                file.canonicalFile == draftFile(taskId, revisionLabel, record.layoutName, record.configuration).canonicalFile)
+            requireNotNull(load(taskId, revisionLabel, record.layoutName, record.configuration)) {
+                "화면 편집 내용을 불러오지 못했어요. ${record.layoutName} 화면을 다시 확인해 주세요."
+            }
+        }.toList()
+    }
+
     fun persistImage(
         taskId: String,
         revisionLabel: String,

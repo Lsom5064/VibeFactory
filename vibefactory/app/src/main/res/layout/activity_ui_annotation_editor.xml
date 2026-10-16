@@ -160,6 +160,8 @@
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:fillViewport="false"
+                android:scrollbars="horizontal"
+                android:fadeScrollbars="false"
                 android:paddingStart="8dp"
                 android:paddingTop="8dp"
                 android:paddingEnd="8dp"
@@ -169,6 +171,12 @@
                     android:id="@+id/uiAnnotationVerticalViewport"
                     android:layout_width="wrap_content"
                     android:layout_height="match_parent"
+                    android:scrollbars="vertical"
+                    android:fadeScrollbars="false"
+                    android:scrollbarStyle="insideInset"
+                    android:paddingEnd="12dp"
+                    android:paddingBottom="100dp"
+                    android:clipToPadding="false"
                     android:fillViewport="false">
 
                     <FrameLayout

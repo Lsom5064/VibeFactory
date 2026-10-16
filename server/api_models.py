@@ -62,6 +62,14 @@ class UiEditorSubmitRequest(BaseModel):
     preview_mime_type: str = Field(default="image/jpeg", max_length=100)
 
 
+class UiEditorBatchConfirmItem(UiEditorSubmitRequest):
+    draft_id: str = Field(..., min_length=1, max_length=120)
+
+
+class UiEditorBatchConfirmRequest(BaseModel):
+    drafts: list[UiEditorBatchConfirmItem] = Field(..., min_length=1, max_length=100)
+
+
 class TaskUpdateRequest(BaseModel):
     app_name: str = Field(..., min_length=1, max_length=80)
 

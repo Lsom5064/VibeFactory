@@ -48,6 +48,7 @@ try:
         TaskUpdateRequest,
         UiEditorDraftRequest,
         UiEditorImageRequest,
+        UiEditorBatchConfirmRequest,
         UiEditorSubmitRequest,
     )
 except ImportError:
@@ -64,6 +65,7 @@ except ImportError:
         TaskUpdateRequest,
         UiEditorDraftRequest,
         UiEditorImageRequest,
+        UiEditorBatchConfirmRequest,
         UiEditorSubmitRequest,
     )
 
@@ -4857,6 +4859,30 @@ class Database:
                 (task_id, base_revision_label),
             ).fetchall()
         return [self.serialize_ui_editor_draft(row) for row in rows]
+
+    def confirm_ui_editor_drafts(
+        self, *, task_id: str, base_revision_label: str, drafts: list[dict[str, Any]],
+    ) -> bool:
+        """Confirm the exact validated versions together; never leave a partially saved batch."""
+        if not drafts or len({item["draft_id"] for item in drafts}) != len(drafts):
+            raise ValueError("draft confirmation batch must be nonempty and unique")
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for item in drafts:
+                cursor = connection.execute(
+                    """UPDATE ui_editor_drafts SET confirmed_at = ?, preview_workspace_path = ?,
+                       preview_sha256 = ?, preview_size_bytes = ?, updated_at = ?
+                       WHERE draft_id = ? AND task_id = ? AND base_revision_label = ?
+                         AND version = ? AND status = 'draft'""",
+                    (now, item["workspace_path"], item["sha256"], item["size_bytes"], now,
+                     item["draft_id"], task_id, base_revision_label, item["expected_version"]),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return False
+            connection.commit()
+        return True
 
     def confirm_ui_editor_draft(
         self,
@@ -11741,6 +11767,7 @@ def create_app() -> FastAPI:
         task: dict[str, Any],
         draft_id: str,
         preview_image_base64: Optional[str],
+        immutable: bool = False,
     ) -> dict[str, Any]:
         settings: Settings = app.state.settings
         preview_base64 = normalize_reference_image_base64(preview_image_base64)
@@ -11758,12 +11785,13 @@ def create_app() -> FastAPI:
         workspace = Path(str(task.get("workspace_path") or "")).resolve()
         if not workspace.is_dir() or not ensure_within_root(workspace, settings.workspaces_root.resolve()):
             raise UiEditorDraftStateError("task workspace is unavailable")
-        preview_relative = Path(".ui_editor_drafts") / draft_id / "preview.jpg"
+        optimized_bytes = cast(bytes, preview_optimized["data"])
+        filename = f"preview_{hashlib.sha256(optimized_bytes).hexdigest()}.jpg" if immutable else "preview.jpg"
+        preview_relative = Path(".ui_editor_drafts") / draft_id / filename
         preview_target = (workspace / preview_relative).resolve()
         if not ensure_within_root(preview_target, workspace):
             raise UiEditorSecurityError("unsafe preview path")
         preview_target.parent.mkdir(parents=True, exist_ok=True)
-        optimized_bytes = cast(bytes, preview_optimized["data"])
         preview_target.write_bytes(optimized_bytes)
         return {
             "workspace_path": preview_relative.as_posix(),
@@ -11998,24 +12026,11 @@ def create_app() -> FastAPI:
         )
         return ui_editor_draft_response(db, draft)
 
-    @app.post("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/confirm")
-    def confirm_ui_editor_draft_endpoint(
-        task_id: str,
-        revision_label: str,
-        draft_id: str,
-        request: UiEditorSubmitRequest,
-        device_id: Optional[str] = Query(default=None),
-        phone_number: Optional[str] = Query(default=None),
-        user_id: Optional[str] = Query(default=None),
+    def validated_draft_for_confirmation(
+        *, task: dict[str, Any], snapshot: dict[str, Any], task_id: str,
+        revision_label: str, draft_id: str, expected_version: int,
     ) -> dict[str, Any]:
-        _ = user_id
         db: Database = app.state.db
-        task, snapshot = require_ui_revision(
-            task_id,
-            revision_label,
-            device_id=device_id,
-            phone_number=phone_number,
-        )
         draft = db.get_ui_editor_draft(draft_id)
         if (
             draft is None
@@ -12023,7 +12038,7 @@ def create_app() -> FastAPI:
             or str(draft["base_revision_label"]) != revision_label
         ):
             raise HTTPException(status_code=404, detail="UI editor draft not found")
-        if draft["status"] != "draft" or int(draft["version"]) != request.expected_version:
+        if draft["status"] != "draft" or int(draft["version"]) != expected_version:
             raise HTTPException(
                 status_code=409,
                 detail={"message": "draft version conflict", "current": ui_editor_draft_response(db, draft)},
@@ -12087,6 +12102,76 @@ def create_app() -> FastAPI:
                 linked_ui_annotation_images(draft_annotations, images)
             except (UiEditorInputError, UiEditorSecurityError, UiEditorFileTooLargeError, UiEditorXmlError) as exc:
                 raise ui_editor_http_exception(exc) from exc
+        return draft
+
+    @app.post("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/confirm")
+    def confirm_ui_editor_drafts_endpoint(
+        task_id: str, revision_label: str, request: UiEditorBatchConfirmRequest,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        _ = user_id
+        db: Database = app.state.db
+        task, snapshot = require_ui_revision(task_id, revision_label, device_id=device_id, phone_number=phone_number)
+        ids = [item.draft_id for item in request.drafts]
+        if len(set(ids)) != len(ids):
+            raise HTTPException(status_code=422, detail="duplicate draft in confirmation batch")
+        validated = [validated_draft_for_confirmation(
+            task=task, snapshot=snapshot, task_id=task_id, revision_label=revision_label,
+            draft_id=item.draft_id, expected_version=item.expected_version,
+        ) for item in request.drafts]
+        previews = []
+        for item in request.drafts:
+            try:
+                preview = save_ui_editor_preview(task=task, draft_id=item.draft_id,
+                    preview_image_base64=item.preview_image_base64, immutable=True)
+            except (UiEditorInputError, UiEditorSecurityError, UiEditorFileTooLargeError) as exc:
+                raise ui_editor_http_exception(exc) from exc
+            if not preview["workspace_path"]:
+                raise HTTPException(status_code=422, detail="every saved screen requires an annotated preview")
+            previews.append({**preview, "draft_id": item.draft_id, "expected_version": item.expected_version})
+        if not db.confirm_ui_editor_drafts(task_id=task_id, base_revision_label=revision_label, drafts=previews):
+            raise HTTPException(status_code=409, detail="draft batch changed; reload before saving")
+        confirmed = []
+        for draft, preview in zip(validated, previews):
+            current = db.get_ui_editor_draft(str(draft["draft_id"])) or draft
+            db.log_event(task_id, actor="user", event_type="ui_editor_draft_confirmed",
+                message_text="편집한 모든 화면의 UI 변경 표시를 함께 저장했습니다.", payload={
+                    "draft": ui_editor_draft_response(db, current), "batch_draft_ids": ids,
+                    "original_xml": current["original_xml"], "annotation_xml": current["annotation_xml"],
+                    "annotations": validate_ui_annotation_xml(str(current["annotation_xml"]), task_id=task_id,
+                        revision_label=revision_label, layout_name=str(current["layout_name"]),
+                        configuration=str(current["configuration"]), base_xml_sha256=str(current["base_xml_sha256"])),
+                    "descriptions": current["descriptions"], "images": db.list_ui_editor_images(str(current["draft_id"])),
+                    "preview_workspace_path": preview["workspace_path"], "preview_sha256": preview["sha256"],
+                    "preview_size_bytes": preview["size_bytes"],
+                })
+            confirmed.append(ui_editor_draft_response(db, current))
+        return {"task_id": task_id, "status": "saved", "drafts": confirmed}
+
+    @app.post("/tasks/{task_id}/revisions/{revision_label}/ui/drafts/{draft_id}/confirm")
+    def confirm_ui_editor_draft_endpoint(
+        task_id: str,
+        revision_label: str,
+        draft_id: str,
+        request: UiEditorSubmitRequest,
+        device_id: Optional[str] = Query(default=None),
+        phone_number: Optional[str] = Query(default=None),
+        user_id: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        _ = user_id
+        db: Database = app.state.db
+        task, snapshot = require_ui_revision(
+            task_id,
+            revision_label,
+            device_id=device_id,
+            phone_number=phone_number,
+        )
+        draft = validated_draft_for_confirmation(
+            task=task, snapshot=snapshot, task_id=task_id, revision_label=revision_label,
+            draft_id=draft_id, expected_version=request.expected_version,
+        )
         try:
             preview = save_ui_editor_preview(
                 task=task,

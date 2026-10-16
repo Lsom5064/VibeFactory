@@ -32,6 +32,13 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.doOnPreDraw
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kr.ac.kangwon.hai.vibefactory.UiEditorBatchConfirmItemDto
+import kr.ac.kangwon.hai.vibefactory.UiEditorBatchConfirmRequestDto
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.lifecycle.ViewModelProvider
@@ -46,7 +53,6 @@ import kr.ac.kangwon.hai.vibefactory.UiEditorDraftDto
 import kr.ac.kangwon.hai.vibefactory.UiEditorDraftRequestDto
 import kr.ac.kangwon.hai.vibefactory.UiEditorImageDto
 import kr.ac.kangwon.hai.vibefactory.UiEditorImageUploadRequestDto
-import kr.ac.kangwon.hai.vibefactory.UiEditorSaveRequestDto
 import kr.ac.kangwon.hai.vibefactory.UiLayoutSummaryDto
 import kr.ac.kangwon.hai.vibefactory.buildSelectedAttachment
 import kr.ac.kangwon.hai.vibefactory.createVibeApiService
@@ -309,6 +315,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     }
 
     private fun armTool(action: UiAnnotationAction) {
+        if (isSaving) return
         cancelCurrentAction(clearBanner = false)
         armedAction = action
         overlay?.enableTargetSelection(true)
@@ -330,23 +337,25 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         val generation = ++loadGeneration
         showLoading(getString(R.string.ui_editor_loading_layouts))
         lifecycleScope.launch {
-            runCatching {
+            runSuspendCatching {
                 withContext(Dispatchers.IO) {
-                    apiService.getRevisionUiLayouts(
+                    val response = apiService.getRevisionUiLayouts(
                         taskId = taskId,
                         revisionLabel = revisionLabel,
                         deviceId = preferencesStore.getOrCreateDeviceId(),
                         userId = null,
                         phoneNumber = preferencesStore.loadPhoneNumber()
                     )
+                    response to draftStore.loadAll(taskId, revisionLabel)
                 }
-            }.onSuccess { response ->
+            }.onSuccess { (response, drafts) ->
                 if (generation != loadGeneration) return@onSuccess
                 if (!response.source_available) {
                     showError(response.unavailable_reason.ifBlank { getString(R.string.ui_editor_source_unavailable) })
                     return@onSuccess
                 }
                 viewModel.setLayouts(response.layouts)
+                viewModel.rememberDrafts(drafts)
                 val layout = response.layouts.firstOrNull {
                     it.layout_name == restoredLayoutName && it.configuration == restoredConfiguration
                 } ?: response.layouts.firstOrNull {
@@ -1529,8 +1538,12 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     private fun persistLocal() {
         val session = viewModel.session ?: return
         val snapshot = snapshotForPersistence(session)
-        val sequence = ++viewModel.nextLocalSaveSequence
-        lifecycleScope.launch(Dispatchers.IO) { persistLocalRecord(draftStore.recordFor(snapshot), sequence) }
+        val sequence = viewModel.nextLocalSaveSequence.incrementAndGet()
+        viewModel.annotationCounts()
+        viewModel.localSaveJobs.removeAll { it.isCompleted }
+        viewModel.localSaveJobs += viewModel.persistenceScope.launch {
+            persistLocalRecord(draftStore.recordFor(snapshot), sequence)
+        }
     }
 
     private fun snapshotForPersistence(session: UiAnnotationSession) = session.copy(
@@ -1538,11 +1551,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     )
 
     private suspend fun persistLocalRecord(record: UiAnnotationDraftRecord, sequence: Long) {
-        viewModel.localDraftMutex.withLock {
-            if (sequence <= viewModel.savedLocalSequence) return
-            draftStore.save(record)
-            viewModel.savedLocalSequence = sequence
-        }
+        viewModel.persistRecord(record, sequence, draftStore::save)
     }
 
     private suspend fun persistRemote(
@@ -1558,7 +1567,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
             val response = try {
                 saveRemoteRecord(session, record)
             } catch (error: HttpException) {
-                if (error.code() != 409 || session.serverDraftId != null) throw error
+                if (error.code() != 409) throw error
                 val remote = apiService.getUiEditorDraft(
                     taskId = record.taskId,
                     revisionLabel = record.revisionLabel,
@@ -1568,13 +1577,13 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
                     userId = null,
                     phoneNumber = preferencesStore.loadPhoneNumber()
                 )
-                if (remote.annotation_xml != record.annotationXml) throw error
+                if (remote.status != "draft" || remote.annotation_xml != record.annotationXml) throw error
                 remote
             }
             session.serverDraftId = response.draft_id
             session.serverDraftVersion = response.version
             uploadReferencedImages(session, response)
-            val localSequence = ++viewModel.nextLocalSaveSequence
+            val localSequence = viewModel.nextLocalSaveSequence.incrementAndGet()
             persistLocalRecord(draftStore.recordFor(session), localSequence)
             response
         }
@@ -1640,63 +1649,116 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
         if (index >= 0) session.images[index] = session.images[index].copy(serverWorkspacePath = path)
     }
 
-    private fun saveForChat() {
-        val session = viewModel.session ?: return
-        if (isSaving || session.annotations.isEmpty()) return
-        val validationError = validateAnnotationsForSubmit(session.annotations)
-        if (validationError != null) {
-            Toast.makeText(this, validationError, Toast.LENGTH_LONG).show()
-            return
+    private suspend fun sessionForSave(layout: UiLayoutSummaryDto): UiAnnotationSession {
+        viewModel.cachedSession(taskId, revisionLabel, layout)?.let { return it }
+        val deviceId = preferencesStore.getOrCreateDeviceId()
+        val phone = preferencesStore.loadPhoneNumber()
+        val document = withContext(Dispatchers.IO) {
+            apiService.getRevisionUiLayout(taskId, revisionLabel, layout.layout_name,
+                layout.configuration, deviceId, null, phone)
         }
-        cancelCurrentAction()
-        remoteSaveJob?.cancel()
+        val parsed = withContext(Dispatchers.Default) { AndroidXmlDocument.parse(document.xml, document.sha256) }
+        val draft = withContext(Dispatchers.IO) {
+            val local = draftStore.load(taskId, revisionLabel, layout.layout_name, layout.configuration)
+            val remote = try { apiService.getUiEditorDraft(taskId, revisionLabel, layout.layout_name,
+                layout.configuration, deviceId, null, phone) } catch (error: HttpException) {
+                if (error.code() != 404) throw error
+                null
+            }
+            reconcileDrafts(parsed, local, remote)
+        }
+        return viewModel.initialize(taskId, revisionLabel, layout, parsed,
+            ResolvedUiResources.from(document.resource_files), document.unresolved_resources.size,
+            document.preview_children, document.preview_dynamic_text_view_ids.toSet(),
+            document.preview_hidden_view_ids.toSet(), draft)
+    }
+
+    private suspend fun renderForSave(session: UiAnnotationSession, index: Int, total: Int) {
+        viewModel.session = session
+        selectedLayout = session.layout
+        renderSession()
+        showLoading(getString(R.string.ui_annotation_saving_screen, index, total))
+        val canvas = findViewById<View>(R.id.uiAnnotationCanvas)
+        suspendCancellableCoroutine<Unit> { continuation ->
+            val listener = canvas.doOnPreDraw { if (continuation.isActive) continuation.resume(Unit) }
+            continuation.invokeOnCancellation { canvas.post { listener.removeListener() } }
+            canvas.requestLayout()
+        }
+    }
+
+    private fun saveForChat() {
+        val originalSession = viewModel.session ?: return
+        if (isSaving) return
         isSaving = true
         updateActions()
         showLoading(getString(R.string.ui_annotation_saving))
         lifecycleScope.launch {
-            val result = runCatching {
-                val snapshot = snapshotForPersistence(session)
-                val saved = withContext(Dispatchers.IO) {
-                    persistRemote(session, draftStore.recordFor(snapshot)).getOrThrow()
+            val result = runSuspendCatching {
+                remoteSaveJob?.cancelAndJoin()
+                persistLocal()
+                viewModel.localSaveJobs.toList().joinAll()
+                val records = withContext(Dispatchers.IO) { draftStore.loadAll(taskId, revisionLabel) }
+                for (record in records) {
+                    val layout = viewModel.layouts.firstOrNull {
+                        it.layout_name == record.layoutName && it.configuration == record.configuration
+                    }
+                    if (record.pendingAddition != null || record.pendingModification != null) {
+                        error(getString(R.string.ui_annotation_finish_other_screen,
+                            layout?.let(::layoutDisplayName) ?: record.layoutName))
+                    }
+                    validateAnnotationsForSubmit(record.annotations)?.let { error(it) }
                 }
-                val preview = requireNotNull(captureAnnotatedPreview()) {
-                    getString(R.string.ui_annotation_preview_failed)
+                require(records.any { it.annotations.isNotEmpty() }) { getString(R.string.ui_annotation_empty) }
+                cancelCurrentAction()
+                val sessions = records.filter { it.annotations.isNotEmpty() || it.serverDraftId != null }.map { record ->
+                    val layout = requireNotNull(viewModel.layouts.firstOrNull {
+                        it.layout_name == record.layoutName && it.configuration == record.configuration
+                    }) { "${record.layoutName} 화면의 원본을 확인할 수 없어요." }
+                    sessionForSave(layout)
                 }
-                withContext(Dispatchers.IO) {
-                    apiService.confirmUiEditorDraft(
-                        taskId = session.taskId,
-                        revisionLabel = session.revisionLabel,
-                        draftId = saved.draft_id,
-                        deviceId = preferencesStore.getOrCreateDeviceId(),
-                        userId = null,
-                        phoneNumber = preferencesStore.loadPhoneNumber(),
-                        request = UiEditorSaveRequestDto(
-                            expected_version = session.serverDraftVersion ?: saved.version,
-                            preview_image_base64 = preview
-                        )
-                    )
+                val confirmations = mutableListOf<UiEditorBatchConfirmItemDto>()
+                for ((index, session) in sessions.withIndex()) {
+                    renderForSave(session, index + 1, sessions.size)
+                    val snapshot = snapshotForPersistence(session)
+                    val saved = withContext(Dispatchers.IO) {
+                        persistRemote(session, draftStore.recordFor(snapshot)).getOrThrow()
+                    }
+                    // Empty layouts must also be flushed so a cleared, previously confirmed draft cannot leak through.
+                    if (session.annotations.isEmpty()) continue
+                    val preview = requireNotNull(captureAnnotatedPreview()) { getString(R.string.ui_annotation_preview_failed) }
+                    confirmations += UiEditorBatchConfirmItemDto(saved.draft_id,
+                        session.serverDraftVersion ?: saved.version, preview)
+                }
+                val response = try {
+                    withContext(Dispatchers.IO) {
+                        apiService.confirmUiEditorDrafts(taskId, revisionLabel,
+                            preferencesStore.getOrCreateDeviceId(), preferencesStore.loadPhoneNumber(),
+                            UiEditorBatchConfirmRequestDto(confirmations))
+                    }
+                } catch (error: HttpException) {
+                    if (error.code() == 404 || error.code() == 405) error(getString(R.string.ui_annotation_batch_server_required))
+                    throw error
+                }
+                check(response.drafts.map { it.draft_id }.toSet() == confirmations.map { it.draft_id }.toSet()) {
+                    "일부 화면이 저장되지 않았어요. 다시 저장해 주세요."
+                }
+                for (session in sessions) {
+                    val record = draftStore.recordFor(session, confirmed = session.annotations.isNotEmpty())
+                    val sequence = viewModel.nextLocalSaveSequence.incrementAndGet()
+                    withContext(Dispatchers.IO) { persistLocalRecord(record, sequence) }
                 }
             }
             result.onSuccess {
-                val localSequence = ++viewModel.nextLocalSaveSequence
-                withContext(Dispatchers.IO) {
-                    persistLocalRecord(
-                        draftStore.recordFor(session, confirmed = true),
-                        localSequence
-                    )
-                }
                 Toast.makeText(this@UiAnnotationEditorActivity, R.string.ui_annotation_saved, Toast.LENGTH_LONG).show()
-                setResult(RESULT_OK, Intent().putExtra(EXTRA_TASK_ID, session.taskId))
+                setResult(RESULT_OK, Intent().putExtra(EXTRA_TASK_ID, taskId))
                 finish()
             }.onFailure {
                 isSaving = false
-                showCanvas()
-                updateActions()
-                Toast.makeText(
-                    this@UiAnnotationEditorActivity,
-                    it.message?.takeIf(String::isNotBlank) ?: getString(R.string.ui_editor_save_failed),
-                    Toast.LENGTH_LONG
-                ).show()
+                viewModel.session = originalSession
+                selectedLayout = originalSession.layout
+                renderSession()
+                Toast.makeText(this@UiAnnotationEditorActivity,
+                    it.message?.takeIf(String::isNotBlank) ?: getString(R.string.ui_editor_save_failed), Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -1775,18 +1837,16 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
             visibility = if (pendingMoveSource != null) View.VISIBLE else View.GONE
             isEnabled = pendingMoveSource != null && previewDestination != null && !isSaving
         }
-        findViewById<ImageButton>(R.id.btnUiAnnotationUndo).isEnabled = session?.history?.canUndo == true
-        findViewById<ImageButton>(R.id.btnUiAnnotationRedo).isEnabled = session?.history?.canRedo == true
-        findViewById<ImageButton>(R.id.btnUiAnnotationList).isEnabled = session?.annotations?.isNotEmpty() == true
-        findViewById<ImageButton>(R.id.btnUiAnnotationClear).isEnabled = session?.annotations?.isNotEmpty() == true
-        findViewById<Button>(R.id.btnUiAnnotationSave).isEnabled =
-            session?.annotations?.isNotEmpty() == true && session.pendingAddition == null &&
-                session.pendingModification == null && pendingMoveSource == null && !isSaving
-        findViewById<TextView>(R.id.uiAnnotationCount).text = if (session?.annotations.isNullOrEmpty()) {
-            getString(R.string.ui_annotation_empty)
-        } else {
-            getString(R.string.ui_annotation_count, session?.annotations?.size ?: 0)
-        }
+        findViewById<ImageButton>(R.id.btnUiAnnotationUndo).isEnabled = session?.history?.canUndo == true && !isSaving
+        findViewById<ImageButton>(R.id.btnUiAnnotationRedo).isEnabled = session?.history?.canRedo == true && !isSaving
+        findViewById<ImageButton>(R.id.btnUiAnnotationList).isEnabled = session?.annotations?.isNotEmpty() == true && !isSaving
+        findViewById<ImageButton>(R.id.btnUiAnnotationClear).isEnabled = session?.annotations?.isNotEmpty() == true && !isSaving
+        val counts = viewModel.annotationCounts().filterValues { it > 0 }
+        findViewById<Button>(R.id.btnUiAnnotationScreen).isEnabled = !isSaving
+        findViewById<Button>(R.id.btnUiAnnotationSave).isEnabled = counts.isNotEmpty() &&
+            session?.pendingAddition == null && session?.pendingModification == null && pendingMoveSource == null && !isSaving
+        findViewById<TextView>(R.id.uiAnnotationCount).text = if (counts.isEmpty()) getString(R.string.ui_annotation_empty)
+            else getString(R.string.ui_annotation_all_screens_count, counts.size, counts.values.sum())
     }
 
     private fun cancelCurrentAction(clearBanner: Boolean = true, clearPendingAddition: Boolean = true) {
@@ -1810,6 +1870,7 @@ class UiAnnotationEditorActivity : AppCompatActivity() {
     }
 
     private fun handleBack() {
+        if (isSaving) return
         if (armedAction != null || pendingMoveSource != null || viewModel.session?.pendingAddition != null) {
             cancelCurrentAction()
         } else {
