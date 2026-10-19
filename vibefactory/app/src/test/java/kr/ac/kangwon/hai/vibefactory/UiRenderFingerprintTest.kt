@@ -63,6 +63,12 @@ class UiRenderFingerprintTest {
         )
     }
 
+    @Test fun submissionStateChangeRefreshesTheReadOnlyAction() {
+        val draft = sampleMessage().copy(kind = MessageKind.CONFIRMATION)
+        assertNotEquals(UiRenderFingerprint.messages("task", listOf(draft)),
+            UiRenderFingerprint.messages("task", listOf(draft.copy(promptReviewSubmitted = true))))
+    }
+
     private fun sampleMessage(): ChatMessage {
         return ChatMessage(
             id = "message-1",

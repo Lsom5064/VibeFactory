@@ -47,6 +47,7 @@ data class ChatMessage(
     val confirmPayload: String? = null,
     val promptReviewTaskId: String? = null,
     val promptReviewText: String? = null,
+    val promptReviewSubmitted: Boolean = false,
     val artifactTaskId: String? = null,
     val artifactApkUrl: String? = null,
     val artifactApkPath: String? = null,

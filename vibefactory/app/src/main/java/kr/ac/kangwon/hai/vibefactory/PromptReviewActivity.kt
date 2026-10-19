@@ -101,6 +101,9 @@ class PromptReviewActivity : AppCompatActivity() {
         footer.addView(back, LinearLayout.LayoutParams(0, dp(48), 1f))
         val send = Button(this).apply {
             text = getString(R.string.prompt_review_send)
+            isAllCaps = false
+            maxLines = 2
+            minHeight = dp(48)
             setTextColor(ContextCompat.getColor(this@PromptReviewActivity, R.color.text_inverse))
             background = ContextCompat.getDrawable(this@PromptReviewActivity, R.drawable.bg_button_primary)
             setOnClickListener {
@@ -122,7 +125,7 @@ class PromptReviewActivity : AppCompatActivity() {
         }
         footer.addView(
             send,
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f).apply {
                 marginStart = dp(10)
             }
         )

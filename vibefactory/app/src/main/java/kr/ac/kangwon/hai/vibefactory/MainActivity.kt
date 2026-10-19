@@ -1474,6 +1474,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openPromptReview(message: ChatMessage) {
+        if (!PromptReviewMessagePolicy.canEdit(message, message.id in handledConfirmationMessageIds)) return
         val taskId = message.promptReviewTaskId
             ?: message.confirmTaskId
             ?: screenState.selectedTaskId
@@ -4980,10 +4981,12 @@ ${record.stackTrace}
             val confirmationPayload = firstString(obj, "confirmation_payload")?.trim().orEmpty()
             val renderMode = firstString(obj, "render_mode")?.trim().orEmpty()
             val awaitingConfirmation = obj.get("awaiting_confirmation")?.takeIf { it.isJsonPrimitive }?.asBoolean == true
-            val awaitingPromptReview = obj.get("awaiting_prompt_review")?.takeIf { it.isJsonPrimitive }?.asBoolean == true ||
-                renderMode == "prompt_review_bubble" ||
-                confirmationAction == "submit_initial_prompt" ||
-                isPromptReviewRenderMode(response)
+            val awaitingPromptReview = PromptReviewMessagePolicy.shouldRestoreReview(
+                awaitingReview = obj.get("awaiting_prompt_review")?.takeIf { it.isJsonPrimitive }?.asBoolean,
+                renderMode = renderMode,
+                confirmationAction = confirmationAction,
+                responseSuggestsReview = isPromptReviewRenderMode(response)
+            )
             val preparedPrompt = firstString(obj, "prepared_prompt")?.trim().orEmpty()
                 .ifBlank { response.prepared_prompt?.trim().orEmpty() }
                 .ifBlank { confirmationPayload }
@@ -5008,6 +5011,19 @@ ${record.stackTrace}
 
             val latestQuestions = stringList(obj, "latest_assistant_questions")
             if (awaitingPromptReview && preparedPrompt.isNotBlank()) {
+                // A rejected or undelivered submission can explicitly return to review.
+                // Only that active draft becomes editable again; sent history stays read-only.
+                val timeline = editableTaskTimeline(taskId)
+                val activeIndex = timeline?.indexOfLast { message ->
+                    PromptReviewMessagePolicy.isPromptReview(message) &&
+                        (message.promptReviewTaskId ?: message.confirmTaskId) == taskId &&
+                        hasSameMessageText(message.promptReviewText ?: message.body, preparedPrompt)
+                } ?: -1
+                if (taskId !in activeGenerateTaskIds && timeline != null && activeIndex >= 0 &&
+                    timeline[activeIndex].promptReviewSubmitted) {
+                    timeline[activeIndex] = timeline[activeIndex].copy(promptReviewSubmitted = false)
+                    persistTaskChat(taskId)
+                }
                 if (!timelineContainsBody(taskId, preparedPrompt)) {
                     appendTaskTimelineMessage(
                         taskId,
@@ -5995,25 +6011,15 @@ ${record.stackTrace}
                 (message.promptReviewTaskId ?: message.confirmTaskId) == normalizedTaskId
         }
         if (promptReviewIndices.isEmpty()) return
-        val preferredIndex = promptReviewIndices.firstOrNull { index ->
-            timeline[index].id == preferredMessageId
-        }
-        val messageIndex = preferredIndex ?: promptReviewIndices.last()
-        val existing = timeline[messageIndex]
-        val updated = PromptReviewMessagePolicy.withSubmittedPrompt(
-            message = existing,
+        val nextTimeline = PromptReviewMessagePolicy.reconcileSubmittedReviews(
+            messages = timeline,
+            taskId = normalizedTaskId,
             submittedPrompt = submittedPrompt,
-            submittedDetail = getString(R.string.prompt_review_submitted_detail)
+            submittedDetail = getString(R.string.prompt_review_submitted_detail),
+            preferredMessageId = preferredMessageId
         )
-        val promptReviewIndexSet = promptReviewIndices.toSet()
-        val nextTimeline = timeline.mapIndexedNotNull { index, message ->
-            when {
-                index == messageIndex -> updated
-                index in promptReviewIndexSet -> null
-                else -> message
-            }
-        }
         handledConfirmationMessageIds += promptReviewIndices.map { index -> timeline[index].id }
+        refreshConfirmationActions(promptReviewIndices.map { timeline[it].id }.toSet())
         if (nextTimeline == timeline) return
         taskConversationMessages[normalizedTaskId] = nextTimeline.toMutableList()
         taskTimelineRenderCache.markChanged(normalizedTaskId)

@@ -47,7 +47,7 @@ class PromptReviewMessagePolicyTest {
     }
 
     @Test
-    fun `handled prompt review hides its action while normal confirmation remains visible`() {
+    fun `prompt review uses a single view action while normal confirmation remains visible`() {
         val promptReview = ChatMessage(
             id = "prompt-review",
             kind = MessageKind.CONFIRMATION,
@@ -62,9 +62,11 @@ class PromptReviewMessagePolicyTest {
             promptReviewText = null
         )
 
-        assertTrue(PromptReviewMessagePolicy.shouldShowConfirmationActions(promptReview, handled = false))
-        assertFalse(PromptReviewMessagePolicy.shouldShowConfirmationActions(promptReview, handled = true))
-        assertTrue(PromptReviewMessagePolicy.shouldShowConfirmationActions(normalConfirmation, handled = true))
+        assertFalse(PromptReviewMessagePolicy.shouldShowConfirmationActions(promptReview))
+        assertTrue(PromptReviewMessagePolicy.canEdit(promptReview, handled = false))
+        assertFalse(PromptReviewMessagePolicy.canEdit(promptReview, handled = true))
+        assertFalse(PromptReviewMessagePolicy.canEdit(promptReview.copy(promptReviewSubmitted = true), handled = false))
+        assertTrue(PromptReviewMessagePolicy.shouldShowConfirmationActions(normalConfirmation))
     }
 
     @Test
@@ -90,5 +92,66 @@ class PromptReviewMessagePolicyTest {
         assertEquals("수정 후 최종 프롬프트", submitted.confirmPayload)
         assertEquals("수정 후 최종 프롬프트", submitted.promptReviewText)
         assertEquals("전송한 최종 프롬프트", submitted.detail)
+        assertTrue(submitted.promptReviewSubmitted)
     }
+
+    @Test fun `explicitly finished review never restores a stale confirmation action`() {
+        assertFalse(PromptReviewMessagePolicy.shouldRestoreReview(false, "status_only", "submit_initial_prompt", false))
+        assertFalse(PromptReviewMessagePolicy.shouldRestoreReview(false, "prompt_review_bubble", "submit_initial_prompt", true))
+        assertTrue(PromptReviewMessagePolicy.shouldRestoreReview(true, "prompt_review_bubble", "submit_initial_prompt", true))
+    }
+
+    @Test fun `legacy review responses without an explicit flag remain supported`() {
+        assertTrue(PromptReviewMessagePolicy.shouldRestoreReview(null, "prompt_review_bubble", "", false))
+        assertTrue(PromptReviewMessagePolicy.shouldRestoreReview(null, "", "submit_initial_prompt", false))
+        assertFalse(PromptReviewMessagePolicy.shouldRestoreReview(null, "status_only", "", false))
+    }
+
+    private fun review(id: String, prompt: String, task: String = "task") = ChatMessage(
+        id = id, kind = MessageKind.CONFIRMATION, title = "확인", body = prompt,
+        confirmAction = "submit_initial_prompt", promptReviewTaskId = task, promptReviewText = prompt)
+
+    private val notice = ChatMessage("notice", MessageKind.USER, "나", "전송 안내")
+
+    @Test fun `existing duplicate submitted cards collapse before the original send notice`() {
+        val first = review("original", "최종 내용").copy(createdAt = "2026-10-19 12:47:05")
+        val duplicate = review("restored", "최종 내용")
+        val fixed = PromptReviewMessagePolicy.reconcileSubmittedReviews(
+            listOf(first, notice, duplicate), "task", "최종 내용", "전송한 내용")
+        assertEquals(listOf("original", "notice"), fixed.map { it.id })
+        assertEquals(first.createdAt, fixed.first().createdAt)
+        assertTrue(fixed.first().promptReviewSubmitted)
+        assertEquals(fixed, PromptReviewMessagePolicy.reconcileSubmittedReviews(fixed, "task", "최종 내용", "전송한 내용"))
+    }
+
+    @Test fun `editing preserves the original card and removes a later copy of the edited prompt`() {
+        val fixed = PromptReviewMessagePolicy.reconcileSubmittedReviews(
+            listOf(review("original", "초안"), notice, review("copy", "최종 내용")),
+            "task", "최종 내용", "전송한 내용", "original")
+        assertEquals(listOf("original", "notice"), fixed.map { it.id })
+        assertEquals("최종 내용", fixed.first().body)
+        assertEquals("최종 내용", fixed.first().confirmPayload)
+    }
+
+    @Test fun `reconciliation preserves genuinely different drafts and other tasks`() {
+        val old = review("old", "이전 명세")
+        val anotherTask = review("other", "최종 내용", "other-task")
+        val fixed = PromptReviewMessagePolicy.reconcileSubmittedReviews(
+            listOf(old, review("selected", "초안"), notice, anotherTask),
+            "task", "최종 내용", "전송한 내용", "selected")
+        assertEquals(4, fixed.size)
+        assertEquals(old, fixed.first())
+        assertEquals(anotherTask, fixed.last())
+    }
+
+    @Test fun `a later submission does not overwrite an earlier different submission`() {
+        val old = review("old", "이전 전송").copy(promptReviewSubmitted = true)
+        val first = PromptReviewMessagePolicy.reconcileSubmittedReviews(
+            listOf(old, review("current", "새 초안"), notice), "task", "새 전송", "전송한 내용", "current")
+        val restored = PromptReviewMessagePolicy.reconcileSubmittedReviews(first, "task", "새 전송", "전송한 내용")
+        assertEquals(old, restored.first())
+        assertEquals("새 전송", restored[1].body)
+        assertTrue(restored[1].promptReviewSubmitted)
+    }
+
 }

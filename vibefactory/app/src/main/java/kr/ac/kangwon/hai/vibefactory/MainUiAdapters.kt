@@ -426,9 +426,31 @@ class ChatMessageAdapter(
 
         private fun bindExpandableChatMessage(item: ChatMessage) {
             val isLongChatMessage = isExpandableChatMessage(item)
+            body.maxLines = if (isLongChatMessage) CHAT_MESSAGE_COLLAPSED_MAX_LINES else Int.MAX_VALUE
+            body.ellipsize = if (isLongChatMessage) TextUtils.TruncateAt.END else null
+            if (PromptReviewMessagePolicy.isPromptReview(item)) {
+                val canEdit = PromptReviewMessagePolicy.canEdit(item, isConfirmationHandled(item.id))
+                val label = itemView.context.getString(when {
+                    canEdit -> R.string.prompt_review_open
+                    item.promptReviewSubmitted -> R.string.prompt_review_submitted_open
+                    else -> R.string.prompt_review_previous_open
+                })
+                expandToggle.visibility = View.VISIBLE
+                expandToggle.text = label
+                expandToggle.contentDescription = label
+                expandToggle.setOnClickListener {
+                    if (PromptReviewMessagePolicy.canEdit(item, isConfirmationHandled(item.id))) {
+                        onPromptReviewOpen(item)
+                    } else {
+                        itemView.context.startActivity(Intent(itemView.context, FullMessageActivity::class.java)
+                            .putExtra(FullMessageActivity.EXTRA_TITLE, itemView.context.getString(
+                                if (item.promptReviewSubmitted) R.string.prompt_review_submitted_title else R.string.prompt_review_title))
+                            .putExtra(FullMessageActivity.EXTRA_BODY, item.promptReviewText ?: item.body))
+                    }
+                }
+                return
+            }
             if (!isLongChatMessage) {
-                body.maxLines = Int.MAX_VALUE
-                body.ellipsize = null
                 expandToggle.visibility = View.GONE
                 expandToggle.setOnClickListener(null)
                 return
@@ -628,7 +650,7 @@ class ChatMessageAdapter(
             val isPromptReview = PromptReviewMessagePolicy.isPromptReview(item)
             val handled = isConfirmationHandled(item.id)
             confirmationActions.visibility = if (
-                PromptReviewMessagePolicy.shouldShowConfirmationActions(item, handled)
+                PromptReviewMessagePolicy.shouldShowConfirmationActions(item)
             ) {
                 View.VISIBLE
             } else {
@@ -667,7 +689,7 @@ class ChatMessageAdapter(
         }
 
         private fun bindPromptReviewOpen(item: ChatMessage) {
-            if (!isPromptReviewMessage(item)) {
+            if (!PromptReviewMessagePolicy.canEdit(item, isConfirmationHandled(item.id))) {
                 container.setOnLongClickListener(null)
                 container.isLongClickable = false
                 return
@@ -682,10 +704,6 @@ class ChatMessageAdapter(
             container.isLongClickable = true
             body.setOnLongClickListener(openReview)
             body.isLongClickable = true
-        }
-
-        private fun isPromptReviewMessage(item: ChatMessage): Boolean {
-            return PromptReviewMessagePolicy.isPromptReview(item)
         }
 
         private fun bindArtifactActions(item: ChatMessage, context: android.content.Context) {

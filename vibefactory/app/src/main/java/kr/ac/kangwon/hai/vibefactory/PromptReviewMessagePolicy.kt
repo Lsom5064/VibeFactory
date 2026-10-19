@@ -25,9 +25,40 @@ internal object PromptReviewMessagePolicy {
             )
     }
 
-    fun shouldShowConfirmationActions(message: ChatMessage, handled: Boolean): Boolean {
-        if (message.kind != MessageKind.CONFIRMATION) return false
-        return !handled || !isPromptReview(message)
+    fun shouldShowConfirmationActions(message: ChatMessage): Boolean =
+        message.kind == MessageKind.CONFIRMATION && !isPromptReview(message)
+
+    fun canEdit(message: ChatMessage, handled: Boolean): Boolean =
+        isPromptReview(message) && !handled && !message.promptReviewSubmitted
+
+    fun shouldRestoreReview(
+        awaitingReview: Boolean?, renderMode: String, confirmationAction: String,
+        responseSuggestsReview: Boolean
+    ): Boolean = awaitingReview ?: (renderMode == "prompt_review_bubble" ||
+        confirmationAction == "submit_initial_prompt" || responseSuggestsReview)
+
+    /** Keep the original card's slot and identity; discard only duplicate copies of this submission. */
+    fun reconcileSubmittedReviews(
+        messages: List<ChatMessage>, taskId: String, submittedPrompt: String,
+        submittedDetail: String, preferredMessageId: String = ""
+    ): List<ChatMessage> {
+        val finalPrompt = normalize(submittedPrompt)
+        if (finalPrompt.isBlank()) return messages
+        val indices = messages.indices.filter { index ->
+            val message = messages[index]
+            isPromptReview(message) && (message.promptReviewTaskId ?: message.confirmTaskId) == taskId
+        }
+        if (indices.isEmpty()) return messages
+        val selected = indices.firstOrNull { messages[it].id == preferredMessageId }
+            ?: indices.firstOrNull { canonicalPrompt(messages[it]) == finalPrompt }
+            ?: indices.last()
+        return messages.mapIndexedNotNull { index, message ->
+            when {
+                index == selected -> withSubmittedPrompt(message, submittedPrompt, submittedDetail)
+                index in indices && canonicalPrompt(message) == finalPrompt -> null
+                else -> message
+            }
+        }
     }
 
     fun withSubmittedPrompt(
@@ -41,7 +72,8 @@ internal object PromptReviewMessagePolicy {
             body = finalPrompt,
             detail = submittedDetail.trim().ifBlank { message.detail },
             confirmPayload = finalPrompt,
-            promptReviewText = finalPrompt
+            promptReviewText = finalPrompt,
+            promptReviewSubmitted = true
         )
     }
 

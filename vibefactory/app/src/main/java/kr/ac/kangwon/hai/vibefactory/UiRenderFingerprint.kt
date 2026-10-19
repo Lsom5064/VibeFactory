@@ -31,6 +31,7 @@ internal object UiRenderFingerprint {
             fingerprint = mix(fingerprint, message.title)
             fingerprint = mix(fingerprint, message.body)
             fingerprint = mix(fingerprint, message.detail)
+            fingerprint = mix(fingerprint, message.promptReviewSubmitted)
             fingerprint = mix(fingerprint, message.createdAt)
             fingerprint = mix(fingerprint, message.isLoading)
             fingerprint = mix(fingerprint, message.artifactDownloading)
